@@ -112,7 +112,7 @@ if alert:
     formatters["Δqty"] = "{:.0f}".format
 
 # --- 8. Slack Incoming Webhook 送信 ---
-SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/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"
+SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/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"
 
 header = (
     f"*📈 VIX MA5:* {vix_ma5:.2f}\n"
