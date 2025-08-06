@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
+import os
 
 # --- 1. ポートフォリオ定義 ---
 raw_list = """
@@ -111,8 +112,10 @@ formatters = {
 if alert:
     formatters["Δqty"] = "{:.0f}".format
 
-# --- 8. Slack Incoming Webhook 送信 ---
-SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/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"
+# --- 8. Slack Incoming Webhook 送信（Secrets対応） ---
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+if not SLACK_WEBHOOK_URL:
+    raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
 
 header = (
     f"*📈 VIX MA5:* {vix_ma5:.2f}\n"
@@ -128,7 +131,9 @@ else:
 table_text = df_small.to_string(formatters=formatters, index=False)
 payload    = {"text": header + "\n```" + table_text + "```"}
 
-resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
-resp.raise_for_status()
-
-print("✅ Slack（Webhook）へ送信しました")
+try:
+    resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
+    resp.raise_for_status()
+    print("✅ Slack（Webhook）へ送信しました")
+except Exception as e:
+    print(f"⚠️ Slack通知エラー: {e}")
