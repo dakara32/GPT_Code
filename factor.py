@@ -8,7 +8,8 @@ import requests
 # ----- ユニバースと定数 -----
 exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
 cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
-tickers = sorted(set(exist + cand))
+# 候補銘柄の価格上限（調整可能）
+CAND_PRICE_MAX = 400
 # ベンチマークsp500
 bench = '^GSPC'
 # G枠とD枠の保持数
@@ -22,6 +23,13 @@ corr_thresh_D = 0.5   # Defense側
 corrM = 45
 
 # ----- データ取得 -----
+cand_info = yf.Tickers(" ".join(cand))
+cand_prices = {
+    t: cand_info.tickers[t].fast_info.get('lastPrice', np.inf)
+    for t in cand
+}
+cand = [t for t, p in cand_prices.items() if p <= CAND_PRICE_MAX]
+tickers = sorted(set(exist + cand))
 data = yf.download(tickers + [bench], period='400d', auto_adjust=True, progress=False)
 px = data['Close']
 spx = px[bench]
@@ -137,6 +145,7 @@ df_z.rename(columns={
 
 # ----- スコアリング -----
 g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
+d_score_all = df_z.mul(pd.Series(D_weights)).sum(axis=1)
 
 # 相関抑制ロジック
 def greedy_select(candidates, corr, target_n, thresh):
@@ -157,7 +166,7 @@ while len(chosen_G) < N_G and thresh_G < corr_thresh_G:
 top_G = chosen_G
 
 D_pool = df_z.drop(top_G)
-d_score = D_pool.mul(pd.Series(D_weights)).sum(axis=1)
+d_score = d_score_all.drop(top_G)
 init_D = d_score.nlargest(corrM).index.tolist()
 thresh_D = corr_thresh_D
 chosen_D = greedy_select(init_D, corr, N_D, thresh_D)
@@ -183,6 +192,13 @@ d_table = pd.concat([
 ], axis=1)
 print("[D枠]")
 print(d_table)
+# 低スコアランキング
+low_g = g_score.nsmallest(5).rename('GSC')
+low_d = d_score_all.nsmallest(5).rename('DSC')
+print("[Low G Score Bottom5]")
+print(low_g.to_frame())
+print("[Low D Score Bottom5]")
+print(low_d.to_frame())
 # IN / OUT
 in_list = sorted(set(list(top_G) + list(top_D)) - set(exist))
 out_list = sorted(set(exist) - set(list(top_G) + list(top_D)))
@@ -226,6 +242,8 @@ message = (
     "ファクター分散最適化の結果\n"
     "[G枠]\n```" + g_table.to_string() + "```\n"
     "[D枠]\n```" + d_table.to_string() + "```\n"
+    "[Low G Score Bottom5]\n```" + low_g.to_frame().to_string() + "```\n"
+    "[Low D Score Bottom5]\n```" + low_d.to_frame().to_string() + "```\n"
     "Changes\n```" + io_table.to_string(index=False) + "```\n"
     "Performance Comparison:\n```" + df_metrics_fmt.to_string() + "```"
 )
