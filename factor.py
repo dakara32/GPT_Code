@@ -30,6 +30,8 @@ corr = returns.corr()
 
 # ----- ファクター計算関数 -----
 def trend(s):
+    """移動平均線と52週レンジで強い上昇トレンドを判定。
+    全条件を満たせば1、そうでなければ0を返す。"""
     if len(s) < 252:
         return 0
     sma50 = s.rolling(50).mean().iloc[-1]
@@ -42,6 +44,8 @@ def trend(s):
 
 
 def rs(s, b):
+    """12ヶ月と1ヶ月のリターンからベンチマークに対する相対強度を算出。
+    正の値はベンチマーク超過を示す。"""
     r12 = s.iloc[-1] / s.iloc[-252] - 1
     r1 = s.iloc[-1] / s.iloc[-22] - 1
     br12 = b.iloc[-1] / b.iloc[-252] - 1
@@ -50,12 +54,14 @@ def rs(s, b):
 
 
 def tr_str(s):
+    """終値が50日移動平均からどれだけ乖離しているかで短期トレンドの強さを測定。"""
     if len(s) < 50:
         return np.nan
     return s.iloc[-1] / s.rolling(50).mean().iloc[-1] - 1
 
 
 def div_streak(t):
+    """企業が何年連続で配当を増やしているかを求める。"""
     try:
         divs = yf.Ticker(t).dividends.dropna()
         ann = divs.groupby(divs.index.year).sum()
