@@ -166,10 +166,10 @@ for name, ticks in portfolios.items():
     sharpe = ann_ret / ann_vol
     drawdown = (cum - cum.cummax()).min()
     metrics[name] = {
-        'Annual Return': ann_ret,
-        'Annual Vol': ann_vol,
-        'Sharpe': sharpe,
-        'Max DD': drawdown
+        'RET': ann_ret,
+        'VOL': ann_vol,
+        'SHP': sharpe,
+        'MDD': drawdown
     }
 
 df_metrics = pd.DataFrame(metrics).T
