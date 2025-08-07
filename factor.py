@@ -18,8 +18,8 @@ N_G, N_D = 12, 13
 g_weights = {'GRW': 0.2, 'MOM': 0.35, 'TRD': 0.45}
 D_weights = {'QAL': 0.15, 'YLD': 0.35, 'VOL': -0.5}
 # 貪欲選定の相関閾値（0.3 → 強く分散、0.5 → 適度に分散、0.8 → ほぼ分散条件なし）
-corr_thresh_G = 0.5   # Growth側
-corr_thresh_D = 0.5   # Defense側
+corr_thresh_G = 0.45   # Growth側
+corr_thresh_D = 0.45   # Defense側
 corrM = 45
 
 # ----- データ取得 -----
