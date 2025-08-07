@@ -11,7 +11,7 @@ cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
 tickers = sorted(set(exist + cand))
 bench = '^GSPC'
 N_G, N_D = 12, 13
-g_weights = {'GRW': 0.3, 'MOM': 0.7}
+g_weights = {'GRW': 0.2, 'MOM': 0.3, 'TRD': 0.5}
 D_weights = {'QAL': 0.2, 'YLD': 0.4, 'VOL': -0.4}
 corr_thresh_G = 0.5   # Growth側
 corr_thresh_D = 0.5   # Defense側
@@ -31,16 +31,16 @@ corr = returns.corr()
 # ----- ファクター計算関数 -----
 def trend(s):
     """移動平均線と52週レンジで強い上昇トレンドを判定。
-    全条件を満たせば1、そうでなければ0を返す。"""
+    全条件を満たせば1、そうでなければ-1を返す。"""
     if len(s) < 252:
-        return 0
+        return -1
     sma50 = s.rolling(50).mean().iloc[-1]
     sma150 = s.rolling(150).mean().iloc[-1]
     sma200 = s.rolling(200).mean().iloc[-1]
     prev200 = s.rolling(200).mean().iloc[-21]
     p = s.iloc[-1]
     hi, lo = s[-252:].max(), s[-252:].min()
-    return int(all([p > sma50 > sma150 > sma200, sma150 > sma200, sma200 > prev200, p > 0.75 * hi, p > 1.3 * lo]))
+    return 1 if all([p > sma50 > sma150 > sma200, sma150 > sma200, sma200 > prev200, p > 0.75 * hi, p > 1.3 * lo]) else -1
 
 
 def rs(s, b):
@@ -100,7 +100,7 @@ for t in tickers:
 z = lambda x: np.nan_to_num(zscore(x.fillna(x.mean())))
 df_z = df.apply(z)
 df_z['DIV'] = z(df['DIV'])
-df_z['TR_pm1'] = df['TR'].replace({0: -1, 1: 1})
+df_z['TR'] = df['TR']
 df_z['DIV_STREAK'] = z(df['DIV_STREAK'])
 
 
@@ -110,7 +110,7 @@ df_z['MOM_F'] = 0.7 * df_z['RS'] + 0.3 * df_z['TR_str']
 df_z['QUALITY_F'] = (df_z['FCF'] + df_z['ROE']) / 2
 df_z['YIELD_F'] = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
 df_z['VOL'] = df_z['BETA']
-df_z['TREND'] = df_z['TR_pm1']
+df_z['TREND'] = df_z['TR']
 
 
 # ----- Compositeファクターの再標準化 -----
@@ -132,8 +132,7 @@ df_z.rename(columns={
 
 
 # ----- スコアリング -----
-G_pool = df_z[df['TR'] == 1]
-g_score = G_pool.mul(pd.Series(g_weights)).sum(axis=1)
+g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
 
 # 相関抑制ロジック
 def greedy_select(candidates, corr, target_n, thresh):
