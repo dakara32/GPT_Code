@@ -11,7 +11,7 @@ cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
 tickers = sorted(set(exist + cand))
 bench = '^GSPC'
 N_G, N_D = 12, 13
-g_weights = {'GRW': 0.4, 'MOM': 0.6}
+g_weights = {'GRW': 0.3, 'MOM': 0.7}
 D_weights = {'QAL': 0.2, 'YLD': 0.4, 'VOL': -0.4}
 corr_thresh_G = 0.5   # Growth側
 corr_thresh_D = 0.5   # Defense側
