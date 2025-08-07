@@ -156,7 +156,7 @@ print(io_table.to_string(index=False))
 all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench]))
 prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
 ret = prices.pct_change().dropna()
-portfolios = {'Current': exist, 'New': list(top_G) + list(top_D)}
+portfolios = {'CUR': exist, 'NEW': list(top_G) + list(top_D)}
 metrics = {}
 for name, ticks in portfolios.items():
     pr = ret[ticks].mean(axis=1)
