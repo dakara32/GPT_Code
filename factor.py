@@ -4,21 +4,8 @@ import numpy as np
 from scipy.stats import zscore
 
 # ----- ユニバースと定数 -----
-exist = [
-    'AAPL','MRVL','NET','TTD','AMZN','NVDA','UBER',
-    'TSM','AMAT','GOOGL','VEEV','ENB','APO','ICE',
-    'TJX','CME','ACGL','VRT','WMB','SYY','TSLA','ABBV','CEG','CLS','IBKR'
-]
-cand = [
-    'NKE','DOCS','DASH','U','GLW','GRBK','HON','GDDY','LRCX',
-    'LVMUY','CPNG','PSX','PAC','JD','SPOT','BMO','FUJHY','NTR',
-    'LTH','VZ','SIRI','LH','BN','GEHC','META','CASY','ELF',
-    'SBUX','WELL','SYM','ARM','CYBR','PLTR','ASML','RXRX',
-    'NXST','TMDX','GRAB','ANET','PSTG','RACE','OXY','YOU',
-    'FI','GKOS','AMCR','SMCI','CRDO','QRVO','IBM','NVO',
-    'AAOI','ALAB','IONQ','CRSP','HWM','UNP','SO',
-    'VICI','BR','WM','KO'
-]
+exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
+cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
 tickers = sorted(set(exist + cand))
 bench = '^GSPC'
 N_G, N_D = 12, 13
