@@ -9,10 +9,14 @@ import requests
 exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
 cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
 tickers = sorted(set(exist + cand))
+# ベンチマークsp500
 bench = '^GSPC'
+# G枠とD枠の保持数
 N_G, N_D = 12, 13
+# 枠別のファクター重み
 g_weights = {'GRW': 0.3, 'MOM': 0.2, 'TRD': 0.5}
 D_weights = {'QAL': 0.25, 'YLD': 0.25, 'VOL': -0.5}
+# 貪欲選定の相関閾値（0.3 → 強く分散、0.5 → 適度に分散、0.8 → ほぼ分散条件なし）
 corr_thresh_G = 0.5   # Growth側
 corr_thresh_D = 0.5   # Defense側
 corrM = 45
