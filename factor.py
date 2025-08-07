@@ -13,9 +13,9 @@ bench = '^GSPC'
 N_G, N_D = 12, 13
 g_weights = {'GRW': 0.5, 'MOM': 0.5}
 D_weights = {'QAL': 0.25, 'YLD': 0.35, 'VOL': -0.4}
-corr_thresh_G = 0.3   # Growth側
-corr_thresh_D = 0.3   # Defense側
-M = 30
+corr_thresh_G = 0.5   # Growth側
+corr_thresh_D = 0.5   # Defense側
+corrM = 50
 
 # ----- データ取得 -----
 data = yf.download(tickers + [bench], period='400d', auto_adjust=True, progress=False)
@@ -139,21 +139,21 @@ def greedy_select(candidates, corr, target_n, thresh):
             break
     return selected
 
-init_G = g_score.nlargest(M).index.tolist()
+init_G = g_score.nlargest(corrM).index.tolist()
 thresh_G = corr_thresh_G
 chosen_G = greedy_select(init_G, corr, N_G, thresh_G)
-while len(chosen_G) < N_G and thresh_G < 0.6:
-    thresh_G += 0.05
+while len(chosen_G) < N_G and thresh_G < corr_thresh_G:
+    thresh_G += 0.02
     chosen_G = greedy_select(init_G, corr, N_G, thresh_G)
 top_G = chosen_G
 
 D_pool = df_z.drop(top_G)
 d_score = D_pool.mul(pd.Series(D_weights)).sum(axis=1)
-init_D = d_score.nlargest(M).index.tolist()
+init_D = d_score.nlargest(corrM).index.tolist()
 thresh_D = corr_thresh_D
 chosen_D = greedy_select(init_D, corr, N_D, thresh_D)
-while len(chosen_D) < N_D and thresh_D < 0.6:
-    thresh_D += 0.05
+while len(chosen_D) < N_D and thresh_D < corr_thresh_D:
+    thresh_D += 0.02
     chosen_D = greedy_select(init_D, corr, N_D, thresh_D)
 top_D = chosen_D
 
