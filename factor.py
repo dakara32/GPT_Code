@@ -11,6 +11,8 @@ cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
 tickers = sorted(set(exist + cand))
 bench = '^GSPC'
 N_G, N_D = 12, 13
+g_weights = {'GRW': 0.5, 'MOM': 0.5}
+D_weights = {'QAL': 0.25, 'YLD': 0.35, 'VOL': -0.4}
 
 # ----- データ取得 -----
 data = yf.download(tickers + [bench], period='400d', auto_adjust=True, progress=False)
@@ -105,15 +107,23 @@ df_z['QUALITY_F'] = z(df_z['QUALITY_F'])
 df_z['YIELD_F'] = z(df_z['YIELD_F'])
 df_z['VOL'] = z(df_z['VOL'])
 
+# ----- カラム名を短縮 -----
+df_z.rename(columns={
+    'GROWTH_F': 'GRW',
+    'MOM_F': 'MOM',
+    'TREND': 'TRD',
+    'QUALITY_F': 'QAL',
+    'YIELD_F': 'YLD',
+    'VOL': 'VOL'
+}, inplace=True)
+
 
 # ----- スコアリング -----
 G_pool = df_z[df['TR'] == 1]
-g_weights = {'GROWTH_F': 0.5, 'MOM_F': 0.5}
 g_score = G_pool.mul(pd.Series(g_weights)).sum(axis=1)
 top_G = g_score.nlargest(N_G).index
 
 D_pool = df_z.drop(top_G)
-D_weights = {'QUALITY_F': 0.25, 'YIELD_F': 0.35, 'VOL': -0.4}
 d_score = D_pool.mul(pd.Series(D_weights)).sum(axis=1)
 top_D = d_score.nlargest(N_D).index
 
@@ -122,23 +132,24 @@ top_D = d_score.nlargest(N_D).index
 pd.set_option('display.float_format', '{:.3f}'.format)
 # Growth枠
 g_table = pd.concat([
-    df_z.loc[top_G, ['GROWTH_F', 'MOM_F', 'TREND']],
-    g_score[top_G].rename('G_score')
+    df_z.loc[top_G, ['GRW', 'MOM', 'TRD']],
+    g_score[top_G].rename('GSC')
 ], axis=1)
 print("[G枠]")
 print(g_table)
 # Defense枠
 d_table = pd.concat([
-    df_z.loc[top_D, ['QUALITY_F', 'YIELD_F', 'VOL']],
-    d_score[top_D].rename('D_score')
+    df_z.loc[top_D, ['QAL', 'YLD', 'VOL']],
+    d_score[top_D].rename('DSC')
 ], axis=1)
 print("[D枠]")
 print(d_table)
 # IN / OUT
 in_list = sorted(set(list(top_G) + list(top_D)) - set(exist))
 out_list = sorted(set(exist) - set(list(top_G) + list(top_D)))
-print("IN  :", in_list)
-print("OUT :", out_list)
+io_table = pd.DataFrame({'IN': pd.Series(in_list), 'OUT': pd.Series(out_list)})
+print("Changes:")
+print(io_table.to_string(index=False))
 
 
 # ----- パフォーマンス比較 -----
@@ -173,10 +184,10 @@ if not SLACK_WEBHOOK_URL:
     raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
 
 message = (
+    "ファクター分散最適化の結果\n"
     "[G枠]\n```" + g_table.to_string() + "```\n"
     "[D枠]\n```" + d_table.to_string() + "```\n"
-    f"IN  : {', '.join(in_list)}\n"
-    f"OUT : {', '.join(out_list)}\n"
+    "Changes\n```" + io_table.to_string(index=False) + "```\n"
     "Performance Comparison:\n```" + df_metrics_fmt.to_string() + "```"
 )
 
