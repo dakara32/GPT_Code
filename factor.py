@@ -16,7 +16,7 @@ bench = '^GSPC'
 N_G, N_D = 12, 13
 # 枠別のファクター重み
 g_weights = {'GRW': 0.2, 'MOM': 0.35, 'TRD': 0.45}
-D_weights = {'QAL': 0.20, 'YLD': 0.35, 'VOL': -0.45}
+D_weights = {'QAL': 0.2, 'YLD': 0.45, 'VOL': -0.35}
 # 貪欲選定の相関閾値（0.3 → 強く分散、0.5 → 適度に分散、0.8 → ほぼ分散条件なし）
 corr_thresh_G = 0.5   # Growth側
 corr_thresh_D = 0.5   # Defense側
