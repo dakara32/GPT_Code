@@ -3,39 +3,16 @@ import pandas as pd
 import numpy as np
 import requests
 import os
+import csv
+from pathlib import Path
 
 # --- 1. ポートフォリオ定義 ---
-raw_list = """
-NET,11
-MRVL,29
-NVDA,12
-GOOG,10
-VRT,14
-TTD,22
-ENB,40
-WMB,31
-TJX,14
-ABBV,9
-IBKR,28
-ACGL,20
-CLS,9
-APO,12
-CEG,5
-AMZN,8
-CME,6
-UBER,19
-VEEV,6
-ICE,9
-SYY,21
-TSM,7
-AAPL,8
-AMAT,9
-TSLA,5
-"""
-lines = [line.split(",") for line in raw_list.strip().splitlines()]
+tickers_path = Path(__file__).with_name("current_tickers.csv")
+with tickers_path.open() as f:
+    reader = list(csv.reader(f))
 portfolio = [
-    {"symbol": sym.strip().upper(), "shares": int(qty), "target_ratio": 1/25}
-    for sym, qty in lines
+    {"symbol": sym.strip().upper(), "shares": int(qty), "target_ratio": 1/len(reader)}
+    for sym, qty in reader
 ]
 
 # --- 2. VIX MA5 & 閾値設定 ---
