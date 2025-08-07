@@ -13,13 +13,31 @@ bench = '^GSPC'
 N_G, N_D = 12, 13
 g_weights = {'GRW': 0.5, 'MOM': 0.5}
 D_weights = {'QAL': 0.25, 'YLD': 0.35, 'VOL': -0.4}
+corr_thresh_G = 0.3   # Growth側
+corr_thresh_D = 0.3   # Defense側
+M = 30
 
 # ----- データ取得 -----
 data = yf.download(tickers + [bench], period='400d', auto_adjust=True, progress=False)
-px = data['Close']
-spx = px[bench]
+px = data['Close'] if 'Close' in data else pd.DataFrame()
+spx = px[bench] if bench in px else pd.Series(dtype=float)
+tickers = [t for t in tickers if t in px.columns]
+if not tickers:
+    raise RuntimeError("No price data fetched for any tickers")
 tickers_bulk = yf.Tickers(" ".join(tickers))
-info = {t: tickers_bulk.tickers[t].info for t in tickers}
+info = {}
+for t in tickers:
+    try:
+        info[t] = tickers_bulk.tickers[t].info
+    except Exception:
+        info[t] = {}
+
+# ----- 相関行列 ----
+returns = px[tickers].pct_change().dropna(axis=1, how='all').dropna()
+corr = returns.corr()
+tickers = returns.columns.tolist()
+if not tickers:
+    raise RuntimeError("No valid returns data for tickers")
 
 # ----- ファクター計算関数 -----
 def trend(s):
@@ -35,6 +53,8 @@ def trend(s):
 
 
 def rs(s, b):
+    if len(s) < 252 or len(b) < 252:
+        return np.nan
     r12 = s.iloc[-1] / s.iloc[-252] - 1
     r1 = s.iloc[-1] / s.iloc[-22] - 1
     br12 = b.iloc[-1] / b.iloc[-252] - 1
@@ -121,11 +141,34 @@ df_z.rename(columns={
 # ----- スコアリング -----
 G_pool = df_z[df['TR'] == 1]
 g_score = G_pool.mul(pd.Series(g_weights)).sum(axis=1)
-top_G = g_score.nlargest(N_G).index
+
+# 相関抑制ロジック
+def greedy_select(candidates, corr, target_n, thresh):
+    selected = []
+    for t in candidates:
+        if all(abs(corr.loc[t, s]) < thresh for s in selected):
+            selected.append(t)
+        if len(selected) == target_n:
+            break
+    return selected
+
+init_G = g_score.nlargest(M).index.tolist()
+thresh_G = corr_thresh_G
+chosen_G = greedy_select(init_G, corr, N_G, thresh_G)
+while len(chosen_G) < N_G and thresh_G < 0.6:
+    thresh_G += 0.05
+    chosen_G = greedy_select(init_G, corr, N_G, thresh_G)
+top_G = chosen_G
 
 D_pool = df_z.drop(top_G)
 d_score = D_pool.mul(pd.Series(D_weights)).sum(axis=1)
-top_D = d_score.nlargest(N_D).index
+init_D = d_score.nlargest(M).index.tolist()
+thresh_D = corr_thresh_D
+chosen_D = greedy_select(init_D, corr, N_D, thresh_D)
+while len(chosen_D) < N_D and thresh_D < 0.6:
+    thresh_D += 0.05
+    chosen_D = greedy_select(init_D, corr, N_D, thresh_D)
+top_D = chosen_D
 
 
 # ----- 出力 -----
@@ -154,11 +197,17 @@ print(io_table.to_string(index=False))
 
 # ----- パフォーマンス比較 -----
 all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench]))
-prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
+prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False).get('Close', pd.DataFrame())
+prices = prices.dropna(axis=1, how='all')
 ret = prices.pct_change().dropna()
-portfolios = {'CUR': exist, 'NEW': list(top_G) + list(top_D)}
+portfolios = {
+    'CUR': [t for t in exist if t in ret.columns],
+    'NEW': [t for t in list(top_G) + list(top_D) if t in ret.columns]
+}
 metrics = {}
 for name, ticks in portfolios.items():
+    if not ticks:
+        continue
     pr = ret[ticks].mean(axis=1)
     cum = (1 + pr).cumprod() - 1
     ann_ret = (1 + cum.iloc[-1]) ** (252 / len(cum)) - 1
