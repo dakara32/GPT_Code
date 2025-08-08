@@ -4,6 +4,7 @@ from scipy.stats import zscore
 import os
 import requests
 import time
+import yfinance as yf
 
 # ----- ユニバースと定数 -----
 exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
@@ -64,7 +65,13 @@ def fetch_candles(symbol, days):
         "from": start,
         "to": end
     })
-    if not data or data.get("s") != "ok":
+    if not data or data.get("s") != "ok" or len(data.get("c", [])) < 252:
+        try:
+            yf_data = yf.download(symbol, period=f"{days}d", auto_adjust=True, progress=False)
+            if not yf_data.empty:
+                return yf_data["Close"]
+        except Exception:
+            pass
         return pd.Series(dtype=float)
     t = pd.to_datetime(data["t"], unit="s")
     return pd.Series(data["c"], index=t)
@@ -72,13 +79,29 @@ def fetch_candles(symbol, days):
 
 def fetch_metrics(symbol):
     data = finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"})
-    return data.get("metric", {}) if isinstance(data, dict) else {}
+    metrics = data.get("metric", {}) if isinstance(data, dict) else {}
+    if metrics:
+        return metrics
+    try:
+        return yf.Ticker(symbol).info
+    except Exception:
+        return {}
 
 
 def fetch_dividends(symbol):
     today = pd.Timestamp.today().strftime("%Y-%m-%d")
     data = finnhub_get("stock/dividend", {"symbol": symbol, "from": "1980-01-01", "to": today})
-    return data if isinstance(data, list) else []
+    if isinstance(data, list) and data:
+        return data
+    try:
+        divs = yf.Ticker(symbol).dividends.dropna()
+        if divs.empty:
+            return []
+        if divs.index.tz is not None:
+            divs.index = divs.index.tz_localize(None)
+        return [{"date": d.strftime("%Y-%m-%d"), "amount": float(a)} for d, a in divs.items()]
+    except Exception:
+        return []
 
 
 # ----- データ取得 -----
@@ -120,6 +143,9 @@ def trend(s):
 def rs(s, b):
     """12ヶ月と1ヶ月のリターンからベンチマークに対する相対強度を算出。
     正の値はベンチマーク超過を示す。"""
+    # 十分なデータがない場合は計算せずNaNを返す
+    if len(s) < 252 or len(b) < 252:
+        return np.nan
     r12 = s.iloc[-1] / s.iloc[-252] - 1
     r1 = s.iloc[-1] / s.iloc[-22] - 1
     br12 = b.iloc[-1] / b.iloc[-252] - 1
