@@ -28,11 +28,15 @@ def finnhub_get(endpoint, params):
     try:
         resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params)
         resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.JSONDecodeError as e:
+        print(f"⚠️ Finnhub API JSON decode error: {e}")
+        return {}
     except Exception as e:
         print(f"⚠️ Finnhub API error: {e}")
         return {}
     call_times.append(time.time())
-    return resp.json()
+    return data
 
 
 def fetch_price(symbol):
