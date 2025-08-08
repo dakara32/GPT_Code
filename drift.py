@@ -5,6 +5,7 @@ import os
 import csv
 import time
 from pathlib import Path
+import yfinance as yf
 
 # --- Finnhub settings & helper ---
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
@@ -54,10 +55,18 @@ def fetch_vix_ma5():
         "index/candle",
         {"symbol": "^VIX", "resolution": "D", "from": frm, "to": now},
     )
-    if data.get("s") != "ok":
-        return float("nan")
-    closes = data.get("c", [])[-5:]
-    return sum(closes) / len(closes) if closes else float("nan")
+    closes = data.get("c", []) if data.get("s") == "ok" else []
+    if len(closes) >= 5:
+        return sum(closes[-5:]) / 5
+    # fallback to yfinance if Finnhub data missing
+    try:
+        vix = yf.download("^VIX", period="7d", interval="1d", progress=False)["Close"]
+        closes = vix.dropna().tail(5)
+        if not closes.empty:
+            return closes.mean()
+    except Exception:
+        pass
+    return float("nan")
 
 # --- 1. ポートフォリオ定義 ---
 tickers_path = Path(__file__).with_name("current_tickers.csv")
