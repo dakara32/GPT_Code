@@ -1,9 +1,9 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.stats import zscore
 import os
 import requests
+import time
 
 # ----- ユニバースと定数 -----
 exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
@@ -24,19 +24,79 @@ corrM = 45
 # デバッグモード（Trueで詳細情報を表示）
 debug_mode = True
 
+# ----- Finnhub設定 -----
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+if not FINNHUB_API_KEY:
+    raise ValueError("FINNHUB_API_KEY not set (環境変数が未設定です)")
+
+RATE_LIMIT = 55  # free tier 60/min, keep a cushion
+call_times = []
+
+
+def finnhub_get(endpoint, params):
+    """Call Finnhub API with simple rate limiting."""
+    now = time.time()
+    cutoff = now - 60
+    while call_times and call_times[0] < cutoff:
+        call_times.pop(0)
+    if len(call_times) >= RATE_LIMIT:
+        sleep_time = 60 - (now - call_times[0])
+        time.sleep(sleep_time)
+    params = {**params, "token": FINNHUB_API_KEY}
+    try:
+        resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.JSONDecodeError:
+        return {}
+    except Exception:
+        return {}
+    call_times.append(time.time())
+    return data
+
+
+def fetch_candles(symbol, days):
+    end = int(pd.Timestamp.utcnow().timestamp())
+    start = int((pd.Timestamp.utcnow() - pd.Timedelta(days=days)).timestamp())
+    data = finnhub_get("stock/candle", {
+        "symbol": symbol,
+        "resolution": "D",
+        "from": start,
+        "to": end
+    })
+    if not data or data.get("s") != "ok":
+        return pd.Series(dtype=float)
+    t = pd.to_datetime(data["t"], unit="s")
+    return pd.Series(data["c"], index=t)
+
+
+def fetch_metrics(symbol):
+    data = finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"})
+    return data.get("metric", {}) if isinstance(data, dict) else {}
+
+
+def fetch_dividends(symbol):
+    today = pd.Timestamp.today().strftime("%Y-%m-%d")
+    data = finnhub_get("stock/dividend", {"symbol": symbol, "from": "1980-01-01", "to": today})
+    return data if isinstance(data, list) else []
+
+
 # ----- データ取得 -----
-cand_info = yf.Tickers(" ".join(cand))
-cand_prices = {
-    t: cand_info.tickers[t].fast_info.get('lastPrice', np.inf)
-    for t in cand
-}
+# 価格データ取得（候補+保有+ベンチマーク）
+raw_tickers = sorted(set(exist + cand + [bench]))
+px_dict = {t: fetch_candles(t, 400) for t in raw_tickers}
+
+# 候補の価格フィルタリング
+cand_prices = {t: (px_dict.get(t).iloc[-1] if not px_dict.get(t).empty else np.inf) for t in cand}
 cand = [t for t, p in cand_prices.items() if p <= CAND_PRICE_MAX]
 tickers = sorted(set(exist + cand))
-data = yf.download(tickers + [bench], period='400d', auto_adjust=True, progress=False)
-px = data['Close']
+
+# DataFrame化
+px = pd.DataFrame({t: px_dict[t] for t in tickers + [bench]}).dropna()
 spx = px[bench]
-tickers_bulk = yf.Tickers(" ".join(tickers))
-info = {t: tickers_bulk.tickers[t].info for t in tickers}
+
+# ファンダメンタル指標
+info = {t: fetch_metrics(t) for t in tickers}
 
 # ----- 相関行列 ----
 returns = px[tickers].pct_change().dropna()
@@ -77,9 +137,15 @@ def tr_str(s):
 def div_streak(t):
     """企業が何年連続で配当を増やしているかを求める。"""
     try:
-        divs = yf.Ticker(t).dividends.dropna()
-        ann = divs.groupby(divs.index.year).sum()
-        ann = ann[ann.index < pd.Timestamp.today().year]
+        data = fetch_dividends(t)
+        if not data:
+            return 0
+        df_div = pd.DataFrame(data)
+        if df_div.empty:
+            return 0
+        df_div["date"] = pd.to_datetime(df_div["date"])
+        df_div = df_div[df_div["date"].dt.year < pd.Timestamp.today().year]
+        ann = df_div.groupby(df_div["date"].dt.year)["amount"].sum()
         years = sorted(ann.index)
         streak = 0
         for i in range(len(years) - 1, 0, -1):
@@ -100,12 +166,12 @@ for t in tickers:
     s = px[t]
     ev = d.get('enterpriseValue', np.nan)
     df.loc[t, 'TR'] = trend(s)
-    df.loc[t, 'EPS'] = d.get('earningsQuarterlyGrowth', np.nan)
-    df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
-    df.loc[t, 'ROE'] = d.get('returnOnEquity', np.nan)
+    df.loc[t, 'EPS'] = d.get('epsGrowthQuarterlyYoY') or d.get('netIncomeGrowthQuarterlyYoY') or np.nan
+    df.loc[t, 'REV'] = d.get('revenueGrowthTTM') or d.get('revenueGrowthQuarterlyYoY') or np.nan
+    df.loc[t, 'ROE'] = d.get('roeTTM') or d.get('roeAnnual') or np.nan
     df.loc[t, 'BETA'] = d.get('beta', np.nan)
-    df.loc[t, 'DIV'] = d.get('dividendYield') or d.get('trailingAnnualDividendYield') or np.nan
-    df.loc[t, 'FCF'] = (d.get('freeCashflow', np.nan) / ev) if ev else np.nan
+    df.loc[t, 'DIV'] = d.get('dividendYieldIndicatedAnnual') or d.get('dividendYield') or np.nan
+    df.loc[t, 'FCF'] = (d.get('freeCashFlowTTM', np.nan) / ev) if ev else np.nan
     df.loc[t, 'RS'] = rs(s, spx)
     df.loc[t, 'TR_str'] = tr_str(s)
     df.loc[t, 'DIV_STREAK'] = div_streak(t)
@@ -229,7 +295,7 @@ print(io_table.to_string(index=False))
 
 # ----- パフォーマンス比較 -----
 all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench]))
-prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
+prices = px[all_tickers].iloc[-252:]
 ret = prices.pct_change().dropna()
 portfolios = {'CUR': exist, 'NEW': list(top_G) + list(top_D)}
 metrics = {}
