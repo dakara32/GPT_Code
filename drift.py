@@ -8,7 +8,7 @@ from pathlib import Path
 import yfinance as yf
 
 # Debug flag
-debug_mode = False  # set to True for detailed output
+debug_mode = True  # set to True for detailed output
 
 # --- Finnhub settings & helper ---
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
