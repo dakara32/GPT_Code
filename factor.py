@@ -7,8 +7,8 @@ import time
 import yfinance as yf
 
 # ----- ユニバースと定数 -----
-exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
-cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
+exist = pd.read_csv("current_tickers.csv", header=None)[0].astype(str).str.strip().tolist()
+cand = pd.read_csv("candidate_tickers.csv", header=None)[0].astype(str).str.strip().tolist()
 # 候補銘柄の価格上限（調整可能）
 CAND_PRICE_MAX = 400
 # ベンチマークsp500
@@ -110,7 +110,15 @@ raw_tickers = sorted(set(exist + cand + [bench]))
 px_dict = {t: fetch_candles(t, 400) for t in raw_tickers}
 
 # 候補の価格フィルタリング
-cand_prices = {t: (px_dict.get(t).iloc[-1] if not px_dict.get(t).empty else np.inf) for t in cand}
+cand_prices = {}
+for t in cand:
+    s = px_dict.get(t)
+    if s is None or s.empty:
+        cand_prices[t] = np.inf
+        continue
+    last = s.iloc[-1]
+    cand_prices[t] = float(last) if np.isscalar(last) else np.inf
+
 cand = [t for t, p in cand_prices.items() if p <= CAND_PRICE_MAX]
 tickers = sorted(set(exist + cand))
 
