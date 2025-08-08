@@ -12,7 +12,7 @@ cand = pd.read_csv("candidate_tickers.csv", header=None)[0].astype(str).str.stri
 # 候補銘柄の価格上限（調整可能）
 CAND_PRICE_MAX = 400
 # ベンチマークsp500
-bench = '^GSPC'
+bench = 'SPY'
 # G枠とD枠の保持数
 N_G, N_D = 12, 13
 # 枠別のファクター重み
