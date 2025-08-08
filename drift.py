@@ -25,8 +25,12 @@ def finnhub_get(endpoint, params):
         sleep_time = 60 - (now - call_times[0])
         time.sleep(sleep_time)
     params = {**params, "token": FINNHUB_API_KEY}
-    resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params)
-    resp.raise_for_status()
+    try:
+        resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"⚠️ Finnhub API error: {e}")
+        return {}
     call_times.append(time.time())
     return resp.json()
 
