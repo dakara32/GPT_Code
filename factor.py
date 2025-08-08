@@ -23,6 +23,7 @@ corr_thresh_D = 0.45   # Defense側
 corrM = 45
 # デバッグモード（Trueで詳細情報を表示）
 debug_mode = False
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 # ----- データ取得 -----
 cand_info = yf.Tickers(" ".join(cand))
@@ -92,6 +93,28 @@ def div_streak(t):
         return 0
 
 
+def fetch_finnhub_metrics(symbol):
+    """finnhub API から不足データを取得"""
+    if not FINNHUB_API_KEY:
+        return {}
+    url = "https://finnhub.io/api/v1/stock/metric"
+    params = {"symbol": symbol, "metric": "all", "token": FINNHUB_API_KEY}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        m = r.json().get("metric", {})
+        return {
+            'EPS': m.get('epsGrowthTTMYoy'),
+            'REV': m.get('revenueGrowthTTMYoy'),
+            'ROE': m.get('roeTTM'),
+            'BETA': m.get('beta'),
+            'DIV': m.get('dividendYieldIndicatedAnnual'),
+            'FCF': (m.get('freeCashFlowTTM') / m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.get('enterpriseValue') else None,
+        }
+    except Exception:
+        return {}
+
+
 # ----- ベースファクター計算 -----
 df = pd.DataFrame(index=tickers)
 missing_logs = []
@@ -109,7 +132,15 @@ for t in tickers:
     df.loc[t, 'RS'] = rs(s, spx)
     df.loc[t, 'TR_str'] = tr_str(s)
     df.loc[t, 'DIV_STREAK'] = div_streak(t)
-    for col in ['EPS', 'REV', 'ROE', 'BETA', 'DIV', 'FCF', 'RS', 'TR_str', 'DIV_STREAK']:
+    fin_cols = ['EPS', 'REV', 'ROE', 'BETA', 'DIV', 'FCF']
+    need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t, col])]
+    if need_finnhub:
+        fin_data = fetch_finnhub_metrics(t)
+        for col in need_finnhub:
+            val = fin_data.get(col)
+            if val is not None and not pd.isna(val):
+                df.loc[t, col] = val
+    for col in fin_cols + ['RS', 'TR_str', 'DIV_STREAK']:
         if pd.isna(df.loc[t, col]):
             missing_logs.append({'Ticker': t, 'Column': col})
 
