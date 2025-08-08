@@ -1,10 +1,53 @@
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
 import os
 import csv
+import time
 from pathlib import Path
+
+# --- Finnhub settings & helper ---
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+if not FINNHUB_API_KEY:
+    raise ValueError("FINNHUB_API_KEY not set (環境変数が未設定です)")
+
+RATE_LIMIT = 55  # requests per minute (free tier is 60)
+call_times = []
+
+
+def finnhub_get(endpoint, params):
+    """Call Finnhub API with basic rate limiting."""
+    now = time.time()
+    cutoff = now - 60
+    while call_times and call_times[0] < cutoff:
+        call_times.pop(0)
+    if len(call_times) >= RATE_LIMIT:
+        sleep_time = 60 - (now - call_times[0])
+        time.sleep(sleep_time)
+    params = {**params, "token": FINNHUB_API_KEY}
+    resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params)
+    resp.raise_for_status()
+    call_times.append(time.time())
+    return resp.json()
+
+
+def fetch_price(symbol):
+    try:
+        data = finnhub_get("quote", {"symbol": symbol})
+        return data.get("c") or 0
+    except Exception:
+        return 0
+
+
+def fetch_vix_ma5():
+    now = int(time.time())
+    frm = now - 60 * 60 * 24 * 7
+    data = finnhub_get(
+        "stock/candle",
+        {"symbol": "^VIX", "resolution": "D", "from": frm, "to": now},
+    )
+    closes = data.get("c", [])[-5:]
+    return sum(closes) / len(closes) if closes else float("nan")
 
 # --- 1. ポートフォリオ定義 ---
 tickers_path = Path(__file__).with_name("current_tickers.csv")
@@ -16,15 +59,12 @@ portfolio = [
 ]
 
 # --- 2. VIX MA5 & 閾値設定 ---
-vix_ma5 = yf.Ticker("^VIX").history(period="7d")["Close"].tail(5).mean()
+vix_ma5 = fetch_vix_ma5()
 drift_threshold = 10 if vix_ma5 < 20 else 12 if vix_ma5 < 26 else float("inf")
 
 # --- 3. 株価取得＆ドリフト計算 ---
 for stock in portfolio:
-    try:
-        price = yf.Ticker(stock["symbol"]).history(period="1d")["Close"].iloc[-1]
-    except Exception:
-        price = 0
+    price = fetch_price(stock["symbol"])
     stock["price"] = price
     stock["value"] = price * stock["shares"]
 
