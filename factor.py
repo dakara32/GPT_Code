@@ -212,14 +212,15 @@ print(d_table)
 
 in_list = sorted(set(list(top_G) + list(top_D)) - set(exist))
 out_list = sorted(set(exist) - set(list(top_G) + list(top_D)))
-io_table = pd.concat([
-    pd.DataFrame({'IN': pd.Series(in_list)}),
-    pd.DataFrame({
-        'OUT': out_list,
-        'GSC': g_score.reindex(out_list).round(3),
-        'DSC': d_score_all.reindex(out_list).round(3)
-    })
-], axis=1)
+
+# IN/OUTの組み合わせがずれないようにインデックスをリセットして連結
+in_df = pd.DataFrame({'IN': in_list}).reset_index(drop=True)
+out_df = pd.DataFrame({
+    'OUT': out_list,
+    'GSC': g_score.reindex(out_list).round(3).to_list(),
+    'DSC': d_score_all.reindex(out_list).round(3).to_list()
+}).reset_index(drop=True)
+io_table = pd.concat([in_df, out_df], axis=1)
 print("Changes:")
 print(io_table.to_string(index=False))
 
