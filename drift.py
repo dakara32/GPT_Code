@@ -7,6 +7,9 @@ import time
 from pathlib import Path
 import yfinance as yf
 
+# Debug flag
+debug_mode = False  # set to True for detailed output
+
 # --- Finnhub settings & helper ---
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 if not FINNHUB_API_KEY:
@@ -108,7 +111,23 @@ if alert:
     simulated_total_drift_abs   = df["simulated_drift_abs"].sum()
 else:
     df["trade_shares"]        = np.nan
+    df["new_shares"]         = np.nan
+    df["new_value"]          = np.nan
+    new_total_value          = np.nan
+    df["simulated_ratio"]    = np.nan
+    df["simulated_drift_abs"] = np.nan
     simulated_total_drift_abs = np.nan
+
+if debug_mode:
+    debug_cols = [
+        "symbol", "shares", "price", "value", "current_ratio", "drift", "drift_abs",
+        "adjusted_ratio", "adjustable", "trade_shares", "new_shares", "new_value",
+        "simulated_ratio", "simulated_drift_abs"
+    ]
+    print("\n=== DEBUG: full dataframe ===")
+    print(df[debug_cols])
+    print(f"total_value={total_value}, new_total_value={new_total_value}")
+    print(f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}")
 
 # --- 6. 合計行追加＆必要カラム抽出 ---
 summary = {
