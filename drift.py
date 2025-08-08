@@ -9,6 +9,7 @@ import yfinance as yf
 
 # Debug flag
 debug_mode = True  # set to True for detailed output
+debug_text = ""
 
 # --- Finnhub settings & helper ---
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
@@ -124,10 +125,13 @@ if debug_mode:
         "adjusted_ratio", "adjustable", "trade_shares", "new_shares", "new_value",
         "simulated_ratio", "simulated_drift_abs"
     ]
-    print("\n=== DEBUG: full dataframe ===")
-    print(df[debug_cols])
-    print(f"total_value={total_value}, new_total_value={new_total_value}")
-    print(f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}")
+    debug_text = (
+        "=== DEBUG: full dataframe ===\n" +
+        df[debug_cols].to_string() +
+        f"\n\ntotal_value={total_value}, new_total_value={new_total_value}\n" +
+        f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}"
+    )
+    print("\n" + debug_text)
 
 # --- 6. 合計行追加＆必要カラム抽出 ---
 summary = {
@@ -186,3 +190,12 @@ try:
     print("✅ Slack（Webhook）へ送信しました")
 except Exception as e:
     print(f"⚠️ Slack通知エラー: {e}")
+
+if debug_mode:
+    debug_payload = {"text": "```" + debug_text + "```"}
+    try:
+        resp = requests.post(SLACK_WEBHOOK_URL, json=debug_payload)
+        resp.raise_for_status()
+        print("✅ Debug情報をSlackに送信しました")
+    except Exception as e:
+        print(f"⚠️ Slack通知エラー: {e}")
