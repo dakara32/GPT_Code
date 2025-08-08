@@ -8,7 +8,7 @@ from pathlib import Path
 import yfinance as yf
 
 # Debug flag
-debug_mode = True  # set to True for detailed output
+debug_mode = False  # set to True for detailed output
 debug_text = ""
 
 # --- Finnhub settings & helper ---
