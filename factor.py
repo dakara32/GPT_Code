@@ -92,6 +92,7 @@ def div_streak(t):
 
 # ----- ベースファクター計算 -----
 df = pd.DataFrame(index=tickers)
+missing_logs = []
 for t in tickers:
     d = info[t]
     s = px[t]
@@ -101,11 +102,14 @@ for t in tickers:
     df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
     df.loc[t, 'ROE'] = d.get('returnOnEquity', np.nan)
     df.loc[t, 'BETA'] = d.get('beta', np.nan)
-    df.loc[t, 'DIV'] = d.get('dividendYield') or d.get('trailingAnnualDividendYield') or 0
+    df.loc[t, 'DIV'] = d.get('dividendYield') or d.get('trailingAnnualDividendYield') or np.nan
     df.loc[t, 'FCF'] = (d.get('freeCashflow', np.nan) / ev) if ev else np.nan
     df.loc[t, 'RS'] = rs(s, spx)
     df.loc[t, 'TR_str'] = tr_str(s)
     df.loc[t, 'DIV_STREAK'] = div_streak(t)
+    for col in ['EPS', 'REV', 'ROE', 'BETA', 'DIV', 'FCF', 'RS', 'TR_str', 'DIV_STREAK']:
+        if pd.isna(df.loc[t, col]):
+            missing_logs.append({'Ticker': t, 'Column': col})
 
 
 # ----- 正規化 (Zスコア) -----
@@ -178,31 +182,43 @@ top_D = chosen_D
 
 # ----- 出力 -----
 pd.set_option('display.float_format', '{:.3f}'.format)
-# Growth枠
+print("📈 ファクター分散最適化の結果")
+miss_df = pd.DataFrame(missing_logs)
+if not miss_df.empty:
+    print("Missing Data:")
+    print(miss_df.to_string(index=False))
+
+extra_G = [t for t in init_G if t not in top_G][:5]
+G_UNI = top_G + extra_G
 g_table = pd.concat([
-    df_z.loc[top_G, ['GRW', 'MOM', 'TRD']],
-    g_score[top_G].rename('GSC')
+    df_z.loc[G_UNI, ['GRW', 'MOM', 'TRD']],
+    g_score[G_UNI].rename('GSC')
 ], axis=1)
-print("[G枠]")
+g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
+g_title = f"[G枠 / {N_G} / GRW{int(g_weights['GRW']*100)} MOM{int(g_weights['MOM']*100)} TRD{int(g_weights['TRD']*100)} / corr{int(corr_thresh_G*100)}]"
+print(g_title)
 print(g_table)
-# Defense枠
+
+extra_D = [t for t in init_D if t not in top_D][:5]
+D_UNI = top_D + extra_D
 d_table = pd.concat([
-    df_z.loc[top_D, ['QAL', 'YLD', 'VOL']],
-    d_score[top_D].rename('DSC')
+    df_z.loc[D_UNI, ['QAL', 'YLD', 'VOL']],
+    d_score_all[D_UNI].rename('DSC')
 ], axis=1)
-print("[D枠]")
+d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
+d_title = f"[D枠 / {N_D} / QAL{int(D_weights['QAL']*100)} YLD{int(D_weights['YLD']*100)} VOL{int(D_weights['VOL']*100)} / corr{int(corr_thresh_D*100)}]"
+print(d_title)
 print(d_table)
-# 低スコアランキング
-low_g = g_score.nsmallest(5).rename('GSC')
-low_d = d_score_all.nsmallest(5).rename('DSC')
-print("[Low G Score Bottom5]")
-print(low_g.to_frame())
-print("[Low D Score Bottom5]")
-print(low_d.to_frame())
-# IN / OUT
+
 in_list = sorted(set(list(top_G) + list(top_D)) - set(exist))
 out_list = sorted(set(exist) - set(list(top_G) + list(top_D)))
-io_table = pd.DataFrame({'IN': pd.Series(in_list), 'OUT': pd.Series(out_list)})
+in_df = pd.DataFrame({'IN': in_list})
+out_df = pd.DataFrame({
+    'OUT': out_list,
+    'GSC': g_score.reindex(out_list).round(3).values,
+    'DSC': d_score_all.reindex(out_list).round(3).values
+})
+io_table = pd.concat([in_df, out_df], axis=1)
 print("Changes:")
 print(io_table.to_string(index=False))
 
@@ -228,7 +244,11 @@ for name, ticks in portfolios.items():
     }
 
 df_metrics = pd.DataFrame(metrics).T
-df_metrics_fmt = df_metrics.apply(lambda col: col.map(lambda x: f"{x:.2%}"))
+df_metrics_pct = df_metrics.copy()
+for col in ['RET', 'VOL', 'MDD']:
+    df_metrics_pct[col] = df_metrics_pct[col] * 100
+df_metrics_pct = df_metrics_pct.rename(columns={'RET': 'RET%', 'VOL': 'VOL%', 'MDD': 'MDD%'})
+df_metrics_fmt = df_metrics_pct.applymap(lambda x: f"{x:.1f}")
 print("Performance Comparison:")
 print(df_metrics_fmt)
 
@@ -238,15 +258,13 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 if not SLACK_WEBHOOK_URL:
     raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
 
-message = (
-    "ファクター分散最適化の結果\n"
-    "[G枠]\n```" + g_table.to_string() + "```\n"
-    "[D枠]\n```" + d_table.to_string() + "```\n"
-    "[Low G Score Bottom5]\n```" + low_g.to_frame().to_string() + "```\n"
-    "[Low D Score Bottom5]\n```" + low_d.to_frame().to_string() + "```\n"
-    "Changes\n```" + io_table.to_string(index=False) + "```\n"
-    "Performance Comparison:\n```" + df_metrics_fmt.to_string() + "```"
-)
+message = "📈 ファクター分散最適化の結果\n"
+if not miss_df.empty:
+    message += "Missing Data\n```" + miss_df.to_string(index=False) + "```\n"
+message += g_title + "\n```" + g_table.to_string() + "```\n"
+message += d_title + "\n```" + d_table.to_string() + "```\n"
+message += "Changes\n```" + io_table.to_string(index=False) + "```\n"
+message += "Performance Comparison:\n```" + df_metrics_fmt.to_string() + "```"
 
 payload = {"text": message}
 try:
