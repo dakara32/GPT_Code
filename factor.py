@@ -1,18 +1,17 @@
+import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.stats import zscore
 import os
 import requests
-import time
-import yfinance as yf
 
 # ----- ユニバースと定数 -----
-exist = pd.read_csv("current_tickers.csv", header=None)[0].astype(str).str.strip().tolist()
-cand = pd.read_csv("candidate_tickers.csv", header=None)[0].astype(str).str.strip().tolist()
+exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
+cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
 # 候補銘柄の価格上限（調整可能）
 CAND_PRICE_MAX = 400
 # ベンチマークsp500
-bench = 'SPY'
+bench = '^GSPC'
 # G枠とD枠の保持数
 N_G, N_D = 12, 13
 # 枠別のファクター重み
@@ -25,126 +24,19 @@ corrM = 45
 # デバッグモード（Trueで詳細情報を表示）
 debug_mode = True
 
-# ----- Finnhub設定 -----
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
-if not FINNHUB_API_KEY:
-    raise ValueError("FINNHUB_API_KEY not set (環境変数が未設定です)")
-
-RATE_LIMIT = 55  # free tier 60/min, keep a cushion
-MAX_RETRIES = 3
-RETRY_DELAY = 3  # seconds between retries
-call_times = []
-
-
-def finnhub_get(endpoint, params):
-    """Call Finnhub API with rate limiting and retry logic."""
-    for attempt in range(MAX_RETRIES):
-        now = time.time()
-        cutoff = now - 60
-        while call_times and call_times[0] < cutoff:
-            call_times.pop(0)
-        if len(call_times) >= RATE_LIMIT:
-            sleep_time = 60 - (now - call_times[0])
-            time.sleep(sleep_time)
-
-        params_with_token = {**params, "token": FINNHUB_API_KEY}
-        try:
-            resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params_with_token)
-            resp.raise_for_status()
-            data = resp.json()
-            call_times.append(time.time())
-            return data
-        except Exception:
-            call_times.append(time.time())
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY)
-    return {}
-
-
-def fetch_candles(symbol, days):
-    end = int(pd.Timestamp.utcnow().timestamp())
-    start = int((pd.Timestamp.utcnow() - pd.Timedelta(days=days)).timestamp())
-    data = finnhub_get("stock/candle", {
-        "symbol": symbol,
-        "resolution": "D",
-        "from": start,
-        "to": end
-    })
-    if not data or data.get("s") != "ok" or len(data.get("c", [])) < 252:
-        try:
-            yf_data = yf.download(symbol, period=f"{days}d", auto_adjust=True, progress=False)
-            if not yf_data.empty:
-                return yf_data["Close"]
-        except Exception:
-            pass
-        return pd.Series(dtype=float)
-    t = pd.to_datetime(data["t"], unit="s")
-    return pd.Series(data["c"], index=t)
-
-
-def fetch_metrics(symbol):
-    data = finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"})
-    metrics = data.get("metric", {}) if isinstance(data, dict) else {}
-    if metrics:
-        return metrics
-    try:
-        return yf.Ticker(symbol).info
-    except Exception:
-        return {}
-
-
-def fetch_dividends(symbol):
-    today = pd.Timestamp.today().strftime("%Y-%m-%d")
-    data = finnhub_get("stock/dividend", {"symbol": symbol, "from": "1980-01-01", "to": today})
-    if isinstance(data, list) and data:
-        return data
-    try:
-        divs = yf.Ticker(symbol).dividends.dropna()
-        if divs.empty:
-            return []
-        if divs.index.tz is not None:
-            divs.index = divs.index.tz_localize(None)
-        return [{"date": d.strftime("%Y-%m-%d"), "amount": float(a)} for d, a in divs.items()]
-    except Exception:
-        return []
-
-
 # ----- データ取得 -----
-# 価格データ取得（候補+保有+ベンチマーク）
-raw_tickers = sorted(set(exist + cand + [bench]))
-px_dict = {t: fetch_candles(t, 400) for t in raw_tickers}
-
-# 候補の価格フィルタリング
-cand_prices = {}
-for t in cand:
-    s = px_dict.get(t)
-    if s is None or s.empty:
-        cand_prices[t] = np.inf
-        continue
-    last = s.iloc[-1]
-    cand_prices[t] = float(last) if np.isscalar(last) else np.inf
-
+cand_info = yf.Tickers(" ".join(cand))
+cand_prices = {
+    t: cand_info.tickers[t].fast_info.get('lastPrice', np.inf)
+    for t in cand
+}
 cand = [t for t, p in cand_prices.items() if p <= CAND_PRICE_MAX]
 tickers = sorted(set(exist + cand))
-
-# DataFrame化
-px_valid = {}
-for t in tickers + [bench]:
-    s = px_dict.get(t)
-    if isinstance(s, pd.Series) and not s.empty:
-        px_valid[t] = s
-    elif debug_mode:
-        print(f"Missing price data for {t}")
-
-tickers = [t for t in tickers if t in px_valid]
-if bench not in px_valid:
-    raise ValueError(f"No price data for benchmark {bench}")
-
-px = pd.concat(px_valid, axis=1).dropna()
+data = yf.download(tickers + [bench], period='400d', auto_adjust=True, progress=False)
+px = data['Close']
 spx = px[bench]
-
-# ファンダメンタル指標
-info = {t: fetch_metrics(t) for t in tickers}
+tickers_bulk = yf.Tickers(" ".join(tickers))
+info = {t: tickers_bulk.tickers[t].info for t in tickers}
 
 # ----- 相関行列 ----
 returns = px[tickers].pct_change().dropna()
@@ -168,9 +60,6 @@ def trend(s):
 def rs(s, b):
     """12ヶ月と1ヶ月のリターンからベンチマークに対する相対強度を算出。
     正の値はベンチマーク超過を示す。"""
-    # 十分なデータがない場合は計算せずNaNを返す
-    if len(s) < 252 or len(b) < 252:
-        return np.nan
     r12 = s.iloc[-1] / s.iloc[-252] - 1
     r1 = s.iloc[-1] / s.iloc[-22] - 1
     br12 = b.iloc[-1] / b.iloc[-252] - 1
@@ -188,15 +77,9 @@ def tr_str(s):
 def div_streak(t):
     """企業が何年連続で配当を増やしているかを求める。"""
     try:
-        data = fetch_dividends(t)
-        if not data:
-            return 0
-        df_div = pd.DataFrame(data)
-        if df_div.empty:
-            return 0
-        df_div["date"] = pd.to_datetime(df_div["date"])
-        df_div = df_div[df_div["date"].dt.year < pd.Timestamp.today().year]
-        ann = df_div.groupby(df_div["date"].dt.year)["amount"].sum()
+        divs = yf.Ticker(t).dividends.dropna()
+        ann = divs.groupby(divs.index.year).sum()
+        ann = ann[ann.index < pd.Timestamp.today().year]
         years = sorted(ann.index)
         streak = 0
         for i in range(len(years) - 1, 0, -1):
@@ -217,12 +100,12 @@ for t in tickers:
     s = px[t]
     ev = d.get('enterpriseValue', np.nan)
     df.loc[t, 'TR'] = trend(s)
-    df.loc[t, 'EPS'] = d.get('epsGrowthQuarterlyYoY') or d.get('netIncomeGrowthQuarterlyYoY') or np.nan
-    df.loc[t, 'REV'] = d.get('revenueGrowthTTM') or d.get('revenueGrowthQuarterlyYoY') or np.nan
-    df.loc[t, 'ROE'] = d.get('roeTTM') or d.get('roeAnnual') or np.nan
+    df.loc[t, 'EPS'] = d.get('earningsQuarterlyGrowth', np.nan)
+    df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
+    df.loc[t, 'ROE'] = d.get('returnOnEquity', np.nan)
     df.loc[t, 'BETA'] = d.get('beta', np.nan)
-    df.loc[t, 'DIV'] = d.get('dividendYieldIndicatedAnnual') or d.get('dividendYield') or np.nan
-    df.loc[t, 'FCF'] = (d.get('freeCashFlowTTM', np.nan) / ev) if ev else np.nan
+    df.loc[t, 'DIV'] = d.get('dividendYield') or d.get('trailingAnnualDividendYield') or np.nan
+    df.loc[t, 'FCF'] = (d.get('freeCashflow', np.nan) / ev) if ev else np.nan
     df.loc[t, 'RS'] = rs(s, spx)
     df.loc[t, 'TR_str'] = tr_str(s)
     df.loc[t, 'DIV_STREAK'] = div_streak(t)
@@ -346,7 +229,7 @@ print(io_table.to_string(index=False))
 
 # ----- パフォーマンス比較 -----
 all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench]))
-prices = px[all_tickers].iloc[-252:]
+prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
 ret = prices.pct_change().dropna()
 portfolios = {'CUR': exist, 'NEW': list(top_G) + list(top_D)}
 metrics = {}
