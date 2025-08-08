@@ -216,7 +216,7 @@ out_list = sorted(set(exist) - set(list(top_G) + list(top_D)))
 # IN/OUTの組み合わせがずれないようにインデックスをリセットして連結
 in_df = pd.DataFrame({'IN': in_list}).reset_index(drop=True)
 out_df = pd.DataFrame({
-    'OUT': out_list,
+    '/ OUT': out_list,
     'GSC': g_score.reindex(out_list).round(3).to_list(),
     'DSC': d_score_all.reindex(out_list).round(3).to_list()
 }).reset_index(drop=True)
