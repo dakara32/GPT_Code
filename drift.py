@@ -47,9 +47,11 @@ def fetch_vix_ma5():
     now = int(time.time())
     frm = now - 60 * 60 * 24 * 7
     data = finnhub_get(
-        "stock/candle",
+        "index/candle",
         {"symbol": "^VIX", "resolution": "D", "from": frm, "to": now},
     )
+    if data.get("s") != "ok":
+        return float("nan")
     closes = data.get("c", [])[-5:]
     return sum(closes) / len(closes) if closes else float("nan")
 
