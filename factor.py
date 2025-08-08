@@ -31,29 +31,34 @@ if not FINNHUB_API_KEY:
     raise ValueError("FINNHUB_API_KEY not set (環境変数が未設定です)")
 
 RATE_LIMIT = 55  # free tier 60/min, keep a cushion
+MAX_RETRIES = 3
+RETRY_DELAY = 3  # seconds between retries
 call_times = []
 
 
 def finnhub_get(endpoint, params):
-    """Call Finnhub API with simple rate limiting."""
-    now = time.time()
-    cutoff = now - 60
-    while call_times and call_times[0] < cutoff:
-        call_times.pop(0)
-    if len(call_times) >= RATE_LIMIT:
-        sleep_time = 60 - (now - call_times[0])
-        time.sleep(sleep_time)
-    params = {**params, "token": FINNHUB_API_KEY}
-    try:
-        resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params)
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.JSONDecodeError:
-        return {}
-    except Exception:
-        return {}
-    call_times.append(time.time())
-    return data
+    """Call Finnhub API with rate limiting and retry logic."""
+    for attempt in range(MAX_RETRIES):
+        now = time.time()
+        cutoff = now - 60
+        while call_times and call_times[0] < cutoff:
+            call_times.pop(0)
+        if len(call_times) >= RATE_LIMIT:
+            sleep_time = 60 - (now - call_times[0])
+            time.sleep(sleep_time)
+
+        params_with_token = {**params, "token": FINNHUB_API_KEY}
+        try:
+            resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params_with_token)
+            resp.raise_for_status()
+            data = resp.json()
+            call_times.append(time.time())
+            return data
+        except Exception:
+            call_times.append(time.time())
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+    return {}
 
 
 def fetch_candles(symbol, days):
@@ -123,7 +128,19 @@ cand = [t for t, p in cand_prices.items() if p <= CAND_PRICE_MAX]
 tickers = sorted(set(exist + cand))
 
 # DataFrame化
-px = pd.DataFrame({t: px_dict[t] for t in tickers + [bench]}).dropna()
+px_valid = {}
+for t in tickers + [bench]:
+    s = px_dict.get(t)
+    if isinstance(s, pd.Series) and not s.empty:
+        px_valid[t] = s
+    elif debug_mode:
+        print(f"Missing price data for {t}")
+
+tickers = [t for t in tickers if t in px_valid]
+if bench not in px_valid:
+    raise ValueError(f"No price data for benchmark {bench}")
+
+px = pd.concat(px_valid, axis=1).dropna()
 spx = px[bench]
 
 # ファンダメンタル指標
