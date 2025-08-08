@@ -153,8 +153,8 @@ header = (
     f"*📉 現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
 )
 if alert:
-    header += f"*🔁 半戻し後ドリフト合計:* {simulated_total_drift_abs * 100:.2f}%\n"
-    header += "🚨 *アラート: 発生！！ Δqtyのマイナス分を売却、任意銘柄を買い増しバランスを取りましょう！*\n"
+    header += f"*🔁 半戻し後ドリフト合計(想定):* {simulated_total_drift_abs * 100:.2f}%\n"
+    header += "🚨 *アラート: 発生！！ Δqtyのマイナス銘柄を売却、任意の銘柄を買い増してバランスを取りましょう！*\n"
 else:
     header += "✅ アラートなし\n"
 
