@@ -21,6 +21,8 @@ D_weights = {'QAL': 0.15, 'YLD': 0.35, 'VOL': -0.5}
 corr_thresh_G = 0.45   # Growth側
 corr_thresh_D = 0.45   # Defense側
 corrM = 45
+# デバッグモード（Trueで詳細情報を表示）
+debug_mode = False
 
 # ----- データ取得 -----
 cand_info = yf.Tickers(" ".join(cand))
@@ -135,6 +137,9 @@ df_z['MOM_F'] = z(df_z['MOM_F'])
 df_z['QUALITY_F'] = z(df_z['QUALITY_F'])
 df_z['YIELD_F'] = z(df_z['YIELD_F'])
 df_z['VOL'] = z(df_z['VOL'])
+
+# Debug用にリネーム前の複合ファクターを保持
+debug_factors = df_z[['GROWTH_F', 'MOM_F', 'QUALITY_F', 'YIELD_F', 'VOL', 'TREND']].copy()
 
 # ----- カラム名を短縮 -----
 df_z.rename(columns={
@@ -254,6 +259,17 @@ df_metrics_fmt = df_metrics_pct.applymap(lambda x: f"{x:.1f}")
 print("Performance Comparison:")
 print(df_metrics_fmt)
 
+debug_table = None
+if debug_mode:
+    debug_table = pd.concat([
+        df[['TR', 'EPS', 'REV', 'ROE', 'BETA', 'DIV', 'FCF', 'RS', 'TR_str', 'DIV_STREAK']],
+        debug_factors,
+        g_score.rename('GSC'),
+        d_score_all.rename('DSC')
+    ], axis=1).round(3)
+    print("Debug Data:")
+    print(debug_table.to_string())
+
 
 # ----- Slack送信 -----
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
@@ -267,6 +283,8 @@ message += g_title + "\n```" + g_table.to_string() + "```\n"
 message += d_title + "\n```" + d_table.to_string() + "```\n"
 message += "Changes\n```" + io_table.to_string(index=False) + "```\n"
 message += "Performance Comparison:\n```" + df_metrics_fmt.to_string() + "```"
+if debug_mode and debug_table is not None:
+    message += "\nDebug Data\n```" + debug_table.to_string() + "```"
 
 payload = {"text": message}
 try:
