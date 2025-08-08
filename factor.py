@@ -22,7 +22,7 @@ corr_thresh_G = 0.45   # Growth側
 corr_thresh_D = 0.45   # Defense側
 corrM = 45
 # デバッグモード（Trueで詳細情報を表示）
-debug_mode = True
+debug_mode = False
 
 # ----- データ取得 -----
 cand_info = yf.Tickers(" ".join(cand))
