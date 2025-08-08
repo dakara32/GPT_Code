@@ -138,9 +138,6 @@ df_z['QUALITY_F'] = z(df_z['QUALITY_F'])
 df_z['YIELD_F'] = z(df_z['YIELD_F'])
 df_z['VOL'] = z(df_z['VOL'])
 
-# Debug用にリネーム前の複合ファクターを保持
-debug_factors = df_z[['GROWTH_F', 'MOM_F', 'QUALITY_F', 'YIELD_F', 'VOL', 'TREND']].copy()
-
 # ----- カラム名を短縮 -----
 df_z.rename(columns={
     'GROWTH_F': 'GRW',
@@ -263,7 +260,6 @@ debug_table = None
 if debug_mode:
     debug_table = pd.concat([
         df[['TR', 'EPS', 'REV', 'ROE', 'BETA', 'DIV', 'FCF', 'RS', 'TR_str', 'DIV_STREAK']],
-        debug_factors,
         g_score.rename('GSC'),
         d_score_all.rename('DSC')
     ], axis=1).round(3)
