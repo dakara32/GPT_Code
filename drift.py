@@ -49,24 +49,18 @@ def fetch_price(symbol):
 
 
 def fetch_vix_ma5():
-    now = int(time.time())
-    frm = now - 60 * 60 * 24 * 7
-    data = finnhub_get(
-        "index/candle",
-        {"symbol": "^VIX", "resolution": "D", "from": frm, "to": now},
-    )
-    closes = data.get("c", []) if data.get("s") == "ok" else []
-    if len(closes) >= 5:
-        return sum(closes[-5:]) / 5
-    # fallback to yfinance if Finnhub data missing
+    """Retrieve VIX 5-day moving average via yfinance."""
     try:
-        vix = yf.download("^VIX", period="7d", interval="1d", progress=False)["Close"]
-        closes = vix.dropna().tail(5)
-        if not closes.empty:
-            return closes.mean()
+        vix = (
+            yf.download("^VIX", period="7d", interval="1d", progress=False)["Close"]
+            .dropna()
+            .tail(5)
+        )
+        if len(vix) < 5:
+            return float("nan")
+        return float(vix.mean())
     except Exception:
-        pass
-    return float("nan")
+        return float("nan")
 
 # --- 1. ポートフォリオ定義 ---
 tickers_path = Path(__file__).with_name("current_tickers.csv")
