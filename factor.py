@@ -171,14 +171,18 @@ def compute_fcf_with_fallback(tickers: list[str], finnhub_api_key: str | None = 
     df = yf_df.join(fh_df, how="outer")
     df["cfo_ttm"] = df["cfo_ttm_yf"].where(df["cfo_ttm_yf"].notna(), df["cfo_ttm_fh"])
     df["capex_ttm"] = df["capex_ttm_yf"].where(df["capex_ttm_yf"].notna(), df["capex_ttm_fh"])
-    df["cfo_source"] = np.where(df["cfo_ttm_yf"].notna(), "yfinance",
-                         np.where(df["cfo_ttm_fh"].notna(), "finnhub", np.nan))
-    df["capex_source"] = np.where(df["capex_ttm_yf"].notna(), "yfinance",
-                           np.where(df["capex_ttm_fh"].notna(), "finnhub", np.nan))
-    df["fcf_ttm"] = pd.to_numeric(df["cfo_ttm"], errors="coerce") - \
-                     pd.to_numeric(df["capex_ttm"], errors="coerce").abs()
-    df["fcf_imputed"] = df[["cfo_ttm_yf", "capex_ttm_yf"]].isna().any(axis=1) & \
-                         df[["cfo_ttm", "capex_ttm"]].notna().all(axis=1)
+    df["cfo_source"] = pd.Series(index=df.index, dtype="object")
+    df.loc[df["cfo_ttm_yf"].notna(), "cfo_source"] = "yfinance"
+    df.loc[df["cfo_ttm_yf"].isna() & df["cfo_ttm_fh"].notna(), "cfo_source"] = "finnhub"
+
+    df["capex_source"] = pd.Series(index=df.index, dtype="object")
+    df.loc[df["capex_ttm_yf"].notna(), "capex_source"] = "yfinance"
+    df.loc[df["capex_ttm_yf"].isna() & df["capex_ttm_fh"].notna(), "capex_source"] = "finnhub"
+
+    cfo = pd.to_numeric(df["cfo_ttm"], errors="coerce")
+    capex = pd.to_numeric(df["capex_ttm"], errors="coerce").abs()
+    df["fcf_ttm"] = cfo - capex
+    df["fcf_imputed"] = df[["cfo_ttm_yf", "capex_ttm_yf"]].isna().any(axis=1) & df[["cfo_ttm", "capex_ttm"]].notna().all(axis=1)
     cols = ["cfo_ttm_yf", "capex_ttm_yf", "cfo_ttm_fh", "capex_ttm_fh",
             "cfo_ttm", "capex_ttm", "fcf_ttm", "cfo_source", "capex_source", "fcf_imputed"]
     return df[cols].sort_index()
