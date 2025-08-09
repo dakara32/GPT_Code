@@ -75,6 +75,38 @@ def tr_str(s):
     return s.iloc[-1] / s.rolling(50).mean().iloc[-1] - 1
 
 
+def dividend_status(ticker: str) -> str:
+    """銘柄の配当状況を簡易判定する。
+
+    has            : 配当イベントが存在（=配当あり）
+    none_confident : 分割イベントは見えるが配当はなし（=無配と判断）
+    maybe_missing  : fast_info に配当痕跡がありデータ欠損の可能性
+    unknown        : 情報が得られない
+    """
+    t = yf.Ticker(ticker)
+    # 1) 配当イベントがあれば配当あり
+    if not t.dividends.empty:
+        return "has"
+
+    # 2) 分割イベントがあればフィードは生きている → 無配と判断
+    a = t.actions
+    if (
+        a is not None
+        and not a.empty
+        and "Stock Splits" in a.columns
+        and a["Stock Splits"].abs().sum() > 0
+    ):
+        return "none_confident"
+
+    # 3) fast_info に配当の痕跡があれば取りこぼし疑い
+    fi = t.fast_info
+    if any(getattr(fi, k, None) for k in ("last_dividend_date", "dividend_rate", "dividend_yield")):
+        return "maybe_missing"
+
+    # 4) それ以外は情報不足
+    return "unknown"
+
+
 def div_streak(t):
     """企業が何年連続で配当を増やしているかを求める。"""
     try:
@@ -127,7 +159,10 @@ for t in tickers:
     df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
     df.loc[t, 'ROE'] = d.get('returnOnEquity', np.nan)
     df.loc[t, 'BETA'] = d.get('beta', np.nan)
-    df.loc[t, 'DIV'] = d.get('dividendYield') or d.get('trailingAnnualDividendYield') or np.nan
+    div = d.get('dividendYield')
+    if div is None or pd.isna(div):
+        div = d.get('trailingAnnualDividendYield')
+    df.loc[t, 'DIV'] = div if div is not None else np.nan
     df.loc[t, 'FCF'] = (d.get('freeCashflow', np.nan) / ev) if ev else np.nan
     df.loc[t, 'RS'] = rs(s, spx)
     df.loc[t, 'TR_str'] = tr_str(s)
@@ -142,7 +177,12 @@ for t in tickers:
                 df.loc[t, col] = val
     for col in fin_cols + ['RS', 'TR_str', 'DIV_STREAK']:
         if pd.isna(df.loc[t, col]):
-            missing_logs.append({'Ticker': t, 'Column': col})
+            if col == 'DIV':
+                status = dividend_status(t)
+                if status != 'none_confident':
+                    missing_logs.append({'Ticker': t, 'Column': col, 'Status': status})
+            else:
+                missing_logs.append({'Ticker': t, 'Column': col})
 
 
 # ----- 正規化 (Zスコア) -----
