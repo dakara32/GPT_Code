@@ -4,6 +4,184 @@ import numpy as np
 from scipy.stats import zscore
 import os
 import requests
+import time
+
+# ========= EPS補完 & FCF算出ユーティリティ =========
+
+def impute_eps_ttm(df: pd.DataFrame,
+                   ttm_col: str = "eps_ttm",
+                   q_col: str = "eps_q_recent",
+                   out_col: str | None = None) -> pd.DataFrame:
+    if out_col is None:
+        out_col = ttm_col
+    df = df.copy()
+    df["eps_imputed"] = False
+    cand = df[q_col] * 4
+    ok = df[ttm_col].isna() & cand.replace([np.inf, -np.inf], np.nan).notna()
+    df.loc[ok, out_col] = cand[ok]
+    df.loc[ok, "eps_imputed"] = True
+    return df
+
+_CF_ALIASES = {
+    "cfo": [
+        "Operating Cash Flow",
+        "Total Cash From Operating Activities",
+    ],
+    "capex": [
+        "Capital Expenditure",
+        "Capital Expenditures",
+    ],
+}
+
+def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series | None:
+    if df is None or df.empty:
+        return None
+    idx_lower = {str(i).lower(): i for i in df.index}
+    for name in names:
+        key = name.lower()
+        if key in idx_lower:
+            return df.loc[idx_lower[key]]
+    return None
+
+def _sum_last_n(s: pd.Series | None, n: int) -> float | None:
+    if s is None or s.empty:
+        return None
+    vals = s.dropna().astype(float)
+    if vals.empty:
+        return None
+    return vals.iloc[:n].sum()
+
+def _latest(s: pd.Series | None) -> float | None:
+    if s is None or s.empty:
+        return None
+    vals = s.dropna().astype(float)
+    return vals.iloc[0] if not vals.empty else None
+
+def fetch_cfo_capex_ttm_yf(tickers: list[str]) -> pd.DataFrame:
+    rows = []
+    for t in tickers:
+        tk = yf.Ticker(t)
+        qcf = tk.quarterly_cashflow
+        cfo_q = _pick_row(qcf, _CF_ALIASES["cfo"])
+        capex_q = _pick_row(qcf, _CF_ALIASES["capex"])
+        cfo_ttm = _sum_last_n(cfo_q, 4)
+        capex_ttm = _sum_last_n(capex_q, 4)
+
+        if cfo_ttm is None or capex_ttm is None:
+            acf = tk.cashflow
+            cfo_a = _pick_row(acf, _CF_ALIASES["cfo"])
+            capex_a = _pick_row(acf, _CF_ALIASES["capex"])
+            if cfo_ttm is None:
+                cfo_ttm = _latest(cfo_a)
+            if capex_ttm is None:
+                capex_ttm = _latest(capex_a)
+
+        rows.append({
+            "ticker": t,
+            "cfo_ttm_yf": cfo_ttm if cfo_ttm is not None else np.nan,
+            "capex_ttm_yf": capex_ttm if capex_ttm is not None else np.nan,
+        })
+    return pd.DataFrame(rows).set_index("ticker")
+
+_FINN_CFO_KEYS = [
+    "netCashProvidedByOperatingActivities",
+    "netCashFromOperatingActivities",
+    "cashFlowFromOperatingActivities",
+    "operatingCashFlow",
+]
+_FINN_CAPEX_KEYS = [
+    "capitalExpenditure",
+    "capitalExpenditures",
+    "purchaseOfPPE",
+    "investmentsInPropertyPlantAndEquipment",
+]
+
+def _first_key(d: dict, keys: list[str]):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+def _finn_get(session: requests.Session, url: str, params: dict,
+              retries: int = 3, sleep_s: float = 0.5):
+    for i in range(retries):
+        r = session.get(url, params=params, timeout=15)
+        if r.status_code == 429:
+            time.sleep(min(2**i * sleep_s, 4.0))
+            continue
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()
+
+def fetch_cfo_capex_ttm_finnhub(tickers: list[str], api_key: str | None = None) -> pd.DataFrame:
+    api_key = api_key or os.getenv("FINNHUB_API_KEY")
+    if not api_key:
+        raise ValueError("Finnhub API key not provided. Set FINNHUB_API_KEY or pass api_key=")
+
+    base = "https://finnhub.io/api/v1"
+    s = requests.Session()
+    rows = []
+    for sym in tickers:
+        cfo_ttm = None
+        capex_ttm = None
+        try:
+            j = _finn_get(s, f"{base}/stock/cash-flow", {
+                "symbol": sym, "frequency": "quarterly", "limit": 8, "token": api_key
+            })
+            arr = j.get("cashFlow") or []
+            cfo_vals, capex_vals = [], []
+            for item in arr[:4]:
+                cfo_vals.append(_first_key(item, _FINN_CFO_KEYS))
+                capex_vals.append(_first_key(item, _FINN_CAPEX_KEYS))
+            if any(v is not None for v in cfo_vals):
+                cfo_ttm = float(np.nansum([np.nan if v is None else float(v) for v in cfo_vals]))
+            if any(v is not None for v in capex_vals):
+                capex_ttm = float(np.nansum([np.nan if v is None else float(v) for v in capex_vals]))
+        except Exception:
+            pass
+        if cfo_ttm is None or capex_ttm is None:
+            try:
+                j = _finn_get(s, f"{base}/stock/cash-flow", {
+                    "symbol": sym, "frequency": "annual", "limit": 1, "token": api_key
+                })
+                arr = j.get("cashFlow") or []
+                if arr:
+                    item0 = arr[0]
+                    if cfo_ttm is None:
+                        v = _first_key(item0, _FINN_CFO_KEYS)
+                        if v is not None:
+                            cfo_ttm = float(v)
+                    if capex_ttm is None:
+                        v = _first_key(item0, _FINN_CAPEX_KEYS)
+                        if v is not None:
+                            capex_ttm = float(v)
+            except Exception:
+                pass
+
+        rows.append({
+            "ticker": sym,
+            "cfo_ttm_fh": np.nan if cfo_ttm is None else cfo_ttm,
+            "capex_ttm_fh": np.nan if capex_ttm is None else capex_ttm,
+        })
+    return pd.DataFrame(rows).set_index("ticker")
+
+def compute_fcf_with_fallback(tickers: list[str], finnhub_api_key: str | None = None) -> pd.DataFrame:
+    yf_df = fetch_cfo_capex_ttm_yf(tickers)
+    fh_df = fetch_cfo_capex_ttm_finnhub(tickers, api_key=finnhub_api_key)
+    df = yf_df.join(fh_df, how="outer")
+    df["cfo_ttm"] = df["cfo_ttm_yf"].where(df["cfo_ttm_yf"].notna(), df["cfo_ttm_fh"])
+    df["capex_ttm"] = df["capex_ttm_yf"].where(df["capex_ttm_yf"].notna(), df["capex_ttm_fh"])
+    df["cfo_source"] = np.where(df["cfo_ttm_yf"].notna(), "yfinance",
+                         np.where(df["cfo_ttm_fh"].notna(), "finnhub", np.nan))
+    df["capex_source"] = np.where(df["capex_ttm_yf"].notna(), "yfinance",
+                           np.where(df["capex_ttm_fh"].notna(), "finnhub", np.nan))
+    df["fcf_ttm"] = pd.to_numeric(df["cfo_ttm"], errors="coerce") - \
+                     pd.to_numeric(df["capex_ttm"], errors="coerce").abs()
+    df["fcf_imputed"] = df[["cfo_ttm_yf", "capex_ttm_yf"]].isna().any(axis=1) & \
+                         df[["cfo_ttm", "capex_ttm"]].notna().all(axis=1)
+    cols = ["cfo_ttm_yf", "capex_ttm_yf", "cfo_ttm_fh", "capex_ttm_fh",
+            "cfo_ttm", "capex_ttm", "fcf_ttm", "cfo_source", "capex_source", "fcf_imputed"]
+    return df[cols].sort_index()
 
 # ----- ユニバースと定数 -----
 exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
@@ -38,6 +216,25 @@ px = data['Close']
 spx = px[bench]
 tickers_bulk = yf.Tickers(" ".join(tickers))
 info = {t: tickers_bulk.tickers[t].info for t in tickers}
+
+# EPSとFCFの補完データを用意
+eps_rows = []
+for t in tickers:
+    info_t = info[t]
+    eps_ttm = info_t.get("trailingEps", np.nan)
+    eps_q = np.nan
+    try:
+        qearn = tickers_bulk.tickers[t].quarterly_earnings
+        so = info_t.get("sharesOutstanding")
+        if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
+            eps_q = qearn["Earnings"].iloc[-1] / so
+    except Exception:
+        pass
+    eps_rows.append({"ticker": t, "eps_ttm": eps_ttm, "eps_q_recent": eps_q})
+eps_df = pd.DataFrame(eps_rows).set_index("ticker")
+eps_df = impute_eps_ttm(eps_df, ttm_col="eps_ttm", q_col="eps_q_recent")
+
+fcf_df = compute_fcf_with_fallback(tickers, finnhub_api_key=FINNHUB_API_KEY)
 
 # ----- 相関行列 ----
 returns = px[tickers].pct_change().dropna()
@@ -155,7 +352,7 @@ for t in tickers:
     s = px[t]
     ev = d.get('enterpriseValue', np.nan)
     df.loc[t, 'TR'] = trend(s)
-    df.loc[t, 'EPS'] = d.get('earningsQuarterlyGrowth', np.nan)
+    df.loc[t, 'EPS'] = eps_df.loc[t, 'eps_ttm']
     df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
     df.loc[t, 'ROE'] = d.get('returnOnEquity', np.nan)
     df.loc[t, 'BETA'] = d.get('beta', np.nan)
@@ -163,11 +360,12 @@ for t in tickers:
     if div is None or pd.isna(div):
         div = d.get('trailingAnnualDividendYield')
     df.loc[t, 'DIV'] = div if div is not None else np.nan
-    df.loc[t, 'FCF'] = (d.get('freeCashflow', np.nan) / ev) if ev else np.nan
+    fcf_val = fcf_df.loc[t, 'fcf_ttm'] if t in fcf_df.index else np.nan
+    df.loc[t, 'FCF'] = (fcf_val / ev) if ev and not pd.isna(fcf_val) else np.nan
     df.loc[t, 'RS'] = rs(s, spx)
     df.loc[t, 'TR_str'] = tr_str(s)
     df.loc[t, 'DIV_STREAK'] = div_streak(t)
-    fin_cols = ['EPS', 'REV', 'ROE', 'BETA', 'DIV', 'FCF']
+    fin_cols = ['REV', 'ROE', 'BETA', 'DIV', 'FCF']
     need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t, col])]
     if need_finnhub:
         fin_data = fetch_finnhub_metrics(t)
@@ -175,7 +373,7 @@ for t in tickers:
             val = fin_data.get(col)
             if val is not None and not pd.isna(val):
                 df.loc[t, col] = val
-    for col in fin_cols + ['RS', 'TR_str', 'DIV_STREAK']:
+    for col in fin_cols + ['EPS', 'RS', 'TR_str', 'DIV_STREAK']:
         if pd.isna(df.loc[t, col]):
             if col == 'DIV':
                 status = dividend_status(t)
