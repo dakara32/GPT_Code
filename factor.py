@@ -503,14 +503,19 @@ print(io_table.to_string(index=False))
 # ----- パフォーマンス比較 -----
 all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench]))
 prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
-ret = prices.pct_change().dropna()
+ret = prices.pct_change()
 portfolios = {'CUR': exist, 'NEW': list(top_G) + list(top_D)}
 metrics = {}
 for name, ticks in portfolios.items():
-    pr = ret[ticks].mean(axis=1)
+    pr = ret[ticks].mean(axis=1, skipna=True).dropna()
     cum = (1 + pr).cumprod() - 1
-    ann_ret = (1 + cum.iloc[-1]) ** (252 / len(cum)) - 1
-    ann_vol = pr.std() * np.sqrt(252)
+    n = len(pr)
+    if n >= 252:
+        ann_ret = (1 + cum.iloc[-1]) ** (252 / n) - 1
+        ann_vol = pr.std() * np.sqrt(252)
+    else:
+        ann_ret = cum.iloc[-1]
+        ann_vol = pr.std() * np.sqrt(n)
     sharpe = ann_ret / ann_vol
     drawdown = (cum - cum.cummax()).min()
     metrics[name] = {
