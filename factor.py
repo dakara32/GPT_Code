@@ -18,7 +18,7 @@ bench = '^GSPC'
 # G枠とD枠の保持数
 N_G, N_D = 12, 13
 # 枠別のファクター重み
-g_weights = {'GRW': 0.5, 'MOM': 0.1, 'TRD': 0.4}
+g_weights = {'GRW': 0.3, 'MOM': 0.2, 'TRD': 0.5}
 D_weights = {'QAL': 0.15, 'YLD': 0.35, 'VOL': -0.5}
 corrM = 45
 # ----- DRRS params -----
