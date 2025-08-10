@@ -656,11 +656,17 @@ for name, ticks in portfolios.items():
         ann_vol = pr.std() * np.sqrt(n)
     sharpe = ann_ret / ann_vol
     drawdown = (cum - cum.cummax()).min()
+    if len(ticks) >= 2:
+        corr_mat = ret[ticks].corr()
+        avg_corr = corr_mat.mask(np.eye(len(ticks), dtype=bool)).stack().mean()
+    else:
+        avg_corr = np.nan
     metrics[name] = {
         'RET': ann_ret,
         'VOL': ann_vol,
         'SHP': sharpe,
-        'MDD': drawdown
+        'MDD': drawdown,
+        'CORR': avg_corr
     }
 
 df_metrics = pd.DataFrame(metrics).T
