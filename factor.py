@@ -7,6 +7,33 @@ import requests
 import time
 import json
 
+
+# ----- ユニバースと定数 -----
+exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
+cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
+# 候補銘柄の価格上限（調整可能）
+CAND_PRICE_MAX = 400
+# ベンチマークsp500
+bench = '^GSPC'
+# G枠とD枠の保持数
+N_G, N_D = 12, 13
+# 枠別のファクター重み
+g_weights = {'GRW': 0.3, 'MOM': 0.3, 'TRD': 0.4}
+D_weights = {'QAL': 0.15, 'YLD': 0.35, 'VOL': -0.5}
+corrM = 45
+# ----- DRRS params -----
+DRRS_G = dict(lookback=252, n_pc=3, gamma=1.2, lam=0.60, eta=0.8)
+DRRS_D = dict(lookback=504, n_pc=4, gamma=0.8, lam=0.85, eta=0.5)
+DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク
+RESULTS_DIR = "results"
+G_PREV_JSON = os.path.join(RESULTS_DIR, "G_selection.json")
+D_PREV_JSON = os.path.join(RESULTS_DIR, "D_selection.json")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+# デバッグモード（Trueで詳細情報を表示）
+debug_mode = False
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+
+
 # ========= EPS補完 & FCF算出ユーティリティ =========
 
 def impute_eps_ttm(df: pd.DataFrame,
@@ -187,31 +214,6 @@ def compute_fcf_with_fallback(tickers: list[str], finnhub_api_key: str | None = 
     cols = ["cfo_ttm_yf", "capex_ttm_yf", "cfo_ttm_fh", "capex_ttm_fh",
             "cfo_ttm", "capex_ttm", "fcf_ttm", "cfo_source", "capex_source", "fcf_imputed"]
     return df[cols].sort_index()
-
-# ----- ユニバースと定数 -----
-exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
-cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
-# 候補銘柄の価格上限（調整可能）
-CAND_PRICE_MAX = 400
-# ベンチマークsp500
-bench = '^GSPC'
-# G枠とD枠の保持数
-N_G, N_D = 12, 13
-# 枠別のファクター重み
-g_weights = {'GRW': 0.2, 'MOM': 0.35, 'TRD': 0.45}
-D_weights = {'QAL': 0.15, 'YLD': 0.35, 'VOL': -0.5}
-corrM = 45
-# ----- DRRS params -----
-DRRS_G = dict(lookback=252, n_pc=3, gamma=1.2, lam=0.60, eta=0.8)
-DRRS_D = dict(lookback=504, n_pc=4, gamma=0.8, lam=0.85, eta=0.5)
-DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク
-RESULTS_DIR = "results"
-G_PREV_JSON = os.path.join(RESULTS_DIR, "G_selection.json")
-D_PREV_JSON = os.path.join(RESULTS_DIR, "D_selection.json")
-os.makedirs(RESULTS_DIR, exist_ok=True)
-# デバッグモード（Trueで詳細情報を表示）
-debug_mode = False
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 # ----- データ取得 -----
 cand_info = yf.Tickers(" ".join(cand))
