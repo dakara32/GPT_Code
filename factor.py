@@ -267,7 +267,7 @@ def residual_corr(R: np.ndarray, n_pc: int = 3, shrink: float = 0.1) -> np.ndarr
 def rrqr_like_det(R: np.ndarray, score: np.ndarray, k: int, gamma: float = 1.0):
     """スコア重み付き RRQR 風の決定論初期選定（乱数なし・タイブレーク固定）。"""
     Z = _z_np(R)
-    w = (score - score.min()) / (score.ptp() + 1e-12)
+    w = (score - score.min()) / (np.ptp(score) + 1e-12)
     X = Z * (1.0 + gamma * w)  # 列スケーリング
     N = X.shape[1]
     S = []
