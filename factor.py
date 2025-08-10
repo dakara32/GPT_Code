@@ -5,6 +5,7 @@ from scipy.stats import zscore
 import os
 import requests
 import time
+import json
 
 # ========= EPS補完 & FCF算出ユーティリティ =========
 
@@ -199,10 +200,15 @@ N_G, N_D = 12, 13
 # 枠別のファクター重み
 g_weights = {'GRW': 0.2, 'MOM': 0.35, 'TRD': 0.45}
 D_weights = {'QAL': 0.15, 'YLD': 0.35, 'VOL': -0.5}
-# 貪欲選定の相関閾値（0.3 → 強く分散、0.5 → 適度に分散、0.8 → ほぼ分散条件なし）
-corr_thresh_G = 0.45   # Growth側
-corr_thresh_D = 0.45   # Defense側
 corrM = 45
+# ----- DRRS params -----
+DRRS_G = dict(lookback=252, n_pc=3, gamma=1.2, lam=0.60, eta=0.8)
+DRRS_D = dict(lookback=504, n_pc=4, gamma=0.8, lam=0.85, eta=0.5)
+DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク
+RESULTS_DIR = "results"
+G_PREV_JSON = os.path.join(RESULTS_DIR, "G_selection.json")
+D_PREV_JSON = os.path.join(RESULTS_DIR, "D_selection.json")
+os.makedirs(RESULTS_DIR, exist_ok=True)
 # デバッグモード（Trueで詳細情報を表示）
 debug_mode = False
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
@@ -215,7 +221,7 @@ cand_prices = {
 }
 cand = [t for t, p in cand_prices.items() if p <= CAND_PRICE_MAX]
 tickers = sorted(set(exist + cand))
-data = yf.download(tickers + [bench], period='400d', auto_adjust=True, progress=False)
+data = yf.download(tickers + [bench], period='600d', auto_adjust=True, progress=False)
 px = data['Close']
 spx = px[bench]
 tickers_bulk = yf.Tickers(" ".join(tickers))
@@ -240,9 +246,125 @@ eps_df = impute_eps_ttm(eps_df, ttm_col="eps_ttm", q_col="eps_q_recent")
 
 fcf_df = compute_fcf_with_fallback(tickers, finnhub_api_key=FINNHUB_API_KEY)
 
-# ----- 相関行列 ----
+# ===== DRRS helpers (決定論RRQR・残差相関スワップ) =====
+def _z_np(X: np.ndarray) -> np.ndarray:
+    X = np.asarray(X, dtype=np.float32)
+    m = np.nanmean(X, axis=0, keepdims=True)
+    s = np.nanstd(X, axis=0, keepdims=True) + 1e-9
+    return (np.nan_to_num(X) - m) / s
+
+def residual_corr(R: np.ndarray, n_pc: int = 3, shrink: float = 0.1) -> np.ndarray:
+    """PCA残差の相関 + 対角シュリンク。決定論。R: T×N（日次リターン）。"""
+    Z = _z_np(R)
+    U, S, Vt = np.linalg.svd(Z, full_matrices=False)  # SVDは符号不定でも残差相関は不変
+    F = U[:, :n_pc] * S[:n_pc]
+    B = np.linalg.lstsq(F, Z, rcond=None)[0]
+    E = Z - F @ B
+    C = np.corrcoef(E, rowvar=False)
+    N = C.shape[0]
+    return (1.0 - shrink) * C + shrink * np.eye(N, dtype=C.dtype)
+
+def rrqr_like_det(R: np.ndarray, score: np.ndarray, k: int, gamma: float = 1.0):
+    """スコア重み付き RRQR 風の決定論初期選定（乱数なし・タイブレーク固定）。"""
+    Z = _z_np(R)
+    w = (score - score.min()) / (score.ptp() + 1e-12)
+    X = Z * (1.0 + gamma * w)  # 列スケーリング
+    N = X.shape[1]
+    S = []
+    selected = np.zeros(N, dtype=bool)
+    Rres = X.copy()
+    for _ in range(k):
+        norms = (Rres * Rres).sum(axis=0)
+        cand = np.where(~selected)[0]
+        # タイブレーク固定：残差ノルム↓ → スコア↓ → インデックス↑
+        j = sorted(cand, key=lambda c: (-norms[c], -w[c], c))[0]
+        S.append(j); selected[j] = True
+        u = X[:, j:j+1]
+        u /= (np.linalg.norm(u) + 1e-12)
+        Rres = Rres - u @ (u.T @ Rres)  # 正射影で除去
+    return sorted(S)
+
+def _obj(corrM: np.ndarray, score: np.ndarray, idx, lam: float) -> float:
+    idx = list(idx)
+    P = corrM[np.ix_(idx, idx)]
+    s = (score - score.mean()) / (score.std() + 1e-9)
+    # Σ score − λ Σ_{i<j} corr_ij
+    return float(s[idx].sum() - lam * ((P.sum() - np.trace(P)) / 2.0))
+
+def swap_local_det(corrM: np.ndarray, score: np.ndarray, idx, lam: float = 0.6, max_pass: int = 15):
+    """1入替のbest-improvementのみ。固定順序・微小差バリア付き（決定論）。"""
+    S = sorted(idx)
+    best = _obj(corrM, score, S, lam)
+    improved, passes = True, 0
+    while improved and passes < max_pass:
+        improved = False; passes += 1
+        for i, out in enumerate(list(S)):          # 固定順
+            for inn in range(len(score)):          # 固定順
+                if inn in S: continue
+                cand = S.copy(); cand[i] = inn; cand = sorted(cand)
+                v = _obj(corrM, score, cand, lam)
+                if v > best + 1e-10:               # 微小差での振り子防止
+                    S, best, improved = cand, v, True
+                    break
+            if improved: break
+    return S, best
+
+def avg_corr(C: np.ndarray, idx) -> float:
+    k = len(idx)
+    P = C[np.ix_(idx, idx)]
+    return float((P.sum() - np.trace(P)) / (k * (k - 1) + 1e-12))
+
+def _load_prev(path: str):
+    try:
+        return json.load(open(path)).get("tickers")
+    except Exception:
+        return None
+
+def _save_sel(path: str, tickers: list[str], avg_r: float, sum_score: float, objective: float):
+    with open(path, "w") as f:
+        json.dump({
+            "tickers": tickers,
+            "avg_res_corr": round(avg_r, 6),
+            "sum_score": round(sum_score, 6),
+            "objective": round(objective, 6),
+        }, f, indent=2)
+
+def select_bucket_drrs(returns_df: pd.DataFrame,
+                       score_ser: pd.Series,
+                       pool_tickers: list[str],
+                       k: int, *, n_pc: int, gamma: float, lam: float, eta: float,
+                       lookback: int, prev_tickers: list[str] | None,
+                       shrink: float = 0.10):
+    """returns_df: T×N 全銘柄の日次リターン（pct_change済）。pool_tickers: 候補の順序。"""
+    # ルックバックで切り出し（足りなければ全期間）
+    Rdf = returns_df[pool_tickers]
+    Rdf = Rdf.iloc[-lookback:] if len(Rdf) >= lookback else Rdf
+    R = Rdf.to_numpy()
+    score = score_ser.reindex(pool_tickers).to_numpy(dtype=np.float32)
+
+    C = residual_corr(R, n_pc=n_pc, shrink=shrink)
+    S0 = rrqr_like_det(R, score, k, gamma=gamma)
+    S, Jn = swap_local_det(C, score, S0, lam=lam, max_pass=15)
+
+    # 粘着性（据え置き判定）
+    if prev_tickers:
+        prev_idx = [pool_tickers.index(t) for t in prev_tickers if t in pool_tickers]
+        if len(prev_idx) == k:
+            Jp = _obj(C, score, prev_idx, lam)
+            if Jn < Jp + eta:
+                S, Jn = sorted(prev_idx), Jp
+
+    selected_tickers = [pool_tickers[i] for i in S]
+    return dict(
+        idx=S,
+        tickers=selected_tickers,
+        avg_res_corr=avg_corr(C, S),
+        sum_score=float(score[S].sum()),
+        objective=float(Jn),
+    )
+
+# ----- リターン計算（DRRS用） -----
 returns = px[tickers].pct_change().dropna()
-corr = returns.corr()
 
 # ----- ファクター計算関数 -----
 def trend(s):
@@ -425,35 +547,43 @@ df_z.rename(columns={
 # ----- スコアリング -----
 g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
 d_score_all = df_z.mul(pd.Series(D_weights)).sum(axis=1)
+# ----- DRRS 選定（決定論RRQR・残差相関スワップ） -----
 
-# 相関抑制ロジック
-def greedy_select(candidates, corr, target_n, thresh):
-    selected = []
-    for t in candidates:
-        if all(abs(corr.loc[t, s]) < thresh for s in selected):
-            selected.append(t)
-        if len(selected) == target_n:
-            break
-    return selected
-
+# 1) Gプール：スコア上位からcorrM件（現行ロジックを踏襲）
 init_G = g_score.nlargest(corrM).index.tolist()
-thresh_G = corr_thresh_G
-chosen_G = greedy_select(init_G, corr, N_G, thresh_G)
-while len(chosen_G) < N_G and thresh_G < corr_thresh_G:
-    thresh_G += 0.02
-    chosen_G = greedy_select(init_G, corr, N_G, thresh_G)
-top_G = chosen_G
+# 前回G（粘着性用）
+prevG = _load_prev(G_PREV_JSON)
 
-D_pool = df_z.drop(top_G)
+resG = select_bucket_drrs(
+    returns_df=returns,
+    score_ser=g_score,
+    pool_tickers=init_G,
+    k=N_G,
+    n_pc=DRRS_G["n_pc"], gamma=DRRS_G["gamma"], lam=DRRS_G["lam"], eta=DRRS_G["eta"],
+    lookback=DRRS_G["lookback"], prev_tickers=prevG, shrink=DRRS_SHRINK
+)
+top_G = resG["tickers"]
+
+# 2) Dプール：Gで選ばれた銘柄を除外してから、スコア上位corrM件
+D_pool_index = df_z.drop(top_G).index
 d_score = d_score_all.drop(top_G)
-init_D = d_score.nlargest(corrM).index.tolist()
-thresh_D = corr_thresh_D
-chosen_D = greedy_select(init_D, corr, N_D, thresh_D)
-while len(chosen_D) < N_D and thresh_D < corr_thresh_D:
-    thresh_D += 0.02
-    chosen_D = greedy_select(init_D, corr, N_D, thresh_D)
-top_D = chosen_D
+init_D = d_score.loc[D_pool_index].nlargest(corrM).index.tolist()
 
+prevD = _load_prev(D_PREV_JSON)
+
+resD = select_bucket_drrs(
+    returns_df=returns,
+    score_ser=d_score_all,  # 元スコア（プールでreindexする）
+    pool_tickers=init_D,
+    k=N_D,
+    n_pc=DRRS_D["n_pc"], gamma=DRRS_D["gamma"], lam=DRRS_D["lam"], eta=DRRS_D["eta"],
+    lookback=DRRS_D["lookback"], prev_tickers=prevD, shrink=DRRS_SHRINK
+)
+top_D = resD["tickers"]
+
+
+_save_sel(G_PREV_JSON, top_G, resG["avg_res_corr"], resG["sum_score"], resG["objective"])
+_save_sel(D_PREV_JSON, top_D, resD["avg_res_corr"], resD["sum_score"], resD["objective"])
 
 # ----- 出力 -----
 pd.set_option('display.float_format', '{:.3f}'.format)
@@ -470,7 +600,10 @@ g_table = pd.concat([
     g_score[G_UNI].rename('GSC')
 ], axis=1)
 g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
-g_title = f"[G枠 / {N_G} / GRW{int(g_weights['GRW']*100)} MOM{int(g_weights['MOM']*100)} TRD{int(g_weights['TRD']*100)} / corr{int(corr_thresh_G*100)}]"
+g_title = (
+    f"[G枠 / {N_G} / GRW{int(g_weights['GRW']*100)} MOM{int(g_weights['MOM']*100)} TRD{int(g_weights['TRD']*100)} "
+    f"/ avgρ{resG['avg_res_corr']:.2f} / method=DRRS]"
+)
 print(g_title)
 print(g_table)
 
@@ -481,7 +614,10 @@ d_table = pd.concat([
     d_score_all[D_UNI].rename('DSC')
 ], axis=1)
 d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
-d_title = f"[D枠 / {N_D} / QAL{int(D_weights['QAL']*100)} YLD{int(D_weights['YLD']*100)} VOL{int(D_weights['VOL']*100)} / corr{int(corr_thresh_D*100)}]"
+d_title = (
+    f"[D枠 / {N_D} / QAL{int(D_weights['QAL']*100)} YLD{int(D_weights['YLD']*100)} VOL{int(D_weights['VOL']*100)} "
+    f"/ avgρ{resD['avg_res_corr']:.2f} / method=DRRS]"
+)
 print(d_title)
 print(d_table)
 
