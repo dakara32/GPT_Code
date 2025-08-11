@@ -30,7 +30,7 @@ G_PREV_JSON = os.path.join(RESULTS_DIR, "G_selection.json")
 D_PREV_JSON = os.path.join(RESULTS_DIR, "D_selection.json")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 # デバッグモード（Trueで詳細情報を表示）
-debug_mode = False
+debug_mode = True
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 
