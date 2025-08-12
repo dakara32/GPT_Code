@@ -217,17 +217,26 @@ def compute_fcf_with_fallback(tickers: list[str], finnhub_api_key: str | None = 
 
 # ----- データ取得 -----
 cand_info = yf.Tickers(" ".join(cand))
-cand_prices = {
-    t: cand_info.tickers[t].fast_info.get('lastPrice', np.inf)
-    for t in cand
-}
+cand_prices = {}
+for t in cand:
+    try:
+        cand_prices[t] = cand_info.tickers[t].fast_info.get("lastPrice", np.inf)
+    except Exception as e:
+        print(f"{t}: price fetch failed ({e})")
+        cand_prices[t] = np.inf
 cand = [t for t, p in cand_prices.items() if p <= CAND_PRICE_MAX]
 tickers = sorted(set(exist + cand))
-data = yf.download(tickers + [bench], period='600d', auto_adjust=True, progress=False)
-px = data['Close']
+data = yf.download(tickers + [bench], period="600d", auto_adjust=True, progress=False)
+px = data["Close"]
 spx = px[bench]
 tickers_bulk = yf.Tickers(" ".join(tickers))
-info = {t: tickers_bulk.tickers[t].info for t in tickers}
+info = {}
+for t in tickers:
+    try:
+        info[t] = tickers_bulk.tickers[t].info
+    except Exception as e:
+        print(f"{t}: info fetch failed ({e})")
+        info[t] = {}
 
 # EPSとFCFの補完データを用意
 eps_rows = []
@@ -409,26 +418,31 @@ def dividend_status(ticker: str) -> str:
     unknown        : 情報が得られない
     """
     t = yf.Ticker(ticker)
-    # 1) 配当イベントがあれば配当あり
-    if not t.dividends.empty:
-        return "has"
+    try:
+        if not t.dividends.empty:
+            return "has"
+    except Exception:
+        return "unknown"
 
-    # 2) 分割イベントがあればフィードは生きている → 無配と判断
-    a = t.actions
-    if (
-        a is not None
-        and not a.empty
-        and "Stock Splits" in a.columns
-        and a["Stock Splits"].abs().sum() > 0
-    ):
-        return "none_confident"
+    try:
+        a = t.actions
+        if (
+            a is not None
+            and not a.empty
+            and "Stock Splits" in a.columns
+            and a["Stock Splits"].abs().sum() > 0
+        ):
+            return "none_confident"
+    except Exception:
+        pass
 
-    # 3) fast_info に配当の痕跡があれば取りこぼし疑い
-    fi = t.fast_info
-    if any(getattr(fi, k, None) for k in ("last_dividend_date", "dividend_rate", "dividend_yield")):
-        return "maybe_missing"
+    try:
+        fi = t.fast_info
+        if any(getattr(fi, k, None) for k in ("last_dividend_date", "dividend_rate", "dividend_yield")):
+            return "maybe_missing"
+    except Exception:
+        pass
 
-    # 4) それ以外は情報不足
     return "unknown"
 
 
