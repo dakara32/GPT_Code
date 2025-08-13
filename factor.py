@@ -21,6 +21,30 @@ def robust_z(s: pd.Series, p=0.02):
     return np.nan_to_num(zscore(s2.fillna(s2.mean())))
 
 
+def ev_fallback(info_t: dict, tk: yf.Ticker) -> float:
+    """EV欠損時の簡易代替: EV ≒ 時価総額 + 負債 - 現金。取れなければ NaN"""
+    ev = info_t.get('enterpriseValue', np.nan)
+    if pd.notna(ev) and ev > 0:
+        return float(ev)
+    mc = info_t.get('marketCap', np.nan)
+    debt = cash = np.nan
+    try:
+        bs = tk.quarterly_balance_sheet
+        if bs is not None and not bs.empty:
+            c = bs.columns[0]
+            for k in ("Total Debt", "Long Term Debt", "Short Long Term Debt"):
+                if k in bs.index:
+                    debt = float(bs.loc[k, c]); break
+            for k in ("Cash And Cash Equivalents", "Cash And Cash Equivalents And Short Term Investments", "Cash"):
+                if k in bs.index:
+                    cash = float(bs.loc[k, c]); break
+    except Exception:
+        pass
+    if pd.notna(mc):
+        return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
+    return np.nan
+
+
 # ----- ユニバースと定数 -----
 exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
 cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
@@ -265,6 +289,11 @@ def prepare_data():
             qearn = tickers_bulk.tickers[t].quarterly_earnings
             so = info_t.get("sharesOutstanding")
             if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
+                eps_ttm_q = qearn["Earnings"].head(4).sum() / so
+                # 情報源間の単位ズレを是正し、4Q合算を優先
+                if pd.notna(eps_ttm_q):
+                    if pd.isna(eps_ttm) or (abs(eps_ttm) > 0 and abs(eps_ttm/eps_ttm_q) > 3):
+                        eps_ttm = eps_ttm_q
                 eps_q = qearn["Earnings"].iloc[-1] / so
         except Exception:
             pass
@@ -275,7 +304,7 @@ def prepare_data():
     fcf_df = compute_fcf_with_fallback(tickers, finnhub_api_key=FINNHUB_API_KEY)
 
     # DRRSで使用するリターン
-    returns = px[tickers].pct_change().dropna()
+    returns = px[tickers].pct_change()  # ここでは dropna しない
 
 # ===== DRRS helpers (決定論RRQR・残差相関スワップ) =====
 def _z_np(X: np.ndarray) -> np.ndarray:
@@ -285,15 +314,20 @@ def _z_np(X: np.ndarray) -> np.ndarray:
     return (np.nan_to_num(X) - m) / s
 
 def residual_corr(R: np.ndarray, n_pc: int = 3, shrink: float = 0.1) -> np.ndarray:
-    """PCA残差の相関 + 対角シュリンク。決定論。R: T×N（日次リターン）。"""
     Z = _z_np(R)
-    U, S, Vt = np.linalg.svd(Z, full_matrices=False)  # SVDは符号不定でも残差相関は不変
+    U, S, _ = np.linalg.svd(Z, full_matrices=False)
     F = U[:, :n_pc] * S[:n_pc]
     B = np.linalg.lstsq(F, Z, rcond=None)[0]
     E = Z - F @ B
     C = np.corrcoef(E, rowvar=False)
+
+    off = C - np.diag(np.diag(C))
+    iu = np.triu_indices_from(off, 1)
+    avg_abs = np.nanmean(np.abs(off[iu])) if iu[0].size else 0.0
+    shrink_eff = float(np.clip(shrink + 0.5 * avg_abs, 0.1, 0.6))
+
     N = C.shape[0]
-    return (1.0 - shrink) * C + shrink * np.eye(N, dtype=C.dtype)
+    return (1.0 - shrink_eff) * C + shrink_eff * np.eye(N, dtype=C.dtype)
 
 def rrqr_like_det(R: np.ndarray, score: np.ndarray, k: int, gamma: float = 1.0):
     """スコア重み付き RRQR 風の決定論初期選定（乱数なし・タイブレーク固定）。"""
@@ -373,6 +407,7 @@ def select_bucket_drrs(returns_df: pd.DataFrame,
     # ルックバックで切り出し（足りなければ全期間）
     Rdf = returns_df[pool_tickers]
     Rdf = Rdf.iloc[-lookback:] if len(Rdf) >= lookback else Rdf
+    Rdf = Rdf.dropna()  # プール内で共通サンプル期間に限定
     R = Rdf.to_numpy()
     score = score_ser.reindex(pool_tickers).to_numpy(dtype=np.float32)
 
@@ -541,7 +576,7 @@ def calculate_scores():
     for t in tickers:
         d = info[t]
         s = px[t]
-        ev = d.get('enterpriseValue', np.nan)
+        ev = ev_fallback(d, tickers_bulk.tickers[t])
         df.loc[t, 'TR'] = trend(s)
         df.loc[t, 'EPS'] = eps_df.loc[t, 'eps_ttm']
         df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
@@ -566,7 +601,7 @@ def calculate_scores():
         # 最終的に欠損なら「0%」として扱う（=YLDでしっかりマイナス評価される）
         df.loc[t, 'DIV'] = 0.0 if (div is None or pd.isna(div)) else float(div)
         fcf_val = fcf_df.loc[t, 'fcf_ttm'] if t in fcf_df.index else np.nan
-        df.loc[t, 'FCF'] = (fcf_val / ev) if ev and not pd.isna(fcf_val) else np.nan
+        df.loc[t, 'FCF'] = (fcf_val / ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev > 0) else np.nan
         df.loc[t, 'RS'] = rs(s, spx)
         df.loc[t, 'TR_str'] = tr_str(s)
         df.loc[t, 'DIV_STREAK'] = div_streak(t)
