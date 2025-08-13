@@ -215,47 +215,54 @@ def compute_fcf_with_fallback(tickers: list[str], finnhub_api_key: str | None = 
             "cfo_ttm", "capex_ttm", "fcf_ttm", "cfo_source", "capex_source", "fcf_imputed"]
     return df[cols].sort_index()
 
-# ----- データ取得 -----
-cand_info = yf.Tickers(" ".join(cand))
-cand_prices = {}
-for t in cand:
-    try:
-        cand_prices[t] = cand_info.tickers[t].fast_info.get("lastPrice", np.inf)
-    except Exception as e:
-        print(f"{t}: price fetch failed ({e})")
-        cand_prices[t] = np.inf
-cand = [t for t, p in cand_prices.items() if p <= CAND_PRICE_MAX]
-tickers = sorted(set(exist + cand))
-data = yf.download(tickers + [bench], period="600d", auto_adjust=True, progress=False)
-px = data["Close"]
-spx = px[bench]
-tickers_bulk = yf.Tickers(" ".join(tickers))
-info = {}
-for t in tickers:
-    try:
-        info[t] = tickers_bulk.tickers[t].info
-    except Exception as e:
-        print(f"{t}: info fetch failed ({e})")
-        info[t] = {}
+def prepare_data():
+    """Fetch price and fundamental data for all tickers."""
+    global cand_info, cand_prices, cand, tickers, data, px, spx
+    global tickers_bulk, info, eps_df, fcf_df, returns
 
-# EPSとFCFの補完データを用意
-eps_rows = []
-for t in tickers:
-    info_t = info[t]
-    eps_ttm = info_t.get("trailingEps", np.nan)
-    eps_q = np.nan
-    try:
-        qearn = tickers_bulk.tickers[t].quarterly_earnings
-        so = info_t.get("sharesOutstanding")
-        if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
-            eps_q = qearn["Earnings"].iloc[-1] / so
-    except Exception:
-        pass
-    eps_rows.append({"ticker": t, "eps_ttm": eps_ttm, "eps_q_recent": eps_q})
-eps_df = pd.DataFrame(eps_rows).set_index("ticker")
-eps_df = impute_eps_ttm(eps_df, ttm_col="eps_ttm", q_col="eps_q_recent")
+    cand_info = yf.Tickers(" ".join(cand))
+    cand_prices = {}
+    for t in cand:
+        try:
+            cand_prices[t] = cand_info.tickers[t].fast_info.get("lastPrice", np.inf)
+        except Exception as e:
+            print(f"{t}: price fetch failed ({e})")
+            cand_prices[t] = np.inf
+    cand = [t for t, p in cand_prices.items() if p <= CAND_PRICE_MAX]
+    tickers = sorted(set(exist + cand))
+    data = yf.download(tickers + [bench], period="600d", auto_adjust=True, progress=False)
+    px = data["Close"]
+    spx = px[bench]
+    tickers_bulk = yf.Tickers(" ".join(tickers))
+    info = {}
+    for t in tickers:
+        try:
+            info[t] = tickers_bulk.tickers[t].info
+        except Exception as e:
+            print(f"{t}: info fetch failed ({e})")
+            info[t] = {}
 
-fcf_df = compute_fcf_with_fallback(tickers, finnhub_api_key=FINNHUB_API_KEY)
+    # EPSとFCFの補完データを用意
+    eps_rows = []
+    for t in tickers:
+        info_t = info[t]
+        eps_ttm = info_t.get("trailingEps", np.nan)
+        eps_q = np.nan
+        try:
+            qearn = tickers_bulk.tickers[t].quarterly_earnings
+            so = info_t.get("sharesOutstanding")
+            if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
+                eps_q = qearn["Earnings"].iloc[-1] / so
+        except Exception:
+            pass
+        eps_rows.append({"ticker": t, "eps_ttm": eps_ttm, "eps_q_recent": eps_q})
+    eps_df = pd.DataFrame(eps_rows).set_index("ticker")
+    eps_df = impute_eps_ttm(eps_df, ttm_col="eps_ttm", q_col="eps_q_recent")
+
+    fcf_df = compute_fcf_with_fallback(tickers, finnhub_api_key=FINNHUB_API_KEY)
+
+    # DRRSで使用するリターン
+    returns = px[tickers].pct_change().dropna()
 
 # ===== DRRS helpers (決定論RRQR・残差相関スワップ) =====
 def _z_np(X: np.ndarray) -> np.ndarray:
@@ -374,9 +381,6 @@ def select_bucket_drrs(returns_df: pd.DataFrame,
         objective=float(Jn),
     )
 
-# ----- リターン計算（DRRS用） -----
-returns = px[tickers].pct_change().dropna()
-
 # ----- ファクター計算関数 -----
 def trend(s):
     """移動平均線と52週レンジで強い上昇トレンドを判定。
@@ -486,242 +490,252 @@ def fetch_finnhub_metrics(symbol):
         return {}
 
 
-# ----- ベースファクター計算 -----
-df = pd.DataFrame(index=tickers)
-missing_logs = []
-for t in tickers:
-    d = info[t]
-    s = px[t]
-    ev = d.get('enterpriseValue', np.nan)
-    df.loc[t, 'TR'] = trend(s)
-    df.loc[t, 'EPS'] = eps_df.loc[t, 'eps_ttm']
-    df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
-    df.loc[t, 'ROE'] = d.get('returnOnEquity', np.nan)
-    df.loc[t, 'BETA'] = d.get('beta', np.nan)
-    div = d.get('dividendYield')
-    if div is None or pd.isna(div):
-        div = d.get('trailingAnnualDividendYield')
-    df.loc[t, 'DIV'] = div if div is not None else np.nan
-    fcf_val = fcf_df.loc[t, 'fcf_ttm'] if t in fcf_df.index else np.nan
-    df.loc[t, 'FCF'] = (fcf_val / ev) if ev and not pd.isna(fcf_val) else np.nan
-    df.loc[t, 'RS'] = rs(s, spx)
-    df.loc[t, 'TR_str'] = tr_str(s)
-    df.loc[t, 'DIV_STREAK'] = div_streak(t)
-    fin_cols = ['REV', 'ROE', 'BETA', 'DIV', 'FCF']
-    need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t, col])]
-    if need_finnhub:
-        fin_data = fetch_finnhub_metrics(t)
-        for col in need_finnhub:
-            val = fin_data.get(col)
-            if val is not None and not pd.isna(val):
-                df.loc[t, col] = val
-    for col in fin_cols + ['EPS', 'RS', 'TR_str', 'DIV_STREAK']:
-        if pd.isna(df.loc[t, col]):
-            if col == 'DIV':
-                status = dividend_status(t)
-                if status != 'none_confident':
-                    missing_logs.append({'Ticker': t, 'Column': col, 'Status': status})
-            else:
-                missing_logs.append({'Ticker': t, 'Column': col})
+def calculate_scores():
+    """Calculate factor scores and perform DRRS selection."""
+    global df, missing_logs, df_z, g_score, d_score_all
+    global init_G, init_D, resG, resD, top_G, top_D
+
+    df = pd.DataFrame(index=tickers)
+    missing_logs = []
+    for t in tickers:
+        d = info[t]
+        s = px[t]
+        ev = d.get('enterpriseValue', np.nan)
+        df.loc[t, 'TR'] = trend(s)
+        df.loc[t, 'EPS'] = eps_df.loc[t, 'eps_ttm']
+        df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
+        df.loc[t, 'ROE'] = d.get('returnOnEquity', np.nan)
+        df.loc[t, 'BETA'] = d.get('beta', np.nan)
+        div = d.get('dividendYield')
+        if div is None or pd.isna(div):
+            div = d.get('trailingAnnualDividendYield')
+        df.loc[t, 'DIV'] = div if div is not None else np.nan
+        fcf_val = fcf_df.loc[t, 'fcf_ttm'] if t in fcf_df.index else np.nan
+        df.loc[t, 'FCF'] = (fcf_val / ev) if ev and not pd.isna(fcf_val) else np.nan
+        df.loc[t, 'RS'] = rs(s, spx)
+        df.loc[t, 'TR_str'] = tr_str(s)
+        df.loc[t, 'DIV_STREAK'] = div_streak(t)
+        fin_cols = ['REV', 'ROE', 'BETA', 'DIV', 'FCF']
+        need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t, col])]
+        if need_finnhub:
+            fin_data = fetch_finnhub_metrics(t)
+            for col in need_finnhub:
+                val = fin_data.get(col)
+                if val is not None and not pd.isna(val):
+                    df.loc[t, col] = val
+        for col in fin_cols + ['EPS', 'RS', 'TR_str', 'DIV_STREAK']:
+            if pd.isna(df.loc[t, col]):
+                if col == 'DIV':
+                    status = dividend_status(t)
+                    if status != 'none_confident':
+                        missing_logs.append({'Ticker': t, 'Column': col, 'Status': status})
+                else:
+                    missing_logs.append({'Ticker': t, 'Column': col})
+
+    # ----- 正規化 (Zスコア) -----
+    z = lambda x: np.nan_to_num(zscore(x.fillna(x.mean())))
+    df_z = df.apply(z)
+    df_z['DIV'] = z(df['DIV'])
+    df_z['TR'] = df['TR']
+    df_z['DIV_STREAK'] = z(df['DIV_STREAK'])
+
+    # ----- 6ファクター合成 -----
+    df_z['GROWTH_F'] = 0.5 * df_z['REV'] + 0.3 * df_z['EPS'] + 0.2 * df_z['ROE']
+    df_z['MOM_F'] = 0.7 * df_z['RS'] + 0.3 * df_z['TR_str']
+    df_z['QUALITY_F'] = (df_z['FCF'] + df_z['ROE']) / 2
+    df_z['YIELD_F'] = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
+    df_z['VOL'] = df_z['BETA']
+    df_z['TREND'] = df_z['TR']
+
+    # ----- Compositeファクターの再標準化 -----
+    df_z['GROWTH_F'] = z(df_z['GROWTH_F'])
+    df_z['MOM_F'] = z(df_z['MOM_F'])
+    df_z['QUALITY_F'] = z(df_z['QUALITY_F'])
+    df_z['YIELD_F'] = z(df_z['YIELD_F'])
+    df_z['VOL'] = z(df_z['VOL'])
+
+    # ----- カラム名を短縮 -----
+    df_z.rename(columns={
+        'GROWTH_F': 'GRW',
+        'MOM_F': 'MOM',
+        'TREND': 'TRD',
+        'QUALITY_F': 'QAL',
+        'YIELD_F': 'YLD',
+        'VOL': 'VOL'
+    }, inplace=True)
+
+    # ----- スコアリング -----
+    g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
+    d_score_all = df_z.mul(pd.Series(D_weights)).sum(axis=1)
+
+    # ----- DRRS 選定（決定論RRQR・残差相関スワップ） -----
+
+    # 1) Gプール：スコア上位からcorrM件（現行ロジックを踏襲）
+    init_G = g_score.nlargest(corrM).index.tolist()
+    prevG = _load_prev(G_PREV_JSON)  # 前回G（粘着性用）
+
+    resG = select_bucket_drrs(
+        returns_df=returns,
+        score_ser=g_score,
+        pool_tickers=init_G,
+        k=N_G,
+        n_pc=DRRS_G["n_pc"], gamma=DRRS_G["gamma"], lam=DRRS_G["lam"], eta=DRRS_G["eta"],
+        lookback=DRRS_G["lookback"], prev_tickers=prevG, shrink=DRRS_SHRINK
+    )
+    top_G = resG["tickers"]
+
+    # 2) Dプール：Gで選ばれた銘柄を除外してから、スコア上位corrM件
+    D_pool_index = df_z.drop(top_G).index
+    d_score = d_score_all.drop(top_G)
+    init_D = d_score.loc[D_pool_index].nlargest(corrM).index.tolist()
+
+    prevD = _load_prev(D_PREV_JSON)
+
+    resD = select_bucket_drrs(
+        returns_df=returns,
+        score_ser=d_score_all,  # 元スコア（プールでreindexする）
+        pool_tickers=init_D,
+        k=N_D,
+        n_pc=DRRS_D["n_pc"], gamma=DRRS_D["gamma"], lam=DRRS_D["lam"], eta=DRRS_D["eta"],
+        lookback=DRRS_D["lookback"], prev_tickers=prevD, shrink=DRRS_SHRINK
+    )
+    top_D = resD["tickers"]
+
+    _save_sel(G_PREV_JSON, top_G, resG["avg_res_corr"], resG["sum_score"], resG["objective"])
+    _save_sel(D_PREV_JSON, top_D, resD["avg_res_corr"], resD["sum_score"], resD["objective"])
+
+def display_results():
+    """Show results and prepare tables for Slack notification."""
+    global miss_df, g_title, g_table, d_title, d_table, io_table
+    global df_metrics_fmt, debug_table
+
+    pd.set_option('display.float_format', '{:.3f}'.format)
+    print("📈 ファクター分散最適化の結果")
+    miss_df = pd.DataFrame(missing_logs)
+    if not miss_df.empty:
+        print("Missing Data:")
+        print(miss_df.to_string(index=False))
+
+    extra_G = [t for t in init_G if t not in top_G][:5]
+    G_UNI = top_G + extra_G
+    g_table = pd.concat([
+        df_z.loc[G_UNI, ['GRW', 'MOM', 'TRD']],
+        g_score[G_UNI].rename('GSC')
+    ], axis=1)
+    g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
+    g_title = (
+        f"[G枠 / {N_G} / GRW{int(g_weights['GRW']*100)} MOM{int(g_weights['MOM']*100)} TRD{int(g_weights['TRD']*100)} "
+        f"/ avgρ{resG['avg_res_corr']:.2f} / method=DRRS]"
+    )
+    print(g_title)
+    print(g_table)
+
+    extra_D = [t for t in init_D if t not in top_D][:5]
+    D_UNI = top_D + extra_D
+    d_table = pd.concat([
+        df_z.loc[D_UNI, ['QAL', 'YLD', 'VOL']],
+        d_score_all[D_UNI].rename('DSC')
+    ], axis=1)
+    d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
+    d_title = (
+        f"[D枠 / {N_D} / QAL{int(D_weights['QAL']*100)} YLD{int(D_weights['YLD']*100)} VOL{int(D_weights['VOL']*100)} "
+        f"/ avgρ{resD['avg_res_corr']:.2f} / method=DRRS]"
+    )
+    print(d_title)
+    print(d_table)
+
+    in_list = sorted(set(list(top_G) + list(top_D)) - set(exist))
+    out_list = sorted(set(exist) - set(list(top_G) + list(top_D)))
+
+    # IN/OUTの組み合わせがずれないようにインデックスをリセットして連結
+    in_df = pd.DataFrame({'IN': in_list}).reset_index(drop=True)
+    out_df = pd.DataFrame({
+        '/ OUT': out_list,
+        'GSC': g_score.reindex(out_list).round(3).to_list(),
+        'DSC': d_score_all.reindex(out_list).round(3).to_list()
+    }).reset_index(drop=True)
+    io_table = pd.concat([in_df, out_df], axis=1)
+    print("Changes:")
+    print(io_table.to_string(index=False))
+
+    # ----- パフォーマンス比較 -----
+    all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench]))
+    prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
+    ret = prices.pct_change()
+    portfolios = {'CUR': exist, 'NEW': list(top_G) + list(top_D)}
+    metrics = {}
+    for name, ticks in portfolios.items():
+        pr = ret[ticks].mean(axis=1, skipna=True).dropna()
+        cum = (1 + pr).cumprod() - 1
+        n = len(pr)
+        if n >= 252:
+            ann_ret = (1 + cum.iloc[-1]) ** (252 / n) - 1
+            ann_vol = pr.std() * np.sqrt(252)
+        else:
+            ann_ret = cum.iloc[-1]
+            ann_vol = pr.std() * np.sqrt(n)
+        sharpe = ann_ret / ann_vol
+        drawdown = (cum - cum.cummax()).min()
+        if len(ticks) >= 2:
+            corr_mat = ret[ticks].corr()
+            avg_corr = corr_mat.mask(np.eye(len(ticks), dtype=bool)).stack().mean()
+        else:
+            avg_corr = np.nan
+        metrics[name] = {
+            'RET': ann_ret,
+            'VOL': ann_vol,
+            'SHP': sharpe,
+            'MDD': drawdown,
+            'CORR': avg_corr
+        }
+
+    df_metrics = pd.DataFrame(metrics).T
+    df_metrics_pct = df_metrics.copy()
+    for col in ['RET', 'VOL', 'MDD']:
+        df_metrics_pct[col] = df_metrics_pct[col] * 100
+    df_metrics_pct = df_metrics_pct.rename(columns={'RET': 'RET%', 'VOL': 'VOL%', 'MDD': 'MDD%'})
+    df_metrics_fmt = df_metrics_pct.applymap(lambda x: f"{x:.1f}")
+    print("Performance Comparison:")
+    print(df_metrics_fmt)
+
+    debug_table = None
+    if debug_mode:
+        debug_table = pd.concat([
+            df[['TR', 'EPS', 'REV', 'ROE', 'BETA', 'DIV', 'FCF', 'RS', 'TR_str', 'DIV_STREAK']],
+            g_score.rename('GSC'),
+            d_score_all.rename('DSC')
+        ], axis=1).round(3)
+        print("Debug Data:")
+        print(debug_table.to_string())
 
 
-# ----- 正規化 (Zスコア) -----
-z = lambda x: np.nan_to_num(zscore(x.fillna(x.mean())))
-df_z = df.apply(z)
-df_z['DIV'] = z(df['DIV'])
-df_z['TR'] = df['TR']
-df_z['DIV_STREAK'] = z(df['DIV_STREAK'])
+def notify_slack():
+    """Send results to Slack webhook."""
+    SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+    if not SLACK_WEBHOOK_URL:
+        raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+
+    message = "📈 ファクター分散最適化の結果\n"
+    if not miss_df.empty:
+        message += "Missing Data\n```" + miss_df.to_string(index=False) + "```\n"
+    message += g_title + "\n```" + g_table.to_string() + "```\n"
+    message += d_title + "\n```" + d_table.to_string() + "```\n"
+    message += "Changes\n```" + io_table.to_string(index=False) + "```\n"
+    message += "Performance Comparison:\n```" + df_metrics_fmt.to_string() + "```"
+    if debug_mode and debug_table is not None:
+        message += "\nDebug Data\n```" + debug_table.to_string() + "```"
+
+    payload = {"text": message}
+    try:
+        resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
+        resp.raise_for_status()
+        print("✅ Slack（Webhook）へ送信しました")
+    except Exception as e:
+        print(f"⚠️ Slack通知エラー: {e}")
 
 
-# ----- 6ファクター合成 -----
-df_z['GROWTH_F'] = 0.5 * df_z['REV'] + 0.3 * df_z['EPS'] + 0.2 * df_z['ROE']
-df_z['MOM_F'] = 0.7 * df_z['RS'] + 0.3 * df_z['TR_str']
-df_z['QUALITY_F'] = (df_z['FCF'] + df_z['ROE']) / 2
-df_z['YIELD_F'] = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
-df_z['VOL'] = df_z['BETA']
-df_z['TREND'] = df_z['TR']
-
-
-# ----- Compositeファクターの再標準化 -----
-df_z['GROWTH_F'] = z(df_z['GROWTH_F'])
-df_z['MOM_F'] = z(df_z['MOM_F'])
-df_z['QUALITY_F'] = z(df_z['QUALITY_F'])
-df_z['YIELD_F'] = z(df_z['YIELD_F'])
-df_z['VOL'] = z(df_z['VOL'])
-
-# ----- カラム名を短縮 -----
-df_z.rename(columns={
-    'GROWTH_F': 'GRW',
-    'MOM_F': 'MOM',
-    'TREND': 'TRD',
-    'QUALITY_F': 'QAL',
-    'YIELD_F': 'YLD',
-    'VOL': 'VOL'
-}, inplace=True)
-
-
-# ----- スコアリング -----
-g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
-d_score_all = df_z.mul(pd.Series(D_weights)).sum(axis=1)
-# ----- DRRS 選定（決定論RRQR・残差相関スワップ） -----
-
-# 1) Gプール：スコア上位からcorrM件（現行ロジックを踏襲）
-init_G = g_score.nlargest(corrM).index.tolist()
-# 前回G（粘着性用）
-prevG = _load_prev(G_PREV_JSON)
-
-resG = select_bucket_drrs(
-    returns_df=returns,
-    score_ser=g_score,
-    pool_tickers=init_G,
-    k=N_G,
-    n_pc=DRRS_G["n_pc"], gamma=DRRS_G["gamma"], lam=DRRS_G["lam"], eta=DRRS_G["eta"],
-    lookback=DRRS_G["lookback"], prev_tickers=prevG, shrink=DRRS_SHRINK
-)
-top_G = resG["tickers"]
-
-# 2) Dプール：Gで選ばれた銘柄を除外してから、スコア上位corrM件
-D_pool_index = df_z.drop(top_G).index
-d_score = d_score_all.drop(top_G)
-init_D = d_score.loc[D_pool_index].nlargest(corrM).index.tolist()
-
-prevD = _load_prev(D_PREV_JSON)
-
-resD = select_bucket_drrs(
-    returns_df=returns,
-    score_ser=d_score_all,  # 元スコア（プールでreindexする）
-    pool_tickers=init_D,
-    k=N_D,
-    n_pc=DRRS_D["n_pc"], gamma=DRRS_D["gamma"], lam=DRRS_D["lam"], eta=DRRS_D["eta"],
-    lookback=DRRS_D["lookback"], prev_tickers=prevD, shrink=DRRS_SHRINK
-)
-top_D = resD["tickers"]
-
-
-_save_sel(G_PREV_JSON, top_G, resG["avg_res_corr"], resG["sum_score"], resG["objective"])
-_save_sel(D_PREV_JSON, top_D, resD["avg_res_corr"], resD["sum_score"], resD["objective"])
-
-# ----- 出力 -----
-pd.set_option('display.float_format', '{:.3f}'.format)
-print("📈 ファクター分散最適化の結果")
-miss_df = pd.DataFrame(missing_logs)
-if not miss_df.empty:
-    print("Missing Data:")
-    print(miss_df.to_string(index=False))
-
-extra_G = [t for t in init_G if t not in top_G][:5]
-G_UNI = top_G + extra_G
-g_table = pd.concat([
-    df_z.loc[G_UNI, ['GRW', 'MOM', 'TRD']],
-    g_score[G_UNI].rename('GSC')
-], axis=1)
-g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
-g_title = (
-    f"[G枠 / {N_G} / GRW{int(g_weights['GRW']*100)} MOM{int(g_weights['MOM']*100)} TRD{int(g_weights['TRD']*100)} "
-    f"/ avgρ{resG['avg_res_corr']:.2f} / method=DRRS]"
-)
-print(g_title)
-print(g_table)
-
-extra_D = [t for t in init_D if t not in top_D][:5]
-D_UNI = top_D + extra_D
-d_table = pd.concat([
-    df_z.loc[D_UNI, ['QAL', 'YLD', 'VOL']],
-    d_score_all[D_UNI].rename('DSC')
-], axis=1)
-d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
-d_title = (
-    f"[D枠 / {N_D} / QAL{int(D_weights['QAL']*100)} YLD{int(D_weights['YLD']*100)} VOL{int(D_weights['VOL']*100)} "
-    f"/ avgρ{resD['avg_res_corr']:.2f} / method=DRRS]"
-)
-print(d_title)
-print(d_table)
-
-in_list = sorted(set(list(top_G) + list(top_D)) - set(exist))
-out_list = sorted(set(exist) - set(list(top_G) + list(top_D)))
-
-# IN/OUTの組み合わせがずれないようにインデックスをリセットして連結
-in_df = pd.DataFrame({'IN': in_list}).reset_index(drop=True)
-out_df = pd.DataFrame({
-    '/ OUT': out_list,
-    'GSC': g_score.reindex(out_list).round(3).to_list(),
-    'DSC': d_score_all.reindex(out_list).round(3).to_list()
-}).reset_index(drop=True)
-io_table = pd.concat([in_df, out_df], axis=1)
-print("Changes:")
-print(io_table.to_string(index=False))
-
-
-# ----- パフォーマンス比較 -----
-all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench]))
-prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
-ret = prices.pct_change()
-portfolios = {'CUR': exist, 'NEW': list(top_G) + list(top_D)}
-metrics = {}
-for name, ticks in portfolios.items():
-    pr = ret[ticks].mean(axis=1, skipna=True).dropna()
-    cum = (1 + pr).cumprod() - 1
-    n = len(pr)
-    if n >= 252:
-        ann_ret = (1 + cum.iloc[-1]) ** (252 / n) - 1
-        ann_vol = pr.std() * np.sqrt(252)
-    else:
-        ann_ret = cum.iloc[-1]
-        ann_vol = pr.std() * np.sqrt(n)
-    sharpe = ann_ret / ann_vol
-    drawdown = (cum - cum.cummax()).min()
-    if len(ticks) >= 2:
-        corr_mat = ret[ticks].corr()
-        avg_corr = corr_mat.mask(np.eye(len(ticks), dtype=bool)).stack().mean()
-    else:
-        avg_corr = np.nan
-    metrics[name] = {
-        'RET': ann_ret,
-        'VOL': ann_vol,
-        'SHP': sharpe,
-        'MDD': drawdown,
-        'CORR': avg_corr
-    }
-
-df_metrics = pd.DataFrame(metrics).T
-df_metrics_pct = df_metrics.copy()
-for col in ['RET', 'VOL', 'MDD']:
-    df_metrics_pct[col] = df_metrics_pct[col] * 100
-df_metrics_pct = df_metrics_pct.rename(columns={'RET': 'RET%', 'VOL': 'VOL%', 'MDD': 'MDD%'})
-df_metrics_fmt = df_metrics_pct.applymap(lambda x: f"{x:.1f}")
-print("Performance Comparison:")
-print(df_metrics_fmt)
-
-debug_table = None
-if debug_mode:
-    debug_table = pd.concat([
-        df[['TR', 'EPS', 'REV', 'ROE', 'BETA', 'DIV', 'FCF', 'RS', 'TR_str', 'DIV_STREAK']],
-        g_score.rename('GSC'),
-        d_score_all.rename('DSC')
-    ], axis=1).round(3)
-    print("Debug Data:")
-    print(debug_table.to_string())
-
-
-# ----- Slack送信 -----
-SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-if not SLACK_WEBHOOK_URL:
-    raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-
-message = "📈 ファクター分散最適化の結果\n"
-if not miss_df.empty:
-    message += "Missing Data\n```" + miss_df.to_string(index=False) + "```\n"
-message += g_title + "\n```" + g_table.to_string() + "```\n"
-message += d_title + "\n```" + d_table.to_string() + "```\n"
-message += "Changes\n```" + io_table.to_string(index=False) + "```\n"
-message += "Performance Comparison:\n```" + df_metrics_fmt.to_string() + "```"
-if debug_mode and debug_table is not None:
-    message += "\nDebug Data\n```" + debug_table.to_string() + "```"
-
-payload = {"text": message}
-try:
-    resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
-    resp.raise_for_status()
-    print("✅ Slack（Webhook）へ送信しました")
-except Exception as e:
-    print(f"⚠️ Slack通知エラー: {e}")
+if __name__ == "__main__":
+    prepare_data()
+    calculate_scores()
+    display_results()
+    notify_slack()
