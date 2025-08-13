@@ -129,22 +129,29 @@ def fetch_cfo_capex_ttm_yf(tickers: list[str]) -> pd.DataFrame:
         qcf = tk.quarterly_cashflow
         cfo_q = _pick_row(qcf, _CF_ALIASES["cfo"])
         capex_q = _pick_row(qcf, _CF_ALIASES["capex"])
+        fcf_q = _pick_row(qcf, ["Free Cash Flow", "FreeCashFlow", "Free cash flow"])
+
         cfo_ttm = _sum_last_n(cfo_q, 4)
         capex_ttm = _sum_last_n(capex_q, 4)
+        fcf_ttm_direct = _sum_last_n(fcf_q, 4)
 
-        if cfo_ttm is None or capex_ttm is None:
+        if cfo_ttm is None or capex_ttm is None or fcf_ttm_direct is None:
             acf = tk.cashflow
             cfo_a = _pick_row(acf, _CF_ALIASES["cfo"])
             capex_a = _pick_row(acf, _CF_ALIASES["capex"])
+            fcf_a = _pick_row(acf, ["Free Cash Flow", "FreeCashFlow", "Free cash flow"])
             if cfo_ttm is None:
                 cfo_ttm = _latest(cfo_a)
             if capex_ttm is None:
                 capex_ttm = _latest(capex_a)
+            if fcf_ttm_direct is None:
+                fcf_ttm_direct = _latest(fcf_a)
 
         rows.append({
             "ticker": t,
             "cfo_ttm_yf": cfo_ttm if cfo_ttm is not None else np.nan,
             "capex_ttm_yf": capex_ttm if capex_ttm is not None else np.nan,
+            "fcf_ttm_yf_direct": fcf_ttm_direct if fcf_ttm_direct is not None else np.nan,
         })
     return pd.DataFrame(rows).set_index("ticker")
 
@@ -234,22 +241,26 @@ def compute_fcf_with_fallback(tickers: list[str], finnhub_api_key: str | None = 
     yf_df = fetch_cfo_capex_ttm_yf(tickers)
     fh_df = fetch_cfo_capex_ttm_finnhub(tickers, api_key=finnhub_api_key)
     df = yf_df.join(fh_df, how="outer")
+
     df["cfo_ttm"] = df["cfo_ttm_yf"].where(df["cfo_ttm_yf"].notna(), df["cfo_ttm_fh"])
     df["capex_ttm"] = df["capex_ttm_yf"].where(df["capex_ttm_yf"].notna(), df["capex_ttm_fh"])
-    df["cfo_source"] = pd.Series(index=df.index, dtype="object")
-    df.loc[df["cfo_ttm_yf"].notna(), "cfo_source"] = "yfinance"
-    df.loc[df["cfo_ttm_yf"].isna() & df["cfo_ttm_fh"].notna(), "cfo_source"] = "finnhub"
-
-    df["capex_source"] = pd.Series(index=df.index, dtype="object")
-    df.loc[df["capex_ttm_yf"].notna(), "capex_source"] = "yfinance"
-    df.loc[df["capex_ttm_yf"].isna() & df["capex_ttm_fh"].notna(), "capex_source"] = "finnhub"
 
     cfo = pd.to_numeric(df["cfo_ttm"], errors="coerce")
     capex = pd.to_numeric(df["capex_ttm"], errors="coerce").abs()
-    df["fcf_ttm"] = cfo - capex
-    df["fcf_imputed"] = df[["cfo_ttm_yf", "capex_ttm_yf"]].isna().any(axis=1) & df[["cfo_ttm", "capex_ttm"]].notna().all(axis=1)
-    cols = ["cfo_ttm_yf", "capex_ttm_yf", "cfo_ttm_fh", "capex_ttm_fh",
-            "cfo_ttm", "capex_ttm", "fcf_ttm", "cfo_source", "capex_source", "fcf_imputed"]
+    fcf_calc = cfo - capex
+
+    fcf_direct = pd.to_numeric(df.get("fcf_ttm_yf_direct"), errors="coerce")
+    df["fcf_ttm"] = fcf_calc.where(fcf_calc.notna(), fcf_direct)
+
+    df["cfo_source"] = np.where(df["cfo_ttm_yf"].notna(), "yfinance",
+                           np.where(df["cfo_ttm_fh"].notna(), "finnhub", ""))
+    df["capex_source"] = np.where(df["capex_ttm_yf"].notna(), "yfinance",
+                             np.where(df["capex_ttm_fh"].notna(), "finnhub", ""))
+    df["fcf_imputed"] = df[["cfo_ttm","capex_ttm"]].isna().any(axis=1) & df["fcf_ttm"].notna()
+
+    cols = ["cfo_ttm_yf","capex_ttm_yf","cfo_ttm_fh","capex_ttm_fh",
+            "cfo_ttm","capex_ttm","fcf_ttm","fcf_ttm_yf_direct",
+            "cfo_source","capex_source","fcf_imputed"]
     return df[cols].sort_index()
 
 def prepare_data():
@@ -433,7 +444,7 @@ def select_bucket_drrs(returns_df: pd.DataFrame,
     )
 
 # ----- ファクター計算関数 -----
-def trend(s):
+def trend(s: pd.Series):
     if len(s) < 200:
         return np.nan
     sma50  = s.rolling(50).mean().iloc[-1]
@@ -441,18 +452,21 @@ def trend(s):
     sma200 = s.rolling(200).mean().iloc[-1]
     prev200 = s.rolling(200).mean().iloc[-21]
     p = s.iloc[-1]
-    if len(s) >= 252:
-        hi, lo = s[-252:].max(), s[-252:].min()
-    else:
-        hi, lo = s.max(), s.min()
-    score = 0
-    score += 1 if p > sma50 else -1
-    score += 1 if sma50 > sma150 else -1
-    score += 1 if sma150 > sma200 else -1
-    score += 1 if sma200 > prev200 else -1
-    score += 1 if p > 0.75 * hi else 0
-    score += 1 if p > 1.15 * lo else 0
-    return score
+    lo_52 = s[-252:].min() if len(s) >= 252 else s.min()
+    hi_52 = s[-252:].max() if len(s) >= 252 else s.max()
+    rng = (hi_52 - lo_52) if hi_52 > lo_52 else np.nan
+
+    def clip(x, lo, hi):
+        return np.nan if pd.isna(x) else max(lo, min(hi, x))
+
+    a = clip(p / (s.rolling(50).mean().iloc[-1])  - 1, -0.5,  0.5)   # 価格 vs 50MA
+    b = clip(sma50  / sma150 - 1,                  -0.5,  0.5)       # 50/150
+    c = clip(sma150 / sma200 - 1,                  -0.5,  0.5)       # 150/200
+    d = clip(sma200 / prev200 - 1,                 -0.2,  0.2)       # 200MA 勾配
+    e = clip((p - lo_52) / (rng if rng and rng>0 else np.nan) - 0.5, -0.5,  0.5)  # 52週位置
+
+    parts = [0.0 if pd.isna(x) else x for x in (a,b,c,d,e)]
+    return 0.30*parts[0] + 0.20*parts[1] + 0.15*parts[2] + 0.15*parts[3] + 0.20*parts[4]
 
 
 def rs(s, b):
@@ -636,6 +650,7 @@ def calculate_scores():
 
     # QUALITY は winsorize 済みの生値を平均→Z
     df_z['QUALITY_F'] = robust_z((df['FCF_W'] + df['ROE_W']) / 2.0)
+    df_z['QUALITY_F'] = df_z['QUALITY_F'].clip(-3.0, 3.0)
 
     # YIELD は利回りと増配年数の合成（ここは既存通り）
     df_z['YIELD_F'] = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
