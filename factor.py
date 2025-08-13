@@ -56,7 +56,7 @@ bench = '^GSPC'
 N_G, N_D = 12, 13
 # 枠別のファクター重み（G枠にVOLを追加）
 g_weights = {'GRW': 0.35, 'MOM': 0.20, 'TRD': 0.45, 'VOL': -0.10}
-D_weights = {'QAL': 0.15, 'YLD': 0.1, 'VOL': -0.40, 'TRD': 0.35}
+D_weights = {'QAL': 0.25, 'YLD': 0.1, 'VOL': -0.40, 'TRD': 0.25}
 corrM = 45
 # ----- DRRS params -----
 DRRS_G = dict(lookback=252, n_pc=3, gamma=1.2, lam=0.68, eta=0.8)  # 相関罰則を僅かに強める
