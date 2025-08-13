@@ -749,7 +749,7 @@ def _cross_block_raw_rho(ret_df: pd.DataFrame, left: list, right: list) -> float
 def display_results():
     """Show results and prepare tables for Slack notification."""
     global miss_df, g_title, g_table, d_title, d_table, io_table
-    global df_metrics_fmt, debug_table, div_details
+    global df_metrics_fmt, debug_table, div_details, g_formatters, d_formatters
 
     pd.set_option('display.float_format', '{:.3f}'.format)
     print("📈 ファクター分散最適化の結果")
@@ -765,6 +765,8 @@ def display_results():
         g_score[G_UNI].rename('GSC')
     ], axis=1)
     g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
+    g_formatters = {col: "{:.2f}".format for col in ['GRW', 'MOM', 'TRD', 'VOL']}
+    g_formatters['GSC'] = "{:.3f}".format
     g_title = (
         f"[G枠 / {N_G} / "
         f"GRW{int(g_weights['GRW']*100)} "
@@ -780,7 +782,7 @@ def display_results():
         f"shrink={DRRS_SHRINK}]"
     )
     print(g_title)
-    print(g_table)
+    print(g_table.to_string(formatters=g_formatters))
 
     extra_D = [t for t in init_D if t not in top_D][:5]
     D_UNI = top_D + extra_D
@@ -789,6 +791,8 @@ def display_results():
         d_score_all[D_UNI].rename('DSC')
     ], axis=1)
     d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
+    d_formatters = {col: "{:.2f}".format for col in ['QAL', 'YLD', 'VOL']}
+    d_formatters['DSC'] = "{:.3f}".format
     d_title = (
         f"[D枠 / {N_D} / "
         f"QAL{int(D_weights['QAL']*100)} "
@@ -803,7 +807,7 @@ def display_results():
         f"shrink={DRRS_SHRINK}]"
     )
     print(d_title)
-    print(d_table)
+    print(d_table.to_string(formatters=d_formatters))
 
     in_list = sorted(set(list(top_G) + list(top_D)) - set(exist))
     out_list = sorted(set(exist) - set(list(top_G) + list(top_D)))
@@ -916,8 +920,8 @@ def notify_slack():
     message = "📈 ファクター分散最適化の結果\n"
     if not miss_df.empty:
         message += "Missing Data\n```" + miss_df.to_string(index=False) + "```\n"
-    message += g_title + "\n```" + g_table.to_string() + "```\n"
-    message += d_title + "\n```" + d_table.to_string() + "```\n"
+    message += g_title + "\n```" + g_table.to_string(formatters=g_formatters) + "```\n"
+    message += d_title + "\n```" + d_table.to_string(formatters=d_formatters) + "```\n"
     message += "Changes\n```" + io_table.to_string(index=False) + "```\n"
     message += "Performance Comparison:\n```" + df_metrics_fmt.to_string() + "```"
     message += "\nDiversification (NEW breakdown):\n```" + "\n".join(
