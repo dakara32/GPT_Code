@@ -707,10 +707,41 @@ def calculate_scores():
     _save_sel(G_PREV_JSON, top_G, resG["avg_res_corr"], resG["sum_score"], resG["objective"])
     _save_sel(D_PREV_JSON, top_D, resD["avg_res_corr"], resD["sum_score"], resD["objective"])
 
+def _avg_offdiag(A: np.ndarray) -> float:
+    n = A.shape[0]
+    if n < 2:
+        return np.nan
+    return float((A.sum() - np.trace(A)) / (n * (n - 1)))
+
+def _resid_avg_rho(ret_df: pd.DataFrame, n_pc=3, shrink=DRRS_SHRINK) -> float:
+    Rdf = ret_df.dropna()
+    if Rdf.shape[0] < 10 or Rdf.shape[1] < 2:
+        return np.nan
+    Z = (Rdf - Rdf.mean()) / (Rdf.std(ddof=0) + 1e-9)
+    U, S, _ = np.linalg.svd(Z.values, full_matrices=False)
+    F = U[:, :n_pc] * S[:n_pc]
+    B = np.linalg.lstsq(F, Z.values, rcond=None)[0]
+    E = Z.values - F @ B
+    C = np.corrcoef(E, rowvar=False)
+    return _avg_offdiag(C)
+
+def _raw_avg_rho(ret_df: pd.DataFrame) -> float:
+    Rdf = ret_df.dropna()
+    if Rdf.shape[1] < 2:
+        return np.nan
+    return _avg_offdiag(Rdf.corr().values)
+
+def _cross_block_raw_rho(ret_df: pd.DataFrame, left: list, right: list) -> float:
+    R = ret_df[left + right].dropna()
+    if len(left) < 1 or len(right) < 1 or R.shape[0] < 10:
+        return np.nan
+    C = R.corr().loc[left, right].values
+    return float(np.nanmean(C))
+
 def display_results():
     """Show results and prepare tables for Slack notification."""
     global miss_df, g_title, g_table, d_title, d_table, io_table
-    global df_metrics_fmt, debug_table
+    global df_metrics_fmt, debug_table, div_details
 
     pd.set_option('display.float_format', '{:.3f}'.format)
     print("📈 ファクター分散最適化の結果")
@@ -728,7 +759,8 @@ def display_results():
     g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
     g_title = (
         f"[G枠 / {N_G} / GRW{int(g_weights['GRW']*100)} MOM{int(g_weights['MOM']*100)} TRD{int(g_weights['TRD']*100)} "
-        f"/ avgρ{resG['avg_res_corr']:.2f} / method=DRRS]"
+        f"/ corrM={corrM} / LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} "
+        f"λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK} / method=DRRS]"
     )
     print(g_title)
     print(g_table)
@@ -742,7 +774,8 @@ def display_results():
     d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
     d_title = (
         f"[D枠 / {N_D} / QAL{int(D_weights['QAL']*100)} YLD{int(D_weights['YLD']*100)} VOL{int(D_weights['VOL']*100)} "
-        f"/ avgρ{resD['avg_res_corr']:.2f} / method=DRRS]"
+        f"/ corrM={corrM} / LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} "
+        f"λ={DRRS_D['lam']} η={DRRS_D['eta']} shrink={DRRS_SHRINK} / VOL=BETA(252d) / method=DRRS]"
     )
     print(d_title)
     print(d_table)
@@ -791,15 +824,49 @@ def display_results():
             'MDD': drawdown,
             'CORR': avg_corr
         }
+    # 分散の実測を追加（CUR/NEW）
+    for name, ticks in portfolios.items():
+        sub = ret[ticks].dropna()
+        metrics[name]["RAWρ"] = _raw_avg_rho(sub)
+        metrics[name]["RESIDρ"] = _resid_avg_rho(sub, n_pc=max(DRRS_G["n_pc"], DRRS_D["n_pc"]))
+
+    ticks_G = list(top_G)
+    ticks_D = list(top_D)
+    ret_1y = ret
+    div_details = {
+        "NEW_rawρ": _raw_avg_rho(ret_1y[ticks_G + ticks_D]),
+        "NEW_residρ": _resid_avg_rho(ret_1y[ticks_G + ticks_D], n_pc=max(DRRS_G["n_pc"], DRRS_D["n_pc"])),
+        "G_rawρ": _raw_avg_rho(ret_1y[ticks_G]),
+        "D_rawρ": _raw_avg_rho(ret_1y[ticks_D]),
+        "G↔D_rawρ": _cross_block_raw_rho(ret_1y, ticks_G, ticks_D),
+    }
 
     df_metrics = pd.DataFrame(metrics).T
     df_metrics_pct = df_metrics.copy()
     for col in ['RET', 'VOL', 'MDD']:
         df_metrics_pct[col] = df_metrics_pct[col] * 100
-    df_metrics_pct = df_metrics_pct.rename(columns={'RET': 'RET%', 'VOL': 'VOL%', 'MDD': 'MDD%'})
-    df_metrics_fmt = df_metrics_pct.applymap(lambda x: f"{x:.1f}")
+
+    cols_order = ['RET','VOL','SHP','MDD','CORR','RAWρ','RESIDρ']
+    df_metrics_pct = df_metrics_pct.reindex(columns=cols_order)
+
+    def _fmt_row(s):
+        out = {}
+        out['RET'] = f"{s['RET']:.1f}%"
+        out['VOL'] = f"{s['VOL']:.1f}%"
+        out['SHP'] = f"{s['SHP']:.1f}"
+        out['MDD'] = f"{s['MDD']:.1f}%"
+        out['CORR'] = f"{s['CORR']:.2f}" if pd.notna(s['CORR']) else "NaN"
+        out['RAWρ'] = f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"
+        out['RESIDρ'] = f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN"
+        return pd.Series(out)
+
+    df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1)
     print("Performance Comparison:")
-    print(df_metrics_fmt)
+    print(df_metrics_fmt.to_string())
+
+    print("Diversification (NEW breakdown):")
+    for k, v in div_details.items():
+        print(f"  {k}: {np.nan if v is None else round(v, 3)}")
 
     debug_table = None
     if debug_mode:
@@ -825,6 +892,9 @@ def notify_slack():
     message += d_title + "\n```" + d_table.to_string() + "```\n"
     message += "Changes\n```" + io_table.to_string(index=False) + "```\n"
     message += "Performance Comparison:\n```" + df_metrics_fmt.to_string() + "```"
+    message += "\nDiversification (NEW breakdown):\n```" + "\n".join(
+        [f"{k}: {np.nan if v is None else round(v,3)}" for k, v in div_details.items()]
+    ) + "```"
     if debug_mode and debug_table is not None:
         message += "\nDebug Data\n```" + debug_table.to_string() + "```"
 
