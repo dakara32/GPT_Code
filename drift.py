@@ -137,7 +137,8 @@ def prepare_summary(df, total_drift_abs, alert):
     }
     if alert:
         summary["trade_shares"] = np.nan
-
+    # Sort details by evaluation value descending before appending summary
+    df = df.sort_values(by="value", ascending=False)
     df = pd.concat([df, pd.DataFrame([summary])], ignore_index=True)
     if alert:
         cols = ["symbol", "shares", "value", "current_ratio", "drift_abs", "trade_shares"]
