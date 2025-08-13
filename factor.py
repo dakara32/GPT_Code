@@ -8,6 +8,44 @@ import time
 import json
 
 
+# ===== ユニバースと定数（冒頭に固定） =====
+exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
+cand  = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
+
+# 候補銘柄の価格上限・ベンチマーク
+CAND_PRICE_MAX = 400
+bench = '^GSPC'
+
+# G/D枠のサイズ
+N_G, N_D = 12, 13
+
+# ファクター重み
+g_weights = {'GRW': 0.35, 'MOM': 0.20, 'TRD': 0.45, 'VOL': -0.10}
+D_weights = {'QAL': 0.15, 'YLD': 0.10, 'VOL': -0.40, 'TRD': 0.35}
+
+# DRRS 初期プール・各種パラメータ
+corrM = 45
+DRRS_G = dict(lookback=252, n_pc=3, gamma=1.2, lam=0.68, eta=0.8)
+DRRS_D = dict(lookback=504, n_pc=4, gamma=0.8, lam=0.85, eta=0.5)
+DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
+
+# クロス相関ペナルティ（未定義なら設定）
+try:
+    CROSS_MU_GD
+except NameError:
+    CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+
+# 出力関連
+RESULTS_DIR = "results"
+G_PREV_JSON = os.path.join(RESULTS_DIR, "G_selection.json")
+D_PREV_JSON = os.path.join(RESULTS_DIR, "D_selection.json")
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# その他
+debug_mode = False
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+
+
 def winsorize_s(s: pd.Series, p=0.02):
     if s is None or s.dropna().empty:
         return s
@@ -43,32 +81,6 @@ def ev_fallback(info_t: dict, tk: yf.Ticker) -> float:
     if pd.notna(mc):
         return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
     return np.nan
-
-
-# ----- ユニバースと定数 -----
-exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
-cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
-# 候補銘柄の価格上限（調整可能）
-CAND_PRICE_MAX = 400
-# ベンチマークsp500
-bench = '^GSPC'
-# G枠とD枠の保持数
-N_G, N_D = 12, 13
-# 枠別のファクター重み（G枠にVOLを追加）
-g_weights = {'GRW': 0.35, 'MOM': 0.20, 'TRD': 0.45, 'VOL': -0.10}
-D_weights = {'QAL': 0.25, 'YLD': 0.1, 'VOL': -0.40, 'TRD': 0.25}
-corrM = 45
-# ----- DRRS params -----
-DRRS_G = dict(lookback=252, n_pc=3, gamma=1.2, lam=0.68, eta=0.8)  # 相関罰則を僅かに強める
-DRRS_D = dict(lookback=504, n_pc=4, gamma=0.8, lam=0.85, eta=0.5)
-DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク
-RESULTS_DIR = "results"
-G_PREV_JSON = os.path.join(RESULTS_DIR, "G_selection.json")
-D_PREV_JSON = os.path.join(RESULTS_DIR, "D_selection.json")
-os.makedirs(RESULTS_DIR, exist_ok=True)
-# デバッグモード（Trueで詳細情報を表示）
-debug_mode = False
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 
 # ========= EPS補完 & FCF算出ユーティリティ =========
@@ -388,6 +400,43 @@ def swap_local_det(corrM: np.ndarray, score: np.ndarray, idx, lam: float = 0.6, 
             if improved: break
     return S, best
 
+if '_obj_with_cross' not in globals():
+    def _obj_with_cross(C_within: np.ndarray, C_cross: np.ndarray | None,
+                        score: np.ndarray, idx, lam: float, mu: float) -> float:
+        """合計スコア − λ×(D内ペア相関総和) − μ×(G↔Dクロス相関総和)"""
+        idx = list(idx)
+        P = C_within[np.ix_(idx, idx)]
+        s = (score - score.mean()) / (score.std() + 1e-9)
+        within = (P.sum() - np.trace(P)) / 2.0
+        cross = 0.0
+        if C_cross is not None and C_cross.size > 0:
+            cross = C_cross[idx, :].sum()  # 総和（平均化しない）：スケールはμで調整
+        return float(s[idx].sum() - lam * within - mu * cross)
+
+if 'swap_local_det_cross' not in globals():
+    def swap_local_det_cross(C_within: np.ndarray, C_cross: np.ndarray | None,
+                             score: np.ndarray, idx, lam: float = 0.6, mu: float = 0.3,
+                             max_pass: int = 15):
+        """クロス相関ペナルティ入りのbest-improvement 1入替（決定論）。"""
+        S = sorted(idx)
+        best = _obj_with_cross(C_within, C_cross, score, S, lam, mu)
+        improved, passes = True, 0
+        N = len(score)
+        while improved and passes < max_pass:
+            improved = False; passes += 1
+            for i, out in enumerate(list(S)):      # 固定順
+                for inn in range(N):               # 固定順
+                    if inn in S:
+                        continue
+                    cand = S.copy(); cand[i] = inn; cand = sorted(cand)
+                    v = _obj_with_cross(C_within, C_cross, score, cand, lam, mu)
+                    if v > best + 1e-10:
+                        S, best, improved = cand, v, True
+                        break
+                if improved:
+                    break
+        return S, best
+
 def avg_corr(C: np.ndarray, idx) -> float:
     k = len(idx)
     P = C[np.ix_(idx, idx)]
@@ -413,32 +462,75 @@ def select_bucket_drrs(returns_df: pd.DataFrame,
                        pool_tickers: list[str],
                        k: int, *, n_pc: int, gamma: float, lam: float, eta: float,
                        lookback: int, prev_tickers: list[str] | None,
-                       shrink: float = 0.10):
-    """returns_df: T×N 全銘柄の日次リターン（pct_change済）。pool_tickers: 候補の順序。"""
-    # ルックバックで切り出し（足りなければ全期間）
-    Rdf = returns_df[pool_tickers]
-    Rdf = Rdf.iloc[-lookback:] if len(Rdf) >= lookback else Rdf
-    Rdf = Rdf.dropna()  # プール内で共通サンプル期間に限定
-    R = Rdf.to_numpy()
-    score = score_ser.reindex(pool_tickers).to_numpy(dtype=np.float32)
+                       shrink: float = 0.10,
+                       g_fixed_tickers: list[str] | None = None,  # ★追加
+                       mu: float = 0.0                              # ★追加
+                       ):
+    """
+    returns_df: T×N の日次リターン（pct_change済）。
+    pool_tickers: 候補集合（この中から k を選ぶ）。
+    g_fixed_tickers: Gを固定してDを最適化する場合に指定。None/[]なら従来動作。
+    mu: G↔Dクロス相関のペナルティ係数（総和に掛ける）。
+    """
+    # ルックバック＆共通サンプル化（pool ∪ Gfixed で揃える）
+    g_fixed = [t for t in (g_fixed_tickers or []) if t in returns_df.columns]
+    union = [t for t in pool_tickers if t in returns_df.columns]
+    for t in g_fixed:
+        if t not in union:
+            union.append(t)
 
-    C = residual_corr(R, n_pc=n_pc, shrink=shrink)
-    S0 = rrqr_like_det(R, score, k, gamma=gamma)
-    S, Jn = swap_local_det(C, score, S0, lam=lam, max_pass=15)
+    Rdf_all = returns_df[union]
+    Rdf_all = Rdf_all.iloc[-lookback:] if len(Rdf_all) >= lookback else Rdf_all
+    Rdf_all = Rdf_all.dropna()
 
-    # 粘着性（据え置き判定）
+    # プール／G固定を「共通サンプル化後の列順」に合わせて確定
+    pool_eff = [t for t in pool_tickers if t in Rdf_all.columns]
+    g_eff = [t for t in g_fixed if t in Rdf_all.columns]
+
+    if len(pool_eff) == 0:
+        return dict(idx=[], tickers=[], avg_res_corr=np.nan, sum_score=0.0, objective=-np.inf)
+
+    # スコア（プール順）
+    score = score_ser.reindex(pool_eff).to_numpy(dtype=np.float32)
+
+    # 残差相関（unionベース）
+    C_all = residual_corr(Rdf_all.to_numpy(), n_pc=n_pc, shrink=shrink)
+
+    # インデックス写像
+    col_pos = {c: i for i, c in enumerate(Rdf_all.columns)}
+    pool_pos = [col_pos[t] for t in pool_eff]
+    C_within = C_all[np.ix_(pool_pos, pool_pos)]
+    C_cross = None
+    if len(g_eff) > 0 and mu > 0.0:
+        g_pos = [col_pos[t] for t in g_eff]
+        C_cross = C_all[np.ix_(pool_pos, g_pos)]
+
+    # 初期解：RRQRライク（プール部分のみで）
+    R_pool = Rdf_all[pool_eff].to_numpy()
+    S0 = rrqr_like_det(R_pool, score, k, gamma=gamma)
+
+    # 局所入替：クロス項あり/なしで分岐
+    if C_cross is not None:
+        S, Jn = swap_local_det_cross(C_within, C_cross, score, S0, lam=lam, mu=mu, max_pass=15)
+    else:
+        S, Jn = swap_local_det(C_within, score, S0, lam=lam, max_pass=15)
+
+    # 粘着性（据え置き）
     if prev_tickers:
-        prev_idx = [pool_tickers.index(t) for t in prev_tickers if t in pool_tickers]
-        if len(prev_idx) == k:
-            Jp = _obj(C, score, prev_idx, lam)
+        prev_idx = [pool_eff.index(t) for t in prev_tickers if t in pool_eff]
+        if len(prev_idx) == min(k, len(pool_eff)):
+            if C_cross is not None:
+                Jp = _obj_with_cross(C_within, C_cross, score, prev_idx, lam, mu)
+            else:
+                Jp = _obj(C_within, score, prev_idx, lam)
             if Jn < Jp + eta:
                 S, Jn = sorted(prev_idx), Jp
 
-    selected_tickers = [pool_tickers[i] for i in S]
+    selected_tickers = [pool_eff[i] for i in S]
     return dict(
         idx=S,
         tickers=selected_tickers,
-        avg_res_corr=avg_corr(C, S),
+        avg_res_corr=avg_corr(C_within, S),
         sum_score=float(score[S].sum()),
         objective=float(Jn),
     )
@@ -580,140 +672,142 @@ def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
     return np.nan if var == 0 else cov / var
 
 
+if 'aggregate_scores' not in globals():
+    def aggregate_scores():
+        """特徴量→Z化→合成スコア作成。相関・選定は触らない。"""
+        global df, missing_logs, df_z, g_score, d_score_all
+
+        df = pd.DataFrame(index=tickers)
+        missing_logs = []
+
+        # ---- 特徴量生成 ----
+        for t in tickers:
+            d = info[t]; s = px[t]
+            ev = ev_fallback(d, tickers_bulk.tickers[t])
+            df.loc[t, 'TR'] = trend(s)
+            df.loc[t, 'EPS'] = eps_df.loc[t, 'eps_ttm']
+            df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
+            df.loc[t, 'ROE'] = d.get('returnOnEquity', np.nan)
+            df.loc[t, 'BETA'] = calc_beta(s, spx, lookback=252)
+            div = d.get('dividendYield') if d.get('dividendYield') is not None else d.get('trailingAnnualDividendYield')
+
+            if div is None or pd.isna(div):
+                try:
+                    divs = yf.Ticker(t).dividends
+                    if divs is not None and not divs.empty:
+                        last_close = s.iloc[-1]
+                        div_1y = divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum()
+                        if last_close and last_close > 0:
+                            div = float(div_1y / last_close)
+                except Exception:
+                    pass
+            df.loc[t, 'DIV'] = 0.0 if (div is None or pd.isna(div)) else float(div)
+
+            fcf_val = fcf_df.loc[t, 'fcf_ttm'] if t in fcf_df.index else np.nan
+            df.loc[t, 'FCF'] = (fcf_val / ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev > 0) else np.nan
+            df.loc[t, 'RS'] = rs(s, spx)
+            df.loc[t, 'TR_str'] = tr_str(s)
+            df.loc[t, 'DIV_STREAK'] = div_streak(t)
+
+            fin_cols = ['REV', 'ROE', 'BETA', 'DIV', 'FCF']
+            need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t, col])]
+            if need_finnhub:
+                fin_data = fetch_finnhub_metrics(t)
+                for col in need_finnhub:
+                    val = fin_data.get(col)
+                    if val is not None and not pd.isna(val):
+                        df.loc[t, col] = val
+
+            for col in fin_cols + ['EPS', 'RS', 'TR_str', 'DIV_STREAK']:
+                if pd.isna(df.loc[t, col]):
+                    if col == 'DIV':
+                        status = dividend_status(t)
+                        if status != 'none_confident':
+                            missing_logs.append({'Ticker': t, 'Column': col, 'Status': status})
+                    else:
+                        missing_logs.append({'Ticker': t, 'Column': col})
+
+        # ---- 安定化＆Z化 ----
+        df['ROE_W'] = winsorize_s(df['ROE'], 0.02)
+        df['FCF_W'] = winsorize_s(df['FCF'], 0.02)
+        df['REV_W'] = winsorize_s(df['REV'], 0.02)
+        df['EPS_W'] = winsorize_s(df['EPS'], 0.02)
+
+        df_z = pd.DataFrame(index=df.index)
+        for col in ['EPS', 'REV', 'ROE', 'FCF', 'RS', 'TR_str', 'BETA', 'DIV', 'DIV_STREAK']:
+            df_z[col] = robust_z(df[col])
+        df_z['REV'] = robust_z(df['REV_W'])
+        df_z['EPS'] = robust_z(df['EPS_W'])
+        df_z['TR']  = robust_z(df['TR'])
+
+        df_z['QUALITY_F'] = robust_z(0.6 * df['FCF_W'] + 0.4 * df['ROE_W']).clip(-3.0, 3.0)
+        df_z['YIELD_F']   = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
+        df_z['GROWTH_F']  = 0.5 * df_z['REV'] + 0.3 * df_z['EPS'] + 0.2 * df_z['ROE']
+        df_z['MOM_F']     = 0.7 * df_z['RS']  + 0.3 * df_z['TR_str']
+        df_z['TREND']     = df_z['TR']
+        df_z['VOL']       = robust_z(df['BETA'])
+
+        df_z.rename(columns={'GROWTH_F': 'GRW', 'MOM_F': 'MOM', 'TREND': 'TRD',
+                             'QUALITY_F': 'QAL', 'YIELD_F': 'YLD'}, inplace=True)
+
+        # ---- 合成スコア（相関は触らない）----
+        g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
+        d_score_all = df_z.mul(pd.Series(D_weights)).sum(axis=1)
+
+        return df, df_z, g_score, d_score_all, missing_logs
+
+if 'select_buckets' not in globals():
+    def select_buckets():
+        """DRRSで相関低減しつつG/D選定。跨り相関μにも対応。"""
+        global init_G, init_D, resG, resD, top_G, top_D
+
+        # --- Gプール作成＆選定 ---
+        init_G = g_score.nlargest(min(corrM, len(g_score))).index.tolist()
+        prevG = _load_prev(G_PREV_JSON)
+
+        resG = select_bucket_drrs(
+            returns_df=returns,
+            score_ser=g_score,
+            pool_tickers=init_G,
+            k=N_G,
+            n_pc=DRRS_G.get("n_pc", 3), gamma=DRRS_G.get("gamma", 1.0),
+            lam=DRRS_G.get("lam", 0.6),  eta=DRRS_G.get("eta", 0.5),
+            lookback=DRRS_G.get("lookback", 252), prev_tickers=prevG, shrink=DRRS_SHRINK,
+            g_fixed_tickers=None, mu=0.0
+        )
+        top_G = resG["tickers"]
+
+        # --- Dプール（G除外）＆選定 ---
+        D_pool_index = df_z.drop(top_G).index
+        d_score = d_score_all.drop(top_G)
+        init_D = d_score.loc[D_pool_index].nlargest(min(corrM, len(D_pool_index))).index.tolist()
+        prevD = _load_prev(D_PREV_JSON)
+
+        mu = globals().get('CROSS_MU_GD', 0.0)
+        resD = select_bucket_drrs(
+            returns_df=returns,
+            score_ser=d_score_all,
+            pool_tickers=init_D,
+            k=N_D,
+            n_pc=DRRS_D.get("n_pc", 4), gamma=DRRS_D.get("gamma", 0.8),
+            lam=DRRS_D.get("lam", 0.85), eta=DRRS_D.get("eta", 0.5),
+            lookback=DRRS_D.get("lookback", 504), prev_tickers=prevD, shrink=DRRS_SHRINK,
+            g_fixed_tickers=top_G, mu=mu
+        )
+        top_D = resD["tickers"]
+
+        # 永続化
+        _save_sel(G_PREV_JSON, top_G, resG["avg_res_corr"], resG["sum_score"], resG["objective"])
+        _save_sel(D_PREV_JSON, top_D, resD["avg_res_corr"], resD["sum_score"], resD["objective"])
+
+        return resG, resD, top_G, top_D, init_G, init_D
+
 def calculate_scores():
-    """Calculate factor scores and perform DRRS selection."""
+    """パイプライン：①スコア集計 → ②相関低減＆選定"""
     global df, missing_logs, df_z, g_score, d_score_all
     global init_G, init_D, resG, resD, top_G, top_D
-
-    df = pd.DataFrame(index=tickers)
-    missing_logs = []
-    for t in tickers:
-        d = info[t]
-        s = px[t]
-        ev = ev_fallback(d, tickers_bulk.tickers[t])
-        df.loc[t, 'TR'] = trend(s)
-        df.loc[t, 'EPS'] = eps_df.loc[t, 'eps_ttm']
-        df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
-        df.loc[t, 'ROE'] = d.get('returnOnEquity', np.nan)
-        df.loc[t, 'BETA'] = calc_beta(s, spx, lookback=252)
-        div = d.get('dividendYield')
-        if div is None or pd.isna(div):
-            div = d.get('trailingAnnualDividendYield')
-
-        # yfinanceの利回りが怪しい銘柄は、直近1年分配/終値で再計算を試みる
-        if div is None or pd.isna(div):
-            try:
-                divs = yf.Ticker(t).dividends
-                if divs is not None and not divs.empty:
-                    last_close = s.iloc[-1]
-                    div_1y = divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum()
-                    if last_close and last_close > 0:
-                        div = float(div_1y / last_close)
-            except Exception:
-                pass
-
-        # 最終的に欠損なら「0%」として扱う（=YLDでしっかりマイナス評価される）
-        df.loc[t, 'DIV'] = 0.0 if (div is None or pd.isna(div)) else float(div)
-        fcf_val = fcf_df.loc[t, 'fcf_ttm'] if t in fcf_df.index else np.nan
-        df.loc[t, 'FCF'] = (fcf_val / ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev > 0) else np.nan
-        df.loc[t, 'RS'] = rs(s, spx)
-        df.loc[t, 'TR_str'] = tr_str(s)
-        df.loc[t, 'DIV_STREAK'] = div_streak(t)
-        fin_cols = ['REV', 'ROE', 'BETA', 'DIV', 'FCF']
-        need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t, col])]
-        if need_finnhub:
-            fin_data = fetch_finnhub_metrics(t)
-            for col in need_finnhub:
-                val = fin_data.get(col)
-                if val is not None and not pd.isna(val):
-                    df.loc[t, col] = val
-        for col in fin_cols + ['EPS', 'RS', 'TR_str', 'DIV_STREAK']:
-            if pd.isna(df.loc[t, col]):
-                if col == 'DIV':
-                    status = dividend_status(t)
-                    if status != 'none_confident':
-                        missing_logs.append({'Ticker': t, 'Column': col, 'Status': status})
-                else:
-                    missing_logs.append({'Ticker': t, 'Column': col})
-
-    # ROE/FCFを軽くwinsorize（外れ値でQALが暴れないように）
-    df['ROE_W'] = winsorize_s(df['ROE'], 0.02)
-    df['FCF_W'] = winsorize_s(df['FCF'], 0.02)
-
-    # GRW安定化: REV/EPSもwinsorizeした値を保持
-    df['REV_W'] = winsorize_s(df['REV'], 0.02)
-    df['EPS_W'] = winsorize_s(df['EPS'], 0.02)
-
-    # ----- 正規化（頑健Z） -----
-    df_z = pd.DataFrame(index=df.index)
-    for col in ['EPS', 'REV', 'ROE', 'FCF', 'RS', 'TR_str', 'BETA', 'DIV', 'DIV_STREAK']:
-        df_z[col] = robust_z(df[col])  # 欠損や外れ値に強い
-
-    # 差し替え（winsorize後のREV/EPSをZ化）
-    df_z['REV'] = robust_z(df['REV_W'])
-    df_z['EPS'] = robust_z(df['EPS_W'])
-
-    # TR は段階点数のままだと飽和するので Z 化
-    df_z['TR'] = robust_z(df['TR'])
-
-    # QUALITY は winsorize 済みの生値を重み付き平均→Z
-    df_z['QUALITY_F'] = robust_z(0.6 * df['FCF_W'] + 0.4 * df['ROE_W'])
-    df_z['QUALITY_F'] = df_z['QUALITY_F'].clip(-3.0, 3.0)
-
-    # YIELD は利回りと増配年数の合成（ここは既存通り）
-    df_z['YIELD_F'] = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
-
-    # MOM/TRD は既存通り
-    df_z['GROWTH_F'] = 0.5 * df_z['REV'] + 0.3 * df_z['EPS'] + 0.2 * df_z['ROE']
-    df_z['MOM_F'] = 0.7 * df_z['RS'] + 0.3 * df_z['TR_str']
-    df_z['TREND'] = df_z['TR']
-
-    # VOL は「一度だけ」Z化（βベースのまま）
-    df_z['VOL'] = robust_z(df['BETA'])
-
-    # 短縮名
-    df_z.rename(columns={'GROWTH_F': 'GRW', 'MOM_F': 'MOM', 'TREND': 'TRD',
-                         'QUALITY_F': 'QAL', 'YIELD_F': 'YLD'}, inplace=True)
-
-    # ----- スコアリング -----
-    g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
-    d_score_all = df_z.mul(pd.Series(D_weights)).sum(axis=1)
-
-    # ----- DRRS 選定（決定論RRQR・残差相関スワップ） -----
-
-    # Gプール
-    init_G = g_score.nlargest(min(corrM, len(g_score))).index.tolist()
-    prevG = _load_prev(G_PREV_JSON)  # 前回G（粘着性用）
-
-    resG = select_bucket_drrs(
-        returns_df=returns,
-        score_ser=g_score,
-        pool_tickers=init_G,
-        k=N_G,
-        n_pc=DRRS_G["n_pc"], gamma=DRRS_G["gamma"], lam=DRRS_G["lam"], eta=DRRS_G["eta"],
-        lookback=DRRS_G["lookback"], prev_tickers=prevG, shrink=DRRS_SHRINK
-    )
-    top_G = resG["tickers"]
-
-    # Dプール
-    D_pool_index = df_z.drop(top_G).index
-    d_score = d_score_all.drop(top_G)
-    init_D = d_score.loc[D_pool_index].nlargest(min(corrM, len(D_pool_index))).index.tolist()
-
-    prevD = _load_prev(D_PREV_JSON)
-
-    resD = select_bucket_drrs(
-        returns_df=returns,
-        score_ser=d_score_all,  # 元スコア（プールでreindexする）
-        pool_tickers=init_D,
-        k=N_D,
-        n_pc=DRRS_D["n_pc"], gamma=DRRS_D["gamma"], lam=DRRS_D["lam"], eta=DRRS_D["eta"],
-        lookback=DRRS_D["lookback"], prev_tickers=prevD, shrink=DRRS_SHRINK
-    )
-    top_D = resD["tickers"]
-
-    _save_sel(G_PREV_JSON, top_G, resG["avg_res_corr"], resG["sum_score"], resG["objective"])
-    _save_sel(D_PREV_JSON, top_D, resD["avg_res_corr"], resD["sum_score"], resD["objective"])
+    df, df_z, g_score, d_score_all, missing_logs = aggregate_scores()
+    resG, resD, top_G, top_D, init_G, init_D = select_buckets()
 
 def _avg_offdiag(A: np.ndarray) -> float:
     n = A.shape[0]
@@ -805,6 +899,7 @@ def display_results():
         f"nPC={DRRS_D['n_pc']} "
         f"γ={DRRS_D['gamma']} "
         f"λ={DRRS_D['lam']} "
+        f"μ={CROSS_MU_GD} "
         f"η={DRRS_D['eta']} "
         f"shrink={DRRS_SHRINK}]"
     )
