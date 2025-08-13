@@ -54,8 +54,8 @@ CAND_PRICE_MAX = 400
 bench = '^GSPC'
 # G枠とD枠の保持数
 N_G, N_D = 12, 13
-# 枠別のファクター重み
-g_weights = {'GRW': 0.3, 'MOM': 0.2, 'TRD': 0.5}
+# 枠別のファクター重み（G枠にVOLを追加）
+g_weights = {'GRW': 0.35, 'MOM': 0.20, 'TRD': 0.45, 'VOL': -0.10}
 D_weights = {'QAL': 0.15, 'YLD': 0.35, 'VOL': -0.5}
 corrM = 45
 # ----- DRRS params -----
@@ -67,7 +67,7 @@ G_PREV_JSON = os.path.join(RESULTS_DIR, "G_selection.json")
 D_PREV_JSON = os.path.join(RESULTS_DIR, "D_selection.json")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 # デバッグモード（Trueで詳細情報を表示）
-debug_mode = True
+debug_mode = False
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 
@@ -761,14 +761,23 @@ def display_results():
     extra_G = [t for t in init_G if t not in top_G][:5]
     G_UNI = top_G + extra_G
     g_table = pd.concat([
-        df_z.loc[G_UNI, ['GRW', 'MOM', 'TRD']],
+        df_z.loc[G_UNI, ['GRW', 'MOM', 'TRD', 'VOL']],
         g_score[G_UNI].rename('GSC')
     ], axis=1)
     g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
     g_title = (
-        f"[G枠 / {N_G} / GRW{int(g_weights['GRW']*100)} MOM{int(g_weights['MOM']*100)} TRD{int(g_weights['TRD']*100)} "
-        f"/ corrM={corrM} / LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} "
-        f"λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK} / method=DRRS]"
+        f"[G枠 / {N_G} / "
+        f"GRW{int(g_weights['GRW']*100)} "
+        f"MOM{int(g_weights['MOM']*100)} "
+        f"TRD{int(g_weights['TRD']*100)} "
+        f"VOL{int(g_weights['VOL']*100)} "
+        f"/ corrM={corrM} / "
+        f"LB={DRRS_G['lookback']} "
+        f"nPC={DRRS_G['n_pc']} "
+        f"γ={DRRS_G['gamma']} "
+        f"λ={DRRS_G['lam']} "
+        f"η={DRRS_G['eta']} "
+        f"shrink={DRRS_SHRINK}]"
     )
     print(g_title)
     print(g_table)
@@ -781,9 +790,17 @@ def display_results():
     ], axis=1)
     d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
     d_title = (
-        f"[D枠 / {N_D} / QAL{int(D_weights['QAL']*100)} YLD{int(D_weights['YLD']*100)} VOL{int(D_weights['VOL']*100)} "
-        f"/ corrM={corrM} / LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} "
-        f"λ={DRRS_D['lam']} η={DRRS_D['eta']} shrink={DRRS_SHRINK} / VOL=BETA(252d) / method=DRRS]"
+        f"[D枠 / {N_D} / "
+        f"QAL{int(D_weights['QAL']*100)} "
+        f"YLD{int(D_weights['YLD']*100)} "
+        f"VOL{int(D_weights['VOL']*100)} "
+        f"/ corrM={corrM} / "
+        f"LB={DRRS_D['lookback']} "
+        f"nPC={DRRS_D['n_pc']} "
+        f"γ={DRRS_D['gamma']} "
+        f"λ={DRRS_D['lam']} "
+        f"η={DRRS_D['eta']} "
+        f"shrink={DRRS_SHRINK}]"
     )
     print(d_title)
     print(d_table)
