@@ -47,22 +47,23 @@ def finnhub_get(endpoint, params):
 def fetch_price(symbol):
     try:
         data = finnhub_get("quote", {"symbol": symbol})
-        return data.get("c") or 0
+        price = data.get("c")
+        return float(price) if price not in (None, 0) else float("nan")
     except Exception:
-        return 0
+        return float("nan")
 
 
 def fetch_vix_ma5():
     """Retrieve VIX 5-day moving average via yfinance."""
     try:
         vix = (
-            yf.download("^VIX", period="7d", interval="1d", progress=False)["Close"]
+            yf.download("^VIX", period="7d", interval="1d", progress=False, auto_adjust=False)["Close"]
             .dropna()
             .tail(5)
         )
         if len(vix) < 5:
             return float("nan")
-        return float(vix.mean())
+        return vix.mean().item()
     except Exception:
         return float("nan")
 
@@ -94,14 +95,16 @@ total_drift_abs     = df["drift_abs"].sum()
 
 # --- 4. 半戻し（ideal）計算 ---
 df["adjusted_ratio"] = df["current_ratio"] - df["drift"] / 2
-df["adjustable"]     = (df["adjusted_ratio"] * total_value) >= df["price"]
+df["adjustable"]     = (
+    (df["adjusted_ratio"] * total_value) >= df["price"]
+    ) & df["price"].notna() & df["price"].gt(0)
 
 # --- 5. 閾値超過時のみシミュレーション ---
 alert = drift_threshold != float("inf") and total_drift_abs * 100 > drift_threshold
 if alert:
     df["trade_shares"] = df.apply(
         lambda r: int(round(((r["adjusted_ratio"] * total_value) - r["value"]) / r["price"]))
-        if r["adjustable"] else 0,
+        if r["adjustable"] and r["price"] > 0 else 0,
         axis=1
     )
     df["new_shares"]            = df["shares"] + df["trade_shares"]
