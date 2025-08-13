@@ -286,8 +286,11 @@ def rrqr_like_det(R: np.ndarray, score: np.ndarray, k: int, gamma: float = 1.0):
     """スコア重み付き RRQR 風の決定論初期選定（乱数なし・タイブレーク固定）。"""
     Z = _z_np(R)
     w = (score - score.min()) / (np.ptp(score) + 1e-12)
-    X = Z * (1.0 + gamma * w)  # 列スケーリング
+    X = Z * (1.0 + gamma * w)
     N = X.shape[1]
+    k = max(0, min(k, N))
+    if k == 0:
+        return []
     S = []
     selected = np.zeros(N, dtype=bool)
     Rres = X.copy()
@@ -299,7 +302,7 @@ def rrqr_like_det(R: np.ndarray, score: np.ndarray, k: int, gamma: float = 1.0):
         S.append(j); selected[j] = True
         u = X[:, j:j+1]
         u /= (np.linalg.norm(u) + 1e-12)
-        Rres = Rres - u @ (u.T @ Rres)  # 正射影で除去
+        Rres = Rres - u @ (u.T @ Rres)
     return sorted(S)
 
 def _obj(corrM: np.ndarray, score: np.ndarray, idx, lam: float) -> float:
@@ -383,27 +386,39 @@ def select_bucket_drrs(returns_df: pd.DataFrame,
 
 # ----- ファクター計算関数 -----
 def trend(s):
-    """移動平均線と52週レンジで強い上昇トレンドを判定。
-    全条件を満たせば1、そうでなければ-1を返す。"""
-    if len(s) < 252:
-        return -1
-    sma50 = s.rolling(50).mean().iloc[-1]
+    if len(s) < 200:
+        return np.nan
+    sma50  = s.rolling(50).mean().iloc[-1]
     sma150 = s.rolling(150).mean().iloc[-1]
     sma200 = s.rolling(200).mean().iloc[-1]
     prev200 = s.rolling(200).mean().iloc[-21]
     p = s.iloc[-1]
-    hi, lo = s[-252:].max(), s[-252:].min()
-    return 1 if all([p > sma50 > sma150 > sma200, sma150 > sma200, sma200 > prev200, p > 0.75 * hi, p > 1.3 * lo]) else -1
+    if len(s) >= 252:
+        hi, lo = s[-252:].max(), s[-252:].min()
+    else:
+        hi, lo = s.max(), s.min()
+    score = 0
+    score += 1 if p > sma50 else -1
+    score += 1 if sma50 > sma150 else -1
+    score += 1 if sma150 > sma200 else -1
+    score += 1 if sma200 > prev200 else -1
+    score += 1 if p > 0.75 * hi else 0
+    score += 1 if p > 1.15 * lo else 0
+    return score
 
 
 def rs(s, b):
-    """12ヶ月と1ヶ月のリターンからベンチマークに対する相対強度を算出。
-    正の値はベンチマーク超過を示す。"""
-    r12 = s.iloc[-1] / s.iloc[-252] - 1
-    r1 = s.iloc[-1] / s.iloc[-22] - 1
-    br12 = b.iloc[-1] / b.iloc[-252] - 1
-    br1 = b.iloc[-1] / b.iloc[-22] - 1
-    return (r12 - r1) - (br12 - br1)
+    n, nb = len(s), len(b)
+    if n < 60 or nb < 60:
+        return np.nan
+    L12 = 252 if n >= 252 and nb >= 252 else min(n, nb) - 1
+    L1  = 22  if n >= 22  and nb >= 22  else max(5, min(n, nb) // 3)
+    r12  = s.iloc[-1] / s.iloc[-L12] - 1
+    r1   = s.iloc[-1] / s.iloc[-L1]  - 1
+    br12 = b.iloc[-1] / b.iloc[-L12] - 1
+    br1  = b.iloc[-1] / b.iloc[-L1]  - 1
+    # 中期>短期の持続性を重視
+    return (r12 - br12) * 0.7 + (r1 - br1) * 0.3
 
 
 def tr_str(s):
@@ -411,6 +426,14 @@ def tr_str(s):
     if len(s) < 50:
         return np.nan
     return s.iloc[-1] / s.rolling(50).mean().iloc[-1] - 1
+
+# === PATCH: 実測ボラ ===
+def realized_vol(s, lookback=90):
+    r = s.pct_change().dropna()
+    if len(r) < 20:
+        return np.nan
+    r = r.iloc[-min(len(r), lookback):]
+    return r.std() * np.sqrt(252)  # 年率化
 
 
 def dividend_status(ticker: str) -> str:
@@ -515,6 +538,7 @@ def calculate_scores():
         df.loc[t, 'RS'] = rs(s, spx)
         df.loc[t, 'TR_str'] = tr_str(s)
         df.loc[t, 'DIV_STREAK'] = div_streak(t)
+        df.loc[t, 'RVOL'] = realized_vol(s)  # ← 追加
         fin_cols = ['REV', 'ROE', 'BETA', 'DIV', 'FCF']
         need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t, col])]
         if need_finnhub:
@@ -544,7 +568,8 @@ def calculate_scores():
     df_z['MOM_F'] = 0.7 * df_z['RS'] + 0.3 * df_z['TR_str']
     df_z['QUALITY_F'] = (df_z['FCF'] + df_z['ROE']) / 2
     df_z['YIELD_F'] = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
-    df_z['VOL'] = df_z['BETA']
+    # 低ボラを高評価にするため符号反転 → 後段でZ化
+    df_z['VOL'] = -df['RVOL']
     df_z['TREND'] = df_z['TR']
 
     # ----- Compositeファクターの再標準化 -----
@@ -570,8 +595,8 @@ def calculate_scores():
 
     # ----- DRRS 選定（決定論RRQR・残差相関スワップ） -----
 
-    # 1) Gプール：スコア上位からcorrM件（現行ロジックを踏襲）
-    init_G = g_score.nlargest(corrM).index.tolist()
+    # Gプール
+    init_G = g_score.nlargest(min(corrM, len(g_score))).index.tolist()
     prevG = _load_prev(G_PREV_JSON)  # 前回G（粘着性用）
 
     resG = select_bucket_drrs(
@@ -584,10 +609,10 @@ def calculate_scores():
     )
     top_G = resG["tickers"]
 
-    # 2) Dプール：Gで選ばれた銘柄を除外してから、スコア上位corrM件
+    # Dプール
     D_pool_index = df_z.drop(top_G).index
     d_score = d_score_all.drop(top_G)
-    init_D = d_score.loc[D_pool_index].nlargest(corrM).index.tolist()
+    init_D = d_score.loc[D_pool_index].nlargest(min(corrM, len(D_pool_index))).index.tolist()
 
     prevD = _load_prev(D_PREV_JSON)
 
