@@ -8,6 +8,19 @@ import time
 import json
 
 
+def winsorize_s(s: pd.Series, p=0.02):
+    if s is None or s.dropna().empty:
+        return s
+    lo, hi = np.nanpercentile(s.astype(float), [100 * p, 100 * (1 - p)])
+    return s.clip(lo, hi)
+
+
+def robust_z(s: pd.Series, p=0.02):
+    """軽い外れ値剪定→Z化。欠損は列平均で埋める（Zに影響最小）。"""
+    s2 = winsorize_s(s, p)
+    return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+
+
 # ----- ユニバースと定数 -----
 exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
 cand = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
@@ -427,14 +440,6 @@ def tr_str(s):
         return np.nan
     return s.iloc[-1] / s.rolling(50).mean().iloc[-1] - 1
 
-# === PATCH: 実測ボラ ===
-def realized_vol(s, lookback=90):
-    r = s.pct_change().dropna()
-    if len(r) < 20:
-        return np.nan
-    r = r.iloc[-min(len(r), lookback):]
-    return r.std() * np.sqrt(252)  # 年率化
-
 
 def dividend_status(ticker: str) -> str:
     """銘柄の配当状況を簡易判定する。
@@ -513,6 +518,19 @@ def fetch_finnhub_metrics(symbol):
         return {}
 
 
+def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
+    r = series.pct_change().dropna()
+    m = market.pct_change().dropna()
+    n = min(len(r), len(m), lookback)
+    if n < 60:  # 最低限
+        return np.nan
+    r = r.iloc[-n:]
+    m = m.iloc[-n:]
+    cov = np.cov(r, m)[0, 1]
+    var = np.var(m)
+    return np.nan if var == 0 else cov / var
+
+
 def calculate_scores():
     """Calculate factor scores and perform DRRS selection."""
     global df, missing_logs, df_z, g_score, d_score_all
@@ -528,17 +546,30 @@ def calculate_scores():
         df.loc[t, 'EPS'] = eps_df.loc[t, 'eps_ttm']
         df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
         df.loc[t, 'ROE'] = d.get('returnOnEquity', np.nan)
-        df.loc[t, 'BETA'] = d.get('beta', np.nan)
+        df.loc[t, 'BETA'] = calc_beta(s, spx, lookback=252)
         div = d.get('dividendYield')
         if div is None or pd.isna(div):
             div = d.get('trailingAnnualDividendYield')
-        df.loc[t, 'DIV'] = div if div is not None else np.nan
+
+        # yfinanceの利回りが怪しい銘柄は、直近1年分配/終値で再計算を試みる
+        if div is None or pd.isna(div):
+            try:
+                divs = yf.Ticker(t).dividends
+                if divs is not None and not divs.empty:
+                    last_close = s.iloc[-1]
+                    div_1y = divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum()
+                    if last_close and last_close > 0:
+                        div = float(div_1y / last_close)
+            except Exception:
+                pass
+
+        # 最終的に欠損なら「0%」として扱う（=YLDでしっかりマイナス評価される）
+        df.loc[t, 'DIV'] = 0.0 if (div is None or pd.isna(div)) else float(div)
         fcf_val = fcf_df.loc[t, 'fcf_ttm'] if t in fcf_df.index else np.nan
         df.loc[t, 'FCF'] = (fcf_val / ev) if ev and not pd.isna(fcf_val) else np.nan
         df.loc[t, 'RS'] = rs(s, spx)
         df.loc[t, 'TR_str'] = tr_str(s)
         df.loc[t, 'DIV_STREAK'] = div_streak(t)
-        df.loc[t, 'RVOL'] = realized_vol(s)  # ← 追加
         fin_cols = ['REV', 'ROE', 'BETA', 'DIV', 'FCF']
         need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t, col])]
         if need_finnhub:
@@ -556,38 +587,35 @@ def calculate_scores():
                 else:
                     missing_logs.append({'Ticker': t, 'Column': col})
 
-    # ----- 正規化 (Zスコア) -----
-    z = lambda x: np.nan_to_num(zscore(x.fillna(x.mean())))
-    df_z = df.apply(z)
-    df_z['DIV'] = z(df['DIV'])
-    df_z['TR'] = df['TR']
-    df_z['DIV_STREAK'] = z(df['DIV_STREAK'])
+    # ROE/FCFを軽くwinsorize（外れ値でQALが暴れないように）
+    df['ROE_W'] = winsorize_s(df['ROE'], 0.02)
+    df['FCF_W'] = winsorize_s(df['FCF'], 0.02)
 
-    # ----- 6ファクター合成 -----
+    # ----- 正規化（頑健Z） -----
+    df_z = pd.DataFrame(index=df.index)
+    for col in ['EPS', 'REV', 'ROE', 'FCF', 'RS', 'TR_str', 'BETA', 'DIV', 'DIV_STREAK']:
+        df_z[col] = robust_z(df[col])  # 欠損や外れ値に強い
+
+    # TR は段階点数のままだと飽和するので Z 化
+    df_z['TR'] = robust_z(df['TR'])
+
+    # QUALITY は winsorize 済みの生値を平均→Z
+    df_z['QUALITY_F'] = robust_z((df['FCF_W'] + df['ROE_W']) / 2.0)
+
+    # YIELD は利回りと増配年数の合成（ここは既存通り）
+    df_z['YIELD_F'] = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
+
+    # MOM/TRD は既存通り
     df_z['GROWTH_F'] = 0.5 * df_z['REV'] + 0.3 * df_z['EPS'] + 0.2 * df_z['ROE']
     df_z['MOM_F'] = 0.7 * df_z['RS'] + 0.3 * df_z['TR_str']
-    df_z['QUALITY_F'] = (df_z['FCF'] + df_z['ROE']) / 2
-    df_z['YIELD_F'] = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
-    # 低ボラを高評価にするため符号反転 → 後段でZ化
-    df_z['VOL'] = -df['RVOL']
     df_z['TREND'] = df_z['TR']
 
-    # ----- Compositeファクターの再標準化 -----
-    df_z['GROWTH_F'] = z(df_z['GROWTH_F'])
-    df_z['MOM_F'] = z(df_z['MOM_F'])
-    df_z['QUALITY_F'] = z(df_z['QUALITY_F'])
-    df_z['YIELD_F'] = z(df_z['YIELD_F'])
-    df_z['VOL'] = z(df_z['VOL'])
+    # VOL は「一度だけ」Z化（βベースのまま）
+    df_z['VOL'] = robust_z(df['BETA'])
 
-    # ----- カラム名を短縮 -----
-    df_z.rename(columns={
-        'GROWTH_F': 'GRW',
-        'MOM_F': 'MOM',
-        'TREND': 'TRD',
-        'QUALITY_F': 'QAL',
-        'YIELD_F': 'YLD',
-        'VOL': 'VOL'
-    }, inplace=True)
+    # 短縮名
+    df_z.rename(columns={'GROWTH_F': 'GRW', 'MOM_F': 'MOM', 'TREND': 'TRD',
+                         'QUALITY_F': 'QAL', 'YIELD_F': 'YLD'}, inplace=True)
 
     # ----- スコアリング -----
     g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
