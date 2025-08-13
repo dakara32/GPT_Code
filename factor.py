@@ -56,7 +56,7 @@ bench = '^GSPC'
 N_G, N_D = 12, 13
 # 枠別のファクター重み（G枠にVOLを追加）
 g_weights = {'GRW': 0.35, 'MOM': 0.20, 'TRD': 0.45, 'VOL': -0.10}
-D_weights = {'QAL': 0.15, 'YLD': 0.35, 'VOL': -0.5}
+D_weights = {'QAL': 0.15, 'YLD': 0.30, 'VOL': -0.45, 'TRD': 0.10}
 corrM = 45
 # ----- DRRS params -----
 DRRS_G = dict(lookback=252, n_pc=3, gamma=1.2, lam=0.68, eta=0.8)  # 相関罰則を僅かに強める
@@ -786,18 +786,20 @@ def display_results():
 
     extra_D = [t for t in init_D if t not in top_D][:5]
     D_UNI = top_D + extra_D
+    cols_D = ['QAL', 'YLD', 'VOL', 'TRD']
     d_table = pd.concat([
-        df_z.loc[D_UNI, ['QAL', 'YLD', 'VOL']],
+        df_z.loc[D_UNI, cols_D],
         d_score_all[D_UNI].rename('DSC')
     ], axis=1)
     d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
-    d_formatters = {col: "{:.2f}".format for col in ['QAL', 'YLD', 'VOL']}
+    d_formatters = {col: "{:.2f}".format for col in cols_D}
     d_formatters['DSC'] = "{:.3f}".format
     d_title = (
         f"[D枠 / {N_D} / "
         f"QAL{int(D_weights['QAL']*100)} "
         f"YLD{int(D_weights['YLD']*100)} "
         f"VOL{int(D_weights['VOL']*100)} "
+        f"TRD{int(D_weights['TRD']*100)} "
         f"/ corrM={corrM} / "
         f"LB={DRRS_D['lookback']} "
         f"nPC={DRRS_D['n_pc']} "
