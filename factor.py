@@ -59,7 +59,7 @@ g_weights = {'GRW': 0.3, 'MOM': 0.2, 'TRD': 0.5}
 D_weights = {'QAL': 0.15, 'YLD': 0.35, 'VOL': -0.5}
 corrM = 45
 # ----- DRRS params -----
-DRRS_G = dict(lookback=252, n_pc=3, gamma=1.2, lam=0.60, eta=0.8)
+DRRS_G = dict(lookback=252, n_pc=3, gamma=1.2, lam=0.68, eta=0.8)  # 相関罰則を僅かに強める
 DRRS_D = dict(lookback=504, n_pc=4, gamma=0.8, lam=0.85, eta=0.5)
 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク
 RESULTS_DIR = "results"
@@ -640,16 +640,24 @@ def calculate_scores():
     df['ROE_W'] = winsorize_s(df['ROE'], 0.02)
     df['FCF_W'] = winsorize_s(df['FCF'], 0.02)
 
+    # GRW安定化: REV/EPSもwinsorizeした値を保持
+    df['REV_W'] = winsorize_s(df['REV'], 0.02)
+    df['EPS_W'] = winsorize_s(df['EPS'], 0.02)
+
     # ----- 正規化（頑健Z） -----
     df_z = pd.DataFrame(index=df.index)
     for col in ['EPS', 'REV', 'ROE', 'FCF', 'RS', 'TR_str', 'BETA', 'DIV', 'DIV_STREAK']:
         df_z[col] = robust_z(df[col])  # 欠損や外れ値に強い
 
+    # 差し替え（winsorize後のREV/EPSをZ化）
+    df_z['REV'] = robust_z(df['REV_W'])
+    df_z['EPS'] = robust_z(df['EPS_W'])
+
     # TR は段階点数のままだと飽和するので Z 化
     df_z['TR'] = robust_z(df['TR'])
 
-    # QUALITY は winsorize 済みの生値を平均→Z
-    df_z['QUALITY_F'] = robust_z((df['FCF_W'] + df['ROE_W']) / 2.0)
+    # QUALITY は winsorize 済みの生値を重み付き平均→Z
+    df_z['QUALITY_F'] = robust_z(0.6 * df['FCF_W'] + 0.4 * df['ROE_W'])
     df_z['QUALITY_F'] = df_z['QUALITY_F'].clip(-3.0, 3.0)
 
     # YIELD は利回りと増配年数の合成（ここは既存通り）
@@ -812,23 +820,27 @@ def display_results():
             ann_vol = pr.std() * np.sqrt(n)
         sharpe = ann_ret / ann_vol
         drawdown = (cum - cum.cummax()).min()
+
+        # 平均相関（RAWρ）と残差相関（RESIDρ）を記録。CORR列は廃止。
         if len(ticks) >= 2:
-            corr_mat = ret[ticks].corr()
-            avg_corr = corr_mat.mask(np.eye(len(ticks), dtype=bool)).stack().mean()
+            C_raw = ret[ticks].corr()
+            RAW_rho = C_raw.mask(np.eye(len(ticks), dtype=bool)).stack().mean()
+
+            R = ret[ticks].dropna().to_numpy()
+            C_resid = residual_corr(R, n_pc=3, shrink=DRRS_SHRINK)
+            RESID_rho = float((C_resid.sum() - np.trace(C_resid)) / (C_resid.shape[0] * (C_resid.shape[0]-1)))
         else:
-            avg_corr = np.nan
+            RAW_rho = np.nan
+            RESID_rho = np.nan
+
         metrics[name] = {
             'RET': ann_ret,
             'VOL': ann_vol,
             'SHP': sharpe,
             'MDD': drawdown,
-            'CORR': avg_corr
+            'RAWρ': RAW_rho,
+            'RESIDρ': RESID_rho,
         }
-    # 分散の実測を追加（CUR/NEW）
-    for name, ticks in portfolios.items():
-        sub = ret[ticks].dropna()
-        metrics[name]["RAWρ"] = _raw_avg_rho(sub)
-        metrics[name]["RESIDρ"] = _resid_avg_rho(sub, n_pc=max(DRRS_G["n_pc"], DRRS_D["n_pc"]))
 
     ticks_G = list(top_G)
     ticks_D = list(top_D)
@@ -846,7 +858,7 @@ def display_results():
     for col in ['RET', 'VOL', 'MDD']:
         df_metrics_pct[col] = df_metrics_pct[col] * 100
 
-    cols_order = ['RET','VOL','SHP','MDD','CORR','RAWρ','RESIDρ']
+    cols_order = ['RET','VOL','SHP','MDD','RAWρ','RESIDρ']
     df_metrics_pct = df_metrics_pct.reindex(columns=cols_order)
 
     def _fmt_row(s):
@@ -855,7 +867,6 @@ def display_results():
         out['VOL'] = f"{s['VOL']:.1f}%"
         out['SHP'] = f"{s['SHP']:.1f}"
         out['MDD'] = f"{s['MDD']:.1f}%"
-        out['CORR'] = f"{s['CORR']:.2f}" if pd.notna(s['CORR']) else "NaN"
         out['RAWρ'] = f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"
         out['RESIDρ'] = f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN"
         return pd.Series(out)
