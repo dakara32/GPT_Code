@@ -59,6 +59,28 @@ def robust_z(s: pd.Series, p=0.02):
     return np.nan_to_num(zscore(s2.fillna(s2.mean())))
 
 
+def _safe_last(series: pd.Series, default=np.nan):
+    try:
+        return float(series.iloc[-1])
+    except Exception:
+        return default
+
+
+def rs_line_slope(s: pd.Series, b: pd.Series, win: int) -> float:
+    """RSライン（価格比 s/b）の対数に回帰して傾きを返す（win日）。
+    +: 上昇、-: 下降。データ不足は NaN。"""
+    r = (s / b).dropna()
+    if len(r) < win:
+        return np.nan
+    y = np.log(r.iloc[-win:])
+    x = np.arange(len(y), dtype=float)
+    try:
+        coef = np.polyfit(x, y, 1)[0]
+        return float(coef)  # 日次傾き
+    except Exception:
+        return np.nan
+
+
 def ev_fallback(info_t: dict, tk: yf.Ticker) -> float:
     """EV欠損時の簡易代替: EV ≒ 時価総額 + 負債 - 現金。取れなければ NaN"""
     ev = info_t.get('enterpriseValue', np.nan)
@@ -707,6 +729,43 @@ if 'aggregate_scores' not in globals():
             df.loc[t, 'FCF'] = (fcf_val / ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev > 0) else np.nan
             df.loc[t, 'RS'] = rs(s, spx)
             df.loc[t, 'TR_str'] = tr_str(s)
+
+            sma50  = s.rolling(50).mean()
+            sma150 = s.rolling(150).mean()
+            sma200 = s.rolling(200).mean()
+            p = _safe_last(s)
+
+            df.loc[t, 'P_OVER_150'] = p / _safe_last(sma150) - 1 if pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan
+            df.loc[t, 'P_OVER_200'] = p / _safe_last(sma200) - 1 if pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
+
+            df.loc[t, 'MA50_OVER_200'] = _safe_last(sma50) / _safe_last(sma200) - 1 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
+
+            df.loc[t, 'MA200_SLOPE_5M'] = np.nan
+            if len(sma200.dropna()) >= 105:
+                cur200 = _safe_last(sma200)
+                old200 = float(sma200.iloc[-105])
+                if old200 and old200 != 0:
+                    df.loc[t, 'MA200_SLOPE_5M'] = cur200 / old200 - 1
+
+            lo52 = s[-252:].min() if len(s) >= 252 else s.min()
+            df.loc[t, 'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52 <= 0 or pd.isna(p)) else (p / (lo52 * 1.25) - 1)
+
+            hi52 = s[-252:].max() if len(s) >= 252 else s.max()
+            df.loc[t, 'NEAR_52W_HIGH'] = np.nan
+            if hi52 and hi52 > 0 and pd.notna(p):
+                d_hi = (p / hi52) - 1.0
+                df.loc[t, 'NEAR_52W_HIGH'] = -abs(min(0.0, d_hi))
+
+            df.loc[t, 'RS_SLOPE_6W']  = rs_line_slope(s, spx, 30)
+            df.loc[t, 'RS_SLOPE_13W'] = rs_line_slope(s, spx, 65)
+
+            prior_50_high = s.rolling(50).max().shift(1)
+            df.loc[t, 'BASE_BRK_SIMPLE'] = np.nan
+            if len(prior_50_high.dropna()) > 0 and pd.notna(p):
+                ph = float(prior_50_high.iloc[-1])
+                cond50 = pd.notna(_safe_last(sma50)) and (p > _safe_last(sma50))
+                df.loc[t, 'BASE_BRK_SIMPLE'] = (p / ph - 1) if (ph and ph > 0 and cond50) else -0.0
+
             df.loc[t, 'DIV_STREAK'] = div_streak(t)
 
             fin_cols = ['REV', 'ROE', 'BETA', 'DIV', 'FCF']
@@ -740,11 +799,35 @@ if 'aggregate_scores' not in globals():
         df_z['EPS'] = robust_z(df['EPS_W'])
         df_z['TR']  = robust_z(df['TR'])
 
+        extra_cols = [
+            'P_OVER_150','P_OVER_200','MA50_OVER_200',
+            'MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH',
+            'RS_SLOPE_6W','RS_SLOPE_13W','BASE_BRK_SIMPLE'
+        ]
+        for col in extra_cols:
+            df_z[col] = robust_z(df[col])
+
         df_z['QUALITY_F'] = robust_z(0.6 * df['FCF_W'] + 0.4 * df['ROE_W']).clip(-3.0, 3.0)
         df_z['YIELD_F']   = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
         df_z['GROWTH_F']  = 0.5 * df_z['REV'] + 0.3 * df_z['EPS'] + 0.2 * df_z['ROE']
-        df_z['MOM_F']     = 0.7 * df_z['RS']  + 0.3 * df_z['TR_str']
-        df_z['TREND']     = df_z['TR']
+        df_z['MOM_F'] = robust_z(
+            0.45 * df_z['RS'] +
+            0.15 * df_z['TR_str'] +
+            0.20 * df_z['RS_SLOPE_6W'] +
+            0.20 * df_z['RS_SLOPE_13W']
+        ).clip(-3.0, 3.0)
+
+        df_z['TREND'] = robust_z(
+            0.20 * df_z['TR'] +
+            0.12 * df_z['P_OVER_150'] +
+            0.12 * df_z['P_OVER_200'] +
+            0.16 * df_z['MA50_OVER_200'] +
+            0.16 * df_z['MA200_SLOPE_5M'] +
+            0.12 * df_z['LOW52PCT25_EXCESS'] +
+            0.07 * df_z['NEAR_52W_HIGH'] +
+            0.05 * df_z['BASE_BRK_SIMPLE']
+        ).clip(-3.0, 3.0)
+
         df_z['VOL']       = robust_z(df['BETA'])
 
         df_z.rename(columns={'GROWTH_F': 'GRW', 'MOM_F': 'MOM', 'TREND': 'TRD',
