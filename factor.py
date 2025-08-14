@@ -1063,25 +1063,24 @@ if 'aggregate_scores' not in globals():
         # ---- 合成スコア（相関は触らない）----
         g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
 
-        # D枠のVOLは「低いほど良い」ため、良さ指標に反転
-        global D_VOL_GOOD
-        D_VOL_GOOD = -df_z['D_VOL_RAW']  # 高いほど低リスク
-
         _d_map = {
             'QAL': df_z['D_QAL'],
             'YLD': df_z['D_YLD'],
-            'VOL': D_VOL_GOOD,
+            'VOL': df_z['D_VOL_RAW'],   # 高いほどリスクが高い
             'TRD': df_z['D_TRD'],
         }
         d_comp = pd.concat(_d_map, axis=1)
 
-        dw = pd.Series(D_weights, dtype=float)
-        for k in ['QAL', 'YLD', 'VOL', 'TRD']:
-            if k not in dw:
-                dw[k] = 0.0
-        dw = dw[['QAL', 'YLD', 'VOL', 'TRD']]
+        dw = pd.Series(D_weights, dtype=float).reindex(['QAL', 'YLD', 'VOL', 'TRD']).fillna(0.0)
 
         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
+
+        # optional sanity check: increasing VOL should not raise score
+        if debug_mode:
+            eps = 0.1
+            _base = d_comp.mul(dw, axis=1).sum(axis=1)
+            _test = d_comp.assign(VOL=d_comp['VOL'] + eps).mul(dw, axis=1).sum(axis=1)
+            print((( _test <= _base ) | _test.isna() | _base.isna()).mean())
 
         return df, df_z, g_score, d_score_all, missing_logs
 
@@ -1213,7 +1212,7 @@ def display_results():
     d_disp = pd.DataFrame(index=D_UNI)
     d_disp['QAL'] = df_z.loc[D_UNI, 'D_QAL']
     d_disp['YLD'] = df_z.loc[D_UNI, 'D_YLD']
-    d_disp['VOL'] = D_VOL_GOOD.reindex(D_UNI)
+    d_disp['VOL'] = (-df_z['D_VOL_RAW']).reindex(D_UNI)   # 高いほど低ボラ＝良
     d_disp['TRD'] = df_z.loc[D_UNI, 'D_TRD']
 
     d_table = pd.concat([ d_disp, d_score_all[D_UNI].rename('DSC') ], axis=1)
