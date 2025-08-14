@@ -1027,15 +1027,27 @@ if 'aggregate_scores' not in globals():
         df_z.rename(columns={'GROWTH_F': 'GRW', 'MOM_F': 'MOM', 'TREND': 'TRD',
                              'QUALITY_F': 'QAL', 'YIELD_F': 'YLD'}, inplace=True)
 
-        # ---------- D専用コンポーネント ----------
+        # --- 0) D_weights を更新（存在すれば上書き、無ければ定義） ---
+        try:
+            D_weights.update({'QAL': 0.2, 'YLD': 0.1, 'VOL': -0.45, 'TRD': 0.25})
+        except NameError:
+            D_weights = {'QAL': 0.2, 'YLD': 0.1, 'VOL': -0.45, 'TRD': 0.25}
+
+        # 前提：df_z に必要列があり、BETA のZ列が無ければここで作る。
+        if 'BETA' not in df_z.columns:
+            df_z['BETA'] = robust_z(df['BETA'])
+
+        # --- 1) VOLの“悪さ”を再定義：SIZE/LIQ弱め＋高βペナルティ追加 ---
+        #   低いほど良い指標。
         df_z['D_VOL_RAW'] = robust_z(
             0.40 * df_z['DOWNSIDE_DEV'] +
             0.22 * df_z['RESID_VOL'] +
             0.18 * df_z['MDD_1Y'] -
             0.10 * df_z['DOWN_OUTPERF'] -
             0.05 * df_z['EXT_200'] -
-            0.15 * df_z['SIZE'] -
-            0.20 * df_z['LIQ']
+            0.08 * df_z['SIZE'] -
+            0.10 * df_z['LIQ'] +
+            0.10 * df_z['BETA']
         )
 
         df_z['D_QAL'] = robust_z(
@@ -1066,7 +1078,7 @@ if 'aggregate_scores' not in globals():
         _d_map = {
             'QAL': df_z['D_QAL'],
             'YLD': df_z['D_YLD'],
-            'VOL': df_z['D_VOL_RAW'],   # 高いほどリスクが高い
+            'VOL': df_z['D_VOL_RAW'],   # 悪さ（大きい=悪）
             'TRD': df_z['D_TRD'],
         }
         d_comp = pd.concat(_d_map, axis=1)
@@ -1080,7 +1092,7 @@ if 'aggregate_scores' not in globals():
             eps = 0.1
             _base = d_comp.mul(dw, axis=1).sum(axis=1)
             _test = d_comp.assign(VOL=d_comp['VOL'] + eps).mul(dw, axis=1).sum(axis=1)
-            print((( _test <= _base ) | _test.isna() | _base.isna()).mean())
+            print("VOL増→d_score低下の比率:", (( _test <= _base ) | _test.isna() | _base.isna()).mean())
 
         return df, df_z, g_score, d_score_all, missing_logs
 
@@ -1212,7 +1224,7 @@ def display_results():
     d_disp = pd.DataFrame(index=D_UNI)
     d_disp['QAL'] = df_z.loc[D_UNI, 'D_QAL']
     d_disp['YLD'] = df_z.loc[D_UNI, 'D_YLD']
-    d_disp['VOL'] = (-df_z['D_VOL_RAW']).reindex(D_UNI)   # 高いほど低ボラ＝良
+    d_disp['VOL'] = df_z.loc[D_UNI, 'D_VOL_RAW']   # 低いほど良い（低ボラ）
     d_disp['TRD'] = df_z.loc[D_UNI, 'D_TRD']
 
     d_table = pd.concat([ d_disp, d_score_all[D_UNI].rename('DSC') ], axis=1)
