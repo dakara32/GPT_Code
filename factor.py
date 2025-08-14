@@ -739,6 +739,114 @@ if 'aggregate_scores' not in globals():
             df.loc[t, 'RS'] = rs(s, spx)
             df.loc[t, 'TR_str'] = tr_str(s)
 
+            # --- リスク系（日足ベース） ---
+            info_t = d
+            r  = s.pct_change().dropna()
+            rm = spx.pct_change().dropna()
+            n  = int(min(len(r), len(rm)))
+
+            # 下方半分散（半年）年率化
+            DOWNSIDE_DEV = np.nan
+            if n >= 60:
+                r6 = r.iloc[-min(len(r), 126):]
+                neg = r6[r6 < 0]
+                if len(neg) >= 10:
+                    DOWNSIDE_DEV = float(neg.std(ddof=0) * np.sqrt(252))
+            df.loc[t, 'DOWNSIDE_DEV'] = DOWNSIDE_DEV
+
+            # 1年最大ドローダウン
+            MDD_1Y = np.nan
+            try:
+                w = s.iloc[-min(len(s), 252):].dropna()
+                if len(w) >= 30:
+                    roll_max = w.cummax()
+                    dd = (w/roll_max - 1.0).min()
+                    MDD_1Y = float(dd)
+            except Exception:
+                pass
+            df.loc[t, 'MDD_1Y'] = MDD_1Y
+
+            # 残差ボラ（β説明後の揺れ）
+            RESID_VOL = np.nan
+            if n >= 120:
+                rr  = r.iloc[-n:].align(rm.iloc[-n:], join='inner')[0]
+                rrm = r.iloc[-n:].align(rm.iloc[-n:], join='inner')[1]
+                if len(rr) == len(rrm) and len(rr) >= 120 and rrm.var() > 0:
+                    beta = float(np.cov(rr, rrm)[0,1] / np.var(rrm))
+                    resid = rr - beta*rrm
+                    RESID_VOL = float(resid.std(ddof=0) * np.sqrt(252))
+            df.loc[t, 'RESID_VOL'] = RESID_VOL
+
+            # マーケット下落日のアウトパフォーム
+            DOWN_OUTPERF = np.nan
+            if n >= 60:
+                m = rm.iloc[-n:]; x = r.iloc[-n:]
+                mask = m < 0
+                if mask.sum() >= 10:
+                    mr = float(m[mask].mean()); sr = float(x[mask].mean())
+                    DOWN_OUTPERF = (sr - mr) / abs(mr) if mr != 0 else np.nan
+            df.loc[t, 'DOWN_OUTPERF'] = DOWN_OUTPERF
+
+            # 200日線乖離（"行き過ぎ"抑制）
+            sma200 = s.rolling(200).mean()
+            EXT_200 = np.nan
+            if pd.notna(sma200.iloc[-1]) and sma200.iloc[-1] != 0:
+                EXT_200 = abs(float(s.iloc[-1]/sma200.iloc[-1] - 1.0))
+            df.loc[t, 'EXT_200'] = EXT_200
+
+            # --- 配当の"質" ---
+            DIV_TTM_PS = np.nan; DIV_VAR5 = np.nan; DIV_YOY = np.nan; DIV_FCF_COVER = np.nan
+            try:
+                divs = yf.Ticker(t).dividends.dropna()
+                if not divs.empty:
+                    last_close = s.iloc[-1]
+                    div_1y = float(divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum())
+                    DIV_TTM_PS = div_1y if div_1y > 0 else np.nan
+                    ann = divs.groupby(divs.index.year).sum()
+                    if len(ann) >= 2 and ann.iloc[-2] != 0:
+                        DIV_YOY = float(ann.iloc[-1]/ann.iloc[-2] - 1.0)
+                    tail = ann.iloc[-5:] if len(ann) >= 5 else ann
+                    if len(tail) >= 3 and tail.mean() != 0:
+                        DIV_VAR5 = float(tail.std(ddof=1) / abs(tail.mean()))
+                so = info_t.get('sharesOutstanding', None)
+                fcf_ttm = fcf_df.loc[t, 'fcf_ttm'] if t in fcf_df.index else np.nan
+                if so and pd.notna(DIV_TTM_PS) and pd.notna(fcf_ttm) and fcf_ttm != 0:
+                    DIV_FCF_COVER = float((fcf_ttm) / (DIV_TTM_PS * float(so)))
+            except Exception:
+                pass
+            df.loc[t, 'DIV_TTM_PS']    = DIV_TTM_PS
+            df.loc[t, 'DIV_VAR5']      = DIV_VAR5
+            df.loc[t, 'DIV_YOY']       = DIV_YOY
+            df.loc[t, 'DIV_FCF_COVER'] = DIV_FCF_COVER
+
+            # --- 財務健全性・収益安定性 ---
+            df.loc[t, 'DEBT2EQ']    = info_t.get('debtToEquity', np.nan)
+            df.loc[t, 'CURR_RATIO'] = info_t.get('currentRatio', np.nan)
+
+            EPS_VAR_8Q = np.nan
+            try:
+                qe = tickers_bulk.tickers[t].quarterly_earnings
+                so = info_t.get('sharesOutstanding', None)
+                if qe is not None and not qe.empty and so:
+                    eps_q = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf], np.nan)
+                    if len(eps_q) >= 4:
+                        EPS_VAR_8Q = float(eps_q.iloc[-min(8,len(eps_q)):].std(ddof=1))
+            except Exception:
+                pass
+            df.loc[t, 'EPS_VAR_8Q'] = EPS_VAR_8Q
+
+            # --- サイズ＆流動性（ソフトペナルティ） ---
+            df.loc[t, 'MARKET_CAP'] = info_t.get('marketCap', np.nan)
+            adv60 = np.nan
+            try:
+                vol_series = data['Volume'][t].dropna()
+                if len(vol_series) >= 5 and len(s) == len(vol_series):
+                    dv = (vol_series * s).rolling(60).mean()
+                    adv60 = float(dv.iloc[-1])
+            except Exception:
+                pass
+            df.loc[t, 'ADV60_USD'] = adv60
+
             REV_Q_YOY = np.nan
             EPS_Q_YOY = np.nan
             REV_YOY_ACC = np.nan
@@ -873,6 +981,18 @@ if 'aggregate_scores' not in globals():
         for col in extra_grw_cols:
             df_z[col] = robust_z(df[col])
 
+        extra_d_cols = [
+            'DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200',
+            'DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER',
+            'DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD'
+        ]
+        for col in extra_d_cols:
+            df_z[col] = robust_z(df[col])
+
+        # ログ圧縮版のサイズ・流動性も作成（NaNはrobust_zで吸収）
+        df_z['SIZE'] = robust_z(np.log1p(df['MARKET_CAP']))
+        df_z['LIQ']  = robust_z(np.log1p(df['ADV60_USD']))
+
         df_z['QUALITY_F'] = robust_z(0.6 * df['FCF_W'] + 0.4 * df['ROE_W']).clip(-3.0, 3.0)
         df_z['YIELD_F']   = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
         df_z['GROWTH_F'] = robust_z(
@@ -907,9 +1027,47 @@ if 'aggregate_scores' not in globals():
         df_z.rename(columns={'GROWTH_F': 'GRW', 'MOM_F': 'MOM', 'TREND': 'TRD',
                              'QUALITY_F': 'QAL', 'YIELD_F': 'YLD'}, inplace=True)
 
+        # ---------- D専用コンポーネント ----------
+        df_z['D_VOL_RAW'] = robust_z(
+            0.40 * df_z['DOWNSIDE_DEV'] +
+            0.22 * df_z['RESID_VOL'] +
+            0.18 * df_z['MDD_1Y'] -
+            0.10 * df_z['DOWN_OUTPERF'] -
+            0.05 * df_z['EXT_200'] -
+            0.15 * df_z['SIZE'] -
+            0.20 * df_z['LIQ']
+        )
+
+        df_z['D_QAL'] = robust_z(
+            0.35 * df_z['QAL'] +
+            0.20 * df_z['FCF'] +
+            0.15 * df_z['CURR_RATIO'] -
+            0.15 * df_z['DEBT2EQ'] -
+            0.15 * df_z['EPS_VAR_8Q']
+        )
+
+        df_z['D_YLD'] = robust_z(
+            0.45 * df_z['DIV'] +
+            0.25 * df_z['DIV_STREAK'] +
+            0.20 * df_z['DIV_FCF_COVER'] -
+            0.10 * df_z['DIV_VAR5']
+        )
+
+        df_z['D_TRD'] = robust_z(
+            0.40 * df_z.get('MA200_SLOPE_5M', 0) -
+            0.30 * df_z.get('EXT_200', 0) +
+            0.15 * df_z.get('NEAR_52W_HIGH', 0) +
+            0.15 * df_z['TR']
+        )
+
         # ---- 合成スコア（相関は触らない）----
         g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
-        d_score_all = df_z.mul(pd.Series(D_weights)).sum(axis=1)
+        d_score_all = (
+            0.10 * df_z['D_QAL'] +
+            0.25 * df_z['D_YLD'] -
+            0.40 * df_z['D_VOL_RAW'] +
+            0.25 * df_z['D_TRD']
+        )
 
         return df, df_z, g_score, d_score_all, missing_logs
 
@@ -1037,11 +1195,14 @@ def display_results():
 
     extra_D = [t for t in init_D if t not in top_D][:5]
     D_UNI = top_D + extra_D
-    cols_D = ['QAL', 'YLD', 'VOL', 'TRD']
-    d_table = pd.concat([
-        df_z.loc[D_UNI, cols_D],
-        d_score_all[D_UNI].rename('DSC')
-    ], axis=1)
+    cols_D = ['QAL','YLD','VOL','TRD']
+    d_disp = pd.DataFrame(index=D_UNI)
+    d_disp['QAL'] = df_z.loc[D_UNI, 'D_QAL']
+    d_disp['YLD'] = df_z.loc[D_UNI, 'D_YLD']
+    d_disp['VOL'] = -df_z.loc[D_UNI, 'D_VOL_RAW']
+    d_disp['TRD'] = df_z.loc[D_UNI, 'D_TRD']
+
+    d_table = pd.concat([ d_disp, d_score_all[D_UNI].rename('DSC') ], axis=1)
     d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
     d_formatters = {col: "{:.2f}".format for col in cols_D}
     d_formatters['DSC'] = "{:.3f}".format
