@@ -1062,12 +1062,26 @@ if 'aggregate_scores' not in globals():
 
         # ---- 合成スコア（相関は触らない）----
         g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
-        d_score_all = (
-            0.10 * df_z['D_QAL'] +
-            0.25 * df_z['D_YLD'] -
-            0.40 * df_z['D_VOL_RAW'] +
-            0.25 * df_z['D_TRD']
-        )
+
+        # D枠のVOLは「低いほど良い」ため、良さ指標に反転
+        global D_VOL_GOOD
+        D_VOL_GOOD = -df_z['D_VOL_RAW']  # 高いほど低リスク
+
+        _d_map = {
+            'QAL': df_z['D_QAL'],
+            'YLD': df_z['D_YLD'],
+            'VOL': D_VOL_GOOD,
+            'TRD': df_z['D_TRD'],
+        }
+        d_comp = pd.concat(_d_map, axis=1)
+
+        dw = pd.Series(D_weights, dtype=float)
+        for k in ['QAL', 'YLD', 'VOL', 'TRD']:
+            if k not in dw:
+                dw[k] = 0.0
+        dw = dw[['QAL', 'YLD', 'VOL', 'TRD']]
+
+        d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
 
         return df, df_z, g_score, d_score_all, missing_logs
 
@@ -1199,7 +1213,7 @@ def display_results():
     d_disp = pd.DataFrame(index=D_UNI)
     d_disp['QAL'] = df_z.loc[D_UNI, 'D_QAL']
     d_disp['YLD'] = df_z.loc[D_UNI, 'D_YLD']
-    d_disp['VOL'] = -df_z.loc[D_UNI, 'D_VOL_RAW']
+    d_disp['VOL'] = D_VOL_GOOD.reindex(D_UNI)
     d_disp['TRD'] = df_z.loc[D_UNI, 'D_TRD']
 
     d_table = pd.concat([ d_disp, d_score_all[D_UNI].rename('DSC') ], axis=1)
