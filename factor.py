@@ -59,6 +59,15 @@ def robust_z(s: pd.Series, p=0.02):
     return np.nan_to_num(zscore(s2.fillna(s2.mean())))
 
 
+def _safe_div(a, b):
+    try:
+        if b is None or float(b) == 0 or pd.isna(b):
+            return np.nan
+        return float(a) / float(b)
+    except Exception:
+        return np.nan
+
+
 def _safe_last(series: pd.Series, default=np.nan):
     try:
         return float(series.iloc[-1])
@@ -730,6 +739,59 @@ if 'aggregate_scores' not in globals():
             df.loc[t, 'RS'] = rs(s, spx)
             df.loc[t, 'TR_str'] = tr_str(s)
 
+            REV_Q_YOY = np.nan
+            EPS_Q_YOY = np.nan
+            REV_YOY_ACC = np.nan
+            REV_YOY_VAR = np.nan
+
+            try:
+                qe = tickers_bulk.tickers[t].quarterly_earnings
+                so = d.get('sharesOutstanding', None)
+
+                if qe is not None and not qe.empty:
+                    if 'Revenue' in qe.columns:
+                        rev = qe['Revenue'].dropna().astype(float)
+                        if len(rev) >= 5:
+                            REV_Q_YOY = _safe_div(rev.iloc[-1] - rev.iloc[-5], rev.iloc[-5])
+                        if len(rev) >= 6:
+                            yoy_now = _safe_div(rev.iloc[-1] - rev.iloc[-5], rev.iloc[-5])
+                            yoy_prev = _safe_div(rev.iloc[-2] - rev.iloc[-6], rev.iloc[-6])
+                            if pd.notna(yoy_now) and pd.notna(yoy_prev):
+                                REV_YOY_ACC = yoy_now - yoy_prev
+                        yoy_list = []
+                        for k in range(1,5):
+                            if len(rev) >= 4+k:
+                                y = _safe_div(rev.iloc[-k] - rev.iloc[-(k+4)], rev.iloc[-(k+4)])
+                                if pd.notna(y):
+                                    yoy_list.append(y)
+                        if len(yoy_list) >= 2:
+                            REV_YOY_VAR = float(np.std(yoy_list, ddof=1))
+
+                    if 'Earnings' in qe.columns and so:
+                        eps_series = (qe['Earnings'].dropna().astype(float) / float(so)).replace([np.inf,-np.inf], np.nan)
+                        if len(eps_series) >= 5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5] != 0:
+                            EPS_Q_YOY = _safe_div(eps_series.iloc[-1] - eps_series.iloc[-5], eps_series.iloc[-5])
+            except Exception:
+                pass
+
+            df.loc[t, 'REV_Q_YOY']   = REV_Q_YOY
+            df.loc[t, 'EPS_Q_YOY']   = EPS_Q_YOY
+            df.loc[t, 'REV_YOY_ACC'] = REV_YOY_ACC
+            df.loc[t, 'REV_YOY_VAR'] = REV_YOY_VAR
+
+            total_rev_ttm = d.get('totalRevenue', np.nan)
+            fcf_ttm = fcf_df.loc[t, 'fcf_ttm'] if t in fcf_df.index else np.nan
+            FCF_MGN = _safe_div(fcf_ttm, total_rev_ttm)
+            df.loc[t, 'FCF_MGN'] = FCF_MGN
+
+            rule40 = np.nan
+            try:
+                r = df.loc[t, 'REV']
+                rule40 = (r if pd.notna(r) else np.nan) + (FCF_MGN if pd.notna(FCF_MGN) else np.nan)
+            except Exception:
+                pass
+            df.loc[t, 'RULE40'] = rule40
+
             sma50  = s.rolling(50).mean()
             sma150 = s.rolling(150).mean()
             sma200 = s.rolling(200).mean()
@@ -807,9 +869,21 @@ if 'aggregate_scores' not in globals():
         for col in extra_cols:
             df_z[col] = robust_z(df[col])
 
+        extra_grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40']
+        for col in extra_grw_cols:
+            df_z[col] = robust_z(df[col])
+
         df_z['QUALITY_F'] = robust_z(0.6 * df['FCF_W'] + 0.4 * df['ROE_W']).clip(-3.0, 3.0)
         df_z['YIELD_F']   = 0.3 * df_z['DIV'] + 0.7 * df_z['DIV_STREAK']
-        df_z['GROWTH_F']  = 0.5 * df_z['REV'] + 0.3 * df_z['EPS'] + 0.2 * df_z['ROE']
+        df_z['GROWTH_F'] = robust_z(
+            0.30 * df_z['REV'] +
+            0.20 * df_z['EPS_Q_YOY'] +
+            0.15 * df_z['REV_Q_YOY'] +
+            0.15 * df_z['REV_YOY_ACC'] +
+            0.10 * df_z['RULE40'] +
+            0.10 * df_z['FCF_MGN'] -
+            0.05 * df_z['REV_YOY_VAR']
+        ).clip(-3.0, 3.0)
         df_z['MOM_F'] = robust_z(
             0.45 * df_z['RS'] +
             0.15 * df_z['TR_str'] +
