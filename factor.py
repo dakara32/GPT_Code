@@ -21,7 +21,7 @@ N_G, N_D = 12, 13
 
 # ファクター重み
 g_weights = {'GRW': 0.35, 'MOM': 0.20, 'TRD': 0.45, 'VOL': -0.10}
-D_weights = {'QAL': 0.1, 'YLD': 0.25, 'VOL': -0.40, 'TRD': 0.25}
+D_weights = {'QAL': 0.2, 'YLD': 0.1, 'VOL': -0.45, 'TRD': 0.25}
 
 # DRRS 初期プール・各種パラメータ
 corrM = 45
