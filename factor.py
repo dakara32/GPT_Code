@@ -1382,5 +1382,35 @@ def notify_slack():
 if __name__ == "__main__":
     prepare_data()
     calculate_scores()
+    
+    # ① 実際に使われた重みを固定化して確認
+    DW_EFF = pd.Series(D_weights, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
+    print("DW_EFF used:", DW_EFF.to_dict())
+    assert DW_EFF['VOL'] < 0, "D枠のVOL重みは負のはず（低いほど加点）。"
+
+    # ② KO/TSM の素点と寄与分解を並べて見る
+    targets = ['KO','TSM']
+    _dmap = {
+        'QAL': df_z['D_QAL'],
+        'YLD': df_z['D_YLD'],
+        'VOL': df_z['D_VOL_RAW'],  # ←必ずこの列
+        'TRD': df_z['D_TRD'],
+    }
+    d_comp = pd.concat(_dmap, axis=1)
+    
+    def contrib(t):
+        row = d_comp.loc[t]
+        w   = DW_EFF
+        return pd.Series({
+            'QAL': row['QAL']*w['QAL'],
+            'YLD': row['YLD']*w['YLD'],
+            'VOL': row['VOL']*w['VOL'],
+            'TRD': row['TRD']*w['TRD'],
+            'DSC_calc': float((row*w).sum())
+        }, name=t)
+    
+    print(pd.concat([contrib(t) for t in targets], axis=1))
+    print("DSC table:", d_score_all[targets].to_dict())  # 画面のDSCと一致するか
+        
     display_results()
     notify_slack()
