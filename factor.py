@@ -1027,12 +1027,6 @@ if 'aggregate_scores' not in globals():
         df_z.rename(columns={'GROWTH_F': 'GRW', 'MOM_F': 'MOM', 'TREND': 'TRD',
                              'QUALITY_F': 'QAL', 'YIELD_F': 'YLD'}, inplace=True)
 
-        # --- 0) D_weights を更新（存在すれば上書き、無ければ定義） ---
-        try:
-            D_weights.update({'QAL': 0.2, 'YLD': 0.1, 'VOL': -0.45, 'TRD': 0.25})
-        except NameError:
-            D_weights = {'QAL': 0.2, 'YLD': 0.1, 'VOL': -0.45, 'TRD': 0.25}
-
         # 前提：df_z に必要列があり、BETA のZ列が無ければここで作る。
         if 'BETA' not in df_z.columns:
             df_z['BETA'] = robust_z(df['BETA'])
@@ -1084,6 +1078,9 @@ if 'aggregate_scores' not in globals():
         d_comp = pd.concat(_d_map, axis=1)
 
         dw = pd.Series(D_weights, dtype=float).reindex(['QAL', 'YLD', 'VOL', 'TRD']).fillna(0.0)
+
+        # 実際に使った D 側の重みをグローバルに保持（表示用）
+        globals()['D_WEIGHTS_EFF'] = dw.copy()
 
         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
 
@@ -1233,10 +1230,10 @@ def display_results():
     d_formatters['DSC'] = "{:.3f}".format
     d_title = (
         f"[D枠 / {N_D} / "
-        f"QAL{int(D_weights['QAL']*100)} "
-        f"YLD{int(D_weights['YLD']*100)} "
-        f"VOL{int(D_weights['VOL']*100)} "
-        f"TRD{int(D_weights['TRD']*100)} "
+        f"QAL{int(D_WEIGHTS_EFF['QAL']*100)} "
+        f"YLD{int(D_WEIGHTS_EFF['YLD']*100)} "
+        f"VOL{int(D_WEIGHTS_EFF['VOL']*100)} "
+        f"TRD{int(D_WEIGHTS_EFF['TRD']*100)} "
         f"/ corrM={corrM} / "
         f"LB={DRRS_D['lookback']} "
         f"nPC={DRRS_D['n_pc']} "
@@ -1382,35 +1379,5 @@ def notify_slack():
 if __name__ == "__main__":
     prepare_data()
     calculate_scores()
-    
-    # ① 実際に使われた重みを固定化して確認
-    DW_EFF = pd.Series(D_weights, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
-    print("DW_EFF used:", DW_EFF.to_dict())
-    assert DW_EFF['VOL'] < 0, "D枠のVOL重みは負のはず（低いほど加点）。"
-
-    # ② KO/TSM の素点と寄与分解を並べて見る
-    targets = ['KO','TSM']
-    _dmap = {
-        'QAL': df_z['D_QAL'],
-        'YLD': df_z['D_YLD'],
-        'VOL': df_z['D_VOL_RAW'],  # ←必ずこの列
-        'TRD': df_z['D_TRD'],
-    }
-    d_comp = pd.concat(_dmap, axis=1)
-    
-    def contrib(t):
-        row = d_comp.loc[t]
-        w   = DW_EFF
-        return pd.Series({
-            'QAL': row['QAL']*w['QAL'],
-            'YLD': row['YLD']*w['YLD'],
-            'VOL': row['VOL']*w['VOL'],
-            'TRD': row['TRD']*w['TRD'],
-            'DSC_calc': float((row*w).sum())
-        }, name=t)
-    
-    print(pd.concat([contrib(t) for t in targets], axis=1))
-    print("DSC table:", d_score_all[targets].to_dict())  # 画面のDSCと一致するか
-        
     display_results()
     notify_slack()
