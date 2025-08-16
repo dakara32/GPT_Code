@@ -1,6 +1,8 @@
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
 import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
 from scipy.stats import zscore
+from dataclasses import dataclass
+from typing import Dict, List
 
 # ===== ユニバースと定数（冒頭に固定） =====
 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
@@ -24,6 +26,59 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # その他
 debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
+
+
+# ===== 共有DTO（クラス間I/O契約）＋ Config =====
+@dataclass(frozen=True)
+class InputBundle:
+    # Input → Aggregator で受け渡す素材（I/O禁止の生データ）
+    cand: List[str]
+    tickers: List[str]
+    bench: str
+    data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
+    px: pd.DataFrame                # data['Close']
+    spx: pd.Series                  # data['Close'][bench]
+    tickers_bulk: object            # yfinance.Tickers
+    info: Dict[str, dict]           # yfinance info per ticker
+    eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
+    fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
+    returns: pd.DataFrame           # px[tickers].pct_change()
+
+@dataclass(frozen=True)
+class FeatureBundle:
+    df: pd.DataFrame
+    df_z: pd.DataFrame
+    g_score: pd.Series
+    d_score_all: pd.Series
+    missing_logs: pd.DataFrame
+
+@dataclass(frozen=True)
+class SelectionBundle:
+    resG: dict
+    resD: dict
+    top_G: List[str]
+    top_D: List[str]
+    init_G: List[str]
+    init_D: List[str]
+
+@dataclass(frozen=True)
+class WeightsConfig:
+    g: Dict[str,float]
+    d: Dict[str,float]
+
+@dataclass(frozen=True)
+class DRRSParams:
+    corrM: int
+    shrink: float
+    G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
+    D: Dict[str,float]
+    cross_mu_gd: float
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    weights: WeightsConfig
+    drrs: DRRSParams
+    price_max: float
 
 
 # ===== 共通ユーティリティ（複数クラスで使用） =====
@@ -394,10 +449,11 @@ class Aggregator:
         selected_tickers = [pool_eff[i] for i in S]
         return dict(idx=S, tickers=selected_tickers, avg_res_corr=cls.avg_corr(C_within,S), sum_score=float(score[S].sum()), objective=float(Jn))
 
-    # ---- スコア集計（元 aggregate_scores のロジックそのまま） ----
-    def aggregate_scores(self, state: dict):
-        px, spx, tickers = state["px"], state["spx"], state["tickers"]
-        tickers_bulk, info, eps_df, fcf_df = state["tickers_bulk"], state["info"], state["eps_df"], state["fcf_df"]
+    # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
+    def aggregate_scores(self, ib: InputBundle, cfg: PipelineConfig) -> FeatureBundle:
+        px, spx, tickers = ib.px, ib.spx, ib.tickers
+        tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
+
         df, missing_logs = pd.DataFrame(index=tickers), []
         for t in tickers:
             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
@@ -468,7 +524,7 @@ class Aggregator:
             df.loc[t,'EPS_VAR_8Q'] = EPS_VAR_8Q
             df.loc[t,'MARKET_CAP'] = d.get('marketCap',np.nan); adv60 = np.nan
             try:
-                vol_series = state['data']['Volume'][t].dropna()
+                vol_series = ib.data['Volume'][t].dropna()
                 if len(vol_series)>=5 and len(s)==len(vol_series):
                     dv = (vol_series*s).rolling(60).mean(); adv60 = float(dv.iloc[-1])
             except Exception: pass
@@ -548,33 +604,52 @@ class Aggregator:
         df_z['VOL'] = robust_z(df['BETA'])
         df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','TREND':'TRD','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
+
         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
         df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
         df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
-        g_score = df_z.mul(pd.Series(g_weights)).sum(axis=1)
+
+        # 重みは cfg から参照（グローバル依存を排除）
+        g_score = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
         d_comp  = pd.concat({'QAL':df_z['D_QAL'],'YLD':df_z['D_YLD'],'VOL':df_z['D_VOL_RAW'],'TRD':df_z['D_TRD']}, axis=1)
-        dw = pd.Series(D_weights, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
-        globals()['D_WEIGHTS_EFF'] = dw.copy()
+        dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
+        globals()['D_WEIGHTS_EFF'] = dw.copy()  # 出力の表示互換のため維持
         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
+
         if debug_mode:
             eps = 0.1; _base = d_comp.mul(dw, axis=1).sum(axis=1); _test = d_comp.assign(VOL=d_comp['VOL']+eps).mul(dw, axis=1).sum(axis=1)
             print("VOL増→d_score低下の比率:", ((_test<=_base)|_test.isna()|_base.isna()).mean())
-        return df, df_z, g_score, d_score_all, missing_logs
 
-    # ---- 選定（元 select_buckets のロジックそのまま） ----
-    def select_buckets(self, returns: pd.DataFrame, df_z: pd.DataFrame, g_score: pd.Series, d_score_all: pd.Series):
-        init_G = g_score.nlargest(min(corrM, len(g_score))).index.tolist(); prevG = _load_prev(G_PREV_JSON)
-        resG = self.select_bucket_drrs(returns_df=returns, score_ser=g_score, pool_tickers=init_G, k=N_G, n_pc=DRRS_G.get("n_pc",3), gamma=DRRS_G.get("gamma",1.2), lam=DRRS_G.get("lam",0.68), eta=DRRS_G.get("eta",0.8), lookback=DRRS_G.get("lookback",252), prev_tickers=prevG, shrink=DRRS_SHRINK, g_fixed_tickers=None, mu=0.0)
+        return FeatureBundle(df=df, df_z=df_z, g_score=g_score, d_score_all=d_score_all, missing_logs=pd.DataFrame(missing_logs))
+
+    # ---- 選定（DTO/Configを受け取り、SelectionBundleを返す）----
+    def select_buckets(self, ib: InputBundle, fb: FeatureBundle, cfg: PipelineConfig) -> SelectionBundle:
+        returns, df_z = ib.returns, fb.df_z
+        g_score, d_score_all = fb.g_score, fb.d_score_all
+
+        init_G = g_score.nlargest(min(cfg.drrs.corrM, len(g_score))).index.tolist(); prevG = _load_prev(G_PREV_JSON)
+        resG = self.select_bucket_drrs(returns_df=returns, score_ser=g_score, pool_tickers=init_G, k=N_G,
+                                       n_pc=cfg.drrs.G.get("n_pc",3), gamma=cfg.drrs.G.get("gamma",1.2),
+                                       lam=cfg.drrs.G.get("lam",0.68), eta=cfg.drrs.G.get("eta",0.8),
+                                       lookback=cfg.drrs.G.get("lookback",252), prev_tickers=prevG,
+                                       shrink=cfg.drrs.shrink, g_fixed_tickers=None, mu=0.0)
         top_G = resG["tickers"]
+
         D_pool_index = df_z.drop(top_G).index; d_score = d_score_all.drop(top_G)
-        init_D = d_score.loc[D_pool_index].nlargest(min(corrM, len(D_pool_index))).index.tolist(); prevD = _load_prev(D_PREV_JSON)
-        mu = globals().get('CROSS_MU_GD', 0.0)
-        resD = self.select_bucket_drrs(returns_df=returns, score_ser=d_score_all, pool_tickers=init_D, k=N_D, n_pc=DRRS_D.get("n_pc",4), gamma=DRRS_D.get("gamma",0.8), lam=DRRS_D.get("lam",0.85), eta=DRRS_D.get("eta",0.5), lookback=DRRS_D.get("lookback",504), prev_tickers=prevD, shrink=DRRS_SHRINK, g_fixed_tickers=top_G, mu=mu)
+        init_D = d_score.loc[D_pool_index].nlargest(min(cfg.drrs.corrM, len(D_pool_index))).index.tolist(); prevD = _load_prev(D_PREV_JSON)
+        mu = cfg.drrs.cross_mu_gd
+        resD = self.select_bucket_drrs(returns_df=returns, score_ser=d_score_all, pool_tickers=init_D, k=N_D,
+                                       n_pc=cfg.drrs.D.get("n_pc",4), gamma=cfg.drrs.D.get("gamma",0.8),
+                                       lam=cfg.drrs.D.get("lam",0.85), eta=cfg.drrs.D.get("eta",0.5),
+                                       lookback=cfg.drrs.D.get("lookback",504), prev_tickers=prevD,
+                                       shrink=cfg.drrs.shrink, g_fixed_tickers=top_G, mu=mu)
         top_D = resD["tickers"]
+
         _save_sel(G_PREV_JSON, top_G, resG["avg_res_corr"], resG["sum_score"], resG["objective"])
         _save_sel(D_PREV_JSON, top_D, resD["avg_res_corr"], resD["sum_score"], resD["objective"])
-        return dict(resG=resG, resD=resD, top_G=top_G, top_D=top_D, init_G=init_G, init_D=init_D)
+
+        return SelectionBundle(resG=resG, resD=resD, top_G=top_G, top_D=top_D, init_G=init_G, init_D=init_D)
 
 
 # ===== Output：出力整形と送信（表示・Slack） =====
@@ -614,8 +689,6 @@ class Output:
     def display_results(self, exist, bench, df_z, g_score, d_score_all, init_G, init_D, top_G, top_D):
         pd.set_option('display.float_format','{:.3f}'.format)
         print("📈 ファクター分散最適化の結果")
-        # miss_df は aggregate_scores の戻りで受け取る → ここに渡す設計にしても良いが、互換のため引数ではなく属性に格納
-        # 呼び出し側で self.miss_df をセットする想定（後方互換の見た目は維持）
         if self.miss_df is not None and not self.miss_df.empty: print("Missing Data:"); print(self.miss_df.to_string(index=False))
 
         extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
@@ -687,18 +760,26 @@ class Output:
 
 # ===== エントリポイント =====
 if __name__ == "__main__":
+    # 0) Config を束ねる（元の定数をそのまま使用）
+    cfg = PipelineConfig(
+        weights=WeightsConfig(g=g_weights, d=D_weights),
+        drrs=DRRSParams(corrM=corrM, shrink=DRRS_SHRINK, G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD),
+        price_max=CAND_PRICE_MAX
+    )
+
     # 1) 入力（外部I/Oと前処理）
-    inp = Input(cand=cand, exist=exist, bench=bench, price_max=CAND_PRICE_MAX, finnhub_api_key=FINNHUB_API_KEY)
+    inp = Input(cand=cand, exist=exist, bench=bench, price_max=cfg.price_max, finnhub_api_key=FINNHUB_API_KEY)
     state = inp.prepare_data()
+    ib = InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench, data=state["data"], px=state["px"], spx=state["spx"], tickers_bulk=state["tickers_bulk"], info=state["info"], eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"])
 
-    # 2) 集計（純粋関数群）：特徴量→Z化→合成スコア→選定
+    # 2) 集計（純粋）：特徴量→Z化→合成スコア→選定
     ag = Aggregator()
-    df, df_z, g_score, d_score_all, missing_logs = ag.aggregate_scores(state)
-    sel = ag.select_buckets(returns=state["returns"], df_z=df_z, g_score=g_score, d_score_all=d_score_all)
+    fb = ag.aggregate_scores(ib, cfg)
+    sb = ag.select_buckets(ib, fb, cfg)
 
-    # 3) 出力（表示→Slack）
+    # 3) 出力（表示→Slack） — 既存I/Fのまま
     out = Output(debug=debug_mode)
-    out.miss_df = pd.DataFrame(missing_logs)  # 互換表示のため display_results 内で利用
-    out.display_results(exist=exist, bench=bench, df_z=df_z, g_score=g_score, d_score_all=d_score_all,
-                        init_G=sel["init_G"], init_D=sel["init_D"], top_G=sel["top_G"], top_D=sel["top_D"])
+    out.miss_df = fb.missing_logs  # 互換表示のため display_results 内で利用
+    out.display_results(exist=exist, bench=bench, df_z=fb.df_z, g_score=fb.g_score, d_score_all=fb.d_score_all,
+                        init_G=sb.init_G, init_D=sb.init_D, top_G=sb.top_G, top_D=sb.top_D)
     out.notify_slack()
