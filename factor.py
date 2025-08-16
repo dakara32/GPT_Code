@@ -6,6 +6,8 @@ import os
 import requests
 import time
 import json
+import warnings
+from typing import Optional
 
 
 # ===== ユニバースと定数（冒頭に固定） =====
@@ -112,6 +114,157 @@ def ev_fallback(info_t: dict, tk: yf.Ticker) -> float:
     if pd.notna(mc):
         return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
     return np.nan
+
+
+# ---------- 0) 警告の抑制（yfinanceの不要Deprecation等） ----------
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
+# ---------- 1) DataFrameにSeriesを格納する列をobjectで定義 ----------
+def _ensure_series_cols(df: pd.DataFrame, cols=('close_series','vol_series','high_series','low_series','open_series','bench_series','pe_series')):
+    for c in cols:
+        if c not in df.columns:
+            df[c] = pd.Series(index=df.index, dtype='object')
+        elif df[c].dtype != 'object':
+            df[c] = df[c].astype('object')
+    return df
+
+
+# ---------- 2) Series正規化（tz/並び/NaN/重複/Inf処理） ----------
+def _norm_series(s: Optional[pd.Series], dropna=True, sort=True):
+    if s is None:
+        return None
+    s = s.copy() if isinstance(s, pd.Series) else pd.Series(s)
+    if s.empty:
+        return None
+    # index→DatetimeIndex & tz-naive
+    if not isinstance(s.index, pd.DatetimeIndex):
+        try:
+            s.index = pd.to_datetime(s.index)
+        except Exception:
+            return None
+    if s.index.tz is not None:
+        s.index = s.index.tz_localize(None)
+    if sort:
+        s = s[~s.index.duplicated(keep='last')].sort_index()
+    # 値の正規化
+    s = pd.to_numeric(s, errors='coerce').replace([np.inf, -np.inf], np.nan)
+    if dropna:
+        s = s.dropna()
+    return s if len(s) else None
+
+
+# ---------- 3) OHLCVの安全抽出 ----------
+def _safe_ohlcv(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return None
+    cols = ['Open','High','Low','Close','Volume']
+    if not all(c in df.columns for c in cols):
+        return None
+    out = df[cols].copy()
+    # tz-naive & index整列・重複除去
+    if isinstance(out.index, pd.DatetimeIndex) and out.index.tz is not None:
+        out.index = out.index.tz_localize(None)
+    out = out[~out.index.duplicated(keep='last')].sort_index()
+    # Inf/NaN処理
+    out = out.replace([np.inf,-np.inf], np.nan).dropna(how='all')
+    return out if len(out)>=10 else None
+
+
+# ---------- 4) ベンチと株価のインデックス整合（inner join, limit ffill） ----------
+def _align_pair(a: pd.Series, b: pd.Series, ffill_limit: int = 3):
+    a = _norm_series(a); b = _norm_series(b)
+    if a is None or b is None:
+        return None, None
+    idx = a.index.intersection(b.index)
+    if len(idx) < 10:
+        # 営業日差異対策：bをaへreindexして限度つきffill
+        b = b.reindex(a.index).ffill(limit=ffill_limit)
+        idx = a.index.intersection(b.index)
+        if len(idx) < 10:
+            return None, None
+    return a.loc[idx], b.loc[idx]
+
+
+# ---------- 5) 安全なRS傾き（polyfit例外・不足データ・定数対策） ----------
+def _rs_slope_safe(close: pd.Series, bench: Optional[pd.Series], win: int) -> float:
+    if bench is None:
+        bench = close
+    c, b = _align_pair(close, bench)
+    if c is None or len(c) < win:
+        return np.nan
+    rs = (c / b).replace([np.inf,-np.inf], np.nan).dropna()
+    if len(rs) < win or rs.std(ddof=0) == 0:
+        return np.nan
+    y = np.log(rs.iloc[-win:])
+    x = np.arange(len(y), dtype=float)
+    try:
+        return float(np.polyfit(x, y, 1)[0])
+    except Exception:
+        return np.nan
+
+
+# ---------- 6) Z正規化のフォールバック（全定数/外れ値でゼロ分散の時もOK） ----------
+def _z_fallback(s: pd.Series):
+    x = pd.to_numeric(s, errors='coerce').replace([np.inf,-np.inf], np.nan)
+    if x.count() < 3:
+        return x.fillna(0.0)
+    x = x.clip(x.quantile(0.02), x.quantile(0.98))
+    std = x.std(ddof=0)
+    z = (x - x.mean()) / (std if std!=0 else 1.0)
+    return z
+
+def _z_norm(s: pd.Series):
+    _robust = globals().get('robust_z', None) or globals().get('_z', None)
+    try:
+        z = _robust(s) if callable(_robust) else _z_fallback(s)
+    except Exception:
+        z = _z_fallback(s)
+    return z.clip(lower=-3, upper=3)
+
+
+# ---------- 7) 安全なpct_change（極端ギャップ・分割を軽減） ----------
+def _pct_change_safe(s: pd.Series, periods=1, cap=0.8):
+    s = _norm_series(s)
+    if s is None:
+        return None
+    r = s.pct_change(periods)
+    # ±80%を超える単日変化は分割/異常値と見なし、一旦クリップ
+    return r.replace([np.inf,-np.inf], np.nan).clip(-cap, cap)
+
+
+# ---------- 8) フェッチの安全ラッパ（404/429/接続失敗 → None; リトライ少数回） ----------
+def _fetch_ohlcv_safe(ticker: str, fetch_func, retries=2, sleep_sec=1.0):
+    for i in range(retries+1):
+        try:
+            dfp = fetch_func(ticker)
+            return _safe_ohlcv(dfp)
+        except Exception as e:
+            msg = str(e).lower()
+            if '404' in msg or 'delisted' in msg or 'no data found' in msg:
+                return None
+            if i < retries:
+                time.sleep(sleep_sec * (i+1))
+            else:
+                return None
+
+
+# ---------- 9) dfへSeries格納は .at で、Noneはスキップ ----------
+def _store_series_row(df: pd.DataFrame, t, **series_dict):
+    for k, s in series_dict.items():
+        if s is not None:
+            df.at[t, k] = s  # .loc ではなく .at を使用
+
+
+# ---------- 10) 前処理フック：aggregate_scores直前あたりで呼ぶ ----------
+def preprocess_for_aggregate(df: pd.DataFrame):
+    _ensure_series_cols(df)
+    # 既存の close_series 等に Series 以外が混じっていれば正規化
+    for c in ['close_series','vol_series','high_series','low_series','open_series','bench_series','pe_series']:
+        if c in df.columns:
+            df[c] = df[c].apply(lambda s: _norm_series(s) if isinstance(s, (pd.Series, list, tuple, dict)) else (s if s is None or isinstance(s, pd.Series) else None))
+    return df
+
 
 
 # ========= EPS補完 & FCF算出ユーティリティ =========
@@ -710,17 +863,23 @@ if 'aggregate_scores' not in globals():
         global df, missing_logs, df_z, g_score, d_score_all
 
         df = pd.DataFrame(index=tickers)
+        df = preprocess_for_aggregate(df)
         missing_logs = []
 
         # ---- 特徴量生成 ----
         for t in tickers:
             d = info[t]; s = px[t]
             ev = ev_fallback(d, tickers_bulk.tickers[t])
-            df.loc[t, 'close_series'] = s
-            df.loc[t, 'vol_series'] = data['Volume'][t]
-            df.loc[t, 'bench_series'] = spx
-            df.loc[t, 'high_series'] = data['High'][t]
-            df.loc[t, 'low_series'] = data['Low'][t]
+
+            s_close = _norm_series(s)
+            s_vol   = _norm_series(data['Volume'][t])
+            s_bench = _norm_series(spx)
+            s_high  = _norm_series(data['High'][t])
+            s_low   = _norm_series(data['Low'][t])
+            _store_series_row(df, t,
+                close_series=s_close, vol_series=s_vol,
+                bench_series=s_bench, high_series=s_high, low_series=s_low
+            )
             df.loc[t, 'TR'] = trend(s)
             df.loc[t, 'EPS'] = eps_df.loc[t, 'eps_ttm']
             df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
