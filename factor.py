@@ -31,7 +31,7 @@ debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
 # ===== 共有DTO（クラス間I/O契約）＋ Config =====
 @dataclass(frozen=True)
 class InputBundle:
-    # Input → Aggregator で受け渡す素材（I/O禁止の生データ）
+    # Input → Scorer で受け渡す素材（I/O禁止の生データ）
     cand: List[str]
     tickers: List[str]
     bench: str
@@ -254,9 +254,9 @@ class Input:
         return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
 
 
-# ===== Aggregator：純粋なスコア集計（DataFrame→DataFrame）＋選定 =====
-class Aggregator:
-    # ----（Aggregator専用）テクニカル・指標系 ----
+# ===== Scorer：純粋なスコア集計（DataFrame→DataFrame） =====
+class Scorer:
+    # ----（Scorer専用）テクニカル・指標系 ----
     @staticmethod
     def trend(s: pd.Series):
         if len(s)<200: return np.nan
@@ -355,7 +355,184 @@ class Aggregator:
         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
         return np.nan if var==0 else cov/var
 
-    # ---- DRRS helpers（Aggregator専用） ----
+    # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
+    def aggregate_scores(self, ib: InputBundle, cfg: PipelineConfig) -> FeatureBundle:
+        px, spx, tickers = ib.px, ib.spx, ib.tickers
+        tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
+
+        df, missing_logs = pd.DataFrame(index=tickers), []
+        for t in tickers:
+            d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
+            df.loc[t,'TR'], df.loc[t,'EPS'], df.loc[t,'REV'], df.loc[t,'ROE'] = self.trend(s), eps_df.loc[t,'eps_ttm'], d.get('revenueGrowth',np.nan), d.get('returnOnEquity',np.nan)
+            df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
+            div = d.get('dividendYield') if d.get('dividendYield') is not None else d.get('trailingAnnualDividendYield')
+            if div is None or pd.isna(div):
+                try:
+                    divs = yf.Ticker(t).dividends
+                    if divs is not None and not divs.empty:
+                        last_close = s.iloc[-1]; div_1y = divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum()
+                        if last_close and last_close>0: div = float(div_1y/last_close)
+                except Exception: pass
+            df.loc[t,'DIV'] = 0.0 if (div is None or pd.isna(div)) else float(div)
+            fcf_val = ib.fcf_df.loc[t,'fcf_ttm'] if t in ib.fcf_df.index else np.nan
+            df.loc[t,'FCF'] = (fcf_val/ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev>0) else np.nan
+            df.loc[t,'RS'], df.loc[t,'TR_str'] = self.rs(s, spx), self.tr_str(s)
+            r, rm, n = s.pct_change().dropna(), spx.pct_change().dropna(), int(min(len(s.pct_change().dropna()), len(spx.pct_change().dropna())))
+            DOWNSIDE_DEV = np.nan
+            if n>=60:
+                r6 = r.iloc[-min(len(r),126):]; neg = r6[r6<0]
+                if len(neg)>=10: DOWNSIDE_DEV = float(neg.std(ddof=0)*np.sqrt(252))
+            df.loc[t,'DOWNSIDE_DEV'] = DOWNSIDE_DEV
+            MDD_1Y = np.nan
+            try:
+                w = s.iloc[-min(len(s),252):].dropna()
+                if len(w)>=30: roll_max = w.cummax(); MDD_1Y = float((w/roll_max - 1.0).min())
+            except Exception: pass
+            df.loc[t,'MDD_1Y'] = MDD_1Y
+            RESID_VOL = np.nan
+            if n>=120:
+                rr, rrm = r.iloc[-n:].align(rm.iloc[-n:], join='inner')
+                if len(rr)==len(rrm) and len(rr)>=120 and rrm.var()>0:
+                    beta = float(np.cov(rr, rrm)[0,1]/np.var(rrm)); resid = rr - beta*rrm
+                    RESID_VOL = float(resid.std(ddof=0)*np.sqrt(252))
+            df.loc[t,'RESID_VOL'] = RESID_VOL
+            DOWN_OUTPERF = np.nan
+            if n>=60:
+                m, x = rm.iloc[-n:], r.iloc[-n:]; mask = m<0
+                if mask.sum()>=10:
+                    mr, sr = float(m[mask].mean()), float(x[mask].mean())
+                    DOWN_OUTPERF = (sr - mr)/abs(mr) if mr!=0 else np.nan
+            df.loc[t,'DOWN_OUTPERF'] = DOWN_OUTPERF
+            sma200 = s.rolling(200).mean(); df.loc[t,'EXT_200'] = np.nan
+            if pd.notna(sma200.iloc[-1]) and sma200.iloc[-1]!=0: df.loc[t,'EXT_200'] = abs(float(s.iloc[-1]/sma200.iloc[-1]-1.0))
+            DIV_TTM_PS=DIV_VAR5=DIV_YOY=DIV_FCF_COVER=np.nan
+            try:
+                divs = yf.Ticker(t).dividends.dropna()
+                if not divs.empty:
+                    last_close = s.iloc[-1]; div_1y = float(divs[divs.index >= (divs.index.max()-pd.Timedelta(days=365))].sum())
+                    DIV_TTM_PS = div_1y if div_1y>0 else np.nan
+                    ann = divs.groupby(divs.index.year).sum()
+                    if len(ann)>=2 and ann.iloc[-2]!=0: DIV_YOY = float(ann.iloc[-1]/ann.iloc[-2]-1.0)
+                    tail = ann.iloc[-5:] if len(ann)>=5 else ann
+                    if len(tail)>=3 and tail.mean()!=0: DIV_VAR5 = float(tail.std(ddof=1)/abs(tail.mean()))
+                so, fcf_ttm = d.get('sharesOutstanding',None), ib.fcf_df.loc[t,'fcf_ttm'] if t in ib.fcf_df.index else np.nan
+                if so and pd.notna(DIV_TTM_PS) and pd.notna(fcf_ttm) and fcf_ttm!=0: DIV_FCF_COVER = float((fcf_ttm)/(DIV_TTM_PS*float(so)))
+            except Exception: pass
+            df.loc[t,'DIV_TTM_PS'], df.loc[t,'DIV_VAR5'], df.loc[t,'DIV_YOY'], df.loc[t,'DIV_FCF_COVER'] = DIV_TTM_PS, DIV_VAR5, DIV_YOY, DIV_FCF_COVER
+            df.loc[t,'DEBT2EQ'], df.loc[t,'CURR_RATIO'] = d.get('debtToEquity',np.nan), d.get('currentRatio',np.nan)
+            EPS_VAR_8Q = np.nan
+            try:
+                qe, so = ib.tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
+                if qe is not None and not qe.empty and so:
+                    eps_q = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
+                    if len(eps_q)>=4: EPS_VAR_8Q = float(eps_q.iloc[-min(8,len(eps_q)):].std(ddof=1))
+            except Exception: pass
+            df.loc[t,'EPS_VAR_8Q'] = EPS_VAR_8Q
+            df.loc[t,'MARKET_CAP'] = d.get('marketCap',np.nan); adv60 = np.nan
+            try:
+                vol_series = ib.data['Volume'][t].dropna()
+                if len(vol_series)>=5 and len(s)==len(vol_series):
+                    dv = (vol_series*s).rolling(60).mean(); adv60 = float(dv.iloc[-1])
+            except Exception: pass
+            df.loc[t,'ADV60_USD'] = adv60
+            REV_Q_YOY=EPS_Q_YOY=REV_YOY_ACC=REV_YOY_VAR=np.nan
+            try:
+                qe, so = ib.tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
+                if qe is not None and not qe.empty:
+                    if 'Revenue' in qe.columns:
+                        rev = qe['Revenue'].dropna().astype(float)
+                        if len(rev)>=5: REV_Q_YOY = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5])
+                        if len(rev)>=6:
+                            yoy_now = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5]); yoy_prev = _safe_div(rev.iloc[-2]-rev.iloc[-6], rev.iloc[-6])
+                            if pd.notna(yoy_now) and pd.notna(yoy_prev): REV_YOY_ACC = yoy_now - yoy_prev
+                        yoy_list=[]
+                        for k in range(1,5):
+                            if len(rev)>=4+k:
+                                y = _safe_div(rev.iloc[-k]-rev.iloc[-(k+4)], rev.iloc[-(k+4)])
+                                if pd.notna(y): yoy_list.append(y)
+                        if len(yoy_list)>=2: REV_YOY_VAR = float(np.std(yoy_list, ddof=1))
+                    if 'Earnings' in qe.columns and so:
+                        eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
+                        if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0: EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
+            except Exception: pass
+            df.loc[t,'REV_Q_YOY'], df.loc[t,'EPS_Q_YOY'], df.loc[t,'REV_YOY_ACC'], df.loc[t,'REV_YOY_VAR'] = REV_Q_YOY, EPS_Q_YOY, REV_YOY_ACC, REV_YOY_VAR
+            total_rev_ttm = d.get('totalRevenue',np.nan); fcf_ttm = ib.fcf_df.loc[t,'fcf_ttm'] if t in ib.fcf_df.index else np.nan
+            FCF_MGN = _safe_div(fcf_ttm, total_rev_ttm); df.loc[t,'FCF_MGN'] = FCF_MGN
+            rule40 = np.nan
+            try: r = df.loc[t,'REV']; rule40 = (r if pd.notna(r) else np.nan) + (FCF_MGN if pd.notna(FCF_MGN) else np.nan)
+            except Exception: pass
+            df.loc[t,'RULE40'] = rule40
+            sma50, sma150, sma200, p = s.rolling(50).mean(), s.rolling(150).mean(), s.rolling(200).mean(), _safe_last(s)
+            df.loc[t,'P_OVER_150'] = p/_safe_last(sma150)-1 if pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan
+            df.loc[t,'P_OVER_200'] = p/_safe_last(sma200)-1 if pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
+            df.loc[t,'MA50_OVER_200'] = _safe_last(sma50)/_safe_last(sma200)-1 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
+            df.loc[t,'MA200_SLOPE_5M'] = np.nan
+            if len(sma200.dropna())>=105:
+                cur200, old200 = _safe_last(sma200), float(sma200.iloc[-105])
+                if old200 and old200!=0: df.loc[t,'MA200_SLOPE_5M'] = cur200/old200 - 1
+            lo52 = s[-252:].min() if len(s)>=252 else s.min()
+            df.loc[t,'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52<=0 or pd.isna(p)) else (p/(lo52*1.25)-1)
+            hi52 = s[-252:].max() if len(s)>=252 else s.max(); df.loc[t,'NEAR_52W_HIGH'] = np.nan
+            if hi52 and hi52>0 and pd.notna(p):
+                d_hi = (p/hi52)-1.0; df.loc[t,'NEAR_52W_HIGH'] = -abs(min(0.0, d_hi))
+            df.loc[t,'RS_SLOPE_6W'], df.loc[t,'RS_SLOPE_13W'] = self.rs_line_slope(s, ib.spx, 30), self.rs_line_slope(s, ib.spx, 65)
+            prior_50_high = s.rolling(50).max().shift(1); df.loc[t,'BASE_BRK_SIMPLE'] = np.nan
+            if len(prior_50_high.dropna())>0 and pd.notna(p):
+                ph = float(prior_50_high.iloc[-1]); cond50 = pd.notna(_safe_last(sma50)) and (p>_safe_last(sma50))
+                df.loc[t,'BASE_BRK_SIMPLE'] = (p/ph-1) if (ph and ph>0 and cond50) else -0.0
+            df.loc[t,'DIV_STREAK'] = self.div_streak(t)
+            fin_cols = ['REV','ROE','BETA','DIV','FCF']; need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t,col])]
+            if need_finnhub:
+                fin_data = self.fetch_finnhub_metrics(t)
+                for col in need_finnhub:
+                    val = fin_data.get(col)
+                    if val is not None and not pd.isna(val): df.loc[t,col] = val
+            for col in fin_cols + ['EPS','RS','TR_str','DIV_STREAK']:
+                if pd.isna(df.loc[t,col]):
+                    if col=='DIV':
+                        status = self.dividend_status(t)
+                        if status!='none_confident': missing_logs.append({'Ticker':t,'Column':col,'Status':status})
+                    else: missing_logs.append({'Ticker':t,'Column':col})
+
+        for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
+        df_z = pd.DataFrame(index=df.index)
+        for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
+        df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
+        for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','BASE_BRK_SIMPLE']: df_z[col] = robust_z(df[col])
+        for col in ['REV_Q_YOY','EPS_Q_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40']: df_z[col] = robust_z(df[col])
+        for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
+        df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
+        df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
+        df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
+        df_z['GROWTH_F']  = robust_z(0.30*df_z['REV'] + 0.20*df_z['EPS_Q_YOY'] + 0.15*df_z['REV_Q_YOY'] + 0.15*df_z['REV_YOY_ACC'] + 0.10*df_z['RULE40'] + 0.10*df_z['FCF_MGN'] - 0.05*df_z['REV_YOY_VAR']).clip(-3.0,3.0)
+        df_z['MOM_F']     = robust_z(0.45*df_z['RS'] + 0.15*df_z['TR_str'] + 0.20*df_z['RS_SLOPE_6W'] + 0.20*df_z['RS_SLOPE_13W']).clip(-3.0,3.0)
+        df_z['TREND']     = robust_z(0.20*df_z['TR'] + 0.12*df_z['P_OVER_150'] + 0.12*df_z['P_OVER_200'] + 0.16*df_z['MA50_OVER_200'] + 0.16*df_z['MA200_SLOPE_5M'] + 0.12*df_z['LOW52PCT25_EXCESS'] + 0.07*df_z['NEAR_52W_HIGH'] + 0.05*df_z['BASE_BRK_SIMPLE']).clip(-3.0,3.0)
+        df_z['VOL'] = robust_z(df['BETA'])
+        df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','TREND':'TRD','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
+        if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
+
+        df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
+        df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
+        df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
+        df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
+
+        # 重みは cfg から参照（グローバル依存を排除）
+        g_score = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
+        d_comp  = pd.concat({'QAL':df_z['D_QAL'],'YLD':df_z['D_YLD'],'VOL':df_z['D_VOL_RAW'],'TRD':df_z['D_TRD']}, axis=1)
+        dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
+        globals()['D_WEIGHTS_EFF'] = dw.copy()  # 出力の表示互換のため維持
+        d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
+
+        if debug_mode:
+            eps = 0.1; _base = d_comp.mul(dw, axis=1).sum(axis=1); _test = d_comp.assign(VOL=d_comp['VOL']+eps).mul(dw, axis=1).sum(axis=1)
+            print("VOL増→d_score低下の比率:", ((_test<=_base)|_test.isna()|_base.isna()).mean())
+
+        return FeatureBundle(df=df, df_z=df_z, g_score=g_score, d_score_all=d_score_all, missing_logs=pd.DataFrame(missing_logs))
+
+
+# ===== Selector：相関低減・選定（スコア＆リターンだけ読む） =====
+class Selector:
+    # ---- DRRS helpers（Selector専用） ----
     @staticmethod
     def _z_np(X: np.ndarray) -> np.ndarray:
         X = np.asarray(X, dtype=np.float32); m = np.nanmean(X, axis=0, keepdims=True); s = np.nanstd(X, axis=0, keepdims=True)+1e-9
@@ -449,197 +626,22 @@ class Aggregator:
         selected_tickers = [pool_eff[i] for i in S]
         return dict(idx=S, tickers=selected_tickers, avg_res_corr=cls.avg_corr(C_within,S), sum_score=float(score[S].sum()), objective=float(Jn))
 
-    # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
-    def aggregate_scores(self, ib: InputBundle, cfg: PipelineConfig) -> FeatureBundle:
-        px, spx, tickers = ib.px, ib.spx, ib.tickers
-        tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
-
-        df, missing_logs = pd.DataFrame(index=tickers), []
-        for t in tickers:
-            d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
-            df.loc[t,'TR'], df.loc[t,'EPS'], df.loc[t,'REV'], df.loc[t,'ROE'] = self.trend(s), eps_df.loc[t,'eps_ttm'], d.get('revenueGrowth',np.nan), d.get('returnOnEquity',np.nan)
-            df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
-            div = d.get('dividendYield') if d.get('dividendYield') is not None else d.get('trailingAnnualDividendYield')
-            if div is None or pd.isna(div):
-                try:
-                    divs = yf.Ticker(t).dividends
-                    if divs is not None and not divs.empty:
-                        last_close = s.iloc[-1]; div_1y = divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum()
-                        if last_close and last_close>0: div = float(div_1y/last_close)
-                except Exception: pass
-            df.loc[t,'DIV'] = 0.0 if (div is None or pd.isna(div)) else float(div)
-            fcf_val = fcf_df.loc[t,'fcf_ttm'] if t in fcf_df.index else np.nan
-            df.loc[t,'FCF'] = (fcf_val/ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev>0) else np.nan
-            df.loc[t,'RS'], df.loc[t,'TR_str'] = self.rs(s, spx), self.tr_str(s)
-            r, rm, n = s.pct_change().dropna(), spx.pct_change().dropna(), int(min(len(s.pct_change().dropna()), len(spx.pct_change().dropna())))
-            DOWNSIDE_DEV = np.nan
-            if n>=60:
-                r6 = r.iloc[-min(len(r),126):]; neg = r6[r6<0]
-                if len(neg)>=10: DOWNSIDE_DEV = float(neg.std(ddof=0)*np.sqrt(252))
-            df.loc[t,'DOWNSIDE_DEV'] = DOWNSIDE_DEV
-            MDD_1Y = np.nan
-            try:
-                w = s.iloc[-min(len(s),252):].dropna()
-                if len(w)>=30: roll_max = w.cummax(); MDD_1Y = float((w/roll_max - 1.0).min())
-            except Exception: pass
-            df.loc[t,'MDD_1Y'] = MDD_1Y
-            RESID_VOL = np.nan
-            if n>=120:
-                rr, rrm = r.iloc[-n:].align(rm.iloc[-n:], join='inner')
-                if len(rr)==len(rrm) and len(rr)>=120 and rrm.var()>0:
-                    beta = float(np.cov(rr, rrm)[0,1]/np.var(rrm)); resid = rr - beta*rrm
-                    RESID_VOL = float(resid.std(ddof=0)*np.sqrt(252))
-            df.loc[t,'RESID_VOL'] = RESID_VOL
-            DOWN_OUTPERF = np.nan
-            if n>=60:
-                m, x = rm.iloc[-n:], r.iloc[-n:]; mask = m<0
-                if mask.sum()>=10:
-                    mr, sr = float(m[mask].mean()), float(x[mask].mean())
-                    DOWN_OUTPERF = (sr - mr)/abs(mr) if mr!=0 else np.nan
-            df.loc[t,'DOWN_OUTPERF'] = DOWN_OUTPERF
-            sma200 = s.rolling(200).mean(); df.loc[t,'EXT_200'] = np.nan
-            if pd.notna(sma200.iloc[-1]) and sma200.iloc[-1]!=0: df.loc[t,'EXT_200'] = abs(float(s.iloc[-1]/sma200.iloc[-1]-1.0))
-            DIV_TTM_PS=DIV_VAR5=DIV_YOY=DIV_FCF_COVER=np.nan
-            try:
-                divs = yf.Ticker(t).dividends.dropna()
-                if not divs.empty:
-                    last_close = s.iloc[-1]; div_1y = float(divs[divs.index >= (divs.index.max()-pd.Timedelta(days=365))].sum())
-                    DIV_TTM_PS = div_1y if div_1y>0 else np.nan
-                    ann = divs.groupby(divs.index.year).sum()
-                    if len(ann)>=2 and ann.iloc[-2]!=0: DIV_YOY = float(ann.iloc[-1]/ann.iloc[-2]-1.0)
-                    tail = ann.iloc[-5:] if len(ann)>=5 else ann
-                    if len(tail)>=3 and tail.mean()!=0: DIV_VAR5 = float(tail.std(ddof=1)/abs(tail.mean()))
-                so, fcf_ttm = d.get('sharesOutstanding',None), fcf_df.loc[t,'fcf_ttm'] if t in fcf_df.index else np.nan
-                if so and pd.notna(DIV_TTM_PS) and pd.notna(fcf_ttm) and fcf_ttm!=0: DIV_FCF_COVER = float((fcf_ttm)/(DIV_TTM_PS*float(so)))
-            except Exception: pass
-            df.loc[t,'DIV_TTM_PS'], df.loc[t,'DIV_VAR5'], df.loc[t,'DIV_YOY'], df.loc[t,'DIV_FCF_COVER'] = DIV_TTM_PS, DIV_VAR5, DIV_YOY, DIV_FCF_COVER
-            df.loc[t,'DEBT2EQ'], df.loc[t,'CURR_RATIO'] = d.get('debtToEquity',np.nan), d.get('currentRatio',np.nan)
-            EPS_VAR_8Q = np.nan
-            try:
-                qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
-                if qe is not None and not qe.empty and so:
-                    eps_q = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
-                    if len(eps_q)>=4: EPS_VAR_8Q = float(eps_q.iloc[-min(8,len(eps_q)):].std(ddof=1))
-            except Exception: pass
-            df.loc[t,'EPS_VAR_8Q'] = EPS_VAR_8Q
-            df.loc[t,'MARKET_CAP'] = d.get('marketCap',np.nan); adv60 = np.nan
-            try:
-                vol_series = ib.data['Volume'][t].dropna()
-                if len(vol_series)>=5 and len(s)==len(vol_series):
-                    dv = (vol_series*s).rolling(60).mean(); adv60 = float(dv.iloc[-1])
-            except Exception: pass
-            df.loc[t,'ADV60_USD'] = adv60
-            REV_Q_YOY=EPS_Q_YOY=REV_YOY_ACC=REV_YOY_VAR=np.nan
-            try:
-                qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
-                if qe is not None and not qe.empty:
-                    if 'Revenue' in qe.columns:
-                        rev = qe['Revenue'].dropna().astype(float)
-                        if len(rev)>=5: REV_Q_YOY = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5])
-                        if len(rev)>=6:
-                            yoy_now = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5]); yoy_prev = _safe_div(rev.iloc[-2]-rev.iloc[-6], rev.iloc[-6])
-                            if pd.notna(yoy_now) and pd.notna(yoy_prev): REV_YOY_ACC = yoy_now - yoy_prev
-                        yoy_list=[]
-                        for k in range(1,5):
-                            if len(rev)>=4+k:
-                                y = _safe_div(rev.iloc[-k]-rev.iloc[-(k+4)], rev.iloc[-(k+4)])
-                                if pd.notna(y): yoy_list.append(y)
-                        if len(yoy_list)>=2: REV_YOY_VAR = float(np.std(yoy_list, ddof=1))
-                    if 'Earnings' in qe.columns and so:
-                        eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
-                        if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0: EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
-            except Exception: pass
-            df.loc[t,'REV_Q_YOY'], df.loc[t,'EPS_Q_YOY'], df.loc[t,'REV_YOY_ACC'], df.loc[t,'REV_YOY_VAR'] = REV_Q_YOY, EPS_Q_YOY, REV_YOY_ACC, REV_YOY_VAR
-            total_rev_ttm = d.get('totalRevenue',np.nan); fcf_ttm = fcf_df.loc[t,'fcf_ttm'] if t in fcf_df.index else np.nan
-            FCF_MGN = _safe_div(fcf_ttm, total_rev_ttm); df.loc[t,'FCF_MGN'] = FCF_MGN
-            rule40 = np.nan
-            try: r = df.loc[t,'REV']; rule40 = (r if pd.notna(r) else np.nan) + (FCF_MGN if pd.notna(FCF_MGN) else np.nan)
-            except Exception: pass
-            df.loc[t,'RULE40'] = rule40
-            sma50, sma150, sma200, p = s.rolling(50).mean(), s.rolling(150).mean(), s.rolling(200).mean(), _safe_last(s)
-            df.loc[t,'P_OVER_150'] = p/_safe_last(sma150)-1 if pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan
-            df.loc[t,'P_OVER_200'] = p/_safe_last(sma200)-1 if pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
-            df.loc[t,'MA50_OVER_200'] = _safe_last(sma50)/_safe_last(sma200)-1 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
-            df.loc[t,'MA200_SLOPE_5M'] = np.nan
-            if len(sma200.dropna())>=105:
-                cur200, old200 = _safe_last(sma200), float(sma200.iloc[-105])
-                if old200 and old200!=0: df.loc[t,'MA200_SLOPE_5M'] = cur200/old200 - 1
-            lo52 = s[-252:].min() if len(s)>=252 else s.min()
-            df.loc[t,'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52<=0 or pd.isna(p)) else (p/(lo52*1.25)-1)
-            hi52 = s[-252:].max() if len(s)>=252 else s.max(); df.loc[t,'NEAR_52W_HIGH'] = np.nan
-            if hi52 and hi52>0 and pd.notna(p):
-                d_hi = (p/hi52)-1.0; df.loc[t,'NEAR_52W_HIGH'] = -abs(min(0.0, d_hi))
-            df.loc[t,'RS_SLOPE_6W'], df.loc[t,'RS_SLOPE_13W'] = self.rs_line_slope(s, spx, 30), self.rs_line_slope(s, spx, 65)
-            prior_50_high = s.rolling(50).max().shift(1); df.loc[t,'BASE_BRK_SIMPLE'] = np.nan
-            if len(prior_50_high.dropna())>0 and pd.notna(p):
-                ph = float(prior_50_high.iloc[-1]); cond50 = pd.notna(_safe_last(sma50)) and (p>_safe_last(sma50))
-                df.loc[t,'BASE_BRK_SIMPLE'] = (p/ph-1) if (ph and ph>0 and cond50) else -0.0
-            df.loc[t,'DIV_STREAK'] = self.div_streak(t)
-            fin_cols = ['REV','ROE','BETA','DIV','FCF']; need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t,col])]
-            if need_finnhub:
-                fin_data = self.fetch_finnhub_metrics(t)
-                for col in need_finnhub:
-                    val = fin_data.get(col)
-                    if val is not None and not pd.isna(val): df.loc[t,col] = val
-            for col in fin_cols + ['EPS','RS','TR_str','DIV_STREAK']:
-                if pd.isna(df.loc[t,col]):
-                    if col=='DIV':
-                        status = self.dividend_status(t)
-                        if status!='none_confident': missing_logs.append({'Ticker':t,'Column':col,'Status':status})
-                    else: missing_logs.append({'Ticker':t,'Column':col})
-
-        for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
-        df_z = pd.DataFrame(index=df.index)
-        for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
-        df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
-        for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','BASE_BRK_SIMPLE']: df_z[col] = robust_z(df[col])
-        for col in ['REV_Q_YOY','EPS_Q_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40']: df_z[col] = robust_z(df[col])
-        for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
-        df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
-        df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
-        df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
-        df_z['GROWTH_F']  = robust_z(0.30*df_z['REV'] + 0.20*df_z['EPS_Q_YOY'] + 0.15*df_z['REV_Q_YOY'] + 0.15*df_z['REV_YOY_ACC'] + 0.10*df_z['RULE40'] + 0.10*df_z['FCF_MGN'] - 0.05*df_z['REV_YOY_VAR']).clip(-3.0,3.0)
-        df_z['MOM_F']     = robust_z(0.45*df_z['RS'] + 0.15*df_z['TR_str'] + 0.20*df_z['RS_SLOPE_6W'] + 0.20*df_z['RS_SLOPE_13W']).clip(-3.0,3.0)
-        df_z['TREND']     = robust_z(0.20*df_z['TR'] + 0.12*df_z['P_OVER_150'] + 0.12*df_z['P_OVER_200'] + 0.16*df_z['MA50_OVER_200'] + 0.16*df_z['MA200_SLOPE_5M'] + 0.12*df_z['LOW52PCT25_EXCESS'] + 0.07*df_z['NEAR_52W_HIGH'] + 0.05*df_z['BASE_BRK_SIMPLE']).clip(-3.0,3.0)
-        df_z['VOL'] = robust_z(df['BETA'])
-        df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','TREND':'TRD','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
-        if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
-
-        df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
-        df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
-        df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
-        df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
-
-        # 重みは cfg から参照（グローバル依存を排除）
-        g_score = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
-        d_comp  = pd.concat({'QAL':df_z['D_QAL'],'YLD':df_z['D_YLD'],'VOL':df_z['D_VOL_RAW'],'TRD':df_z['D_TRD']}, axis=1)
-        dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
-        globals()['D_WEIGHTS_EFF'] = dw.copy()  # 出力の表示互換のため維持
-        d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
-
-        if debug_mode:
-            eps = 0.1; _base = d_comp.mul(dw, axis=1).sum(axis=1); _test = d_comp.assign(VOL=d_comp['VOL']+eps).mul(dw, axis=1).sum(axis=1)
-            print("VOL増→d_score低下の比率:", ((_test<=_base)|_test.isna()|_base.isna()).mean())
-
-        return FeatureBundle(df=df, df_z=df_z, g_score=g_score, d_score_all=d_score_all, missing_logs=pd.DataFrame(missing_logs))
-
-    # ---- 選定（DTO/Configを受け取り、SelectionBundleを返す）----
-    def select_buckets(self, ib: InputBundle, fb: FeatureBundle, cfg: PipelineConfig) -> SelectionBundle:
-        returns, df_z = ib.returns, fb.df_z
-        g_score, d_score_all = fb.g_score, fb.d_score_all
-
+    # ---- 選定（スコア Series / returns だけを受ける）----
+    def select_buckets(self, returns_df: pd.DataFrame, g_score: pd.Series, d_score_all: pd.Series, cfg: PipelineConfig) -> SelectionBundle:
         init_G = g_score.nlargest(min(cfg.drrs.corrM, len(g_score))).index.tolist(); prevG = _load_prev(G_PREV_JSON)
-        resG = self.select_bucket_drrs(returns_df=returns, score_ser=g_score, pool_tickers=init_G, k=N_G,
+        resG = self.select_bucket_drrs(returns_df=returns_df, score_ser=g_score, pool_tickers=init_G, k=N_G,
                                        n_pc=cfg.drrs.G.get("n_pc",3), gamma=cfg.drrs.G.get("gamma",1.2),
                                        lam=cfg.drrs.G.get("lam",0.68), eta=cfg.drrs.G.get("eta",0.8),
                                        lookback=cfg.drrs.G.get("lookback",252), prev_tickers=prevG,
                                        shrink=cfg.drrs.shrink, g_fixed_tickers=None, mu=0.0)
         top_G = resG["tickers"]
 
-        D_pool_index = df_z.drop(top_G).index; d_score = d_score_all.drop(top_G)
+        # df_z に依存せず、スコアの index から D プールを構成（機能は同等）
+        d_score = d_score_all.drop(top_G, errors='ignore')
+        D_pool_index = d_score.index
         init_D = d_score.loc[D_pool_index].nlargest(min(cfg.drrs.corrM, len(D_pool_index))).index.tolist(); prevD = _load_prev(D_PREV_JSON)
         mu = cfg.drrs.cross_mu_gd
-        resD = self.select_bucket_drrs(returns_df=returns, score_ser=d_score_all, pool_tickers=init_D, k=N_D,
+        resD = self.select_bucket_drrs(returns_df=returns_df, score_ser=d_score_all, pool_tickers=init_D, k=N_D,
                                        n_pc=cfg.drrs.D.get("n_pc",4), gamma=cfg.drrs.D.get("gamma",0.8),
                                        lam=cfg.drrs.D.get("lam",0.85), eta=cfg.drrs.D.get("eta",0.5),
                                        lookback=cfg.drrs.D.get("lookback",504), prev_tickers=prevD,
@@ -648,7 +650,6 @@ class Aggregator:
 
         _save_sel(G_PREV_JSON, top_G, resG["avg_res_corr"], resG["sum_score"], resG["objective"])
         _save_sel(D_PREV_JSON, top_D, resD["avg_res_corr"], resD["sum_score"], resD["objective"])
-
         return SelectionBundle(resG=resG, resD=resD, top_G=top_G, top_D=top_D, init_G=init_G, init_D=init_D)
 
 
@@ -722,7 +723,7 @@ class Output:
             sharpe, drawdown = ann_ret/ann_vol, (cum - cum.cummax()).min()
             if len(ticks)>=2:
                 C_raw = ret[ticks].corr(); RAW_rho = C_raw.mask(np.eye(len(ticks), dtype=bool)).stack().mean()
-                R = ret[ticks].dropna().to_numpy(); C_resid = Aggregator.residual_corr(R, n_pc=3, shrink=DRRS_SHRINK)
+                R = ret[ticks].dropna().to_numpy(); C_resid = Selector.residual_corr(R, n_pc=3, shrink=DRRS_SHRINK)
                 RESID_rho = float((C_resid.sum()-np.trace(C_resid))/(C_resid.shape[0]*(C_resid.shape[0]-1)))
             else: RAW_rho = RESID_rho = np.nan
             metrics[name] = {'RET':ann_ret,'VOL':ann_vol,'SHP':sharpe,'MDD':drawdown,'RAWρ':RAW_rho,'RESIDρ':RESID_rho}
@@ -772,10 +773,13 @@ if __name__ == "__main__":
     state = inp.prepare_data()
     ib = InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench, data=state["data"], px=state["px"], spx=state["spx"], tickers_bulk=state["tickers_bulk"], info=state["info"], eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"])
 
-    # 2) 集計（純粋）：特徴量→Z化→合成スコア→選定
-    ag = Aggregator()
-    fb = ag.aggregate_scores(ib, cfg)
-    sb = ag.select_buckets(ib, fb, cfg)
+    # 2) 集計（純粋）：特徴量→Z化→合成スコア
+    scorer = Scorer()
+    fb = scorer.aggregate_scores(ib, cfg)
+
+    # 2.5) 選定（相関低減）
+    selector = Selector()
+    sb = selector.select_buckets(returns_df=ib.returns, g_score=fb.g_score, d_score_all=fb.d_score_all, cfg=cfg)
 
     # 3) 出力（表示→Slack） — 既存I/Fのまま
     out = Output(debug=debug_mode)
