@@ -1,169 +1,128 @@
-import yfinance as yf
-import pandas as pd
-import numpy as np
+import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
 from scipy.stats import zscore
-import os
-import requests
-import time
-import json
-
 
 # ===== ユニバースと定数（冒頭に固定） =====
 exist = pd.read_csv("current_tickers.csv", header=None)[0].tolist()
 cand  = pd.read_csv("candidate_tickers.csv", header=None)[0].tolist()
 
 # 候補銘柄の価格上限・ベンチマーク
-CAND_PRICE_MAX = 400
-bench = '^GSPC'
+CAND_PRICE_MAX, bench = 400, "^GSPC"
 
 # G/D枠のサイズ
 N_G, N_D = 12, 13
 
-# ファクター重み
-g_weights = {'GRW': 0.35, 'MOM': 0.20, 'TRD': 0.45, 'VOL': -0.10}
-D_weights = {'QAL': 0.1, 'YLD': 0.25, 'VOL': -0.4, 'TRD': 0.25}
+# ファクター重み（数値・記号は一切変更なし）
+g_weights = {"GRW": 0.35, "MOM": 0.20, "TRD": 0.45, "VOL": -0.10}
+D_weights = {"QAL": 0.10, "YLD": 0.25, "VOL": -0.40, "TRD": 0.25}
 
-# DRRS 初期プール・各種パラメータ
+# DRRS 初期プール・各種パラメータ（意味はそのまま）
 corrM = 45
 DRRS_G = dict(lookback=252, n_pc=3, gamma=1.2, lam=0.68, eta=0.8)
 DRRS_D = dict(lookback=504, n_pc=4, gamma=0.8, lam=0.85, eta=0.5)
 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
 
-# クロス相関ペナルティ（未定義なら設定）
-try:
-    CROSS_MU_GD
-except NameError:
-    CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+# クロス相関ペナルティ（未定義なら推奨値を採用）
+try: CROSS_MU_GD
+except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
 
 # 出力関連
 RESULTS_DIR = "results"
-G_PREV_JSON = os.path.join(RESULTS_DIR, "G_selection.json")
-D_PREV_JSON = os.path.join(RESULTS_DIR, "D_selection.json")
+G_PREV_JSON, D_PREV_JSON = (os.path.join(RESULTS_DIR, f"{x}_selection.json") for x in ("G", "D"))
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # その他
 debug_mode = False
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
+# ========= ユーティリティ =========
 
 def winsorize_s(s: pd.Series, p=0.02):
-    if s is None or s.dropna().empty:
-        return s
-    lo, hi = np.nanpercentile(s.astype(float), [100 * p, 100 * (1 - p)])
+    if s is None or s.dropna().empty: return s
+    lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)])
     return s.clip(lo, hi)
 
 
 def robust_z(s: pd.Series, p=0.02):
     """軽い外れ値剪定→Z化。欠損は列平均で埋める（Zに影響最小）。"""
-    s2 = winsorize_s(s, p)
-    return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+    t = winsorize_s(s, p).fillna(s.mean())
+    return np.nan_to_num(zscore(t))
 
 
 def _safe_div(a, b):
     try:
-        if b is None or float(b) == 0 or pd.isna(b):
-            return np.nan
+        if b is None or float(b) == 0 or pd.isna(b): return np.nan
         return float(a) / float(b)
-    except Exception:
-        return np.nan
+    except Exception: return np.nan
 
 
 def _safe_last(series: pd.Series, default=np.nan):
-    try:
-        return float(series.iloc[-1])
-    except Exception:
-        return default
+    try: return float(series.iloc[-1])
+    except Exception: return default
 
 
 def rs_line_slope(s: pd.Series, b: pd.Series, win: int) -> float:
-    """RSライン（価格比 s/b）の対数に回帰して傾きを返す（win日）。
-    +: 上昇、-: 下降。データ不足は NaN。"""
+    """RSライン（価格比 s/b）の対数に回帰して傾きを返す（win日）。 +: 上昇、-: 下降。データ不足は NaN。"""
     r = (s / b).dropna()
-    if len(r) < win:
-        return np.nan
-    y = np.log(r.iloc[-win:])
-    x = np.arange(len(y), dtype=float)
-    try:
-        coef = np.polyfit(x, y, 1)[0]
-        return float(coef)  # 日次傾き
-    except Exception:
-        return np.nan
+    if len(r) < win: return np.nan
+    y = np.log(r.iloc[-win:]); x = np.arange(len(y), dtype=float)
+    try: return float(np.polyfit(x, y, 1)[0])  # 日次傾き
+    except Exception: return np.nan
 
 
 def ev_fallback(info_t: dict, tk: yf.Ticker) -> float:
     """EV欠損時の簡易代替: EV ≒ 時価総額 + 負債 - 現金。取れなければ NaN"""
     ev = info_t.get('enterpriseValue', np.nan)
-    if pd.notna(ev) and ev > 0:
-        return float(ev)
-    mc = info_t.get('marketCap', np.nan)
-    debt = cash = np.nan
+    if pd.notna(ev) and ev > 0: return float(ev)
+    mc = info_t.get('marketCap', np.nan); debt = cash = np.nan
     try:
         bs = tk.quarterly_balance_sheet
         if bs is not None and not bs.empty:
             c = bs.columns[0]
             for k in ("Total Debt", "Long Term Debt", "Short Long Term Debt"):
-                if k in bs.index:
-                    debt = float(bs.loc[k, c]); break
+                if k in bs.index: debt = float(bs.loc[k, c]); break
             for k in ("Cash And Cash Equivalents", "Cash And Cash Equivalents And Short Term Investments", "Cash"):
-                if k in bs.index:
-                    cash = float(bs.loc[k, c]); break
-    except Exception:
-        pass
-    if pd.notna(mc):
-        return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
-    return np.nan
+                if k in bs.index: cash = float(bs.loc[k, c]); break
+    except Exception: pass
+    return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash)) if pd.notna(mc) else np.nan
 
 
 # ========= EPS補完 & FCF算出ユーティリティ =========
 
-def impute_eps_ttm(df: pd.DataFrame,
-                   ttm_col: str = "eps_ttm",
-                   q_col: str = "eps_q_recent",
-                   out_col: str | None = None) -> pd.DataFrame:
-    if out_col is None:
-        out_col = ttm_col
-    df = df.copy()
-    df["eps_imputed"] = False
+def impute_eps_ttm(df: pd.DataFrame, ttm_col: str = "eps_ttm", q_col: str = "eps_q_recent", out_col: str | None = None) -> pd.DataFrame:
+    out_col = out_col or ttm_col
+    df = df.copy(); df["eps_imputed"] = False
     cand = df[q_col] * 4
     ok = df[ttm_col].isna() & cand.replace([np.inf, -np.inf], np.nan).notna()
-    df.loc[ok, out_col] = cand[ok]
-    df.loc[ok, "eps_imputed"] = True
+    df.loc[ok, out_col] = cand[ok]; df.loc[ok, "eps_imputed"] = True
     return df
 
+
 _CF_ALIASES = {
-    "cfo": [
-        "Operating Cash Flow",
-        "Total Cash From Operating Activities",
-    ],
-    "capex": [
-        "Capital Expenditure",
-        "Capital Expenditures",
-    ],
+    "cfo": ["Operating Cash Flow", "Total Cash From Operating Activities"],
+    "capex": ["Capital Expenditure", "Capital Expenditures"],
 }
 
+
 def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series | None:
-    if df is None or df.empty:
-        return None
+    if df is None or df.empty: return None
     idx_lower = {str(i).lower(): i for i in df.index}
     for name in names:
         key = name.lower()
-        if key in idx_lower:
-            return df.loc[idx_lower[key]]
+        if key in idx_lower: return df.loc[idx_lower[key]]
     return None
 
+
 def _sum_last_n(s: pd.Series | None, n: int) -> float | None:
-    if s is None or s.empty:
-        return None
+    if s is None or s.empty: return None
     vals = s.dropna().astype(float)
-    if vals.empty:
-        return None
-    return vals.iloc[:n].sum()
+    return vals.iloc[:n].sum() if not vals.empty else None
+
 
 def _latest(s: pd.Series | None) -> float | None:
-    if s is None or s.empty:
-        return None
+    if s is None or s.empty: return None
     vals = s.dropna().astype(float)
     return vals.iloc[0] if not vals.empty else None
+
 
 def fetch_cfo_capex_ttm_yf(tickers: list[str]) -> pd.DataFrame:
     rows = []
@@ -173,23 +132,15 @@ def fetch_cfo_capex_ttm_yf(tickers: list[str]) -> pd.DataFrame:
         cfo_q = _pick_row(qcf, _CF_ALIASES["cfo"])
         capex_q = _pick_row(qcf, _CF_ALIASES["capex"])
         fcf_q = _pick_row(qcf, ["Free Cash Flow", "FreeCashFlow", "Free cash flow"])
-
-        cfo_ttm = _sum_last_n(cfo_q, 4)
-        capex_ttm = _sum_last_n(capex_q, 4)
-        fcf_ttm_direct = _sum_last_n(fcf_q, 4)
-
-        if cfo_ttm is None or capex_ttm is None or fcf_ttm_direct is None:
+        cfo_ttm, capex_ttm, fcf_ttm_direct = (_sum_last_n(x, 4) for x in (cfo_q, capex_q, fcf_q))
+        if None in (cfo_ttm, capex_ttm, fcf_ttm_direct):
             acf = tk.cashflow
             cfo_a = _pick_row(acf, _CF_ALIASES["cfo"])
             capex_a = _pick_row(acf, _CF_ALIASES["capex"])
             fcf_a = _pick_row(acf, ["Free Cash Flow", "FreeCashFlow", "Free cash flow"])
-            if cfo_ttm is None:
-                cfo_ttm = _latest(cfo_a)
-            if capex_ttm is None:
-                capex_ttm = _latest(capex_a)
-            if fcf_ttm_direct is None:
-                fcf_ttm_direct = _latest(fcf_a)
-
+            cfo_ttm = cfo_ttm if cfo_ttm is not None else _latest(cfo_a)
+            capex_ttm = capex_ttm if capex_ttm is not None else _latest(capex_a)
+            fcf_ttm_direct = fcf_ttm_direct if fcf_ttm_direct is not None else _latest(fcf_a)
         rows.append({
             "ticker": t,
             "cfo_ttm_yf": cfo_ttm if cfo_ttm is not None else np.nan,
@@ -198,7 +149,9 @@ def fetch_cfo_capex_ttm_yf(tickers: list[str]) -> pd.DataFrame:
         })
     return pd.DataFrame(rows).set_index("ticker")
 
-_FINN_CFO_KEYS = [
+
+# Finnhub用のキー
+_FINN_CFO_KEYS  = [
     "netCashProvidedByOperatingActivities",
     "netCashFromOperatingActivities",
     "cashFlowFromOperatingActivities",
@@ -211,21 +164,19 @@ _FINN_CAPEX_KEYS = [
     "investmentsInPropertyPlantAndEquipment",
 ]
 
+
 def _first_key(d: dict, keys: list[str]):
     for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
+        if k in d and d[k] is not None: return d[k]
     return None
 
-def _finn_get(session: requests.Session, url: str, params: dict,
-              retries: int = 3, sleep_s: float = 0.5):
+
+def _finn_get(session: requests.Session, url: str, params: dict, retries: int = 3, sleep_s: float = 0.5):
     for i in range(retries):
         r = session.get(url, params=params, timeout=15)
         if r.status_code == 429:
-            time.sleep(min(2**i * sleep_s, 4.0))
-            continue
-        r.raise_for_status()
-        return r.json()
+            time.sleep(min(2**i * sleep_s, 4.0)); continue
+        r.raise_for_status(); return r.json()
     r.raise_for_status()
 
 def fetch_cfo_capex_ttm_finnhub(tickers: list[str], api_key: str | None = None) -> pd.DataFrame:
