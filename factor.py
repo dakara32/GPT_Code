@@ -308,7 +308,7 @@ def compute_fcf_with_fallback(tickers: list[str], finnhub_api_key: str | None = 
 
 def prepare_data():
     """Fetch price and fundamental data for all tickers."""
-    global cand_info, cand_prices, cand, tickers, data, px, spx
+    global cand_info, cand_prices, cand, tickers, data, px, spx, prices
     global tickers_bulk, info, eps_df, fcf_df, returns
 
     cand_info = yf.Tickers(" ".join(cand))
@@ -324,6 +324,7 @@ def prepare_data():
     data = yf.download(tickers + [bench], period="600d", auto_adjust=True, progress=False)
     px = data["Close"]
     spx = px[bench]
+    prices = {t: data.xs(t, axis=1, level=1)[["Open","High","Low","Close","Volume"]] for t in tickers}
     tickers_bulk = yf.Tickers(" ".join(tickers))
     info = {}
     for t in tickers:
@@ -715,6 +716,11 @@ if 'aggregate_scores' not in globals():
         for t in tickers:
             d = info[t]; s = px[t]
             ev = ev_fallback(d, tickers_bulk.tickers[t])
+            df.loc[t, 'close_series'] = s
+            df.loc[t, 'vol_series'] = data['Volume'][t]
+            df.loc[t, 'bench_series'] = spx
+            df.loc[t, 'high_series'] = data['High'][t]
+            df.loc[t, 'low_series'] = data['Low'][t]
             df.loc[t, 'TR'] = trend(s)
             df.loc[t, 'EPS'] = eps_df.loc[t, 'eps_ttm']
             df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
@@ -1026,6 +1032,199 @@ if 'aggregate_scores' not in globals():
 
         df_z.rename(columns={'GROWTH_F': 'GRW', 'MOM_F': 'MOM', 'TREND': 'TRD',
                              'QUALITY_F': 'QAL', 'YIELD_F': 'YLD'}, inplace=True)
+
+        # ========================= BEGIN: G枠 減点ロジック追加 =========================
+        if '__G_PENALTIES_APPLIED__' not in globals():
+
+            _ok_base = (
+                isinstance(globals().get('df', None), pd.DataFrame)
+                and isinstance(globals().get('df_z', None), pd.DataFrame)
+                and {'MOM', 'TRD'}.issubset(df_z.columns)
+            )
+            if _ok_base:
+                _cols = df.columns
+                def _pick(opts):
+                    for k in opts:
+                        if k in _cols:
+                            return k
+                    return None
+
+                _C = _pick(['close_series','px_series','close','price_series'])
+                _V = _pick(['vol_series','volume_series','volume','vol'])
+                _B = _pick(['bench_series','benchmark_series','spx_series','bench'])
+                _H = _pick(['high_series','high','High'])
+                _L = _pick(['low_series','low','Low'])
+                _PE = _pick(['pe_series','PE','pe'])
+
+                if (_C is not None) and (_V is not None):
+
+                    def _z_fallback(s: pd.Series):
+                        x = pd.to_numeric(s, errors='coerce').replace([np.inf,-np.inf], np.nan)
+                        if x.count() < 3:
+                            return x.fillna(0.0)
+                        x = x.clip(x.quantile(0.02), x.quantile(0.98))
+                        std = x.std(ddof=0)
+                        return (x - x.mean()) / (std if std!=0 else 1.0)
+
+                    _norm = globals().get('robust_z', None) or globals().get('_z', None)
+                    if not callable(_norm):
+                        _norm = _z_fallback
+
+                    def _gm(s, n): return s.rolling(n, min_periods=n).mean()
+                    def _gx(s, n): return s.rolling(n, min_periods=n).max()
+
+                    def _rs_slope(close: pd.Series, bench: pd.Series, win: int):
+                        b = bench if (bench is not None) else close
+                        rs = (close / b).replace([np.inf,-np.inf], np.nan).dropna()
+                        if len(rs) < win:
+                            return np.nan
+                        y = np.log(rs.iloc[-win:])
+                        x = np.arange(len(y), dtype=float)
+                        return float(np.polyfit(x, y, 1)[0])
+
+                    def _mom_decel(close: pd.Series, bench: pd.Series, vol: pd.Series) -> float:
+                        s20 = _rs_slope(close, bench, 20)
+                        s60 = _rs_slope(close, bench, 60)
+                        dec = 0.0
+                        if pd.notna(s20) and pd.notna(s60):
+                            dec = max(0.0, (s60 - s20)) + (0.5 if s20 <= 0 else 0.0)
+                        r = close.pct_change().iloc[-10:]
+                        v = vol.iloc[-10:]
+                        up_v = v[r>0].mean(); dn_v = v[r<=0].mean()
+                        if not (pd.isna(up_v) or pd.isna(dn_v) or dn_v==0):
+                            dec += 0.5 * max(0.0, (dn_v - up_v)/dn_v)
+                        return float(dec)
+
+                    def _detect_breakouts(close: pd.Series, vol: pd.Series, lookback_high=55):
+                        hi = _gx(close, lookback_high).shift(1)
+                        vavg20 = _gm(vol, 20)
+                        is_thin = vol < vavg20
+                        brk = (close > hi*1.01)
+                        return brk.fillna(False), is_thin.fillna(False), vavg20
+
+                    def _mom_breakout_bad(close: pd.Series, vol: pd.Series) -> float:
+                        brk, thin, vavg20 = _detect_breakouts(close, vol, 55)
+                        idx = brk[brk].index
+                        if len(idx)==0: return 0.0
+                        d0 = idx[-1]
+                        seg = close.loc[d0:].head(16)
+                        if len(seg)<3: return 0.0
+                        s = 0.0
+                        if bool(thin.get(d0, False)):
+                            for i in seg.index[1:min(6,len(seg))]:
+                                if (close.loc[i] < close.loc[i-1]) and pd.notna(vavg20.loc[i]) and (vol.loc[i] > vavg20.loc[i]*1.2):
+                                    s += 1.0; break
+                        lows = close.loc[d0:].head(16)
+                        ll=0
+                        for k in range(1,len(lows)):
+                            if lows.iloc[k] < lows.iloc[k-1]:
+                                ll += 1
+                                if ll>=3: s += 1.0; break
+                            else:
+                                ll=0
+                        seg_ret = seg.pct_change().dropna()
+                        if (seg_ret.le(0).sum() > seg_ret.gt(0).sum()): s += 0.5
+                        max_gain = (seg.max()/close.loc[d0]-1.0)
+                        now_gain = (close.iloc[-1]/close.loc[d0]-1.0)
+                        if (max_gain >= 0.12) and (now_gain <= 0.02): s += 0.8
+                        return float(s)
+
+                    def _trd_bad(close: pd.Series, vol: pd.Series) -> float:
+                        ma20 = _gm(close, 20); ma50 = _gm(close, 50); vavg20 = _gm(vol, 20)
+                        s = 0.0
+                        if pd.notna(ma20.iloc[-1]) and (close.iloc[-1] < ma20.iloc[-1]): s += 0.7
+                        if pd.notna(ma50.iloc[-1]) and (close.iloc[-1] < ma50.iloc[-1]) and pd.notna(vavg20.iloc[-1]) and (vol.iloc[-1] > vavg20.iloc[-1]*1.3):
+                            s += 1.0
+                        return float(s)
+
+                    def _exhaustion_gap(ohlcv: pd.DataFrame) -> bool:
+                        dfp = ohlcv
+                        if dfp is None or len(dfp)<30: return False
+                        o,h,l,c,v = [dfp[x] for x in ['Open','High','Low','Close','Volume']]
+                        up_trend = c.pct_change(15).iloc[-2] if len(c)>=16 else 0.0
+                        if pd.isna(up_trend) or up_trend < 0.10: return False
+                        prev_high = h.shift(1)
+                        gap_up = (o > prev_high*1.03)
+                        today_bear = (c < o)
+                        next_bear = (c.shift(-1) < c) & (v.shift(-1) > _gm(v,20))
+                        flag = (gap_up & (today_bear | next_bear)).iloc[-2]
+                        return bool(flag) if pd.notna(flag) else False
+
+                    def _warning_score(row) -> float:
+                        c, v = row[_C], row[_V]
+                        if not (isinstance(c, pd.Series) and isinstance(v, pd.Series)) or len(c)<70:
+                            return 0.0
+                        s = 0.0
+                        brk, thin, vavg20 = _detect_breakouts(c, v, 55)
+                        brk_idx = brk[brk].index
+                        late = max(0, len(brk_idx)-2)
+                        s += min(2.0, 0.6*late)
+                        if _PE and isinstance(row.get(_PE), pd.Series):
+                            pe = row[_PE].replace([np.inf,-np.inf], np.nan).dropna()
+                            if len(pe)>60:
+                                pe0 = pe.rolling(20, min_periods=20).min().rolling(252, min_periods=60).min().iloc[-1]
+                                pe_now = pe.iloc[-1]
+                                if pd.notna(pe0) and pe0>0 and pd.notna(pe_now):
+                                    ratio = pe_now/pe0
+                                    if ratio >= 2.0: s += min(1.0, 0.5*(ratio-2.0))
+                        if c.pct_change(10).iloc[-1] >= 0.25: s += 1.0
+                        win = c.tail(12)
+                        if len(win)>5 and (win.pct_change().dropna()>0).mean() >= 0.70: s += 0.8
+                        ret = c.pct_change().dropna()
+                        try:
+                            if len(ret)>3 and ret.idxmax()==ret.index[-1]: s += 0.4
+                        except Exception:
+                            pass
+                        if _H and _L and isinstance(row.get(_H), pd.Series) and isinstance(row.get(_L), pd.Series):
+                            rg = (row[_H] - row[_L]).dropna()
+                            if len(rg)>3 and rg.idxmax()==rg.index[-1]: s += 0.4
+                        df_ohlcv = None
+                        try:
+                            if 'prices' in globals() and isinstance(prices, dict) and row.name in prices:
+                                df_ohlcv = prices[row.name]
+                        except Exception:
+                            df_ohlcv = None
+                        if _exhaustion_gap(df_ohlcv): s += 1.2
+                        if len(brk_idx)>0:
+                            d0 = brk_idx[-1]
+                            if bool(thin.get(d0, False)):
+                                w = c.loc[d0:].head(6).index[1:]
+                                for i in w:
+                                    if (c.loc[i] < c.loc[i-1]) and pd.notna(vavg20.loc[i]) and (v.loc[i] > vavg20.loc[i]*1.2):
+                                        s += 1.0; break
+                        return float(s)
+
+                    _bench_exists = _B is not None
+                    _Decel_raw = df.apply(lambda r: _mom_decel(r[_C], (r[_B] if _bench_exists else r[_C]), r[_V]), axis=1).astype(float)
+                    _BrkBad_raw = df.apply(lambda r: _mom_breakout_bad(r[_C], r[_V]), axis=1).astype(float)
+                    _TrdBad_raw = df.apply(lambda r: _trd_bad(r[_C], r[_V]), axis=1).astype(float)
+                    _Warn_raw   = df.apply(_warning_score, axis=1).astype(float)
+
+                    _Decel_z = _norm(_Decel_raw).clip(lower=-3, upper=3)
+                    _BrkBad_z = _norm(_BrkBad_raw).clip(lower=-3, upper=3)
+                    _TrdBad_z = _norm(_TrdBad_raw).clip(lower=-3, upper=3)
+                    _Warn_z   = _norm(_Warn_raw).clip(lower=-3, upper=3)
+
+                    ALPHA_MOM_DECEL = globals().get('ALPHA_MOM_DECEL', 0.35)
+                    ALPHA_MOM_BAD   = globals().get('ALPHA_MOM_BAD',   0.35)
+                    BETA_TRD_BAD    = globals().get('BETA_TRD_BAD',    0.30)
+                    GAMMA_WARN_MOM  = globals().get('GAMMA_WARN_MOM',  0.25)
+                    GAMMA_WARN_TRD  = globals().get('GAMMA_WARN_TRD',  0.10)
+
+                    df_z.loc[:, 'MOM'] = (
+                        df_z['MOM']
+                        - ALPHA_MOM_DECEL * _Decel_z
+                        - ALPHA_MOM_BAD   * _BrkBad_z
+                        - GAMMA_WARN_MOM  * _Warn_z
+                    )
+                    df_z.loc[:, 'TRD'] = (
+                        df_z['TRD']
+                        - BETA_TRD_BAD   * _TrdBad_z
+                        - GAMMA_WARN_TRD * _Warn_z
+                    )
+
+                    __G_PENALTIES_APPLIED__ = True
+        # ========================== END: G枠 減点ロジック追加 =========================
 
         # 前提：df_z に必要列があり、BETA のZ列が無ければここで作る。
         if 'BETA' not in df_z.columns:
