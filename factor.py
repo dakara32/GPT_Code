@@ -1260,6 +1260,18 @@ if 'aggregate_scores' not in globals():
                         brk = (close > hi*1.01)
                         return brk.fillna(False), is_thin.fillna(False), vavg20
 
+                    def __heavy_reversal_within_5__(close, vol, vavg20, start_ts):
+                        seg = close.loc[start_ts:].head(6)
+                        if len(seg) < 2:
+                            return False
+                        idx = seg.index
+                        prev = seg.shift(1)
+                        v20  = vavg20.reindex(idx)
+                        vv   = vol.reindex(idx)
+                        cond = (seg < prev) & (vv > v20 * 1.2)
+                        # 最初の行は prev が NaN なので除外
+                        return bool(cond.iloc[1:].fillna(False).any())
+
                     def _mom_breakout_bad(close: pd.Series, vol: pd.Series) -> float:
                         brk, thin, vavg20 = _detect_breakouts(close, vol, 55)
                         idx = brk[brk].index
@@ -1269,9 +1281,8 @@ if 'aggregate_scores' not in globals():
                         if len(seg)<3: return 0.0
                         s = 0.0
                         if bool(thin.get(d0, False)):
-                            for i in seg.index[1:min(6,len(seg))]:
-                                if (close.loc[i] < close.loc[i-1]) and pd.notna(vavg20.loc[i]) and (vol.loc[i] > vavg20.loc[i]*1.2):
-                                    s += 1.0; break
+                            if __heavy_reversal_within_5__(close, vol, vavg20, d0):
+                                s += 1.0
                         lows = close.loc[d0:].head(16)
                         ll=0
                         for k in range(1,len(lows)):
@@ -1345,11 +1356,8 @@ if 'aggregate_scores' not in globals():
                         if _exhaustion_gap(df_ohlcv): s += 1.2
                         if len(brk_idx)>0:
                             d0 = brk_idx[-1]
-                            if bool(thin.get(d0, False)):
-                                w = c.loc[d0:].head(6).index[1:]
-                                for i in w:
-                                    if (c.loc[i] < c.loc[i-1]) and pd.notna(vavg20.loc[i]) and (v.loc[i] > vavg20.loc[i]*1.2):
-                                        s += 1.0; break
+                            if bool(thin.get(d0, False)) and __heavy_reversal_within_5__(c, v, vavg20, d0):
+                                s += 1.0
                         return float(s)
 
                     _bench_exists = _B is not None
