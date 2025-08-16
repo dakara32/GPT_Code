@@ -1035,9 +1035,6 @@ if 'aggregate_scores' not in globals():
 
         # ========================= BEGIN: G枠 減点ロジック追加 =========================
         if '__G_PENALTIES_APPLIED__' not in globals():
-            import numpy as np
-            import pandas as pd
-
             _ok_base = (
                 isinstance(globals().get('df', None), pd.DataFrame)
                 and isinstance(globals().get('df_z', None), pd.DataFrame)
