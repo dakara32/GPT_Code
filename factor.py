@@ -6,8 +6,6 @@ import os
 import requests
 import time
 import json
-import warnings
-from typing import Optional
 
 
 # ===== ユニバースと定数（冒頭に固定） =====
@@ -114,157 +112,6 @@ def ev_fallback(info_t: dict, tk: yf.Ticker) -> float:
     if pd.notna(mc):
         return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
     return np.nan
-
-
-# ---------- 0) 警告の抑制（yfinanceの不要Deprecation等） ----------
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-
-# ---------- 1) DataFrameにSeriesを格納する列をobjectで定義 ----------
-def _ensure_series_cols(df: pd.DataFrame, cols=('close_series','vol_series','high_series','low_series','open_series','bench_series','pe_series')):
-    for c in cols:
-        if c not in df.columns:
-            df[c] = pd.Series(index=df.index, dtype='object')
-        elif df[c].dtype != 'object':
-            df[c] = df[c].astype('object')
-    return df
-
-
-# ---------- 2) Series正規化（tz/並び/NaN/重複/Inf処理） ----------
-def _norm_series(s: Optional[pd.Series], dropna=True, sort=True):
-    if s is None:
-        return None
-    s = s.copy() if isinstance(s, pd.Series) else pd.Series(s)
-    if s.empty:
-        return None
-    # index→DatetimeIndex & tz-naive
-    if not isinstance(s.index, pd.DatetimeIndex):
-        try:
-            s.index = pd.to_datetime(s.index)
-        except Exception:
-            return None
-    if s.index.tz is not None:
-        s.index = s.index.tz_localize(None)
-    if sort:
-        s = s[~s.index.duplicated(keep='last')].sort_index()
-    # 値の正規化
-    s = pd.to_numeric(s, errors='coerce').replace([np.inf, -np.inf], np.nan)
-    if dropna:
-        s = s.dropna()
-    return s if len(s) else None
-
-
-# ---------- 3) OHLCVの安全抽出 ----------
-def _safe_ohlcv(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return None
-    cols = ['Open','High','Low','Close','Volume']
-    if not all(c in df.columns for c in cols):
-        return None
-    out = df[cols].copy()
-    # tz-naive & index整列・重複除去
-    if isinstance(out.index, pd.DatetimeIndex) and out.index.tz is not None:
-        out.index = out.index.tz_localize(None)
-    out = out[~out.index.duplicated(keep='last')].sort_index()
-    # Inf/NaN処理
-    out = out.replace([np.inf,-np.inf], np.nan).dropna(how='all')
-    return out if len(out)>=10 else None
-
-
-# ---------- 4) ベンチと株価のインデックス整合（inner join, limit ffill） ----------
-def _align_pair(a: pd.Series, b: pd.Series, ffill_limit: int = 3):
-    a = _norm_series(a); b = _norm_series(b)
-    if a is None or b is None:
-        return None, None
-    idx = a.index.intersection(b.index)
-    if len(idx) < 10:
-        # 営業日差異対策：bをaへreindexして限度つきffill
-        b = b.reindex(a.index).ffill(limit=ffill_limit)
-        idx = a.index.intersection(b.index)
-        if len(idx) < 10:
-            return None, None
-    return a.loc[idx], b.loc[idx]
-
-
-# ---------- 5) 安全なRS傾き（polyfit例外・不足データ・定数対策） ----------
-def _rs_slope_safe(close: pd.Series, bench: Optional[pd.Series], win: int) -> float:
-    if bench is None:
-        bench = close
-    c, b = _align_pair(close, bench)
-    if c is None or len(c) < win:
-        return np.nan
-    rs = (c / b).replace([np.inf,-np.inf], np.nan).dropna()
-    if len(rs) < win or rs.std(ddof=0) == 0:
-        return np.nan
-    y = np.log(rs.iloc[-win:])
-    x = np.arange(len(y), dtype=float)
-    try:
-        return float(np.polyfit(x, y, 1)[0])
-    except Exception:
-        return np.nan
-
-
-# ---------- 6) Z正規化のフォールバック（全定数/外れ値でゼロ分散の時もOK） ----------
-def _z_fallback(s: pd.Series):
-    x = pd.to_numeric(s, errors='coerce').replace([np.inf,-np.inf], np.nan)
-    if x.count() < 3:
-        return x.fillna(0.0)
-    x = x.clip(x.quantile(0.02), x.quantile(0.98))
-    std = x.std(ddof=0)
-    z = (x - x.mean()) / (std if std!=0 else 1.0)
-    return z
-
-def _z_norm(s: pd.Series):
-    _robust = globals().get('robust_z', None) or globals().get('_z', None)
-    try:
-        z = _robust(s) if callable(_robust) else _z_fallback(s)
-    except Exception:
-        z = _z_fallback(s)
-    return z.clip(lower=-3, upper=3)
-
-
-# ---------- 7) 安全なpct_change（極端ギャップ・分割を軽減） ----------
-def _pct_change_safe(s: pd.Series, periods=1, cap=0.8):
-    s = _norm_series(s)
-    if s is None:
-        return None
-    r = s.pct_change(periods)
-    # ±80%を超える単日変化は分割/異常値と見なし、一旦クリップ
-    return r.replace([np.inf,-np.inf], np.nan).clip(-cap, cap)
-
-
-# ---------- 8) フェッチの安全ラッパ（404/429/接続失敗 → None; リトライ少数回） ----------
-def _fetch_ohlcv_safe(ticker: str, fetch_func, retries=2, sleep_sec=1.0):
-    for i in range(retries+1):
-        try:
-            dfp = fetch_func(ticker)
-            return _safe_ohlcv(dfp)
-        except Exception as e:
-            msg = str(e).lower()
-            if '404' in msg or 'delisted' in msg or 'no data found' in msg:
-                return None
-            if i < retries:
-                time.sleep(sleep_sec * (i+1))
-            else:
-                return None
-
-
-# ---------- 9) dfへSeries格納は .at で、Noneはスキップ ----------
-def _store_series_row(df: pd.DataFrame, t, **series_dict):
-    for k, s in series_dict.items():
-        if s is not None:
-            df.at[t, k] = s  # .loc ではなく .at を使用
-
-
-# ---------- 10) 前処理フック：aggregate_scores直前あたりで呼ぶ ----------
-def preprocess_for_aggregate(df: pd.DataFrame):
-    _ensure_series_cols(df)
-    # 既存の close_series 等に Series 以外が混じっていれば正規化
-    for c in ['close_series','vol_series','high_series','low_series','open_series','bench_series','pe_series']:
-        if c in df.columns:
-            df[c] = df[c].apply(lambda s: _norm_series(s) if isinstance(s, (pd.Series, list, tuple, dict)) else (s if s is None or isinstance(s, pd.Series) else None))
-    return df
-
 
 
 # ========= EPS補完 & FCF算出ユーティリティ =========
@@ -461,7 +308,7 @@ def compute_fcf_with_fallback(tickers: list[str], finnhub_api_key: str | None = 
 
 def prepare_data():
     """Fetch price and fundamental data for all tickers."""
-    global cand_info, cand_prices, cand, tickers, data, px, spx, prices
+    global cand_info, cand_prices, cand, tickers, data, px, spx
     global tickers_bulk, info, eps_df, fcf_df, returns
 
     cand_info = yf.Tickers(" ".join(cand))
@@ -477,7 +324,6 @@ def prepare_data():
     data = yf.download(tickers + [bench], period="600d", auto_adjust=True, progress=False)
     px = data["Close"]
     spx = px[bench]
-    prices = {t: data.xs(t, axis=1, level=1)[["Open","High","Low","Close","Volume"]] for t in tickers}
     tickers_bulk = yf.Tickers(" ".join(tickers))
     info = {}
     for t in tickers:
@@ -863,23 +709,12 @@ if 'aggregate_scores' not in globals():
         global df, missing_logs, df_z, g_score, d_score_all
 
         df = pd.DataFrame(index=tickers)
-        df = preprocess_for_aggregate(df)
         missing_logs = []
 
         # ---- 特徴量生成 ----
         for t in tickers:
             d = info[t]; s = px[t]
             ev = ev_fallback(d, tickers_bulk.tickers[t])
-
-            s_close = _norm_series(s)
-            s_vol   = _norm_series(data['Volume'][t])
-            s_bench = _norm_series(spx)
-            s_high  = _norm_series(data['High'][t])
-            s_low   = _norm_series(data['Low'][t])
-            _store_series_row(df, t,
-                close_series=s_close, vol_series=s_vol,
-                bench_series=s_bench, high_series=s_high, low_series=s_low
-            )
             df.loc[t, 'TR'] = trend(s)
             df.loc[t, 'EPS'] = eps_df.loc[t, 'eps_ttm']
             df.loc[t, 'REV'] = d.get('revenueGrowth', np.nan)
@@ -1191,206 +1026,6 @@ if 'aggregate_scores' not in globals():
 
         df_z.rename(columns={'GROWTH_F': 'GRW', 'MOM_F': 'MOM', 'TREND': 'TRD',
                              'QUALITY_F': 'QAL', 'YIELD_F': 'YLD'}, inplace=True)
-
-        # ========================= BEGIN: G枠 減点ロジック追加 =========================
-        if '__G_PENALTIES_APPLIED__' not in globals():
-            _ok_base = (
-                isinstance(globals().get('df', None), pd.DataFrame)
-                and isinstance(globals().get('df_z', None), pd.DataFrame)
-                and {'MOM', 'TRD'}.issubset(df_z.columns)
-            )
-            if _ok_base:
-                _cols = df.columns
-                def _pick(opts):
-                    for k in opts:
-                        if k in _cols:
-                            return k
-                    return None
-
-                _C = _pick(['close_series','px_series','close','price_series'])
-                _V = _pick(['vol_series','volume_series','volume','vol'])
-                _B = _pick(['bench_series','benchmark_series','spx_series','bench'])
-                _H = _pick(['high_series','high','High'])
-                _L = _pick(['low_series','low','Low'])
-                _PE = _pick(['pe_series','PE','pe'])
-
-                if (_C is not None) and (_V is not None):
-
-                    def _z_fallback(s: pd.Series):
-                        x = pd.to_numeric(s, errors='coerce').replace([np.inf,-np.inf], np.nan)
-                        if x.count() < 3:
-                            return x.fillna(0.0)
-                        x = x.clip(x.quantile(0.02), x.quantile(0.98))
-                        std = x.std(ddof=0)
-                        return (x - x.mean()) / (std if std!=0 else 1.0)
-
-                    _norm = globals().get('robust_z', None) or globals().get('_z', None)
-                    if not callable(_norm):
-                        _norm = _z_fallback
-
-                    def _gm(s, n): return s.rolling(n, min_periods=n).mean()
-                    def _gx(s, n): return s.rolling(n, min_periods=n).max()
-
-                    def _rs_slope(close: pd.Series, bench: pd.Series, win: int):
-                        b = bench if (bench is not None) else close
-                        rs = (close / b).replace([np.inf,-np.inf], np.nan).dropna()
-                        if len(rs) < win:
-                            return np.nan
-                        y = np.log(rs.iloc[-win:])
-                        x = np.arange(len(y), dtype=float)
-                        return float(np.polyfit(x, y, 1)[0])
-
-                    def _mom_decel(close: pd.Series, bench: pd.Series, vol: pd.Series) -> float:
-                        s20 = _rs_slope(close, bench, 20)
-                        s60 = _rs_slope(close, bench, 60)
-                        dec = 0.0
-                        if pd.notna(s20) and pd.notna(s60):
-                            dec = max(0.0, (s60 - s20)) + (0.5 if s20 <= 0 else 0.0)
-                        r = close.pct_change().iloc[-10:]
-                        v = vol.iloc[-10:]
-                        up_v = v[r>0].mean(); dn_v = v[r<=0].mean()
-                        if not (pd.isna(up_v) or pd.isna(dn_v) or dn_v==0):
-                            dec += 0.5 * max(0.0, (dn_v - up_v)/dn_v)
-                        return float(dec)
-
-                    def _detect_breakouts(close: pd.Series, vol: pd.Series, lookback_high=55):
-                        hi = _gx(close, lookback_high).shift(1)
-                        vavg20 = _gm(vol, 20)
-                        is_thin = vol < vavg20
-                        brk = (close > hi*1.01)
-                        return brk.fillna(False), is_thin.fillna(False), vavg20
-
-                    def __heavy_reversal_within_5__(close, vol, vavg20, start_ts):
-                        seg = close.loc[start_ts:].head(6)
-                        if len(seg) < 2:
-                            return False
-                        idx = seg.index
-                        prev = seg.shift(1)
-                        v20  = vavg20.reindex(idx)
-                        vv   = vol.reindex(idx)
-                        cond = (seg < prev) & (vv > v20 * 1.2)
-                        # 最初の行は prev が NaN なので除外
-                        return bool(cond.iloc[1:].fillna(False).any())
-
-                    def _mom_breakout_bad(close: pd.Series, vol: pd.Series) -> float:
-                        brk, thin, vavg20 = _detect_breakouts(close, vol, 55)
-                        idx = brk[brk].index
-                        if len(idx)==0: return 0.0
-                        d0 = idx[-1]
-                        seg = close.loc[d0:].head(16)
-                        if len(seg)<3: return 0.0
-                        s = 0.0
-                        if bool(thin.get(d0, False)):
-                            if __heavy_reversal_within_5__(close, vol, vavg20, d0):
-                                s += 1.0
-                        lows = close.loc[d0:].head(16)
-                        ll=0
-                        for k in range(1,len(lows)):
-                            if lows.iloc[k] < lows.iloc[k-1]:
-                                ll += 1
-                                if ll>=3: s += 1.0; break
-                            else:
-                                ll=0
-                        seg_ret = seg.pct_change().dropna()
-                        if (seg_ret.le(0).sum() > seg_ret.gt(0).sum()): s += 0.5
-                        max_gain = (seg.max()/close.loc[d0]-1.0)
-                        now_gain = (close.iloc[-1]/close.loc[d0]-1.0)
-                        if (max_gain >= 0.12) and (now_gain <= 0.02): s += 0.8
-                        return float(s)
-
-                    def _trd_bad(close: pd.Series, vol: pd.Series) -> float:
-                        ma20 = _gm(close, 20); ma50 = _gm(close, 50); vavg20 = _gm(vol, 20)
-                        s = 0.0
-                        if pd.notna(ma20.iloc[-1]) and (close.iloc[-1] < ma20.iloc[-1]): s += 0.7
-                        if pd.notna(ma50.iloc[-1]) and (close.iloc[-1] < ma50.iloc[-1]) and pd.notna(vavg20.iloc[-1]) and (vol.iloc[-1] > vavg20.iloc[-1]*1.3):
-                            s += 1.0
-                        return float(s)
-
-                    def _exhaustion_gap(ohlcv: pd.DataFrame) -> bool:
-                        dfp = ohlcv
-                        if dfp is None or len(dfp)<30: return False
-                        o,h,l,c,v = [dfp[x] for x in ['Open','High','Low','Close','Volume']]
-                        up_trend = c.pct_change(15).iloc[-2] if len(c)>=16 else 0.0
-                        if pd.isna(up_trend) or up_trend < 0.10: return False
-                        prev_high = h.shift(1)
-                        gap_up = (o > prev_high*1.03)
-                        today_bear = (c < o)
-                        next_bear = (c.shift(-1) < c) & (v.shift(-1) > _gm(v,20))
-                        flag = (gap_up & (today_bear | next_bear)).iloc[-2]
-                        return bool(flag) if pd.notna(flag) else False
-
-                    def _warning_score(row) -> float:
-                        c, v = row[_C], row[_V]
-                        if not (isinstance(c, pd.Series) and isinstance(v, pd.Series)) or len(c)<70:
-                            return 0.0
-                        s = 0.0
-                        brk, thin, vavg20 = _detect_breakouts(c, v, 55)
-                        brk_idx = brk[brk].index
-                        late = max(0, len(brk_idx)-2)
-                        s += min(2.0, 0.6*late)
-                        if _PE and isinstance(row.get(_PE), pd.Series):
-                            pe = row[_PE].replace([np.inf,-np.inf], np.nan).dropna()
-                            if len(pe)>60:
-                                pe0 = pe.rolling(20, min_periods=20).min().rolling(252, min_periods=60).min().iloc[-1]
-                                pe_now = pe.iloc[-1]
-                                if pd.notna(pe0) and pe0>0 and pd.notna(pe_now):
-                                    ratio = pe_now/pe0
-                                    if ratio >= 2.0: s += min(1.0, 0.5*(ratio-2.0))
-                        if c.pct_change(10).iloc[-1] >= 0.25: s += 1.0
-                        win = c.tail(12)
-                        if len(win)>5 and (win.pct_change().dropna()>0).mean() >= 0.70: s += 0.8
-                        ret = c.pct_change().dropna()
-                        try:
-                            if len(ret)>3 and ret.idxmax()==ret.index[-1]: s += 0.4
-                        except Exception:
-                            pass
-                        if _H and _L and isinstance(row.get(_H), pd.Series) and isinstance(row.get(_L), pd.Series):
-                            rg = (row[_H] - row[_L]).dropna()
-                            if len(rg)>3 and rg.idxmax()==rg.index[-1]: s += 0.4
-                        df_ohlcv = None
-                        try:
-                            if 'prices' in globals() and isinstance(prices, dict) and row.name in prices:
-                                df_ohlcv = prices[row.name]
-                        except Exception:
-                            df_ohlcv = None
-                        if _exhaustion_gap(df_ohlcv): s += 1.2
-                        if len(brk_idx)>0:
-                            d0 = brk_idx[-1]
-                            if bool(thin.get(d0, False)) and __heavy_reversal_within_5__(c, v, vavg20, d0):
-                                s += 1.0
-                        return float(s)
-
-                    _bench_exists = _B is not None
-                    _Decel_raw = df.apply(lambda r: _mom_decel(r[_C], (r[_B] if _bench_exists else r[_C]), r[_V]), axis=1).astype(float)
-                    _BrkBad_raw = df.apply(lambda r: _mom_breakout_bad(r[_C], r[_V]), axis=1).astype(float)
-                    _TrdBad_raw = df.apply(lambda r: _trd_bad(r[_C], r[_V]), axis=1).astype(float)
-                    _Warn_raw   = df.apply(_warning_score, axis=1).astype(float)
-
-                    _Decel_z = _norm(_Decel_raw).clip(lower=-3, upper=3)
-                    _BrkBad_z = _norm(_BrkBad_raw).clip(lower=-3, upper=3)
-                    _TrdBad_z = _norm(_TrdBad_raw).clip(lower=-3, upper=3)
-                    _Warn_z   = _norm(_Warn_raw).clip(lower=-3, upper=3)
-
-                    ALPHA_MOM_DECEL = globals().get('ALPHA_MOM_DECEL', 0.35)
-                    ALPHA_MOM_BAD   = globals().get('ALPHA_MOM_BAD',   0.35)
-                    BETA_TRD_BAD    = globals().get('BETA_TRD_BAD',    0.30)
-                    GAMMA_WARN_MOM  = globals().get('GAMMA_WARN_MOM',  0.25)
-                    GAMMA_WARN_TRD  = globals().get('GAMMA_WARN_TRD',  0.10)
-
-                    df_z.loc[:, 'MOM'] = (
-                        df_z['MOM']
-                        - ALPHA_MOM_DECEL * _Decel_z
-                        - ALPHA_MOM_BAD   * _BrkBad_z
-                        - GAMMA_WARN_MOM  * _Warn_z
-                    )
-                    df_z.loc[:, 'TRD'] = (
-                        df_z['TRD']
-                        - BETA_TRD_BAD   * _TrdBad_z
-                        - GAMMA_WARN_TRD * _Warn_z
-                    )
-
-                    __G_PENALTIES_APPLIED__ = True
-        # ========================== END: G枠 減点ロジック追加 =========================
 
         # 前提：df_z に必要列があり、BETA のZ列が無ければここで作る。
         if 'BETA' not in df_z.columns:
