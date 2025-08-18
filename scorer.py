@@ -244,104 +244,6 @@ class Scorer:
         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
         return np.nan if var==0 else cov/var
 
-    @staticmethod
-    def _gm(s: pd.Series, n: int): return s.rolling(n, min_periods=n).mean()
-
-    @staticmethod
-    def _gx(s: pd.Series, n: int): return s.rolling(n, min_periods=n).max()
-
-    @staticmethod
-    def _rs_slope_safe(close: pd.Series, bench: Optional[pd.Series], win: int) -> float:
-        if bench is None: bench = close
-        r = (close/bench).replace([np.inf,-np.inf], np.nan).dropna()
-        if len(r)<win: return np.nan
-        y, x = np.log(r.iloc[-win:]), np.arange(win, dtype=float)
-        try: return float(np.polyfit(x, y, 1)[0])
-        except Exception: return np.nan
-
-    def _raw_decel(self, s: pd.Series, b: Optional[pd.Series], v: Optional[pd.Series]) -> float:
-        s20 = self._rs_slope_safe(s, b, 20); s60 = self._rs_slope_safe(s, b, 60); dec = 0.0
-        if pd.notna(s20) and pd.notna(s60): dec += max(0.0, s60 - s20) + (0.5 if s20<=0 else 0.0)
-        if v is not None and len(s)>=12 and len(v)>=12:
-            r10, v10 = s.pct_change().iloc[-10:], v.iloc[-10:]
-            up_v, dn_v = v10[r10>0].mean(), v10[r10<=0].mean()
-            if pd.notna(up_v) and pd.notna(dn_v) and dn_v>0: dec += 0.5*max(0.0, (dn_v-up_v)/dn_v)
-        return float(dec)
-
-    def _raw_brkbad(self, s: pd.Series, v: Optional[pd.Series], l: Optional[pd.Series]) -> float:
-        if v is None or len(s)<70 or len(v)<70: return 0.0
-        hi55 = self._gx(s,55).shift(1); v20 = self._gm(v,20); thin = v < v20; brk = s > hi55*1.01
-        idx = brk[brk].index
-        if len(idx)==0: return 0.0
-        d0 = idx[-1]; seg = s.loc[d0:].head(16)
-        if len(seg)<3: return 0.0
-        score = 0.0
-        # c1: 5日以内の大商い反落（ベクトル化）
-        seg_idx = seg.index; prev = seg.shift(1); cond = (seg < prev) & (v.reindex(seg_idx) > v20.reindex(seg_idx)*1.2)
-        if bool(cond.iloc[1:].fillna(False).any()) and bool(thin.get(d0, False)): score += 1.0
-        # c2: 3連続“安値”切下げ（Low があれば Low 使用、無ければ Close）
-        lows = (l if (l is not None and len(l)>=len(s)) else s).loc[d0:].head(16)
-        if (lows.diff().dropna().rolling(3).apply(lambda x: (x<0).all()).fillna(0).iloc[2:]>0).any(): score += 1.0
-        # c3: 陰線優勢
-        seg_ret = seg.pct_change().dropna();  score += 0.5 if (seg_ret.le(0).sum() > seg_ret.gt(0).sum()) else 0.0
-        # c4: ラウンドトリップ（+12%→+2%以下）
-        try:
-            mg = float(seg.max()/s.loc[d0]-1.0); ng = float(s.iloc[-1]/s.loc[d0]-1.0)
-            if (mg>=0.12) and (ng<=0.02): score += 0.8
-        except Exception: pass
-        return float(score)
-
-    def _raw_trdbad(self, s: pd.Series, v: Optional[pd.Series]) -> float:
-        if len(s)<55: return 0.0
-        ma20, ma50 = self._gm(s,20), self._gm(s,50); score = 0.0
-        if pd.notna(ma20.iloc[-1]) and (s.iloc[-1] < ma20.iloc[-1]): score += 0.7
-        if v is not None and len(v)>=50:
-            v20 = self._gm(v,20)
-            if pd.notna(ma50.iloc[-1]) and (s.iloc[-1] < ma50.iloc[-1]) and pd.notna(v20.iloc[-1]) and (v.iloc[-1] > v20.iloc[-1]*1.3): score += 1.0
-        return float(score)
-
-    def _raw_warning(self, tkr: str, s: pd.Series, v: Optional[pd.Series], pe_series: Optional[pd.Series], ohlcv_df: Optional[pd.DataFrame]) -> float:
-        if len(s)<70: return 0.0
-        v20 = self._gm(v,20) if v is not None else None
-        hi55 = self._gx(s,55).shift(1); brk = s > hi55*1.01
-        thin = (v < v20) if (v is not None and v20 is not None) else pd.Series(index=s.index, dtype=bool)
-        score = 0.0
-        # 後期ベース（3回目以降）
-        late = max(0, len(brk[brk].index)-2); score += min(2.0, 0.6*late)
-        # PER拡張（任意）
-        if pe_series is not None and len(pe_series.dropna())>60:
-            pe = pe_series.dropna(); pe0 = pe.rolling(20,min_periods=20).min().rolling(252,min_periods=60).min().iloc[-1] if len(pe)>=60 else np.nan
-            pe_now = pe.iloc[-1]
-            if pd.notna(pe0) and pe0>0 and pd.notna(pe_now):
-                ratio = pe_now/pe0;  score += min(1.0, 0.5*(ratio-2.0)) if ratio>=2.0 else 0.0
-        # クライマックス / 上げ日70%
-        if s.pct_change(10).iloc[-1] >= 0.25: score += 1.0
-        win = s.tail(12)
-        if len(win)>5 and (win.pct_change().dropna()>0).mean()>=0.70: score += 0.8
-        # 最大上昇/最大レンジが直近
-        ret = s.pct_change().dropna()
-        if len(ret)>3 and ret.idxmax()==ret.index[-1]: score += 0.4
-        if ohlcv_df is not None and set(['High','Low']).issubset(ohlcv_df.columns):
-            rg = (ohlcv_df['High']-ohlcv_df['Low']).dropna()
-            if len(rg)>3 and rg.idxmax()==rg.index[-1]: score += 0.4
-        # イグゾースションGAP
-        if ohlcv_df is not None and set(['Open','High','Close','Volume']).issubset(ohlcv_df.columns) and len(ohlcv_df)>=30:
-            o,h,c,vv = ohlcv_df['Open'], ohlcv_df['High'], ohlcv_df['Close'], ohlcv_df['Volume']
-            up_tr = c.pct_change(15).iloc[-2] if len(c)>=16 else 0.0
-            if pd.notna(up_tr) and up_tr>=0.10:
-                gap_up = (o > h.shift(1)*1.03); today_bear = (c < o)
-                next_bear = (c.shift(-1) < c) & (vv.shift(-1) > self._gm(vv,20))
-                flag = (gap_up & (today_bear | next_bear)).iloc[-2]
-                if bool(flag): score += 1.2
-        # 薄商い上抜け→大商い反落（5日以内）
-        brk_idx = brk[brk].index
-        if len(brk_idx)>0 and v is not None and v20 is not None:
-            d0 = brk_idx[-1]; seg = s.loc[d0:].head(6)
-            if bool(thin.get(d0, False)) and len(seg)>=2:
-                idx = seg.index; prev = seg.shift(1); cond = (seg < prev) & (v.reindex(idx) > v20.reindex(idx)*1.2)
-                if bool(cond.iloc[1:].fillna(False).any()): score += 1.0
-        return float(score)
-
     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
     def aggregate_scores(self, ib: InputBundle, cfg: Optional[PipelineConfig]=None) -> FeatureBundle:
         self._validate_ib_for_scorer(ib)
@@ -352,17 +254,7 @@ class Scorer:
 
         df, missing_logs = pd.DataFrame(index=tickers), []
         for t in tickers:
-            d, s = info[t], px[t].dropna(); ev = self.ev_fallback(d, tickers_bulk.tickers[t])
-            v = ib.data['Volume'][t].dropna() if ('Volume' in ib.data.columns) else None
-            l = ib.data['Low'][t].dropna()    if ('Low'    in ib.data.columns) else None
-            try:
-                ohlcv_df = ib.data.xs(t, level=1, axis=1)[['Open','High','Low','Close','Volume']].dropna(how='all')
-            except Exception:
-                ohlcv_df = None
-            df.loc[t,'DECEL_RAW']  = self._raw_decel(s, spx, v)
-            df.loc[t,'BRKBAD_RAW'] = self._raw_brkbad(s, v, l)
-            df.loc[t,'TRDBAD_RAW'] = self._raw_trdbad(s, v)
-            df.loc[t,'WARN_RAW']   = self._raw_warning(t, s, v, pe_series=None, ohlcv_df=ohlcv_df)
+            d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
             # --- 基本特徴 ---
             df.loc[t,'TR']   = self.trend(s)
             df.loc[t,'EPS']  = eps_df.loc[t,'EPS_TTM'] if t in eps_df.index else np.nan
@@ -555,18 +447,6 @@ class Scorer:
         df_z['VOL'] = robust_z(df['BETA'])
         df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','TREND':'TRD','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
-
-        for _c in ['DECEL_RAW','BRKBAD_RAW','TRDBAD_RAW','WARN_RAW']:
-            if _c not in df.columns: df[_c] = np.nan
-        Decel_z, BrkBad_z = robust_z(df['DECEL_RAW']).clip(-3,3), robust_z(df['BRKBAD_RAW']).clip(-3,3)
-        TrdBad_z, Warn_z  = robust_z(df['TRDBAD_RAW']).clip(-3,3), robust_z(df['WARN_RAW']).clip(-3,3)
-        ALPHA_MOM_DECEL = globals().get('ALPHA_MOM_DECEL', 0.35)
-        ALPHA_MOM_BAD   = globals().get('ALPHA_MOM_BAD',   0.35)
-        BETA_TRD_BAD    = globals().get('BETA_TRD_BAD',    0.30)
-        GAMMA_WARN_MOM  = globals().get('GAMMA_WARN_MOM',  0.25)
-        GAMMA_WARN_TRD  = globals().get('GAMMA_WARN_TRD',  0.10)
-        df_z['MOM'] = (df_z['MOM'] - ALPHA_MOM_DECEL*Decel_z - ALPHA_MOM_BAD*BrkBad_z - GAMMA_WARN_MOM*Warn_z).clip(-3,3)
-        df_z['TRD'] = (df_z['TRD'] - BETA_TRD_BAD*TrdBad_z - GAMMA_WARN_TRD*Warn_z).clip(-3,3)
 
         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
         df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
