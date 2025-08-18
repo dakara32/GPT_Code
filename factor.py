@@ -9,7 +9,7 @@ from scorer import Scorer
 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
 CAND_PRICE_MAX, bench = 400, '^GSPC'  # 価格上限・ベンチマーク
 N_G, N_D = 12, 13  # G/D枠サイズ
-g_weights = {'GRW':0.35,'MOM':0.20,'TRD':0.45,'VOL':-0.10}
+g_weights = {'GRW':0.35,'MOM':0.20,'TRD':0.00,'VOL':-0.10}
 D_weights = {'QAL':0.1,'YLD':0.25,'VOL':-0.4,'TRD':0.25}
 
 # DRRS 初期プール・各種パラメータ
