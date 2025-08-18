@@ -436,10 +436,24 @@ class Output:
                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
 
-        in_list = sorted(set(list(top_G)+list(top_D)) - set(exist)); out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
-        in_df = pd.DataFrame({'IN':in_list}).reset_index(drop=True)
-        out_df = pd.DataFrame({'/ OUT':out_list,'GSC':g_score.reindex(out_list).round(3).to_list(),'DSC':d_score_all.reindex(out_list).round(3).to_list()}).reset_index(drop=True)
-        self.io_table = pd.concat([in_df, out_df], axis=1); print("Changes:"); print(self.io_table.to_string(index=False))
+        # === Changes（IN の GSC/DSC を表示。OUT は銘柄名のみ） ===
+        in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
+        out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
+
+        # 全銘柄スコア（Scorer で df_z['GSC'], df_z['DSC'] を作っている想定）
+        gsc_full = df_z['GSC'] if 'GSC' in df_z.columns else g_score
+        dsc_full = df_z['DSC'] if 'DSC' in df_z.columns else d_score_all
+
+        # 表は「IN / OUT | GSC | DSC」…GSC/DSC は IN の値を表示
+        self.io_table = pd.DataFrame({
+            'IN': pd.Series(in_list),
+            '/ OUT': pd.Series(out_list)
+        })
+        self.io_table['GSC'] = gsc_full.reindex(in_list).round(3).reset_index(drop=True)
+        self.io_table['DSC'] = dsc_full.reindex(in_list).round(3).reset_index(drop=True)
+
+        print("Changes:")
+        print(self.io_table.to_string(index=False, na_rep="NaN"))
 
         all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
