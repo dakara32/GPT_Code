@@ -354,7 +354,7 @@ class Selector:
 
     # ---- 選定（スコア Series / returns だけを受ける）----
     def select_buckets(self, returns_df: pd.DataFrame, g_score: pd.Series, d_score_all: pd.Series, cfg: PipelineConfig) -> SelectionBundle:
-        init_G = g_score.nlargest(min(cfg.drrs.corrM, len(g_score))).index.tolist(); prevG = _load_prev(G_PREV_JSON)
+        init_G = g_score.nlargest(min(cfg.drrs.corrM, len(g_score))).index.tolist(); prevG = None
         resG = self.select_bucket_drrs(returns_df=returns_df, score_ser=g_score, pool_tickers=init_G, k=N_G,
                                        n_pc=cfg.drrs.G.get("n_pc",3), gamma=cfg.drrs.G.get("gamma",1.2),
                                        lam=cfg.drrs.G.get("lam",0.68), eta=cfg.drrs.G.get("eta",0.8),
@@ -365,7 +365,10 @@ class Selector:
         # df_z に依存せず、スコアの index から D プールを構成（機能は同等）
         d_score = d_score_all.drop(top_G, errors='ignore')
         D_pool_index = d_score.index
-        init_D = d_score.loc[D_pool_index].nlargest(min(cfg.drrs.corrM, len(D_pool_index))).index.tolist(); prevD = _load_prev(D_PREV_JSON)
+        init_D = d_score.loc[D_pool_index].nlargest(min(cfg.drrs.corrM, len(D_pool_index))).index.tolist(); prevD = None
+        # 復帰ロジック完全無効化: 常に新規選定
+        prevG = None
+        prevD = None
         mu = cfg.drrs.cross_mu_gd
         resD = self.select_bucket_drrs(returns_df=returns_df, score_ser=d_score_all, pool_tickers=init_D, k=N_D,
                                        n_pc=cfg.drrs.D.get("n_pc",4), gamma=cfg.drrs.D.get("gamma",0.8),
@@ -445,9 +448,7 @@ class Output:
 
         # 全銘柄スコア（Scorer で df_z['GSC'], df_z['DSC'] を作っている想定）
         gsc_full = df_z['GSC'] if 'GSC' in df_z.columns else g_score
-        dsc_full = df_z['DSC_DPASS'] if 'DSC_DPASS' in df_z.columns else (
-            df_z['DSC'] if 'DSC' in df_z.columns else d_score_all
-        )
+        dsc_full = df_z['DSC'] if 'DSC' in df_z.columns else d_score_all
 
         # 表は「IN / OUT | GSC | DSC」…GSC/DSC は IN の値を表示
         self.io_table = pd.DataFrame({
