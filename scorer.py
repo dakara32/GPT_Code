@@ -93,7 +93,7 @@ class PipelineConfig:
     price_max: float
 
 # ---- デフォルト設定（外部が渡せばそれを優先） -------------------------------
-DEFAULT_G_WEIGHTS = {'GRW':0.35,'MOM':0.20,'TRD':0.00,'VOL':-0.10}
+DEFAULT_G_WEIGHTS = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
 DEFAULT_D_WEIGHTS = {'QAL':0.10,'YLD':0.25,'VOL':-0.40,'TRD':0.25}
 DEFAULT_DRRS = DRRSParams(
     corrM=45, shrink=0.10,
@@ -357,6 +357,7 @@ class Scorer:
 
             # --- 売上/利益の加速度等 ---
             REV_Q_YOY=EPS_Q_YOY=REV_YOY_ACC=REV_YOY_VAR=np.nan
+            REV_ANNUAL_STREAK = np.nan
             try:
                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
                 if qe is not None and not qe.empty:
@@ -372,12 +373,28 @@ class Scorer:
                                 y = _safe_div(rev.iloc[-k]-rev.iloc[-(k+4)], rev.iloc[-(k+4)])
                                 if pd.notna(y): yoy_list.append(y)
                         if len(yoy_list)>=2: REV_YOY_VAR = float(np.std(yoy_list, ddof=1))
+                        # NEW: 年次の持続性（直近から遡って前年比プラスが何年連続か、四半期4本揃う完全年のみ）
+                        try:
+                            g = rev.groupby(rev.index.year)
+                            ann_sum, cnt = g.sum(), g.count()
+                            ann_sum = ann_sum[cnt >= 4]
+                            if len(ann_sum) >= 3:
+                                yoy = ann_sum.pct_change().dropna()
+                                streak = 0
+                                for v in yoy.iloc[::-1]:
+                                    if pd.isna(v) or v <= 0:
+                                        break
+                                    streak += 1
+                                REV_ANNUAL_STREAK = float(streak)
+                        except Exception:
+                            pass
                     if 'Earnings' in qe.columns and so:
                         eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
                         if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0:
                             EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
             except Exception: pass
             df.loc[t,'REV_Q_YOY'], df.loc[t,'EPS_Q_YOY'], df.loc[t,'REV_YOY_ACC'], df.loc[t,'REV_YOY_VAR'] = REV_Q_YOY, EPS_Q_YOY, REV_YOY_ACC, REV_YOY_VAR
+            df.loc[t,'REV_ANN_STREAK'] = REV_ANNUAL_STREAK
 
             # --- Rule of 40 や周辺 ---
             total_rev_ttm = d.get('totalRevenue',np.nan)
@@ -421,6 +438,20 @@ class Scorer:
             if len(sma200.dropna())>=105:
                 cur200, old200 = _safe_last(sma200), float(sma200.iloc[-105])
                 if old200 and old200!=0: df.loc[t,'MA200_SLOPE_5M'] = cur200/old200 - 1
+            # NEW: 200日線が連続で上向きの「日数」
+            df.loc[t,'MA200_UP_STREAK_D'] = np.nan
+            try:
+                s200 = sma200.dropna()
+                if len(s200) >= 2:
+                    diff200 = s200.diff()
+                    up = 0
+                    for v in diff200.iloc[::-1]:
+                        if pd.isna(v) or v <= 0:
+                            break
+                        up += 1
+                    df.loc[t,'MA200_UP_STREAK_D'] = float(up)
+            except Exception:
+                pass
             df.loc[t,'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52<=0 or pd.isna(p)) else (p/(lo52*1.25)-1)
             hi52 = s[-252:].max() if len(s)>=252 else s.max(); df.loc[t,'NEAR_52W_HIGH'] = np.nan
             if hi52 and hi52>0 and pd.notna(p):
@@ -452,20 +483,30 @@ class Scorer:
         df_z = pd.DataFrame(index=df.index)
         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
-        for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W']: df_z[col] = robust_z(df[col])
-        for col in ['REV_Q_YOY','EPS_Q_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40']: df_z[col] = robust_z(df[col])
+        for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
+        for col in ['REV_Q_YOY','EPS_Q_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']: df_z[col] = robust_z(df[col])
         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
 
         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
-        df_z['GROWTH_F']  = robust_z(0.30*df_z['REV'] + 0.20*df_z['EPS_Q_YOY'] + 0.15*df_z['REV_Q_YOY'] + 0.15*df_z['REV_YOY_ACC'] + 0.10*df_z['RULE40'] + 0.10*df_z['FCF_MGN'] - 0.05*df_z['REV_YOY_VAR']).clip(-3.0,3.0)
+        df_z['GROWTH_F']  = robust_z(
+              0.30*df_z['REV']
+            + 0.20*df_z['EPS_Q_YOY']
+            + 0.15*df_z['REV_Q_YOY']
+            + 0.15*df_z['REV_YOY_ACC']
+            + 0.10*df_z['RULE40']
+            + 0.10*df_z['FCF_MGN']
+            + 0.10*df_z['REV_ANN_STREAK']
+            - 0.05*df_z['REV_YOY_VAR']
+        ).clip(-3.0,3.0)
         df_z['MOM_F'] = robust_z(
               0.40*df_z['RS']
             + 0.15*df_z['TR_str']
             + 0.15*df_z['RS_SLOPE_6W']
             + 0.15*df_z['RS_SLOPE_13W']
-            + 0.15*df_z['MA200_SLOPE_5M']
+            + 0.10*df_z['MA200_SLOPE_5M']
+            + 0.10*df_z['MA200_UP_STREAK_D']
         ).clip(-3.0,3.0)
         df_z['VOL'] = robust_z(df['BETA'])
         df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
