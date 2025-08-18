@@ -109,7 +109,9 @@ DEFAULT_CONFIG = PipelineConfig(
 
 # Slack/Debug 環境に合わせて既存変数を許容（未定義なら無視）
 debug_mode = bool(os.environ.get("SCORER_DEBUG", "0") == "1")
-D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.9"))
+# D用β帯（既定は 0.20 ≤ β < 0.80）
+D_BETA_MIN = float(os.environ.get("D_BETA_MIN", "0.20"))
+D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.80"))
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 D_WEIGHTS_EFF = None  # 出力表示互換のため
 
@@ -532,10 +534,20 @@ class Scorer:
         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
         globals()['D_WEIGHTS_EFF'] = dw.copy()
 
-        # β フィルタ適用後の D スコア算出
-        d_mask_beta = (df['BETA'] < D_BETA_MAX)
-        d_score_beta = d_comp[d_mask_beta].mul(dw, axis=1).sum(axis=1)
-        d_score_all = d_score_beta.reindex(df.index)
+        # ① 全銘柄での D スコア（表示/Changes 用）
+        d_score_full = d_comp.mul(dw, axis=1).sum(axis=1)
+
+        # ② β帯フィルタ（選定用）：0.20 ≤ β < 0.80
+        d_mask_beta = (df['BETA'] >= D_BETA_MIN) & (df['BETA'] < D_BETA_MAX)
+        d_score_band = d_score_full.where(d_mask_beta)   # 帯外は NaN（=選定対象外）
+
+        # ③ 出力
+        d_score_all = d_score_band.reindex(df.index)      # FeatureBundle 用（選定に使う）
+        df_z['DSC']         = d_score_full                # 表示/Changes はフルを使うので NaN 出ない
+        df_z['D_PASS_BETA'] = d_mask_beta.astype(float)   # 監査フラグ
+        df_z['DSC_DPASS']   = d_score_full.where(d_mask_beta, np.nan)  # 帯通過のみ値
+        # （任意）監査用の生β
+        df_z['BETA_RAW'] = df['BETA']
 
         # ② テンプレ判定（既存ロジックそのまま）
         def _trend_template_pass(row, rs_alpha_thresh=0.10):
