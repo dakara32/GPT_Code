@@ -531,7 +531,11 @@ class Scorer:
         }, axis=1)
         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
         globals()['D_WEIGHTS_EFF'] = dw.copy()
-        d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
+
+        # β フィルタ適用後の D スコア算出
+        d_mask_beta = (df['BETA'] < D_BETA_MAX)
+        d_score_beta = d_comp[d_mask_beta].mul(dw, axis=1).sum(axis=1)
+        d_score_all = d_score_beta.reindex(df.index)
 
         # ② テンプレ判定（既存ロジックそのまま）
         def _trend_template_pass(row, rs_alpha_thresh=0.10):
