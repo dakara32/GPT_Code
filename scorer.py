@@ -93,7 +93,7 @@ class PipelineConfig:
     price_max: float
 
 # ---- デフォルト設定（外部が渡せばそれを優先） -------------------------------
-DEFAULT_G_WEIGHTS = {'GRW':0.35,'MOM':0.20,'TRD':0.45,'VOL':-0.10}
+DEFAULT_G_WEIGHTS = {'GRW':0.35,'MOM':0.20,'TRD':0.00,'VOL':-0.10}
 DEFAULT_D_WEIGHTS = {'QAL':0.10,'YLD':0.25,'VOL':-0.40,'TRD':0.25}
 DEFAULT_DRRS = DRRSParams(
     corrM=45, shrink=0.10,
@@ -390,7 +390,30 @@ class Scorer:
             df.loc[t,'RULE40'] = rule40
 
             # --- トレンド補助 ---
-            sma50, sma150, sma200, p = s.rolling(50).mean(), s.rolling(150).mean(), s.rolling(200).mean(), _safe_last(s)
+            sma50  = s.rolling(50).mean()
+            sma150 = s.rolling(150).mean()
+            sma200 = s.rolling(200).mean()
+            p = _safe_last(s)
+
+            df.loc[t,'MA50_OVER_150'] = (
+                _safe_last(sma50)/_safe_last(sma150) - 1
+                if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan
+            )
+            df.loc[t,'MA150_OVER_200'] = (
+                _safe_last(sma150)/_safe_last(sma200) - 1
+                if pd.notna(_safe_last(sma150)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
+            )
+
+            lo52 = s[-252:].min() if len(s)>=252 else s.min()
+            df.loc[t,'P_OVER_LOW52'] = (p/lo52 - 1) if (lo52 and lo52>0 and pd.notna(p)) else np.nan
+
+            df.loc[t,'MA200_SLOPE_1M'] = np.nan
+            if len(sma200.dropna()) >= 21:
+                cur200 = _safe_last(sma200)
+                old2001 = float(sma200.iloc[-21])
+                if old2001:
+                    df.loc[t,'MA200_SLOPE_1M'] = cur200/old2001 - 1
+
             df.loc[t,'P_OVER_150'] = p/_safe_last(sma150)-1 if pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan
             df.loc[t,'P_OVER_200'] = p/_safe_last(sma200)-1 if pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
             df.loc[t,'MA50_OVER_200'] = _safe_last(sma50)/_safe_last(sma200)-1 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
@@ -398,17 +421,12 @@ class Scorer:
             if len(sma200.dropna())>=105:
                 cur200, old200 = _safe_last(sma200), float(sma200.iloc[-105])
                 if old200 and old200!=0: df.loc[t,'MA200_SLOPE_5M'] = cur200/old200 - 1
-            lo52 = s[-252:].min() if len(s)>=252 else s.min()
             df.loc[t,'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52<=0 or pd.isna(p)) else (p/(lo52*1.25)-1)
             hi52 = s[-252:].max() if len(s)>=252 else s.max(); df.loc[t,'NEAR_52W_HIGH'] = np.nan
             if hi52 and hi52>0 and pd.notna(p):
                 d_hi = (p/hi52)-1.0; df.loc[t,'NEAR_52W_HIGH'] = -abs(min(0.0, d_hi))
             df.loc[t,'RS_SLOPE_6W'] = self.rs_line_slope(s, ib.spx, 30)
             df.loc[t,'RS_SLOPE_13W'] = self.rs_line_slope(s, ib.spx, 65)
-            prior_50_high = s.rolling(50).max().shift(1); df.loc[t,'BASE_BRK_SIMPLE'] = np.nan
-            if len(prior_50_high.dropna())>0 and pd.notna(p):
-                ph = float(prior_50_high.iloc[-1]); cond50 = pd.notna(_safe_last(sma50)) and (p>_safe_last(sma50))
-                df.loc[t,'BASE_BRK_SIMPLE'] = (p/ph-1) if (ph and ph>0 and cond50) else -0.0
 
             df.loc[t,'DIV_STREAK'] = self.div_streak(t)
 
@@ -434,7 +452,7 @@ class Scorer:
         df_z = pd.DataFrame(index=df.index)
         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
-        for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','BASE_BRK_SIMPLE']: df_z[col] = robust_z(df[col])
+        for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W']: df_z[col] = robust_z(df[col])
         for col in ['REV_Q_YOY','EPS_Q_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40']: df_z[col] = robust_z(df[col])
         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
 
@@ -442,10 +460,16 @@ class Scorer:
         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
         df_z['GROWTH_F']  = robust_z(0.30*df_z['REV'] + 0.20*df_z['EPS_Q_YOY'] + 0.15*df_z['REV_Q_YOY'] + 0.15*df_z['REV_YOY_ACC'] + 0.10*df_z['RULE40'] + 0.10*df_z['FCF_MGN'] - 0.05*df_z['REV_YOY_VAR']).clip(-3.0,3.0)
-        df_z['MOM_F']     = robust_z(0.45*df_z['RS'] + 0.15*df_z['TR_str'] + 0.20*df_z['RS_SLOPE_6W'] + 0.20*df_z['RS_SLOPE_13W']).clip(-3.0,3.0)
-        df_z['TREND']     = robust_z(0.20*df_z['TR'] + 0.12*df_z['P_OVER_150'] + 0.12*df_z['P_OVER_200'] + 0.16*df_z['MA50_OVER_200'] + 0.16*df_z['MA200_SLOPE_5M'] + 0.12*df_z['LOW52PCT25_EXCESS'] + 0.07*df_z['NEAR_52W_HIGH'] + 0.05*df_z['BASE_BRK_SIMPLE']).clip(-3.0,3.0)
+        df_z['MOM_F'] = robust_z(
+              0.40*df_z['RS']
+            + 0.15*df_z['TR_str']
+            + 0.15*df_z['RS_SLOPE_6W']
+            + 0.15*df_z['RS_SLOPE_13W']
+            + 0.15*df_z['MA200_SLOPE_5M']
+        ).clip(-3.0,3.0)
         df_z['VOL'] = robust_z(df['BETA'])
-        df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','TREND':'TRD','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
+        df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
+        df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
 
         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
@@ -459,6 +483,45 @@ class Scorer:
         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
         globals()['D_WEIGHTS_EFF'] = dw.copy()
         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
+
+        # --- テンプレ8条件（本家に準拠）: RSはS&P500比 +10% 近似 ---
+        def _trend_template_pass(row, rs_alpha_thresh=0.10):
+            # 1) 株価 > 150日・200日
+            c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
+            # 2) 150日 > 200日
+            c2 = (row.get('MA150_OVER_200', np.nan) > 0)
+            # 3) 200日線が直近1ヶ月で上向き
+            c3 = (row.get('MA200_SLOPE_1M', np.nan) > 0)
+            # 4) 50日 > 150日 & 50日 > 200日
+            c4 = (row.get('MA50_OVER_150', np.nan) > 0) and (row.get('MA50_OVER_200', np.nan) > 0)
+            # 5) 株価 > 50日線
+            c5 = (row.get('TR_str', np.nan) > 0)
+            # 6) 52週安値より30%以上高い
+            c6 = (row.get('P_OVER_LOW52', np.nan) >= 0.30)
+            # 7) 52週高値から25%以内
+            c7 = (row.get('NEAR_52W_HIGH', np.nan) >= -0.25)
+            # 8) RS（S&P500比 α） ≥ +10%
+            c8 = (row.get('RS', np.nan) >= 0.10)
+            return bool(c1 and c2 and c3 and c4 and c5 and c6 and c7 and c8)
+
+        mask = df.apply(_trend_template_pass, axis=1).fillna(False)
+
+        # 候補ゼロのフォールバック（段階的に緩める：任意だが推奨）
+        if not bool(mask.any()):
+            mask = (
+                (df.get('P_OVER_LOW52', np.nan) >= 0.25) &
+                (df.get('NEAR_52W_HIGH', np.nan) >= -0.30) &
+                (df.get('RS', np.nan) >= 0.08) &
+                (df.get('MA200_SLOPE_1M', np.nan) > 0) &
+                (df.get('P_OVER_150', np.nan) > 0) & (df.get('P_OVER_200', np.nan) > 0) &
+                (df.get('MA150_OVER_200', np.nan) > 0) &
+                (df.get('MA50_OVER_150', np.nan) > 0) & (df.get('MA50_OVER_200', np.nan) > 0) &
+                (df.get('TR_str', np.nan) > 0)
+            ).fillna(False)
+
+        # スコアSeriesだけをフィルタ（df/df_zは全銘柄のまま返す）
+        g_score = g_score.loc[mask]
+        d_score_all = d_score_all.loc[mask]
 
         if debug_mode:
             eps = 0.1; _base = d_comp.mul(dw, axis=1).sum(axis=1); _test = d_comp.assign(VOL=d_comp['VOL']+eps).mul(dw, axis=1).sum(axis=1)
