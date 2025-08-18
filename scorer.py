@@ -518,36 +518,34 @@ class Scorer:
         df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
 
-        # 重みは cfg を優先（外部があればそれを使用）
-        g_score = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
-        d_comp  = pd.concat({'QAL':df_z['D_QAL'],'YLD':df_z['D_YLD'],'VOL':df_z['D_VOL_RAW'],'TRD':df_z['D_TRD']}, axis=1)
+        # --- 重みは cfg を優先（外部があればそれを使用） ---
+        # ① 全銘柄で G/D スコアを算出（unmasked）
+        g_score_all = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
+
+        d_comp = pd.concat({
+            'QAL': df_z['D_QAL'],
+            'YLD': df_z['D_YLD'],
+            'VOL': df_z['D_VOL_RAW'],
+            'TRD': df_z['D_TRD']
+        }, axis=1)
         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
         globals()['D_WEIGHTS_EFF'] = dw.copy()
         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
 
-        # --- テンプレ8条件（本家に準拠）: RSはS&P500比 +10% 近似 ---
+        # ② テンプレ判定（既存ロジックそのまま）
         def _trend_template_pass(row, rs_alpha_thresh=0.10):
-            # 1) 株価 > 150日・200日
             c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
-            # 2) 150日 > 200日
             c2 = (row.get('MA150_OVER_200', np.nan) > 0)
-            # 3) 200日線が直近1ヶ月で上向き
             c3 = (row.get('MA200_SLOPE_1M', np.nan) > 0)
-            # 4) 50日 > 150日 & 50日 > 200日
             c4 = (row.get('MA50_OVER_150', np.nan) > 0) and (row.get('MA50_OVER_200', np.nan) > 0)
-            # 5) 株価 > 50日線
             c5 = (row.get('TR_str', np.nan) > 0)
-            # 6) 52週安値より30%以上高い
             c6 = (row.get('P_OVER_LOW52', np.nan) >= 0.30)
-            # 7) 52週高値から25%以内
             c7 = (row.get('NEAR_52W_HIGH', np.nan) >= -0.25)
-            # 8) RS（S&P500比 α） ≥ +10%
             c8 = (row.get('RS', np.nan) >= 0.10)
             return bool(c1 and c2 and c3 and c4 and c5 and c6 and c7 and c8)
 
         mask = df.apply(_trend_template_pass, axis=1).fillna(False)
 
-        # 候補ゼロのフォールバック（段階的に緩める：任意だが推奨）
         if not bool(mask.any()):
             mask = (
                 (df.get('P_OVER_LOW52', np.nan) >= 0.25) &
@@ -560,15 +558,24 @@ class Scorer:
                 (df.get('TR_str', np.nan) > 0)
             ).fillna(False)
 
-        # スコアSeriesだけをフィルタ（df/df_zは全銘柄のまま返す）
-        g_score = g_score.loc[mask]        # Gはテンプレ必須
-        d_score_all = d_score_all          # Dはフィルタせず全銘柄対象
+        # ③ 採用用は mask、表示/分析用は列で全銘柄保存
+        g_score = g_score_all.loc[mask]
+        df_z['GSC'] = g_score_all
+        df_z['DSC'] = d_score_all
 
         if debug_mode:
-            eps = 0.1; _base = d_comp.mul(dw, axis=1).sum(axis=1); _test = d_comp.assign(VOL=d_comp['VOL']+eps).mul(dw, axis=1).sum(axis=1)
-            print("VOL増→d_score低下の比率:", ((_test<=_base)|_test.isna()|_base.isna()).mean())
+            eps = 0.1
+            _base = d_comp.mul(dw, axis=1).sum(axis=1)
+            _test = d_comp.assign(VOL=d_comp['VOL'] + eps).mul(dw, axis=1).sum(axis=1)
+            print("VOL増→d_score低下の比率:", ((_test <= _base) | _test.isna() | _base.isna()).mean())
 
-        return FeatureBundle(df=df, df_z=df_z, g_score=g_score, d_score_all=d_score_all, missing_logs=pd.DataFrame(missing_logs))
+        return FeatureBundle(
+            df=df,
+            df_z=df_z,
+            g_score=g_score,
+            d_score_all=d_score_all,
+            missing_logs=pd.DataFrame(missing_logs)
+        )
 
 
 # === 単体実行サンプル（最小） =================================================
