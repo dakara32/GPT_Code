@@ -10,6 +10,7 @@ exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_ticker
 CAND_PRICE_MAX, bench = 400, '^GSPC'  # 価格上限・ベンチマーク
 N_G, N_D = 12, 13  # G/D枠サイズ
 g_weights = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
+D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.9"))
 D_weights = {'QAL':0.1,'YLD':0.25,'VOL':-0.4,'TRD':0.25}
 
 # DRRS 初期プール・各種パラメータ
@@ -386,6 +387,8 @@ class Output:
         self.g_title = self.d_title = ""
         self.div_details = {}
         self.g_formatters = self.d_formatters = {}
+        # 低スコア（GSC+DSC）Top10 表示/送信用
+        self.low10_table = None
 
     # --- メトリクス補助（Output専用） ---
     @staticmethod
@@ -442,7 +445,9 @@ class Output:
 
         # 全銘柄スコア（Scorer で df_z['GSC'], df_z['DSC'] を作っている想定）
         gsc_full = df_z['GSC'] if 'GSC' in df_z.columns else g_score
-        dsc_full = df_z['DSC'] if 'DSC' in df_z.columns else d_score_all
+        dsc_full = df_z['DSC_DPASS'] if 'DSC_DPASS' in df_z.columns else (
+            df_z['DSC'] if 'DSC' in df_z.columns else d_score_all
+        )
 
         # 表は「IN / OUT | GSC | DSC」…GSC/DSC は IN の値を表示
         self.io_table = pd.DataFrame({
@@ -482,6 +487,18 @@ class Output:
             self.debug_table = pd.concat([df_z[['TR','EPS','REV','ROE','BETA','DIV','FCF','RS','TR_str','DIV_STREAK']], g_score.rename('GSC'), d_score_all.rename('DSC')], axis=1).round(3)
             print("Debug Data:"); print(self.debug_table.to_string())
 
+        # === 追加: GSC+DSC が低い順 TOP10 ===
+        try:
+            all_scores = pd.DataFrame({'GSC': df_z['GSC'], 'DSC': df_z['DSC']}).copy()
+            all_scores['G_plus_D'] = all_scores['GSC'] + all_scores['DSC']
+            all_scores = all_scores.dropna(subset=['G_plus_D'])
+            self.low10_table = all_scores.sort_values('G_plus_D', ascending=True).head(10).round(3)
+            print("Low Score Candidates (GSC+DSC bottom 10):")
+            print(self.low10_table.to_string())
+        except Exception as e:
+            print(f"[warn] low-score ranking failed: {e}")
+            self.low10_table = None
+
     # --- Slack送信（元 notify_slack のロジックそのまま） ---
     def notify_slack(self):
         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
@@ -491,6 +508,9 @@ class Output:
         message += self.g_title + "\n```" + self.g_table.to_string(formatters=self.g_formatters) + "```\n"
         message += self.d_title + "\n```" + self.d_table.to_string(formatters=self.d_formatters) + "```\n"
         message += "Changes\n```" + self.io_table.to_string(index=False) + "```\n"
+        # 低スコアTOP10（GSC+DSC）
+        if self.low10_table is not None:
+            message += "Low Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
         message += "\nDiversification (NEW breakdown):\n```" + "\n".join([f"{k}: {np.nan if v is None else round(v,3)}" for k,v in self.div_details.items()]) + "```"
         if self.debug and self.debug_table is not None: message += "\nDebug Data\n```" + self.debug_table.to_string() + "```"
@@ -518,9 +538,17 @@ if __name__ == "__main__":
     scorer = Scorer()
     fb = scorer.aggregate_scores(ib, cfg)
 
+    # Dスコアを β<0.9 通過銘柄に限定
+    d_score_beta = fb.d_score_all[fb.df['BETA'] < D_BETA_MAX]
+
     # 2.5) 選定（相関低減）
     selector = Selector()
-    sb = selector.select_buckets(returns_df=ib.returns, g_score=fb.g_score, d_score_all=fb.d_score_all, cfg=cfg)
+    sb = selector.select_buckets(
+        returns_df=ib.returns,
+        g_score=fb.g_score,
+        d_score_all=d_score_beta,   # βフィルタ済みを渡す
+        cfg=cfg
+    )
 
     # 3) 出力（表示→Slack） — 既存I/Fのまま
     out = Output(debug=debug_mode)
