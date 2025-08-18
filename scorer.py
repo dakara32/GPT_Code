@@ -520,8 +520,8 @@ class Scorer:
             ).fillna(False)
 
         # スコアSeriesだけをフィルタ（df/df_zは全銘柄のまま返す）
-        g_score = g_score.loc[mask]
-        d_score_all = d_score_all.loc[mask]
+        g_score = g_score.loc[mask]        # Gはテンプレ必須
+        d_score_all = d_score_all          # Dはフィルタせず全銘柄対象
 
         if debug_mode:
             eps = 0.1; _base = d_comp.mul(dw, axis=1).sum(axis=1); _test = d_comp.assign(VOL=d_comp['VOL']+eps).mul(dw, axis=1).sum(axis=1)
