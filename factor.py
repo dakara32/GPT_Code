@@ -448,7 +448,12 @@ class Output:
 
         # 全銘柄スコア（Scorer で df_z['GSC'], df_z['DSC'] を作っている想定）
         gsc_full = df_z['GSC'] if 'GSC' in df_z.columns else g_score
-        dsc_full = df_z['DSC'] if 'DSC' in df_z.columns else d_score_all
+
+        # 帯通過の値を優先、無ければ全体値（= NaN を回避）
+        if 'DSC_DPASS' in df_z.columns and 'DSC' in df_z.columns:
+            dsc_for_display = df_z['DSC_DPASS'].fillna(df_z['DSC'])
+        else:
+            dsc_for_display = df_z['DSC'] if 'DSC' in df_z.columns else d_score_all
 
         # 表は「IN / OUT | GSC | DSC」…GSC/DSC は IN の値を表示
         self.io_table = pd.DataFrame({
@@ -456,7 +461,7 @@ class Output:
             '/ OUT': pd.Series(out_list)
         })
         self.io_table['GSC'] = gsc_full.reindex(in_list).round(3).reset_index(drop=True)
-        self.io_table['DSC'] = dsc_full.reindex(in_list).round(3).reset_index(drop=True)
+        self.io_table['DSC'] = dsc_for_display.reindex(in_list).round(3).reset_index(drop=True)
 
         print("Changes:")
         print(self.io_table.to_string(index=False, na_rep="NaN"))
