@@ -29,6 +29,14 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 # その他
 debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
 
+# ===== One-swap AUTO gate (hardcoded) =====
+ENABLE_ONE_SWAP = True   # 常時ON。ゲートを満たす日だけ実行
+GATE_G = 0.10            # G: 単一入替の最大Δobjectiveがこの値以上なら実行
+GATE_D = 0.20            # D: 同上
+MAX_SWAPS_G = 1          # 1回の実行での入替上限
+MAX_SWAPS_D = 3
+# ==========================================
+
 
 # ===== 共有DTO（クラス間I/O契約）＋ Config =====
 @dataclass(frozen=True)
@@ -415,7 +423,7 @@ class Output:
         C = R.corr().loc[left,right].values; return float(np.nanmean(C))
 
     # --- 表示（元 display_results のロジックそのまま） ---
-    def display_results(self, exist, bench, df_z, g_score, d_score_all, init_G, init_D, top_G, top_D):
+    def display_results(self, exist, bench, df_z, g_score, d_score_all, init_G, init_D, top_G, top_D, feat):
         pd.set_option('display.float_format','{:.3f}'.format)
         print("📈 ファクター分散最適化の結果")
         if self.miss_df is not None and not self.miss_df.empty: print("Missing Data:"); print(self.miss_df.to_string(index=False))
@@ -439,20 +447,25 @@ class Output:
                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
 
-        # --- Changes output (fix: show OUT-side scores) ---
+        # --- Changes output: OUT銘柄の“フィルター前” GSC/DSC を表示 ---
+        _scores = getattr(feat, "scores_full", None)
+        assert _scores is not None, "scores_full is required (pre-filter scores)."
+
         in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
         out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
         changes = list(zip_longest(in_list, out_list, fillvalue=""))
-        lines = ["IN / OUT   GSC    DSC"]
-        for tin, tout in changes:
-            g_out = g_score.get(tout, float("nan"))
-            d_out = d_score_all.get(tout, float("nan"))
-            lines.append(f"{tin:>4} / {tout:<4} {g_out:6.3f} {d_out:6.3f}")
+
         print("Changes")
-        for ln in lines[1:]:
-            print(ln)
+        print("IN / OUT   GSC    DSC")
+        lines = ["IN / OUT   GSC    DSC"]
+        for tin, tout in changes:  # 形式: (IN, OUT)
+            g_out = float(_scores.at[tout, "GSC"])
+            d_out = float(_scores.at[tout, "DSC"])
+            line = f"{tin:>4} / {tout:<4} {g_out:6.3f} {d_out:6.3f}"
+            print(line)
+            lines.append(line)
         self.changes_text = "\n".join(lines)
-        # ---------------------------------------------------
+        # -----------------------------------------------------------------
 
         all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
@@ -570,6 +583,40 @@ def build_debug_min(sel, pool, score_s, corr_mat, lam, cross_mu=0.0, cross_pen=N
 
 # ========== end: minimal debug columns ==========
 
+# --- objective & one-swap helpers ---
+def _max_swap_gain(sel, pool, score_s, corr_mat, lam, cross_mu=0.0, cross_pen=None):
+    S, P = set(sel), set(pool)
+    base = _obj_val(S, score_s, corr_mat, lam, cross_mu, cross_pen)
+    best = 0.0
+    for inn in (P - S):
+        for out in S:
+            cand = (S - {out}) | {inn}
+            gain = _obj_val(cand, score_s, corr_mat, lam, cross_mu, cross_pen) - base
+            if gain > best:
+                best = gain
+    return best
+
+
+def one_swap_local_improve(sel, pool, score_s, corr_mat, lam,
+                           cross_mu=0.0, cross_pen=None, max_swaps=50):
+    S, P = set(sel), set(pool)
+    base = _obj_val(S, score_s, corr_mat, lam, cross_mu, cross_pen)
+    swaps = 0
+    while swaps < max_swaps:
+        best_gain, best_out, best_in = 0.0, None, None
+        for out in list(S):
+            for inn in list(P - S):
+                cand = (S - {out}) | {inn}
+                gain = _obj_val(cand, score_s, corr_mat, lam, cross_mu, cross_pen) - base
+                if gain > best_gain:
+                    best_gain, best_out, best_in = gain, out, inn
+        if best_gain <= 1e-9:
+            break
+        S.remove(best_out); S.add(best_in)
+        base += best_gain; swaps += 1
+    return list(S), base, swaps
+# ------------------------------------
+
 # ========== begin: slack posting helpers ==========
 def _slack_post_text(text: str, webhook: str | None = None):
     # 既存の送信関数があればそちらを使う：
@@ -641,6 +688,7 @@ if __name__ == "__main__":
     )
 
     # ---- build minimal debug frames ----
+    top_G, top_D = sb.top_G, sb.top_D
     pool_D, pool_G = sb.init_D, sb.init_G
 
     R_G = ib.returns[pool_G]
@@ -651,7 +699,7 @@ if __name__ == "__main__":
         index=R_G.columns, columns=R_G.columns
     )
 
-    union_D = list(dict.fromkeys(pool_D + sb.top_G))
+    union_D = list(dict.fromkeys(pool_D + top_G))
     R_D = ib.returns[union_D]
     R_D = R_D.iloc[-DRRS_D["lookback"]:] if len(R_D) >= DRRS_D["lookback"] else R_D
     R_D = R_D.dropna()
@@ -659,7 +707,7 @@ if __name__ == "__main__":
     cols_D = list(R_D.columns)
     pos_map = {c: i for i, c in enumerate(cols_D)}
     pool_pos = [pos_map[t] for t in pool_D if t in pos_map]
-    g_pos = [pos_map[t] for t in sb.top_G if t in pos_map]
+    g_pos = [pos_map[t] for t in top_G if t in pos_map]
     resid_corr_matrix_D = pd.DataFrame(
         C_all_D[np.ix_(pool_pos, pool_pos)],
         index=[cols_D[i] for i in pool_pos],
@@ -671,23 +719,48 @@ if __name__ == "__main__":
         columns=[cols_D[i] for i in g_pos]
     ) if g_pos else None
 
+    if ENABLE_ONE_SWAP:
+        maxD = _max_swap_gain(top_D, pool_D, fb.d_score_all,
+                              resid_corr_matrix_D, DRRS_D["lam"],
+                              cross_mu=locals().get("CROSS_MU_GD", 0.0),
+                              cross_pen=locals().get("cross_penalty_matrix_D", None))
+        if maxD >= GATE_D:
+            top_D, _, nD = one_swap_local_improve(
+                sel=top_D, pool=pool_D, score_s=fb.d_score_all,
+                corr_mat=resid_corr_matrix_D, lam=DRRS_D["lam"],
+                cross_mu=locals().get("CROSS_MU_GD", 0.0),
+                cross_pen=locals().get("cross_penalty_matrix_D", None),
+                max_swaps=MAX_SWAPS_D
+            )
+            _slack_post_text(f"[1-swap] D run: maxΔ={maxD:.3f}, swaps={nD}")
+
+        maxG = _max_swap_gain(top_G, pool_G, fb.g_score,
+                              resid_corr_matrix_G, DRRS_G["lam"])
+        if maxG >= GATE_G:
+            top_G, _, nG = one_swap_local_improve(
+                sel=top_G, pool=pool_G, score_s=fb.g_score,
+                corr_mat=resid_corr_matrix_G, lam=DRRS_G["lam"],
+                max_swaps=MAX_SWAPS_G
+            )
+            _slack_post_text(f"[1-swap] G run: maxΔ={maxG:.3f}, swaps={nG}")
+
     debug_min_D = build_debug_min(
-        sel=sb.top_D, pool=pool_D, score_s=fb.d_score_all,
+        sel=top_D, pool=pool_D, score_s=fb.d_score_all,
         corr_mat=resid_corr_matrix_D, lam=DRRS_D["lam"],
         cross_mu=CROSS_MU_GD,
         cross_pen=cross_penalty_matrix_D
     )
     debug_min_G = build_debug_min(
-        sel=sb.top_G, pool=pool_G, score_s=fb.g_score,
+        sel=top_G, pool=pool_G, score_s=fb.g_score,
         corr_mat=resid_corr_matrix_G, lam=DRRS_G["lam"]
     )
 
     # ---- slack only (no CSV) ----
-    post_selection_debug_to_slack(debug_min_G, debug_min_D, top_G=sb.top_G, top_D=sb.top_D, header_prefix=run_id if 'run_id' in globals() else "")
+    post_selection_debug_to_slack(debug_min_G, debug_min_D, top_G=top_G, top_D=top_D, header_prefix=run_id if 'run_id' in globals() else "")
 
     # 3) 出力（表示→Slack） — 既存I/Fのまま
     out = Output(debug=debug_mode)
     out.miss_df = fb.missing_logs  # 互換表示のため display_results 内で利用
     out.display_results(exist=exist, bench=bench, df_z=fb.df_z, g_score=fb.g_score, d_score_all=fb.d_score_all,
-                        init_G=sb.init_G, init_D=sb.init_D, top_G=sb.top_G, top_D=sb.top_D)
+                        init_G=sb.init_G, init_D=sb.init_D, top_G=top_G, top_D=top_D, feat=fb)
     out.notify_slack()
