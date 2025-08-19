@@ -589,9 +589,11 @@ class Scorer:
 
         # 全銘柄（初期ユニバース）の index を確定
         universe = sorted(set(g_score_all.index) | set(d_score_all.index))
-        scores_full = pd.DataFrame(index=universe)
-        scores_full["GSC"] = g_score_all.reindex(universe)
-        scores_full["DSC"] = d_score_all.reindex(universe)
+        G_full = g_score_all.reindex(universe).astype(float)
+        D_full = d_score_all.reindex(universe).astype(float)
+        G_full = G_full.fillna(0.0)
+        D_full = D_full.fillna(0.0)
+        scores_full = pd.DataFrame({"GSC": G_full, "DSC": D_full}, index=universe)
 
         feat = FeatureBundle(
             df=df,

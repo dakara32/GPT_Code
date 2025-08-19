@@ -428,39 +428,52 @@ class Output:
         print("📈 ファクター分散最適化の結果")
         if self.miss_df is not None and not self.miss_df.empty: print("Missing Data:"); print(self.miss_df.to_string(index=False))
 
-        extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
-        self.g_table = pd.concat([df_z.loc[G_UNI,['GRW','MOM','TRD','VOL']], g_score[G_UNI].rename('GSC')], axis=1)
-        self.g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
-        self.g_formatters = {col:"{:.2f}".format for col in ['GRW','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
+        top_G = list(top_G)
+        top_D = list(top_D)
+
+        # --- build table for G bucket (ensure sort by GSC desc) ---
+        tbl_G = df_z.loc[top_G, ['GRW','MOM','TRD','VOL','GSC']].copy()
+        tbl_G = tbl_G.sort_values('GSC', ascending=False)
+        tbl_G.index = [f"{t}★" for t in tbl_G.index]
+        self.g_table = tbl_G
+        self.g_formatters = {col:"{:.2f}".format for col in ['GRW','MOM','TRD','VOL']}
+        self.g_formatters['GSC'] = "{:.3f}".format
         self.g_title = (f"[G枠 / {N_G} / GRW{int(g_weights['GRW']*100)} MOM{int(g_weights['MOM']*100)} TRD{int(g_weights['TRD']*100)} VOL{int(g_weights['VOL']*100)} / corrM={corrM} / "
                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
-        print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
+        print(self.g_title)
+        print(self.g_table.to_string(formatters=self.g_formatters))
 
-        extra_D = [t for t in init_D if t not in top_D][:5]; D_UNI = top_D + extra_D
-        cols_D = ['QAL','YLD','VOL','TRD']; d_disp = pd.DataFrame(index=D_UNI)
-        d_disp['QAL'], d_disp['YLD'], d_disp['VOL'], d_disp['TRD'] = df_z.loc[D_UNI,'D_QAL'], df_z.loc[D_UNI,'D_YLD'], df_z.loc[D_UNI,'D_VOL_RAW'], df_z.loc[D_UNI,'D_TRD']
-        self.d_table = pd.concat([d_disp, d_score_all[D_UNI].rename('DSC')], axis=1); self.d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
-        self.d_formatters = {col:"{:.2f}".format for col in cols_D}; self.d_formatters['DSC']="{:.3f}".format
+        # --- build table for D bucket (ensure sort by DSC desc) ---
+        tbl_D = df_z.loc[top_D, ['D_QAL','D_YLD','D_VOL_RAW','D_TRD','DSC']].copy()
+        tbl_D.rename(columns={'D_QAL':'QAL','D_YLD':'YLD','D_VOL_RAW':'VOL','D_TRD':'TRD'}, inplace=True)
+        tbl_D = tbl_D.sort_values('DSC', ascending=False)
+        tbl_D.index = [f"{t}★" for t in tbl_D.index]
+        self.d_table = tbl_D
+        self.d_formatters = {col:"{:.2f}".format for col in ['QAL','YLD','VOL','TRD']}
+        self.d_formatters['DSC'] = "{:.3f}".format
         import scorer
         dw_eff = scorer.D_WEIGHTS_EFF
         self.d_title = (f"[D枠 / {N_D} / QAL{int(dw_eff['QAL']*100)} YLD{int(dw_eff['YLD']*100)} VOL{int(dw_eff['VOL']*100)} TRD{int(dw_eff['TRD']*100)} / corrM={corrM} / "
                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
-        print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
+        print(self.d_title)
+        print(self.d_table.to_string(formatters=self.d_formatters))
 
-        # --- Changes output: OUT銘柄の“フィルター前” GSC/DSC を表示 ---
+        # --- Changes: OUT銘柄の“フィルター前” GSC/DSC を表示 ---
         _scores = getattr(feat, "scores_full", None)
         assert _scores is not None, "scores_full is required (pre-filter scores)."
+        assert not _scores[["GSC","DSC"]].isna().any().any(), "scores_full has NaN."
 
-        in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
-        out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
+        in_list = sorted(set(top_G + top_D) - set(exist))
+        out_list = sorted(set(exist) - set(top_G + top_D))
+        out_list = sorted(out_list, key=lambda t: (_scores.at[t, "DSC"], _scores.at[t, "GSC"]), reverse=True)
         changes = list(zip_longest(in_list, out_list, fillvalue=""))
 
         print("Changes")
         print("IN / OUT   GSC    DSC")
         lines = ["IN / OUT   GSC    DSC"]
-        for tin, tout in changes:  # 形式: (IN, OUT)
-            g_out = float(_scores.at[tout, "GSC"])
-            d_out = float(_scores.at[tout, "DSC"])
+        for tin, tout in changes:
+            g_out = float(_scores.at[tout, "GSC"]) if tout else 0.0
+            d_out = float(_scores.at[tout, "DSC"]) if tout else 0.0
             line = f"{tin:>4} / {tout:<4} {g_out:6.3f} {d_out:6.3f}"
             print(line)
             lines.append(line)
