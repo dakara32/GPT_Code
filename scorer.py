@@ -587,13 +587,23 @@ class Scorer:
             _test = d_comp.assign(VOL=d_comp['VOL'] + eps).mul(dw, axis=1).sum(axis=1)
             print("VOL増→d_score低下の比率:", ((_test <= _base) | _test.isna() | _base.isna()).mean())
 
-        return FeatureBundle(
+        # 全銘柄（初期ユニバース）の index を確定
+        universe = sorted(set(g_score_all.index) | set(d_score_all.index))
+        scores_full = pd.DataFrame(index=universe)
+        scores_full["GSC"] = g_score_all.reindex(universe)
+        scores_full["DSC"] = d_score_all.reindex(universe)
+
+        feat = FeatureBundle(
             df=df,
             df_z=df_z,
             g_score=g_score,
             d_score_all=d_score_all,
             missing_logs=pd.DataFrame(missing_logs)
         )
+        object.__setattr__(feat, "scores_full", scores_full)
+        object.__setattr__(feat, "g_score_full", scores_full["GSC"])
+        object.__setattr__(feat, "d_score_full", scores_full["DSC"])
+        return feat
 
 
 # === 単体実行サンプル（最小） =================================================
