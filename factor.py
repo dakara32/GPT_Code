@@ -10,7 +10,6 @@ exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_ticker
 CAND_PRICE_MAX, bench = 400, '^GSPC'  # 価格上限・ベンチマーク
 N_G, N_D = 12, 13  # G/D枠サイズ
 g_weights = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
-D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.9"))
 D_weights = {'QAL':0.1,'YLD':0.25,'VOL':-0.4,'TRD':0.25}
 
 # DRRS 初期プール・各種パラメータ
@@ -27,7 +26,7 @@ RESULTS_DIR, G_PREV_JSON, D_PREV_JSON = "results", os.path.join("results","G_sel
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # その他
-debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
+debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
 
 
 # ===== 共有DTO（クラス間I/O契約）＋ Config =====
@@ -100,10 +99,6 @@ def _safe_div(a, b):
 def _safe_last(series: pd.Series, default=np.nan):
     try: return float(series.iloc[-1])
     except Exception: return default
-
-def _load_prev(path: str):
-    try: return json.load(open(path)).get("tickers")
-    except Exception: return None
 
 def _save_sel(path: str, tickers: list[str], avg_r: float, sum_score: float, objective: float):
     with open(path,"w") as f:
@@ -354,7 +349,8 @@ class Selector:
 
     # ---- 選定（スコア Series / returns だけを受ける）----
     def select_buckets(self, returns_df: pd.DataFrame, g_score: pd.Series, d_score_all: pd.Series, cfg: PipelineConfig) -> SelectionBundle:
-        init_G = g_score.nlargest(min(cfg.drrs.corrM, len(g_score))).index.tolist(); prevG = None
+        init_G = g_score.nlargest(min(cfg.drrs.corrM, len(g_score))).index.tolist()
+        prevG = None
         resG = self.select_bucket_drrs(returns_df=returns_df, score_ser=g_score, pool_tickers=init_G, k=N_G,
                                        n_pc=cfg.drrs.G.get("n_pc",3), gamma=cfg.drrs.G.get("gamma",1.2),
                                        lam=cfg.drrs.G.get("lam",0.68), eta=cfg.drrs.G.get("eta",0.8),
@@ -365,9 +361,7 @@ class Selector:
         # df_z に依存せず、スコアの index から D プールを構成（機能は同等）
         d_score = d_score_all.drop(top_G, errors='ignore')
         D_pool_index = d_score.index
-        init_D = d_score.loc[D_pool_index].nlargest(min(cfg.drrs.corrM, len(D_pool_index))).index.tolist(); prevD = None
-        # 復帰ロジック完全無効化: 常に新規選定
-        prevG = None
+        init_D = d_score.loc[D_pool_index].nlargest(min(cfg.drrs.corrM, len(D_pool_index))).index.tolist()
         prevD = None
         mu = cfg.drrs.cross_mu_gd
         resD = self.select_bucket_drrs(returns_df=returns_df, score_ser=d_score_all, pool_tickers=init_D, k=N_D,
@@ -544,15 +538,12 @@ if __name__ == "__main__":
     scorer = Scorer()
     fb = scorer.aggregate_scores(ib, cfg)
 
-    # Dスコアを β<0.9 通過銘柄に限定
-    d_score_beta = fb.d_score_all[fb.df['BETA'] < D_BETA_MAX]
-
     # 2.5) 選定（相関低減）
     selector = Selector()
     sb = selector.select_buckets(
         returns_df=ib.returns,
         g_score=fb.g_score,
-        d_score_all=d_score_beta,   # βフィルタ済みを渡す
+        d_score_all=fb.d_score_all,
         cfg=cfg
     )
 

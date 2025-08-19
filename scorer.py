@@ -108,7 +108,7 @@ DEFAULT_CONFIG = PipelineConfig(
 )
 
 # Slack/Debug 環境に合わせて既存変数を許容（未定義なら無視）
-debug_mode = bool(os.environ.get("SCORER_DEBUG", "0") == "1")
+debug_mode = True
 # D用β帯（既定は 0.20 ≤ β < 0.80）
 D_BETA_MIN = float(os.environ.get("D_BETA_MIN", "0.20"))
 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.80"))
@@ -578,12 +578,6 @@ class Scorer:
         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
         g_score = g_score_all.loc[mask]
         df_z['GSC'] = g_score_all
-        df_z['DSC'] = d_score_all
-
-        # --- D枠のβフィルタ（採用可視化） ---
-        d_pass_beta = df['BETA'] < D_BETA_MAX
-        df_z['D_PASS_BETA'] = d_pass_beta.astype(float)          # 1/0 フラグ
-        df_z['DSC_DPASS']   = d_score_all.where(d_pass_beta, np.nan)  # β基準未満は NaN
 
         if debug_mode:
             eps = 0.1
