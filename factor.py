@@ -2,6 +2,7 @@
 import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
 from dataclasses import dataclass
 from typing import Dict, List
+from itertools import zip_longest
 from scorer import Scorer
 from scipy.stats import zscore
 
@@ -381,7 +382,8 @@ class Selector:
 class Output:
     def __init__(self, debug=False):
         self.debug = debug
-        self.miss_df = self.g_table = self.d_table = self.io_table = self.df_metrics_fmt = self.debug_table = None
+        self.miss_df = self.g_table = self.d_table = self.df_metrics_fmt = self.debug_table = None
+        self.changes_text = None
         self.g_title = self.d_title = ""
         self.div_details = {}
         self.g_formatters = self.d_formatters = {}
@@ -437,29 +439,20 @@ class Output:
                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
 
-        # === Changes（IN の GSC/DSC を表示。OUT は銘柄名のみ） ===
+        # --- Changes output (fix: show OUT-side scores) ---
         in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
         out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
-
-        # 全銘柄スコア（Scorer で df_z['GSC'], df_z['DSC'] を作っている想定）
-        gsc_full = df_z['GSC'] if 'GSC' in df_z.columns else g_score
-
-        # 帯通過の値を優先、無ければ全体値（= NaN を回避）
-        if 'DSC_DPASS' in df_z.columns and 'DSC' in df_z.columns:
-            dsc_for_display = df_z['DSC_DPASS'].fillna(df_z['DSC'])
-        else:
-            dsc_for_display = df_z['DSC'] if 'DSC' in df_z.columns else d_score_all
-
-        # 表は「IN / OUT | GSC | DSC」…GSC/DSC は IN の値を表示
-        self.io_table = pd.DataFrame({
-            'IN': pd.Series(in_list),
-            '/ OUT': pd.Series(out_list)
-        })
-        self.io_table['GSC'] = gsc_full.reindex(in_list).round(3).reset_index(drop=True)
-        self.io_table['DSC'] = dsc_for_display.reindex(in_list).round(3).reset_index(drop=True)
-
-        print("Changes:")
-        print(self.io_table.to_string(index=False, na_rep="NaN"))
+        changes = list(zip_longest(in_list, out_list, fillvalue=""))
+        lines = ["IN / OUT   GSC    DSC"]
+        for tin, tout in changes:
+            g_out = g_score.get(tout, float("nan"))
+            d_out = d_score_all.get(tout, float("nan"))
+            lines.append(f"{tin:>4} / {tout:<4} {g_out:6.3f} {d_out:6.3f}")
+        print("Changes")
+        for ln in lines[1:]:
+            print(ln)
+        self.changes_text = "\n".join(lines)
+        # ---------------------------------------------------
 
         all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
@@ -511,7 +504,7 @@ class Output:
         if self.miss_df is not None and not self.miss_df.empty: message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
         message += self.g_title + "\n```" + self.g_table.to_string(formatters=self.g_formatters) + "```\n"
         message += self.d_title + "\n```" + self.d_table.to_string(formatters=self.d_formatters) + "```\n"
-        message += "Changes\n```" + self.io_table.to_string(index=False) + "```\n"
+        message += "Changes\n```" + (self.changes_text or "") + "```\n"
         # 低スコアTOP10（GSC+DSC）
         if self.low10_table is not None:
             message += "Low Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
@@ -524,6 +517,102 @@ class Output:
         except Exception as e: print(f"⚠️ Slack通知エラー: {e}")
 
 
+# ========== begin: minimal debug columns ==========
+def _obj_val(S, score_s, corr_mat, lam, cross_mu=0.0, cross_pen=None):
+    S = list(S)
+    if len(S) <= 1:
+        avg_corr = 0.0
+    else:
+        sub = corr_mat.loc[S, S]
+        vals = np.abs(sub.values[np.triu_indices_from(sub, 1)])
+        avg_corr = float(vals.mean()) if vals.size else 0.0
+    sum_score = float(score_s.loc[S].sum()) if len(S) else 0.0
+    cross_term = 0.0
+    if cross_pen is not None and cross_mu > 0 and len(S):
+        cross_term = float(np.abs(cross_pen.loc[S].values).mean())
+    return sum_score - lam * avg_corr - cross_mu * cross_term
+
+
+def build_debug_min(sel, pool, score_s, corr_mat, lam, cross_mu=0.0, cross_pen=None):
+    """
+    返り: index=ticker, columns=[avg_abs_res_corr_to_sel, delta_objective]
+    - 採用: その銘柄を外した場合の Δobjective
+    - 非採用: その銘柄を入れて最良の1名を外した場合の Δobjective
+    """
+    S = list(sel)
+    P = list(set(pool))
+    base = _obj_val(S, score_s, corr_mat, lam, cross_mu, cross_pen)
+
+    rows = []
+
+    # 採用（remove）
+    for t in S:
+        S2 = [x for x in S if x != t]
+        delta = _obj_val(S2, score_s, corr_mat, lam, cross_mu, cross_pen) - base
+        avg_corr = 0.0 if not S2 else float(np.abs(corr_mat.loc[t, S2]).mean())
+        rows.append(dict(ticker=t, avg_abs_res_corr_to_sel=avg_corr, delta_objective=delta))
+
+    # 非採用（add + best remove）
+    outsiders = list(set(P) - set(S))
+    for inn in outsiders:
+        best = -np.inf
+        for out in S:
+            cand = [x for x in S if x != out] + [inn]
+            obj = _obj_val(cand, score_s, corr_mat, lam, cross_mu, cross_pen)
+            if obj > best:
+                best = obj
+        delta = best - base
+        avg_corr = 0.0 if not S else float(np.abs(corr_mat.loc[inn, S]).mean())
+        rows.append(dict(ticker=inn, avg_abs_res_corr_to_sel=avg_corr, delta_objective=delta))
+
+    return pd.DataFrame(rows).set_index("ticker")
+
+
+# ========== end: minimal debug columns ==========
+
+# ========== begin: slack posting helpers ==========
+def _slack_post_text(text: str, webhook: str | None = None):
+    # 既存の送信関数があればそちらを使う：
+    try:
+        from notifier import send_slack
+        return send_slack(text)
+    except Exception:
+        pass
+    # 無ければ webhook 直叩き
+    url = webhook or os.environ.get("SLACK_WEBHOOK_URL")
+    if not url:
+        print("[warn] SLACK_WEBHOOK_URL not set; skip slack post.")
+        return
+    try:
+        requests.post(url, json={"text": text}, timeout=10)
+    except Exception as e:
+        print(f"[warn] slack post failed: {e}")
+
+
+def _format_debug_for_slack(df: pd.DataFrame, selected_set: set[str], title: str, top_pos: int = 12):
+    # Δobjective > 0（改善余地あり）だけ抜粋、上位表示
+    pos = df[df["delta_objective"] > 0].sort_values("delta_objective", ascending=False)
+    head = pos.head(top_pos)
+    lines = [f"*{title}*  (positives {len(pos)}/{len(df)})", "```", "ticker sel  avg_abs_res_corr  delta_objective"]
+    for t, row in head.iterrows():
+        sel = "★" if t in selected_set else " "
+        lines.append(f"{t:6} {sel}   {row['avg_abs_res_corr_to_sel']: .5f}     {row['delta_objective']: .6f}")
+    lines.append("```")
+    if head.empty:
+        lines = [f"*{title}*  (no positives)"]
+    return "\n".join(lines)
+
+
+def post_selection_debug_to_slack(debug_min_G: pd.DataFrame, debug_min_D: pd.DataFrame, top_G: list[str], top_D: list[str], header_prefix: str = ""):
+    chunks = []
+    chunks.append(_format_debug_for_slack(debug_min_G, set(top_G), f"{header_prefix}G-bucket debug"))
+    chunks.append(_format_debug_for_slack(debug_min_D, set(top_D), f"{header_prefix}D-bucket debug"))
+    # Slackの1メッセージ上限を避けるため分割送信
+    for m in chunks:
+        _slack_post_text(m)
+
+
+# ========== end: slack posting helpers ==========
 # ===== エントリポイント =====
 if __name__ == "__main__":
     # 0) Config を束ねる（元の定数をそのまま使用）
@@ -550,6 +639,51 @@ if __name__ == "__main__":
         d_score_all=fb.d_score_all,  # ※ β<0.80 は scorer.py で反映済み
         cfg=cfg
     )
+
+    # ---- build minimal debug frames ----
+    pool_D, pool_G = sb.init_D, sb.init_G
+
+    R_G = ib.returns[pool_G]
+    R_G = R_G.iloc[-DRRS_G["lookback"]:] if len(R_G) >= DRRS_G["lookback"] else R_G
+    R_G = R_G.dropna()
+    resid_corr_matrix_G = pd.DataFrame(
+        Selector.residual_corr(R_G.to_numpy(), n_pc=DRRS_G["n_pc"], shrink=DRRS_SHRINK),
+        index=R_G.columns, columns=R_G.columns
+    )
+
+    union_D = list(dict.fromkeys(pool_D + sb.top_G))
+    R_D = ib.returns[union_D]
+    R_D = R_D.iloc[-DRRS_D["lookback"]:] if len(R_D) >= DRRS_D["lookback"] else R_D
+    R_D = R_D.dropna()
+    C_all_D = Selector.residual_corr(R_D.to_numpy(), n_pc=DRRS_D["n_pc"], shrink=DRRS_SHRINK)
+    cols_D = list(R_D.columns)
+    pos_map = {c: i for i, c in enumerate(cols_D)}
+    pool_pos = [pos_map[t] for t in pool_D if t in pos_map]
+    g_pos = [pos_map[t] for t in sb.top_G if t in pos_map]
+    resid_corr_matrix_D = pd.DataFrame(
+        C_all_D[np.ix_(pool_pos, pool_pos)],
+        index=[cols_D[i] for i in pool_pos],
+        columns=[cols_D[i] for i in pool_pos]
+    )
+    cross_penalty_matrix_D = pd.DataFrame(
+        C_all_D[np.ix_(pool_pos, g_pos)],
+        index=[cols_D[i] for i in pool_pos],
+        columns=[cols_D[i] for i in g_pos]
+    ) if g_pos else None
+
+    debug_min_D = build_debug_min(
+        sel=sb.top_D, pool=pool_D, score_s=fb.d_score_all,
+        corr_mat=resid_corr_matrix_D, lam=DRRS_D["lam"],
+        cross_mu=CROSS_MU_GD,
+        cross_pen=cross_penalty_matrix_D
+    )
+    debug_min_G = build_debug_min(
+        sel=sb.top_G, pool=pool_G, score_s=fb.g_score,
+        corr_mat=resid_corr_matrix_G, lam=DRRS_G["lam"]
+    )
+
+    # ---- slack only (no CSV) ----
+    post_selection_debug_to_slack(debug_min_G, debug_min_D, top_G=sb.top_G, top_D=sb.top_D, header_prefix=run_id if 'run_id' in globals() else "")
 
     # 3) 出力（表示→Slack） — 既存I/Fのまま
     out = Output(debug=debug_mode)
