@@ -1,9 +1,9 @@
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
 import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
-from scipy.stats import zscore
 from dataclasses import dataclass
 from typing import Dict, List
 from scorer import Scorer
+from scipy.stats import zscore
 
 # ===== ユニバースと定数（冒頭に固定） =====
 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
@@ -358,7 +358,8 @@ class Selector:
                                        shrink=cfg.drrs.shrink, g_fixed_tickers=None, mu=0.0)
         top_G = resG["tickers"]
 
-        # df_z に依存せず、スコアの index から D プールを構成（機能は同等）
+        # Dプールは scorer 側で β<0.80 を反映済みの d_score_all を利用
+        # （βフィルタは scorer.py に統一。ここではフィルタを一切行わない）
         d_score = d_score_all.drop(top_G, errors='ignore')
         D_pool_index = d_score.index
         init_D = d_score.loc[D_pool_index].nlargest(min(cfg.drrs.corrM, len(D_pool_index))).index.tolist()
@@ -484,8 +485,9 @@ class Output:
         print("Diversification (NEW breakdown):"); 
         for k,v in self.div_details.items(): print(f"  {k}: {np.nan if v is None else round(v,3)}")
         if self.debug:
+            # Debug は生β（BETA_RAW）のみを表示（Z化βや派生列は表示しない）
             dbg_cols = ['TR','EPS','REV','ROE','BETA_RAW','DIV','FCF','RS','TR_str','DIV_STREAK','DSC']
-            self.debug_table = df_z[dbg_cols].round(3)
+            self.debug_table = df_z.reindex(columns=dbg_cols).round(3)
             print("Debug Data:")
             print(self.debug_table.to_string())
 
@@ -545,7 +547,7 @@ if __name__ == "__main__":
     sb = selector.select_buckets(
         returns_df=ib.returns,
         g_score=fb.g_score,
-        d_score_all=fb.d_score_all,
+        d_score_all=fb.d_score_all,  # ※ β<0.80 は scorer.py で反映済み
         cfg=cfg
     )
 
