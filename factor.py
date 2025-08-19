@@ -12,6 +12,7 @@ N_G, N_D = 12, 13  # G/D枠サイズ
 g_weights = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.9"))
 D_weights = {'QAL':0.1,'YLD':0.25,'VOL':-0.4,'TRD':0.25}
+TT_COL = "TT_OK"
 
 # DRRS 初期プール・各種パラメータ
 corrM = 45
@@ -108,6 +109,14 @@ def _load_prev(path: str):
 def _save_sel(path: str, tickers: list[str], avg_r: float, sum_score: float, objective: float):
     with open(path,"w") as f:
         json.dump({"tickers":tickers,"avg_res_corr":round(avg_r,6),"sum_score":round(sum_score,6),"objective":round(objective,6)}, f, indent=2)
+
+def _diff_changes(prev, curr):
+    prev = prev or []
+    prev_set, curr_set = set(prev), set(curr)
+    out  = [t for t in prev if t not in curr_set]
+    inn  = [t for t in curr if t not in prev_set]
+    stay = [t for t in curr if t in prev_set]
+    return {"Out": out, "In": inn, "Stay": stay}
 
 
 # ===== Input：外部I/Oと前処理（CSV/API・欠損補完） =====
@@ -383,12 +392,14 @@ class Selector:
 class Output:
     def __init__(self, debug=False):
         self.debug = debug
-        self.miss_df = self.g_table = self.d_table = self.io_table = self.df_metrics_fmt = self.debug_table = None
+        self.miss_df = self.g_table = self.d_table = self.df_metrics_fmt = self.debug_table = None
         self.g_title = self.d_title = ""
         self.div_details = {}
         self.g_formatters = self.d_formatters = {}
         # 低スコア（GSC+DSC）Top10 表示/送信用
         self.low10_table = None
+        self.changes = {}
+        self.g_out_table = self.d_out_table = None
 
     # --- メトリクス補助（Output専用） ---
     @staticmethod
@@ -439,26 +450,24 @@ class Output:
                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
 
-        # === Changes（IN の GSC/DSC を表示。OUT は銘柄名のみ） ===
-        in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
-        out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
+        changes = {
+            "GSC": _diff_changes(_load_prev(G_PREV_JSON), top_G),
+            "DSC": _diff_changes(_load_prev(D_PREV_JSON), top_D),
+        }
+        self.changes = changes
+        print(f"GSC Out: {', '.join(changes['GSC']['Out']) or '-'}")
+        print(f"DSC Out: {', '.join(changes['DSC']['Out']) or '-'}")
 
-        # 全銘柄スコア（Scorer で df_z['GSC'], df_z['DSC'] を作っている想定）
-        gsc_full = df_z['GSC'] if 'GSC' in df_z.columns else g_score
-        dsc_full = df_z['DSC_DPASS'] if 'DSC_DPASS' in df_z.columns else (
-            df_z['DSC'] if 'DSC' in df_z.columns else d_score_all
-        )
-
-        # 表は「IN / OUT | GSC | DSC」…GSC/DSC は IN の値を表示
-        self.io_table = pd.DataFrame({
-            'IN': pd.Series(in_list),
-            '/ OUT': pd.Series(out_list)
-        })
-        self.io_table['GSC'] = gsc_full.reindex(in_list).round(3).reset_index(drop=True)
-        self.io_table['DSC'] = dsc_full.reindex(in_list).round(3).reset_index(drop=True)
-
-        print("Changes:")
-        print(self.io_table.to_string(index=False, na_rep="NaN"))
+        G_COLS = ['GRW','MOM','TRD','VOL']
+        D_COLS = ['QAL','YLD','VOL','TRD']
+        self.g_out_table = df_z.reindex(changes['GSC']['Out'])[G_COLS]
+        self.d_out_table = df_z.reindex(changes['DSC']['Out'])[D_COLS]
+        if not self.g_out_table.empty:
+            print("GSC Out detail:")
+            print(self.g_out_table.to_string(formatters=self.g_formatters))
+        if not self.d_out_table.empty:
+            print("DSC Out detail:")
+            print(self.d_out_table.to_string(formatters=self.d_formatters))
 
         all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
@@ -507,7 +516,12 @@ class Output:
         if self.miss_df is not None and not self.miss_df.empty: message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
         message += self.g_title + "\n```" + self.g_table.to_string(formatters=self.g_formatters) + "```\n"
         message += self.d_title + "\n```" + self.d_table.to_string(formatters=self.d_formatters) + "```\n"
-        message += "Changes\n```" + self.io_table.to_string(index=False) + "```\n"
+        message += f"GSC Out: {', '.join(self.changes.get('GSC', {}).get('Out', [])) or '-'}\n"
+        message += f"DSC Out: {', '.join(self.changes.get('DSC', {}).get('Out', [])) or '-'}\n"
+        if self.g_out_table is not None and not self.g_out_table.empty:
+            message += "GSC Out detail\n```" + self.g_out_table.to_string(formatters=self.g_formatters) + "```\n"
+        if self.d_out_table is not None and not self.d_out_table.empty:
+            message += "DSC Out detail\n```" + self.d_out_table.to_string(formatters=self.d_formatters) + "```\n"
         # 低スコアTOP10（GSC+DSC）
         if self.low10_table is not None:
             message += "Low Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
@@ -537,22 +551,25 @@ if __name__ == "__main__":
     # 2) 集計（純粋）：特徴量→Z化→合成スコア
     scorer = Scorer()
     fb = scorer.aggregate_scores(ib, cfg)
+    df, dfz = fb.df, fb.df_z
+    mask_tt = df[TT_COL].eq(1) if TT_COL in df.columns else df.index == df.index
 
-    # Dスコアを β<0.9 通過銘柄に限定
-    d_score_beta = fb.d_score_all[fb.df['BETA'] < D_BETA_MAX]
+    # Dスコアを β<0.9 通過銘柄に限定し、テンプレ合格のみ
+    d_score_beta = fb.d_score_all[mask_tt & (df['BETA'] < D_BETA_MAX)]
+    g_score_tt = fb.g_score[mask_tt]
 
     # 2.5) 選定（相関低減）
     selector = Selector()
     sb = selector.select_buckets(
         returns_df=ib.returns,
-        g_score=fb.g_score,
-        d_score_all=d_score_beta,   # βフィルタ済みを渡す
+        g_score=g_score_tt,
+        d_score_all=d_score_beta,   # β/テンプレ フィルタ済みを渡す
         cfg=cfg
     )
 
     # 3) 出力（表示→Slack） — 既存I/Fのまま
     out = Output(debug=debug_mode)
     out.miss_df = fb.missing_logs  # 互換表示のため display_results 内で利用
-    out.display_results(exist=exist, bench=bench, df_z=fb.df_z, g_score=fb.g_score, d_score_all=fb.d_score_all,
+    out.display_results(exist=exist, bench=bench, df_z=dfz, g_score=fb.g_score, d_score_all=fb.d_score_all,
                         init_G=sb.init_G, init_D=sb.init_D, top_G=sb.top_G, top_D=sb.top_D)
     out.notify_slack()

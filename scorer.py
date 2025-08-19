@@ -112,6 +112,7 @@ debug_mode = bool(os.environ.get("SCORER_DEBUG", "0") == "1")
 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.9"))
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 D_WEIGHTS_EFF = None  # 出力表示互換のため
+TT_COL = "TT_OK"  # Trend Template pass flag (1/0)
 
 # ---- Scorer 本体 -------------------------------------------------------------
 class Scorer:
@@ -545,10 +546,10 @@ class Scorer:
             c8 = (row.get('RS', np.nan) >= 0.10)
             return bool(c1 and c2 and c3 and c4 and c5 and c6 and c7 and c8)
 
-        mask = df.apply(_trend_template_pass, axis=1).fillna(False)
+        mask_tt = df.apply(_trend_template_pass, axis=1).fillna(False)
 
-        if not bool(mask.any()):
-            mask = (
+        if not bool(mask_tt.any()):
+            mask_tt = (
                 (df.get('P_OVER_LOW52', np.nan) >= 0.25) &
                 (df.get('NEAR_52W_HIGH', np.nan) >= -0.30) &
                 (df.get('RS', np.nan) >= 0.08) &
@@ -559,8 +560,12 @@ class Scorer:
                 (df.get('TR_str', np.nan) > 0)
             ).fillna(False)
 
-        # ③ 採用用は mask、表示/分析用は列で全銘柄保存
-        g_score = g_score_all.loc[mask]
+        mask_tt = mask_tt.reindex(df.index).fillna(False)
+        df[TT_COL] = mask_tt.astype(int)
+        df_z[TT_COL] = df[TT_COL].values
+
+        # ③ 行削除はせず、合格フラグのみ付与
+        g_score = g_score_all
         df_z['GSC'] = g_score_all
         df_z['DSC'] = d_score_all
 
