@@ -484,8 +484,10 @@ class Output:
         print("Diversification (NEW breakdown):"); 
         for k,v in self.div_details.items(): print(f"  {k}: {np.nan if v is None else round(v,3)}")
         if self.debug:
-            self.debug_table = pd.concat([df_z[['TR','EPS','REV','ROE','BETA','DIV','FCF','RS','TR_str','DIV_STREAK']], g_score.rename('GSC'), d_score_all.rename('DSC')], axis=1).round(3)
-            print("Debug Data:"); print(self.debug_table.to_string())
+            dbg_cols = ['TR','EPS','REV','ROE','BETA_RAW','DIV','FCF','RS','TR_str','DIV_STREAK','DSC']
+            self.debug_table = df_z[dbg_cols].round(3)
+            print("Debug Data:")
+            print(self.debug_table.to_string())
 
         # === 追加: GSC+DSC が低い順 TOP10 ===
         try:
