@@ -4,6 +4,8 @@ from scipy.stats import zscore
 from dataclasses import dataclass
 from typing import Dict, List
 from scorer import Scorer
+import os
+import requests
 
 # ===== ユニバースと定数（冒頭に固定） =====
 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
@@ -520,6 +522,42 @@ class Output:
         except Exception as e: print(f"⚠️ Slack通知エラー: {e}")
 
 
+def _infer_g_universe(feature_df, selected12=None, near5=None):
+    try:
+        out = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
+        if out: return out
+    except Exception:
+        pass
+    base = set()
+    for lst in (selected12 or []), (near5 or []):
+        for x in (lst or []): base.add(x)
+    return list(base) if base else list(feature_df.index)
+
+
+def _fmt_with_fire_mark(tickers, feature_df):
+    out = []
+    for t in tickers or []:
+        try:
+            br = bool(feature_df.at[t, "G_BREAKOUT_recent_5d"])
+            pb = bool(feature_df.at[t, "G_PULLBACK_recent_5d"])
+            out.append(f"{t}{' 🔥' if (br or pb) else ''}")
+        except Exception:
+            out.append(t)
+    return out
+
+
+def _label_recent_event(t, feature_df):
+    try:
+        br = bool(feature_df.at[t, "G_BREAKOUT_recent_5d"]); dbr = str(feature_df.at[t, "G_BREAKOUT_last_date"]) if br else ""
+        pb = bool(feature_df.at[t, "G_PULLBACK_recent_5d"]); dpb = str(feature_df.at[t, "G_PULLBACK_last_date"]) if pb else ""
+        if   br and not pb: return f"{t}（ブレイクアウト確定 {dbr}）"
+        elif pb and not br: return f"{t}（押し目反発 {dpb}）"
+        elif br and pb:     return f"{t}（ブレイクアウト確定 {dbr}／押し目反発 {dpb}）"
+    except Exception:
+        pass
+    return t
+
+
 # ===== エントリポイント =====
 if __name__ == "__main__":
     # 0) Config を束ねる（元の定数をそのまま使用）
@@ -549,6 +587,44 @@ if __name__ == "__main__":
         d_score_all=d_score_beta,   # βフィルタ済みを渡す
         cfg=cfg
     )
+
+    selected12 = sb.top_G  # 既存ロジックのまま
+
+    # 次点5：g_score降順から選定12を除いた上位5
+    try:
+        ranked_all = fb.g_score.sort_values(ascending=False)
+        near5 = [t for t in ranked_all.index if t not in selected12][:5]
+    except Exception:
+        near5 = []
+
+    df   = fb.df
+    guni = _infer_g_universe(df, selected12, near5)
+
+    # 直近5営業日のイベント（Gユニバース内のみ）
+    try:
+        fire_recent = [t for t in guni
+                       if (str(df.at[t,"G_BREAKOUT_recent_5d"])=="True") or (str(df.at[t,"G_PULLBACK_recent_5d"])=="True")]
+    except Exception:
+        fire_recent = []
+
+    lines = []
+    lines.append("【G枠レポート｜週次モニタ（直近5営業日）】")
+    lines.append("【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知")
+    lines.append(f"選定12: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else "選定12: なし")
+    lines.append(f"次点5: {', '.join(_fmt_with_fire_mark(near5, df))}" if near5 else "次点5: なし")
+
+    if fire_recent:
+        fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
+        lines.append(f"過去5営業日の検知: {fire_list}")
+    else:
+        lines.append("過去5営業日の検知: なし")
+
+    try:
+        webhook = os.environ.get("SLACK_WEBHOOK_URL","")
+        if webhook:
+            requests.post(webhook, json={"text":"\n".join(lines)}, timeout=10)
+    except Exception:
+        pass
 
     # 3) 出力（表示→Slack） — 既存I/Fのまま
     out = Output(debug=debug_mode)
