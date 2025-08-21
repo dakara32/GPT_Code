@@ -96,7 +96,7 @@ class PipelineConfig:
 
 # ---- デフォルト設定（外部が渡せばそれを優先） -------------------------------
 DEFAULT_G_WEIGHTS = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
-DEFAULT_D_WEIGHTS = {'QAL':0.10,'YLD':0.25,'VOL':-0.40,'TRD':0.25}
+DEFAULT_D_WEIGHTS = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
 DEFAULT_DRRS = DRRSParams(
     corrM=45, shrink=0.10,
     G=dict(lookback=252, n_pc=3, gamma=1.2, lam=0.68, eta=0.8),
