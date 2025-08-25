@@ -558,77 +558,155 @@ def _label_recent_event(t, feature_df):
     return t
 
 
-# ===== エントリポイント =====
-if __name__ == "__main__":
-    # 0) Config を束ねる（元の定数をそのまま使用）
+# ===== パイプライン可視化：G/D共通フロー（出力は不変） ==============================
+
+def io_build_input_bundle() -> InputBundle:
+    """
+    既存の『データ取得→前処理』を実行し、InputBundle を返す。
+    処理内容・列名・丸め・例外・ログ文言は現行どおり（変更禁止）。
+    """
+    inp = Input(cand=cand, exist=exist, bench=bench,
+                price_max=CAND_PRICE_MAX, finnhub_api_key=FINNHUB_API_KEY)
+    state = inp.prepare_data()
+    return InputBundle(
+        cand=state["cand"], tickers=state["tickers"], bench=bench,
+        data=state["data"], px=state["px"], spx=state["spx"],
+        tickers_bulk=state["tickers_bulk"], info=state["info"],
+        eps_df=state["eps_df"], fcf_df=state["fcf_df"],
+        returns=state["returns"]
+    )
+
+def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
+              n_target: int, prev_json_path: str) -> tuple[list, float, float, float]:
+    """
+    G/Dを同一手順で処理：採点→フィルター→選定（相関低減込み）。
+    戻り値：(pick, avg_res_corr, sum_score, objective)
+    JSON保存は既存フォーマット（キー名・丸め桁・順序）を踏襲。
+    """
+    sc.cfg = cfg
+
+    feat_fn = getattr(sc, "score_build_features", None)
+    agg_fn = getattr(sc, "score_aggregate", None)
+    if callable(feat_fn):
+        feat = feat_fn(inb)
+        agg = agg_fn(feat, group, cfg) if callable(agg_fn) else feat
+    else:
+        fb = sc.aggregate_scores(inb, cfg)
+        sc._feat = fb
+        agg = fb.g_score if group == "G" else fb.d_score_all
+        if group == "D" and hasattr(fb, "df"):
+            agg = agg[fb.df['BETA'] < D_BETA_MAX]
+
+    flt_fn = getattr(sc, "filter_candidates", None)
+    if callable(flt_fn):
+        mask = flt_fn(inb, agg, group, cfg)
+        agg = agg[mask]
+
+    selector = Selector()
+    prev = _load_prev(prev_json_path)
+    sel_fn = getattr(sc, "select_diversified", None)
+    if callable(sel_fn):
+        pick, avg_r, sum_sc, obj = sel_fn(
+            agg, group, cfg, n_target,
+            selector=selector, prev_tickers=prev,
+            corrM=cfg.drrs.corrM, shrink=cfg.drrs.shrink,
+            cross_mu=cfg.drrs.cross_mu_gd
+        )
+    else:
+        if group == "G":
+            init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
+            res = selector.select_bucket_drrs(
+                returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
+                n_pc=cfg.drrs.G.get("n_pc", 3), gamma=cfg.drrs.G.get("gamma", 1.2),
+                lam=cfg.drrs.G.get("lam", 0.68), eta=cfg.drrs.G.get("eta", 0.8),
+                lookback=cfg.drrs.G.get("lookback", 252), prev_tickers=prev,
+                shrink=cfg.drrs.shrink, g_fixed_tickers=None, mu=0.0
+            )
+        else:
+            init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
+            g_fixed = getattr(sc, "_top_G", None)
+            res = selector.select_bucket_drrs(
+                returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
+                n_pc=cfg.drrs.D.get("n_pc", 4), gamma=cfg.drrs.D.get("gamma", 0.8),
+                lam=cfg.drrs.D.get("lam", 0.85), eta=cfg.drrs.D.get("eta", 0.5),
+                lookback=cfg.drrs.D.get("lookback", 504), prev_tickers=prev,
+                shrink=cfg.drrs.shrink, g_fixed_tickers=g_fixed,
+                mu=cfg.drrs.cross_mu_gd
+            )
+        pick = res["tickers"]; avg_r = res["avg_res_corr"]
+        sum_sc = res["sum_score"]; obj = res["objective"]
+
+    _save_sel(prev_json_path, pick, avg_r, sum_sc, obj)
+    if group == "G":
+        sc._top_G = pick
+    return pick, avg_r, sum_sc, obj
+
+def run_pipeline() -> SelectionBundle:
+    """
+    G/D共通フローの入口。I/Oはここだけで実施し、計算はScorerに委譲。
+    Slack文言・丸め・順序は既存の Output を用いて変更しない。
+    """
+    inb = io_build_input_bundle()
     cfg = PipelineConfig(
         weights=WeightsConfig(g=g_weights, d=D_weights),
-        drrs=DRRSParams(corrM=corrM, shrink=DRRS_SHRINK, G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD),
+        drrs=DRRSParams(corrM=corrM, shrink=DRRS_SHRINK,
+                         G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD),
         price_max=CAND_PRICE_MAX
     )
+    sc = Scorer()
+    top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G, G_PREV_JSON)
+    top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D, D_PREV_JSON)
 
-    # 1) 入力（外部I/Oと前処理）
-    inp = Input(cand=cand, exist=exist, bench=bench, price_max=cfg.price_max, finnhub_api_key=FINNHUB_API_KEY)
-    state = inp.prepare_data()
-    ib = InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench, data=state["data"], px=state["px"], spx=state["spx"], tickers_bulk=state["tickers_bulk"], info=state["info"], eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"])
-
-    # 2) 集計（純粋）：特徴量→Z化→合成スコア
-    scorer = Scorer()
-    fb = scorer.aggregate_scores(ib, cfg)
-
-    # Dスコアを β<0.9 通過銘柄に限定
-    d_score_beta = fb.d_score_all[fb.df['BETA'] < D_BETA_MAX]
-
-    # 2.5) 選定（相関低減）
-    selector = Selector()
-    sb = selector.select_buckets(
-        returns_df=ib.returns,
-        g_score=fb.g_score,
-        d_score_all=d_score_beta,   # βフィルタ済みを渡す
-        cfg=cfg
-    )
-
-    selected12 = sb.top_G  # 既存ロジックのまま
-
-    # 次点5：g_score降順から選定12を除いた上位5
+    fb = getattr(sc, "_feat", None)
+    selected12 = list(top_G)
     try:
         ranked_all = fb.g_score.sort_values(ascending=False)
         near5 = [t for t in ranked_all.index if t not in selected12][:5]
     except Exception:
         near5 = []
-
-    df   = fb.df
+    df = fb.df
     guni = _infer_g_universe(df, selected12, near5)
-
-    # 直近5営業日のイベント（Gユニバース内のみ）
     try:
         fire_recent = [t for t in guni
-                       if (str(df.at[t,"G_BREAKOUT_recent_5d"])=="True") or (str(df.at[t,"G_PULLBACK_recent_5d"])=="True")]
+                       if (str(df.at[t, "G_BREAKOUT_recent_5d"]) == "True") or
+                          (str(df.at[t, "G_PULLBACK_recent_5d"]) == "True")]
     except Exception:
         fire_recent = []
-
-    lines = []
-    lines.append("【G枠レポート｜週次モニタ（直近5営業日）】")
-    lines.append("【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知")
-    lines.append(f"選定12: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else "選定12: なし")
-    lines.append(f"次点5: {', '.join(_fmt_with_fire_mark(near5, df))}" if near5 else "次点5: なし")
-
+    lines = [
+        "【G枠レポート｜週次モニタ（直近5営業日）】",
+        "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
+        f"選定12: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else "選定12: なし",
+        f"次点5: {', '.join(_fmt_with_fire_mark(near5, df))}" if near5 else "次点5: なし",
+    ]
     if fire_recent:
         fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
         lines.append(f"過去5営業日の検知: {fire_list}")
     else:
         lines.append("過去5営業日の検知: なし")
-
     try:
-        webhook = os.environ.get("SLACK_WEBHOOK_URL","")
+        webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
         if webhook:
-            requests.post(webhook, json={"text":"\n".join(lines)}, timeout=10)
+            requests.post(webhook, json={"text": "\n".join(lines)}, timeout=10)
     except Exception:
         pass
 
-    # 3) 出力（表示→Slack） — 既存I/Fのまま
     out = Output(debug=debug_mode)
-    out.miss_df = fb.missing_logs  # 互換表示のため display_results 内で利用
-    out.display_results(exist=exist, bench=bench, df_z=fb.df_z, g_score=fb.g_score, d_score_all=fb.d_score_all,
-                        init_G=sb.init_G, init_D=sb.init_D, top_G=sb.top_G, top_D=sb.top_D)
+    if fb is not None:
+        out.miss_df = fb.missing_logs
+        out.display_results(
+            exist=exist, bench=bench, df_z=fb.df_z,
+            g_score=fb.g_score, d_score_all=fb.d_score_all,
+            init_G=top_G, init_D=top_D, top_G=top_G, top_D=top_D
+        )
     out.notify_slack()
+
+    return SelectionBundle(
+        resG={"tickers": top_G, "avg_res_corr": avgG,
+              "sum_score": sumG, "objective": objG},
+        resD={"tickers": top_D, "avg_res_corr": avgD,
+              "sum_score": sumD, "objective": objD},
+        top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D
+    )
+
+if __name__ == "__main__":
+    run_pipeline()
