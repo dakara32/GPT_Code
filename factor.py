@@ -11,6 +11,8 @@ CAND_PRICE_MAX, bench = 400, '^GSPC'  # 価格上限・ベンチマーク
 N_G, N_D = 12, 13  # G/D枠サイズ
 g_weights = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
+D_D2E_MAX    = float(os.environ.get("D_D2E_MAX",   "500"))
+D_GROWTH_MIN = float(os.environ.get("D_GROWTH_MIN","0"))
 D_weights = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
 
 # DRRS 初期プール・各種パラメータ
@@ -107,6 +109,42 @@ def _load_prev(path: str):
 def _save_sel(path: str, tickers: list[str], avg_r: float, sum_score: float, objective: float):
     with open(path,"w") as f:
         json.dump({"tickers":tickers,"avg_res_corr":round(avg_r,6),"sum_score":round(sum_score,6),"objective":round(objective,6)}, f, indent=2)
+
+
+def _yf_growth_pos_5y(tk):
+    """yfinance Growth Estimates の +5y 年率が D_GROWTH_MIN を超えるか"""
+    try:
+        ge = tk.growth_estimates  # Index: ['0q','+1q','0y','+1y','+5y','-5y']; Columns: ['stock','industry','sector','index']
+        v = pd.to_numeric(ge.loc['+5y','stock'], errors='coerce')
+        return bool(pd.notna(v) and float(v) > D_GROWTH_MIN)
+    except Exception:
+        return False
+
+
+def _info_beta_lt(info_d: dict, thr: float) -> bool:
+    """info['beta'] を用いて β<thr を判定（欠損/例外は False）"""
+    try:
+        b = info_d.get('beta')
+        return bool(pd.notna(b) and float(b) < float(thr))
+    except Exception:
+        return False
+
+
+def _guard_D_candidates(tickers, tickers_bulk, info: dict):
+    """D枠プリフィルター：β<D_BETA_MAX 且つ +5y成長率>D_GROWTH_MIN 且つ D/E<D_D2E_MAX"""
+    tks = getattr(tickers_bulk, 'tickers', {}) if tickers_bulk is not None else {}
+    ok = []
+    for t in tickers:
+        inf = (info.get(t) or {})
+        if not _info_beta_lt(inf, D_BETA_MAX):  # βゲート（欠損は落とす）
+            continue
+        d2e = inf.get('debtToEquity')
+        if not (pd.notna(d2e) and float(d2e) < D_D2E_MAX):
+            continue
+        tk = tks.get(t) if isinstance(tks, dict) else yf.Ticker(t)
+        if _yf_growth_pos_5y(tk):
+            ok.append(t)
+    return ok
 
 
 # ===== Input：外部I/Oと前処理（CSV/API・欠損補完） =====
@@ -362,7 +400,9 @@ class Selector:
         top_G = resG["tickers"]
 
         # df_z に依存せず、スコアの index から D プールを構成（機能は同等）
-        d_score = d_score_all.drop(top_G, errors='ignore')
+        # === D candidates pre-filter (β + +5y成長 + D/E) ===
+        cand_D = _guard_D_candidates(cand, tickers_bulk, info)
+        d_score = d_score_all.drop(top_G, errors='ignore').reindex(cand_D).dropna()
         D_pool_index = d_score.index
         init_D = d_score.loc[D_pool_index].nlargest(min(cfg.drrs.corrM, len(D_pool_index))).index.tolist(); prevD = _load_prev(D_PREV_JSON)
         mu = cfg.drrs.cross_mu_gd
@@ -568,21 +608,19 @@ if __name__ == "__main__":
     # 1) 入力（外部I/Oと前処理）
     inp = Input(cand=cand, exist=exist, bench=bench, price_max=cfg.price_max, finnhub_api_key=FINNHUB_API_KEY)
     state = inp.prepare_data()
-    ib = InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench, data=state["data"], px=state["px"], spx=state["spx"], tickers_bulk=state["tickers_bulk"], info=state["info"], eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"])
+    tickers_bulk, info = state["tickers_bulk"], state["info"]
+    ib = InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench, data=state["data"], px=state["px"], spx=state["spx"], tickers_bulk=tickers_bulk, info=info, eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"])
 
     # 2) 集計（純粋）：特徴量→Z化→合成スコア
     scorer = Scorer()
     fb = scorer.aggregate_scores(ib, cfg)
-
-    # Dスコアを β<0.8 通過銘柄に限定
-    d_score_beta = fb.d_score_all[fb.df['BETA'] < D_BETA_MAX]
 
     # 2.5) 選定（相関低減）
     selector = Selector()
     sb = selector.select_buckets(
         returns_df=ib.returns,
         g_score=fb.g_score,
-        d_score_all=d_score_beta,   # βフィルタ済みを渡す
+        d_score_all=fb.d_score_all,
         cfg=cfg
     )
 
