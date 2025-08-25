@@ -183,10 +183,6 @@ def run_pipeline() -> SelectionBundle:
     io_post_to_slack_safe(sc=sc, top_G=top_G, top_D=top_D, avgG=avgG, avgD=avgD, sumG=sumG, sumD=sumD, objG=objG, objD=objD)
     return SelectionBundle(resG={"tickers": top_G}, resD={"tickers": top_D},
                            top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
-
-
-if __name__ == "__main__":
-    run_pipeline()
 # === END: 共通パイプラインの薄いラッパ ============================================
 # ===== Input：外部I/Oと前処理（CSV/API・欠損補完） =====
 class Input:
@@ -709,3 +705,7 @@ if __name__ == "__main__" and False:
     out.display_results(exist=exist, bench=bench, df_z=fb.df_z, g_score=fb.g_score, d_score_all=fb.d_score_all,
                         init_G=sb.init_G, init_D=sb.init_D, top_G=sb.top_G, top_D=sb.top_D)
     out.notify_slack()
+
+# === Entrypoint（定義評価順の問題回避のため最下部へ移動） ===
+if __name__ == "__main__":
+    run_pipeline()
