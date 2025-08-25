@@ -482,19 +482,13 @@ class Output:
         in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
         out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
 
-        # 全銘柄スコア（Scorer で df_z['GSC'], df_z['DSC'] を作っている想定）
-        gsc_full = df_z['GSC'] if 'GSC' in df_z.columns else g_score
-        dsc_full = df_z['DSC_DPASS'] if 'DSC_DPASS' in df_z.columns else (
-            df_z['DSC'] if 'DSC' in df_z.columns else d_score_all
-        )
-
-        # 表は「IN / OUT | GSC | DSC」…GSC/DSC は IN の値を表示
-        self.io_table = pd.DataFrame({
-            'IN': pd.Series(in_list),
-            '/ OUT': pd.Series(out_list)
-        })
-        self.io_table['GSC'] = gsc_full.reindex(in_list).round(3).reset_index(drop=True)
-        self.io_table['DSC'] = dsc_full.reindex(in_list).round(3).reset_index(drop=True)
+        changes = pd.DataFrame({'IN': pd.Series(in_list), '/ OUT': pd.Series(out_list)})
+        s_in = g_score.combine_first(d_score_all)      # IN は G → D
+        s_out = d_score_all.combine_first(g_score)      # OUT は D → G
+        fmt = (lambda v: '—' if pd.isna(v) else f'{v:.3f}')
+        changes['GSC'] = changes['IN'].map(s_in).map(fmt)
+        changes['DSC'] = changes['/ OUT'].map(s_out).map(fmt)
+        self.io_table = changes
 
         print("Changes:")
         print(self.io_table.to_string(index=False, na_rep="NaN"))
