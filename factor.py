@@ -4,15 +4,13 @@ from scipy.stats import zscore
 from dataclasses import dataclass
 from typing import Dict, List
 from scorer import Scorer
-import os
-import requests
 
 # ===== ユニバースと定数（冒頭に固定） =====
 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
 CAND_PRICE_MAX, bench = 400, '^GSPC'  # 価格上限・ベンチマーク
 N_G, N_D = 12, 13  # G/D枠サイズ
 g_weights = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
-D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.9"))
+D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
 D_weights = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
 
 # DRRS 初期プール・各種パラメータ
@@ -20,9 +18,8 @@ corrM = 45
 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
 
-# クロス相関ペナルティ（未定義なら設定）
-try: CROSS_MU_GD
-except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+# クロス相関ペナルティ（環境変数で指定可能）
+CROSS_MU_GD = float(os.environ.get("CROSS_MU_GD", "0.40"))  # 推奨 0.35–0.45（lam=0.85想定）
 
 # 出力関連
 RESULTS_DIR, G_PREV_JSON, D_PREV_JSON = "results", os.path.join("results","G_selection.json"), os.path.join("results","D_selection.json")
@@ -540,7 +537,8 @@ def _fmt_with_fire_mark(tickers, feature_df):
         try:
             br = bool(feature_df.at[t, "G_BREAKOUT_recent_5d"])
             pb = bool(feature_df.at[t, "G_PULLBACK_recent_5d"])
-            out.append(f"{t}{' 🔥' if (br or pb) else ''}")
+            tt = bool(feature_df.at[t, "TT_PASS"])
+            out.append(f"{t}{' 🔥' if tt and (br or pb) else ''}")
         except Exception:
             out.append(t)
     return out
@@ -576,7 +574,7 @@ if __name__ == "__main__":
     scorer = Scorer()
     fb = scorer.aggregate_scores(ib, cfg)
 
-    # Dスコアを β<0.9 通過銘柄に限定
+    # Dスコアを β<0.8 通過銘柄に限定
     d_score_beta = fb.d_score_all[fb.df['BETA'] < D_BETA_MAX]
 
     # 2.5) 選定（相関低減）
@@ -603,7 +601,7 @@ if __name__ == "__main__":
     # 直近5営業日のイベント（Gユニバース内のみ）
     try:
         fire_recent = [t for t in guni
-                       if (str(df.at[t,"G_BREAKOUT_recent_5d"])=="True") or (str(df.at[t,"G_PULLBACK_recent_5d"])=="True")]
+                       if str(df.at[t,"TT_PASS"])=="True" and ((str(df.at[t,"G_BREAKOUT_recent_5d"])=="True") or (str(df.at[t,"G_PULLBACK_recent_5d"])=="True"))]
     except Exception:
         fire_recent = []
 
