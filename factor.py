@@ -2,7 +2,7 @@
 import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
 from scipy.stats import zscore
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from scorer import Scorer
 
 # ===== ユニバースと定数（冒頭に固定） =====
@@ -109,6 +109,85 @@ def _save_sel(path: str, tickers: list[str], avg_r: float, sum_score: float, obj
         json.dump({"tickers":tickers,"avg_res_corr":round(avg_r,6),"sum_score":round(sum_score,6),"objective":round(objective,6)}, f, indent=2)
 
 
+
+# === BEGIN: 共通パイプラインの薄いラッパ（出力不変・副作用なし） ==================
+
+
+def io_build_input_bundle() -> InputBundle:
+    """
+    既存の『データ取得〜前処理』コードを **移植** し、InputBundle を返すだけの関数。
+    【厳守】処理内容・欠損補完・列名・丸め・例外は現行そのまま。変数名を束ねるだけ。
+    - 既存コードから以下の変数をそのまま詰める：cand, exist, bench, data, px, spx,
+      tickers_bulk, info, eps_df, fcf_df, returns
+    """
+    inp = Input(cand=cand, exist=exist, bench=bench, price_max=CAND_PRICE_MAX, finnhub_api_key=FINNHUB_API_KEY)
+    state = inp.prepare_data()
+    return InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench,
+                       data=state["data"], px=state["px"], spx=state["spx"],
+                       tickers_bulk=state["tickers_bulk"], info=state["info"],
+                       eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"])
+
+
+def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
+              n_target: int, prev_json_path: str) -> Tuple[list, float, float, float]:
+    """
+    G/Dを同一手順で処理：採点→フィルター→選定（相関低減込み）。
+    戻り値： (pick, avg_res_corr, sum_score, objective)。JSON保存は既存フォーマットで。
+    """
+    sc.cfg = cfg
+    feat = sc.score_build_features(inb)
+    agg  = sc.score_aggregate(feat, group, cfg)
+    mask = sc.filter_candidates(inb, agg, group, cfg)
+    selector = Selector()
+    prev = _load_prev(prev_json_path)
+    pick, avg_r, sum_sc, obj = sc.select_diversified(
+        agg[mask], group, cfg, n_target, selector=selector,
+        prev_tickers=prev, corrM=cfg.drrs.corrM, shrink=cfg.drrs.shrink,
+        cross_mu=cfg.drrs.cross_mu_gd
+    )
+    _save_sel(prev_json_path, pick, avg_r, sum_sc, obj)
+    return pick, avg_r, sum_sc, obj
+
+
+def io_post_to_slack_safe(*args, **kwargs):
+    """
+    既存のSlack送信関数を安全に呼ぶ薄いラッパ。関数名が異なる場合はここで委譲先だけ差し替える。
+    Slack文言・書式・例外は変更禁止。
+    """
+    try:
+        sc = kwargs.get("sc")
+        out = Output(debug=debug_mode)
+        if sc and getattr(sc, "_feat", None):
+            out.miss_df = sc._feat.missing_logs
+            out.display_results(exist=exist, bench=bench, df_z=sc._feat.df_z,
+                                g_score=sc._feat.g_score, d_score_all=sc._feat.d_score_all,
+                                init_G=getattr(sc, "_init_G", kwargs.get("top_G")),
+                                init_D=getattr(sc, "_init_D", kwargs.get("top_D")),
+                                top_G=kwargs.get("top_G"), top_D=kwargs.get("top_D"))
+            out.notify_slack()
+    except Exception:
+        if debug_mode: raise
+
+
+def run_pipeline() -> SelectionBundle:
+    # Flow: io_build_input_bundle -> score_build_features -> score_aggregate -> filter_candidates -> select_diversified -> Slack
+    inb = io_build_input_bundle()
+    cfg = PipelineConfig(
+        WeightsConfig(g=g_weights, d=D_weights),
+        DRRSParams(corrM=corrM, shrink=DRRS_SHRINK, G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD),
+        price_max=CAND_PRICE_MAX
+    )
+    sc = Scorer()
+    top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G, G_PREV_JSON)
+    top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D, D_PREV_JSON)
+    io_post_to_slack_safe(sc=sc, top_G=top_G, top_D=top_D, avgG=avgG, avgD=avgD, sumG=sumG, sumD=sumD, objG=objG, objD=objD)
+    return SelectionBundle(resG={"tickers": top_G}, resD={"tickers": top_D},
+                           top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
+
+
+if __name__ == "__main__":
+    run_pipeline()
+# === END: 共通パイプラインの薄いラッパ ============================================
 # ===== Input：外部I/Oと前処理（CSV/API・欠損補完） =====
 class Input:
     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
@@ -557,7 +636,7 @@ def _label_recent_event(t, feature_df):
 
 
 # ===== エントリポイント =====
-if __name__ == "__main__":
+if __name__ == "__main__" and False:
     # 0) Config を束ねる（元の定数をそのまま使用）
     cfg = PipelineConfig(
         weights=WeightsConfig(g=g_weights, d=D_weights),

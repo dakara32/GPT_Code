@@ -121,6 +121,53 @@ class Scorer:
     - 旧カラム名を自動リネームして新スキーマに吸収します。
     """
 
+    # === BEGIN: 手順名が一目の薄い公開API（内部ロジックは既存に委譲） ===
+    def score_build_features(self, inb: "InputBundle") -> "FeatureBundle":
+        if getattr(self, "_feat", None) is None:
+            fb = self.aggregate_scores(inb, getattr(self, "cfg", None))
+            self._feat, self._ib = fb, inb
+        return self._feat
+
+    def score_aggregate(self, feat: "FeatureBundle", group: str, cfg: "PipelineConfig"):
+        self.cfg = cfg
+        return feat.g_score if group == 'G' else feat.d_score_all
+
+    def filter_candidates(self, inb: "InputBundle", scores, group: str, cfg: "PipelineConfig"):
+        mask = pd.Series(True, index=scores.index)
+        if group == 'D' and getattr(self, "_feat", None) is not None:
+            mask = self._feat.df['BETA'].reindex(scores.index) < D_BETA_MAX
+            mask = mask.fillna(False)
+        return mask
+
+    def select_diversified(self, scores, group: str, cfg: "PipelineConfig", n_target: int, *, selector, prev_tickers=None, corrM=None, shrink=None, cross_mu=0.0):
+        corrM = corrM or cfg.drrs.corrM
+        shrink = shrink or cfg.drrs.shrink
+        returns_df = self._ib.returns
+        if group == 'G':
+            pool = scores.nlargest(min(corrM, len(scores))).index.tolist()
+            res = selector.select_bucket_drrs(
+                returns_df=returns_df, score_ser=scores, pool_tickers=pool, k=n_target,
+                n_pc=cfg.drrs.G.get("n_pc",3), gamma=cfg.drrs.G.get("gamma",1.2),
+                lam=cfg.drrs.G.get("lam",0.68), eta=cfg.drrs.G.get("eta",0.8),
+                lookback=cfg.drrs.G.get("lookback",252), prev_tickers=prev_tickers,
+                shrink=shrink, g_fixed_tickers=None, mu=0.0
+            )
+            self._init_G, self._g_selected = pool, res["tickers"]
+        else:
+            scores = scores.drop(getattr(self, "_g_selected", []), errors='ignore')
+            pool_index = scores.index
+            pool = scores.loc[pool_index].nlargest(min(corrM, len(pool_index))).index.tolist()
+            res = selector.select_bucket_drrs(
+                returns_df=returns_df, score_ser=scores, pool_tickers=pool, k=n_target,
+                n_pc=cfg.drrs.D.get("n_pc",4), gamma=cfg.drrs.D.get("gamma",0.8),
+                lam=cfg.drrs.D.get("lam",0.85), eta=cfg.drrs.D.get("eta",0.5),
+                lookback=cfg.drrs.D.get("lookback",504), prev_tickers=prev_tickers,
+                shrink=shrink, g_fixed_tickers=getattr(self, "_g_selected", []), mu=cross_mu
+            )
+            self._init_D, self._d_selected = pool, res["tickers"]
+        return res["tickers"], res["avg_res_corr"], res["sum_score"], res["objective"]
+    # === END: 薄い公開API =========================================================
+
     # === 先頭で旧→新カラム名マップ（移行用） ===
     EPS_RENAME = {"eps_ttm":"EPS_TTM", "eps_q_recent":"EPS_Q_LastQ"}
     FCF_RENAME = {"fcf_ttm":"FCF_TTM"}
