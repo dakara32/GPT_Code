@@ -26,10 +26,8 @@
 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
 # =============================================================================
 
-import os, json, time, requests
+import os, requests
 import numpy as np, pandas as pd, yfinance as yf
-import pandas as pd
-import numpy as np
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 from scipy.stats import zscore
@@ -111,7 +109,7 @@ DEFAULT_CONFIG = PipelineConfig(
 
 # Slack/Debug 環境に合わせて既存変数を許容（未定義なら無視）
 debug_mode = bool(os.environ.get("SCORER_DEBUG", "0") == "1")
-D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.9"))
+D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 D_WEIGHTS_EFF = None  # 出力表示互換のため
 
@@ -561,6 +559,8 @@ class Scorer:
                 (df.get('TR_str', np.nan) > 0)
             ).fillna(False)
 
+        df['TT_PASS'] = mask
+
         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
         g_score = g_score_all.loc[mask]
         df_z['GSC'] = g_score_all
@@ -620,16 +620,9 @@ def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_
 
         # 指標
         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
-        ma50  = px[g_universe].rolling(50).mean()
-        ma150 = px[g_universe].rolling(150).mean()
-        ma200 = px[g_universe].rolling(200).mean()
         atr20 = (hi[g_universe] - lo[g_universe]).rolling(20).mean()
         vol20 = vol[g_universe].rolling(20).mean()
         vol50 = vol[g_universe].rolling(50).mean()
-
-        # トレンドテンプレート合格
-        trend_template_ok = (px[g_universe] > ma50) & (px[g_universe] > ma150) & (px[g_universe] > ma200) \
-                            & (ma150 > ma200) & (ma200.diff() > 0)
 
         # 汎用ピボット：直近65営業日の高値（当日除外）
         pivot_price = hi[g_universe].rolling(65).max().shift(1)
@@ -640,7 +633,7 @@ def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_
         rs_high = rs.rolling(252).max().shift(1)
 
         # ブレイクアウト「発生日」：条件立ち上がり
-        breakout_today = trend_template_ok & (px[g_universe] > pivot_price) \
+        breakout_today = (px[g_universe] > pivot_price) \
                          & (vol[g_universe] >= 1.5 * vol50) & (rs > rs_high)
         breakout_event = breakout_today & ~breakout_today.shift(1).fillna(False)
 
@@ -648,7 +641,7 @@ def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_
         near_ema21_band = px[g_universe].between(ema21 - atr20, ema21 + atr20)
         volume_dryup = (vol20 / vol50) <= 1.0
         pullback_bounce_confirmed = (px[g_universe] > hi[g_universe].shift(1)) & (px[g_universe] > ema21)
-        pullback_today = trend_template_ok & near_ema21_band & volume_dryup & pullback_bounce_confirmed
+        pullback_today = near_ema21_band & volume_dryup & pullback_bounce_confirmed
         pullback_event = pullback_today & ~pullback_today.shift(1).fillna(False)
 
         # 直近N営業日内の発火 / 最終発生日
