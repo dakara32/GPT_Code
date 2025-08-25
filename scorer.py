@@ -567,9 +567,10 @@ class Scorer:
         df_z['DSC'] = d_score_all
 
         # --- D枠のβフィルタ（採用可視化） ---
-        d_pass_beta = df['BETA'] < D_BETA_MAX
-        df_z['D_PASS_BETA'] = d_pass_beta.astype(float)          # 1/0 フラグ
-        df_z['DSC_DPASS']   = d_score_all.where(d_pass_beta, np.nan)  # β基準未満は NaN
+        # removed: beta gate moved to factor.py
+        # d_pass_beta = df['BETA'] < D_BETA_MAX
+        # df_z['D_PASS_BETA'] = d_pass_beta.astype(float)
+        # df_z['DSC_DPASS']   = d_score_all.where(d_pass_beta, np.nan)
 
         if debug_mode:
             eps = 0.1
