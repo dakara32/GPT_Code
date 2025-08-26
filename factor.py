@@ -374,15 +374,19 @@ class Selector:
 
         # df_z に依存せず、スコアの index から D プールを構成（機能は同等）
         d_score = d_score_all.drop(top_G, errors='ignore')
-        D_pool_index = d_score.index
-        init_D = d_score.loc[D_pool_index].nlargest(min(cfg.drrs.corrM, len(D_pool_index))).index.tolist(); prevD = _load_prev(D_PREV_JSON)
+        rankD = d_score.sort_values(ascending=False).index.tolist()
+        init_D = d_score.nlargest(min(cfg.drrs.corrM, len(d_score))).index.tolist(); prevD = _load_prev(D_PREV_JSON)
         mu = cfg.drrs.cross_mu_gd
         resD = self.select_bucket_drrs(returns_df=returns_df, score_ser=d_score_all, pool_tickers=init_D, k=N_D,
                                        n_pc=cfg.drrs.D.get("n_pc",4), gamma=cfg.drrs.D.get("gamma",0.8),
                                        lam=cfg.drrs.D.get("lam",0.85), eta=cfg.drrs.D.get("eta",0.5),
                                        lookback=cfg.drrs.D.get("lookback",504), prev_tickers=prevD,
                                        shrink=cfg.drrs.shrink, g_fixed_tickers=top_G, mu=mu)
-        top_D = resD["tickers"]
+        ex = set(top_G)
+        top_D = [t for t in resD["tickers"] if t not in ex]
+        pool = [t for t in rankD if t not in ex and t not in top_D]
+        top_D += pool[:max(0, N_D - len(top_D))]
+        top_D = list(dict.fromkeys(top_D))[:N_D]
 
         _save_sel(G_PREV_JSON, top_G, resG["avg_res_corr"], resG["sum_score"], resG["objective"])
         _save_sel(D_PREV_JSON, top_D, resD["avg_res_corr"], resD["sum_score"], resD["objective"])
