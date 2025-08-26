@@ -383,6 +383,8 @@ class Selector:
 
 # ===== Output：出力整形と送信（表示・Slack） =====
 class Output:
+    SHOW_NEW_DIV_BREAKDOWN = False
+
     def __init__(self, debug=False):
         self.debug = debug
         self.miss_df = self.g_table = self.d_table = self.io_table = self.df_metrics_fmt = self.debug_table = None
@@ -391,8 +393,6 @@ class Output:
         self.g_formatters = self.d_formatters = {}
         # 低スコア（GSC+DSC）Top10 表示/送信用
         self.low10_table = None
-        # Near-Miss 表示用
-        self.near_miss_G = self.near_miss_D = None
 
     # --- メトリクス補助（Output専用） ---
     @staticmethod
@@ -419,13 +419,21 @@ class Output:
         C = R.corr().loc[left,right].values; return float(np.nanmean(C))
 
     # --- 表示（元 display_results のロジックそのまま） ---
-    def display_results(self, exist, bench, df_z, g_score, d_score_all,
-                        init_G, init_D, top_G, top_D, near_G=None, near_D=None):
+    def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
+                        init_G, init_D, top_G, top_D, **kwargs):
         pd.set_option('display.float_format','{:.3f}'.format)
         print("📈 ファクター分散最適化の結果")
         if self.miss_df is not None and not self.miss_df.empty:
             print("Missing Data:")
             print(self.miss_df.to_string(index=False))
+
+        sc = getattr(self, "_sc", None)
+        if isinstance(getattr(sc, "_agg_G", None), pd.Series):
+            g_score = getattr(sc, "_agg_G")
+        if isinstance(getattr(sc, "_agg_D", None), pd.Series):
+            d_score_all = getattr(sc, "_agg_D")
+        near_G = getattr(sc, "_near_G", []) if sc else []
+        near_D = getattr(sc, "_near_D", []) if sc else []
 
         extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
         self.g_table = pd.concat([df_z.loc[G_UNI,['GRW','MOM','TRD','VOL']], g_score[G_UNI].rename('GSC')], axis=1)
@@ -433,6 +441,11 @@ class Output:
         self.g_formatters = {col:"{:.2f}".format for col in ['GRW','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
         self.g_title = (f"[G枠 / {N_G} / GRW{int(g_weights['GRW']*100)} MOM{int(g_weights['MOM']*100)} TRD{int(g_weights['TRD']*100)} VOL{int(g_weights['VOL']*100)} / corrM={corrM} / "
                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
+        if near_G:
+            add = [t for t in near_G if t not in set(G_UNI)][:5]
+            if add:
+                near_tbl = pd.concat([df_z.loc[add,['GRW','MOM','TRD','VOL']], g_score[add].rename('GSC')], axis=1)
+                self.g_table = pd.concat([self.g_table, near_tbl], axis=0)
         print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
 
         extra_D = [t for t in init_D if t not in top_D][:5]; D_UNI = top_D + extra_D
@@ -444,38 +457,22 @@ class Output:
         dw_eff = scorer.D_WEIGHTS_EFF
         self.d_title = (f"[D枠 / {N_D} / QAL{int(dw_eff['QAL']*100)} YLD{int(dw_eff['YLD']*100)} VOL{int(dw_eff['VOL']*100)} TRD{int(dw_eff['TRD']*100)} / corrM={corrM} / "
                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
+        if near_D:
+            add = [t for t in near_D if t not in set(D_UNI)][:5]
+            if add:
+                d_disp2 = pd.DataFrame(index=add)
+                d_disp2['QAL'], d_disp2['YLD'], d_disp2['VOL'], d_disp2['TRD'] = df_z.loc[add,'D_QAL'], df_z.loc[add,'D_YLD'], df_z.loc[add,'D_VOL_RAW'], df_z.loc[add,'D_TRD']
+                near_tbl = pd.concat([d_disp2, d_score_all[add].rename('DSC')], axis=1)
+                self.d_table = pd.concat([self.d_table, near_tbl], axis=0)
         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
-
-        # --- Near-Miss（惜しくも選定されなかった上位5） ---
-        def _build_near_df(tickers, score_ser):
-            if not tickers:
-                return None
-            df = pd.DataFrame({
-                'TICKER': tickers,
-                'SCORE': [score_ser.get(t) for t in tickers]
-            })
-            df['SCORE'] = df['SCORE'].apply(lambda v: f"{float(v):.3f}" if pd.notna(v) else '—')
-            return df
-        self.near_miss_G = _build_near_df(near_G, g_score)
-        self.near_miss_D = _build_near_df(near_D, d_score_all)
-        if self.near_miss_G is not None:
-            print("Near Miss (G top5):")
-            print(self.near_miss_G.to_string(index=False))
-        if self.near_miss_D is not None:
-            print("Near Miss (D top5):")
-            print(self.near_miss_D.to_string(index=False))
 
         # === Changes（IN の GSC/DSC を表示。OUT は銘柄名のみ） ===
         in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
         out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
 
-        # 全銘柄スコア（Scorer で df_z['GSC'], df_z['DSC'] を作っている想定）
-        gsc_full = df_z['GSC'] if 'GSC' in df_z.columns else g_score
-        dsc_full = df_z['DSC_DPASS'] if 'DSC_DPASS' in df_z.columns else (
-            df_z['DSC'] if 'DSC' in df_z.columns else d_score_all
-        )
+        gsc_full = g_score
+        dsc_full = d_score_all
 
-        # 表は「IN / OUT | GSC | DSC」…GSC/DSC は IN の値を表示
         self.io_table = pd.DataFrame({
             'IN': pd.Series(in_list),
             '/ OUT': pd.Series(out_list)
@@ -518,8 +515,10 @@ class Output:
         def _fmt_row(s):
             return pd.Series({'RET':f"{s['RET']:.1f}%",'VOL':f"{s['VOL']:.1f}%",'SHP':f"{s['SHP']:.1f}",'MDD':f"{s['MDD']:.1f}%",'RAWρ':(f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"),'RESIDρ':(f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN")})
         self.df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1); print("Performance Comparison:"); print(self.df_metrics_fmt.to_string())
-        print("Diversification (NEW breakdown):"); 
-        for k,v in self.div_details.items(): print(f"  {k}: {np.nan if v is None else round(v,3)}")
+        if getattr(self, "SHOW_NEW_DIV_BREAKDOWN", False):
+            print("Diversification (NEW breakdown):")
+            for k,v in self.div_details.items():
+                print(f"  {k}: {np.nan if v is None else round(v,3)}")
         if self.debug:
             self.debug_table = pd.concat([df_z[['TR','EPS','REV','ROE','BETA','DIV','FCF','RS','TR_str','DIV_STREAK']], g_score.rename('GSC'), d_score_all.rename('DSC')], axis=1).round(3)
             print("Debug Data:"); print(self.debug_table.to_string())
@@ -544,16 +543,13 @@ class Output:
         if self.miss_df is not None and not self.miss_df.empty: message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
         message += self.g_title + "\n```" + self.g_table.to_string(formatters=self.g_formatters) + "```\n"
         message += self.d_title + "\n```" + self.d_table.to_string(formatters=self.d_formatters) + "```\n"
-        if getattr(self, 'near_miss_G', None) is not None:
-            message += "Near Miss (G top5)\n```" + self.near_miss_G.to_string(index=False) + "```\n"
-        if getattr(self, 'near_miss_D', None) is not None:
-            message += "Near Miss (D top5)\n```" + self.near_miss_D.to_string(index=False) + "```\n"
         message += "Changes\n```" + self.io_table.to_string(index=False) + "```\n"
         # 低スコアTOP10（GSC+DSC）
         if self.low10_table is not None:
             message += "Low Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
-        message += "\nDiversification (NEW breakdown):\n```" + "\n".join([f"{k}: {np.nan if v is None else round(v,3)}" for k,v in self.div_details.items()]) + "```"
+        if getattr(self, "SHOW_NEW_DIV_BREAKDOWN", False):
+            message += "\nDiversification (NEW breakdown):\n```" + "\n".join([f"{k}: {np.nan if v is None else round(v,3)}" for k,v in self.div_details.items()]) + "```"
         if self.debug and self.debug_table is not None: message += "\nDebug Data\n```" + self.debug_table.to_string() + "```"
         payload = {"text": message}
         try:
@@ -675,10 +671,13 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         pick = res["tickers"]; avg_r = res["avg_res_corr"]
         sum_sc = res["sum_score"]; obj = res["objective"]
     # --- Near-Miss: 惜しくも選ばれなかった上位5を保持（Slack表示用） ---
+    # 5) Near-Miss と最終集計Seriesを保持（表示専用／計算へ影響なし）
     try:
-        pool = agg.drop(index=pick, errors="ignore")
+        pool = agg.drop(index=[t for t in pick if t in agg.index], errors="ignore")
         near5 = list(pool.sort_values(ascending=False).head(5).index)
         setattr(sc, f"_near_{group}", near5)
+        setattr(sc, f"_agg_{group}", agg)
+        setattr(sc, f"_mask_{group}", locals().get("mask"))
     except Exception:
         pass
 
@@ -732,14 +731,19 @@ def run_pipeline() -> SelectionBundle:
         pass
 
     out = Output(debug=debug_mode)
-    if fb is not None:
-        out.miss_df = fb.missing_logs
-        out.display_results(
-            exist=exist, bench=bench, df_z=fb.df_z,
-            g_score=fb.g_score, d_score_all=fb.d_score_all,
-            init_G=top_G, init_D=top_D, top_G=top_G, top_D=top_D,
-            near_G=near_G, near_D=getattr(sc, "_near_D", [])
-        )
+    # 表示側から選定時の集計へアクセスできるように保持（表示専用）
+    try: out._sc = sc
+    except Exception: pass
+    if hasattr(sc, "_feat"):
+        try:
+            out.miss_df = sc._feat.missing_logs
+            out.display_results(
+                exist=exist, bench=bench, df_z=sc._feat.df_z,
+                g_score=sc._feat.g_score, d_score_all=sc._feat.d_score_all,
+                init_G=top_G, init_D=top_D, top_G=top_G, top_D=top_D
+            )
+        except Exception:
+            pass
     out.notify_slack()
 
     return SelectionBundle(
