@@ -528,10 +528,10 @@ class Output:
         message += self.g_title + "\n```" + self.g_table.to_string(formatters=self.g_formatters) + "```\n"
         message += self.d_title + "\n```" + self.d_table.to_string(formatters=self.d_formatters) + "```\n"
         message += "Changes\n```" + self.io_table.to_string(index=False) + "```\n"
+        message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
         # 低スコアTOP10（GSC+DSC）
         if self.low10_table is not None:
-            message += "Low Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
-        message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
+            message += "\nLow Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
         if self.debug and self.debug_table is not None: message += "\nDebug Data\n```" + self.debug_table.to_string() + "```"
         payload = {"text": message}
         try:

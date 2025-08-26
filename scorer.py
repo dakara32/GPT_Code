@@ -27,10 +27,10 @@
 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
 # =============================================================================
 
-import os, json, time, requests
-import numpy as np, pandas as pd, yfinance as yf
-import pandas as pd
+import requests
 import numpy as np
+import pandas as pd
+import yfinance as yf
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 from scipy.stats import zscore
@@ -110,10 +110,9 @@ DEFAULT_CONFIG = PipelineConfig(
     price_max=400.0
 )
 
-# Slack/Debug 環境に合わせて既存変数を許容（未定義なら無視）
-debug_mode = bool(os.environ.get("SCORER_DEBUG", "0") == "1")
-D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.9"))
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+# NOTE: scorerはユーティリティ専用。環境依存の設定は外部で管理する。
+D_BETA_MAX = 0.9
+FINNHUB_API_KEY = None
 D_WEIGHTS_EFF = None  # 出力表示互換のため
 
 # ---- Scorer 本体 -------------------------------------------------------------
@@ -572,11 +571,6 @@ class Scorer:
         df_z['D_PASS_BETA'] = d_pass_beta.astype(float)          # 1/0 フラグ
         df_z['DSC_DPASS']   = d_score_all.where(d_pass_beta, np.nan)  # β基準未満は NaN
 
-        if debug_mode:
-            eps = 0.1
-            _base = d_comp.mul(dw, axis=1).sum(axis=1)
-            _test = d_comp.assign(VOL=d_comp['VOL'] + eps).mul(dw, axis=1).sum(axis=1)
-            print("VOL増→d_score低下の比率:", ((_test <= _base) | _test.isna() | _base.isna()).mean())
         try:
             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
         except Exception:
@@ -684,94 +678,4 @@ def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_
     return feature_df
 
 
-# === 単体実行サンプル（最小） =================================================
-# 使い方: `python scorer.py` を叩くと current_tickers.csv / candidate_tickers.csv を読み込み
-# デフォルト設定でスコア計算だけを行い、上位を表示します。（セレクタは別ファイル）
-if __name__ == "__main__":
-    # 入力CSV（存在しなければサンプルで停止）
-    cur_csv, cand_csv = "current_tickers.csv", "candidate_tickers.csv"
-    if not (os.path.exists(cur_csv) and os.path.exists(cand_csv)):
-        raise SystemExit("current_tickers.csv / candidate_tickers.csv が見つかりません。単体実行の事前準備をしてください。")
-
-    exist = pd.read_csv(cur_csv, header=None)[0].tolist()
-    cand  = pd.read_csv(cand_csv, header=None)[0].tolist()
-    bench = '^GSPC'
-
-    # 価格上限フィルタ（単体実行でも体験を合わせる）
-    info_cand = yf.Tickers(" ".join(cand))
-    last_prices = {}
-    for t in cand:
-        try: last_prices[t] = info_cand.tickers[t].fast_info.get("lastPrice", np.inf)
-        except Exception as e:
-            print(f"{t}: price fetch failed ({e})"); last_prices[t] = np.inf
-    cand_f = [t for t,p in last_prices.items() if p <= DEFAULT_CONFIG.price_max]
-
-    # ユニバース作成 & データ取得
-    tickers = sorted(set(exist + cand_f))
-    data = yf.download(tickers + [bench], period="600d", auto_adjust=True, progress=False)
-    px, spx = data["Close"], data["Close"][bench]
-    tickers_bulk, info = yf.Tickers(" ".join(tickers)), {}
-    for t in tickers:
-        try: info[t] = tickers_bulk.tickers[t].info
-        except Exception as e: print(f"{t}: info fetch failed ({e})"); info[t] = {}
-
-    # EPS/FCF（簡易）：既存パイプライン互換の最低限のみ
-    # EPS_TTM / EPS_Q_LastQ
-    eps_rows=[]
-    for t in tickers:
-        info_t, eps_ttm, eps_q = info[t], info[t].get("trailingEps", np.nan), np.nan
-        try:
-            qearn, so = tickers_bulk.tickers[t].quarterly_earnings, info_t.get("sharesOutstanding")
-            if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
-                eps_ttm_q = qearn["Earnings"].head(4).sum()/so
-                if pd.notna(eps_ttm_q) and (pd.isna(eps_ttm) or (abs(eps_ttm)>0 and abs(eps_ttm/eps_ttm_q)>3)): eps_ttm = eps_ttm_q
-                eps_q = qearn["Earnings"].iloc[-1]/so
-        except Exception: pass
-        eps_rows.append({"ticker":t,"EPS_TTM":eps_ttm,"EPS_Q_LastQ":eps_q})
-    eps_df = pd.DataFrame(eps_rows).set_index("ticker").copy()
-    # FCF_TTM（最低限：yfinanceから CFO/Capex の TTM を近似）
-    def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series|None:
-        if df is None or df.empty: return None
-        idx_lower = {str(i).lower(): i for i in df.index}
-        for name in names:
-            key = name.lower()
-            if key in idx_lower: return df.loc[idx_lower[key]]
-        return None
-    def _sum_last_n(s: pd.Series|None, n: int) -> float|None:
-        if s is None or s.empty: return None
-        vals = s.dropna().astype(float); return None if vals.empty else vals.iloc[:n].sum()
-    CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"], "capex":["Capital Expenditure","Capital Expenditures"]}
-    rows=[]
-    for t in tickers:
-        tk = yf.Ticker(t); qcf = tk.quarterly_cashflow
-        cfo_q = _pick_row(qcf, CF_ALIASES["cfo"]); capex_q = _pick_row(qcf, CF_ALIASES["capex"])
-        cfo_ttm = _sum_last_n(cfo_q,4); capex_ttm = _sum_last_n(capex_q,4)
-        if cfo_ttm is None or capex_ttm is None:
-            acf = tk.cashflow
-            if cfo_ttm is None:
-                s = _pick_row(acf, CF_ALIASES["cfo"]); cfo_ttm = float(s.iloc[0]) if s is not None and not s.dropna().empty else np.nan
-            if capex_ttm is None:
-                s = _pick_row(acf, CF_ALIASES["capex"]); capex_ttm = float(s.iloc[0]) if s is not None and not s.dropna().empty else np.nan
-        fcf_ttm = np.nan
-        if pd.notna(cfo_ttm) and pd.notna(capex_ttm): fcf_ttm = float(cfo_ttm) - float(abs(capex_ttm))
-        rows.append({"ticker":t,"FCF_TTM":fcf_ttm})
-    fcf_df = pd.DataFrame(rows).set_index("ticker")
-
-    returns = px[tickers].pct_change()
-    ib = InputBundle(cand=cand_f, tickers=tickers, bench=bench, data=data, px=px, spx=spx,
-                     tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
-
-    scorer = Scorer()
-    fb = scorer.aggregate_scores(ib, DEFAULT_CONFIG)
-
-    # 単体実行の出力（簡易）
-    print("=== G-score (top 15) ===")
-    print(fb.g_score.sort_values(ascending=False).head(15).round(3).to_string())
-    print("\n=== D-score (top 15) ===")
-    print(fb.d_score_all.sort_values(ascending=False).head(15).round(3).to_string())
-    print("\n=== Missing Data Logs ===")
-    if fb.missing_logs is not None and not fb.missing_logs.empty:
-        print(fb.missing_logs.to_string(index=False))
-    else:
-        print("(none)")
 
