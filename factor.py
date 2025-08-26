@@ -399,10 +399,11 @@ class Output:
         self.g_formatters = self.d_formatters = {}
         # 低スコア（GSC+DSC）Top10 表示/送信用
         self.low10_table = None
+        self.buffer = ""
 
     # --- 表示（元 display_results のロジックそのまま） ---
     def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
-                        init_G, init_D, top_G, top_D, **kwargs):
+                        init_G, init_D, top_G, top_D, **kw):
         import pandas as pd
         pd.set_option('display.float_format','{:.3f}'.format)
         print("📈 ファクター分散最適化の結果")
@@ -472,12 +473,11 @@ class Output:
         # --- D Near-Miss (Top5)：D未採用から上位5（降順）。失敗しても落とさない ---
         def _as_series(x):
             if isinstance(x, pd.DataFrame):
-                prefer = None
-                for name in ("DSC", "GSC", "score", "SCORE"):
-                    if name in x.columns:
-                        prefer = name
-                        break
-                return x[prefer] if prefer else (x.iloc[:, 0] if x.shape[1] else pd.Series(dtype=float))
+                # 優先列があれば使う（なければ先頭列）
+                for c in ("DSC", "GSC", "score", "SCORE"):
+                    if c in x.columns:
+                        return x[c]
+                return x.iloc[:, 0] if x.shape[1] else pd.Series(dtype=float)
             return x
         try:
             d_all = _as_series(d_score_all)
@@ -488,12 +488,11 @@ class Output:
                          .sort_values(ascending=False)\
                          .head(5)
                 if hasattr(near, "empty") and not near.empty:
-                    self.buffer = getattr(self, "buffer", "") + "Near Miss (D top5)\n```" \
-                                   + near.to_frame("SCORE").to_string() + "```\n"
+                    self.buffer += "Near Miss (D top5)\n```" + near.to_frame("SCORE").to_string() + "```\n"
         except Exception:
             pass  # 表示だけの補助情報なので落とさない
 
-        # --- 2) Changes：前回集合(init_*) vs 今回集合(top_*) から“必ず”再構築 ---
+        # --- 2) Changes：前回集合(init_*) vs 今回集合(top_*) から“必ず”再構築（None/emptyどちらでも） ---
         _cur_table = getattr(self, "io_table", None)
         if (_cur_table is None) or (hasattr(_cur_table, "empty") and _cur_table.empty):
             try:
@@ -562,49 +561,58 @@ class Output:
 
     # --- Slack送信 ---
     def notify_slack(self):
-        import requests
+        import requests, os
         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
         if not SLACK_WEBHOOK_URL:
             raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-        buf = getattr(self, "buffer", "")
+        parts = []
+        buf = self.buffer
         if buf and not buf.endswith("\n"):
             buf += "\n"
-        # エラー時など g_table が無ければバッファのみ送信
-        if self.g_table is None or self.d_table is None:
-            if buf:
-                try:
-                    resp = requests.post(SLACK_WEBHOOK_URL, json={"text": buf}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
-                except Exception as e:
-                    print(f"⚠️ Slack通知エラー: {e}")
-            return
+        if buf:
+            parts.append(buf)
 
-        # セクションは“中身がある時だけ”付け足す（空なら見出しを出さない）
         def _section(title: str, df, **kw) -> str:
             try:
                 if df is None or (hasattr(df, "empty") and df.empty):
                     return ""
                 body = df.to_string(**kw) if hasattr(df, "to_string") else str(df)
-                if not str(body).strip():
+                body = str(body)
+                if not body.strip():
                     return ""
                 return f"{title}\n```{body}```\n"
             except Exception:
                 return ""
 
-        message = buf + "📈 ファクター分散最適化の結果\n"
-        if self.miss_df is not None and not self.miss_df.empty:
-            message += _section("Missing Data", self.miss_df, index=False)
-        message += self.g_title + "\n```" + self.g_table.to_string(formatters=self.g_formatters) + "```\n"
-        message += self.d_title + "\n```" + self.d_table.to_string(formatters=self.d_formatters) + "```\n"
-        message += _section("Changes", getattr(self, "io_table", None), index=False)
-        message += _section("Performance Comparison:", getattr(self, "df_metrics_fmt", None))
-        if self.low10_table is not None:
-            message += _section("Low Score Candidates (GSC+DSC bottom 10)", self.low10_table)
-        if self.debug and self.debug_table is not None:
-            message += _section("Debug Data", self.debug_table)
-        try:
-            resp = requests.post(SLACK_WEBHOOK_URL, json={"text": message}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
-        except Exception as e:
-            print(f"⚠️ Slack通知エラー: {e}")
+        s_changes = _section("Changes", getattr(self, "io_table", None), index=False)
+        if s_changes:
+            parts.append(s_changes)
+        s_perf = _section("Performance Comparison:", getattr(self, "df_metrics_fmt", None))
+        if s_perf:
+            parts.append(s_perf)
+
+        msg = "".join(parts)
+        MAXLEN = 35000
+        if len(msg) <= MAXLEN:
+            try:
+                resp = requests.post(SLACK_WEBHOOK_URL, json={"text": msg}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
+            except Exception as e:
+                print(f"⚠️ Slack通知エラー: {e}")
+        else:
+            chunk = ""
+            for p in parts:
+                if len(chunk) + len(p) > MAXLEN and chunk:
+                    try:
+                        resp = requests.post(SLACK_WEBHOOK_URL, json={"text": chunk}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
+                    except Exception as e:
+                        print(f"⚠️ Slack通知エラー: {e}")
+                    chunk = ""
+                chunk += p
+            if chunk:
+                try:
+                    resp = requests.post(SLACK_WEBHOOK_URL, json={"text": chunk}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
+                except Exception as e:
+                    print(f"⚠️ Slack通知エラー: {e}")
 
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
