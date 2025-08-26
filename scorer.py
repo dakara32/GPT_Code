@@ -776,7 +776,7 @@ if __name__ == "__main__":
         print("(none)")
 
 # ====== adapter append (DO NOT REMOVE EXISTING CODE ABOVE) =====================
-# このブロックは既存実装に “委譲するだけ”。新しい数式やI/Oは一切書かない。
+# このブロックは既存実装へ“委譲するだけ”。新しい数式やI/Oは一切書かない。
 
 def _scorer_resolve(*names):
     """
@@ -790,22 +790,8 @@ def _scorer_resolve(*names):
             return fn
     raise NameError("[scorer adapter] implementation not found for any of: " + ", ".join(names))
 
-# ---- module-level utility（純関数・I/O禁止）: 自身を候補に含めず既存実装へ“委譲のみ” ----
-def build_features(inb):
-    # アダプタ自身（build_features）を候補に入れない
-    return _scorer_resolve("_build_features", "features_build", "build_features_core")(inb)
-
-def aggregate_scores(feat, weights):
-    # 自身（aggregate_scores）は候補に入れない
-    return _scorer_resolve("_aggregate", "aggregate_scores_core", "aggregate_core")(feat, weights)
-
-def apply_filters(inb, scores, group, cfg):
-    # 自身（apply_filters）は候補に入れない
-    return _scorer_resolve("_apply_filters", "apply_filters_core", "filters_apply")(inb, scores, group, cfg)
-
-def select_diversified_core(scores, n_target, **kw):
-    # 既存実装にそのまま委譲（自身は候補に含めない）
-    return _scorer_resolve("_select_diversified_core", "select_diversified_core", "_select_core")(scores, n_target, **kw)
+# NOTE: モジュール関数（build_features 等）を**ここで定義しない**。
+#       既存実装の名前空間を汚さず、衝突を避けるため。
 
 # ---- 互換レイヤ（既存クラスがあれば尊重）。上書きはしない：未実装メソッドだけ“後付け” ----
 try:
@@ -813,48 +799,87 @@ try:
 except NameError:
     # クラスが無い環境だけ、薄い互換クラスを定義（既存挙動に忠実に委譲）
     class Scorer:
-        def score_build_features(self, inb): return build_features(inb)
-        def score_aggregate(self, feat, group, cfg):
-            weights = cfg.weights.g if group == "G" else cfg.weights.d
-            return aggregate_scores(feat, weights)
-        def filter_candidates(self, inb, scores, group, cfg): return apply_filters(inb, scores, group, cfg)
-        def select_diversified(self, scores, group, cfg, n_target, **kw): return select_diversified_core(scores, n_target, **kw)
-else:
-    # 既存の Scorer クラスがある場合：未実装の公開メソッドだけ“生やす”。既存は尊重（上書きしない）
-    if not hasattr(Scorer, "score_build_features"):
         def score_build_features(self, inb):
             # 1) self の private 実装を優先
             for name in ("_build_features", "features_build", "build_features_core"):
                 fn = getattr(self, name, None)
-                if callable(fn):
-                    return fn(inb)
-            # 2) なければモジュール関数へ
-            return build_features(inb)
-        Scorer.score_build_features = score_build_features
-    if not hasattr(Scorer, "score_aggregate"):
+                if callable(fn): return fn(inb)
+            # 2) モジュール内の既存実装へ
+            fn = _scorer_resolve("_build_features", "build_features", "features_build", "build_features_core")
+            return fn(inb)
         def score_aggregate(self, feat, group, cfg):
             weights = cfg.weights.g if group == "G" else cfg.weights.d
             for name in ("_aggregate", "aggregate_scores_core", "aggregate_core"):
                 fn = getattr(self, name, None)
-                if callable(fn):
-                    return fn(feat, weights)
-            return aggregate_scores(feat, weights)
-        Scorer.score_aggregate = score_aggregate
-    if not hasattr(Scorer, "filter_candidates"):
+                if callable(fn): return fn(feat, weights)
+            fn = _scorer_resolve("_aggregate", "aggregate_scores", "aggregate_scores_core", "aggregate_core")
+            return fn(feat, weights)
         def filter_candidates(self, inb, scores, group, cfg):
             for name in ("_apply_filters", "apply_filters_core", "filters_apply"):
                 fn = getattr(self, name, None)
-                if callable(fn):
-                    return fn(inb, scores, group, cfg)
-            return apply_filters(inb, scores, group, cfg)
-        Scorer.filter_candidates = filter_candidates
-    if not hasattr(Scorer, "select_diversified"):
+                if callable(fn): return fn(inb, scores, group, cfg)
+            fn = _scorer_resolve("_apply_filters", "apply_filters", "apply_filters_core", "filters_apply")
+            return fn(inb, scores, group, cfg)
         def select_diversified(self, scores, group, cfg, n_target, **kw):
             for name in ("_select_diversified_core", "select_diversified_core", "_select_core"):
                 fn = getattr(self, name, None)
-                if callable(fn):
-                    return fn(scores, n_target, **kw)
-            return select_diversified_core(scores, n_target, **kw)
-        Scorer.select_diversified = select_diversified
+                if callable(fn): return fn(scores, n_target, **kw)
+            fn = _scorer_resolve("_select_diversified_core", "select_diversified_core", "_select_core")
+            return fn(scores, n_target, **kw)
+else:
+    # 既存メソッドが既にある場合でも、**安全ラッパで横取り**する（元の実装には最後にフォールバック）
+    # 1) score_build_features
+    _orig_sbf = getattr(Scorer, "score_build_features", None)
+    def _sbf(self, inb):
+        for name in ("_build_features", "features_build", "build_features_core"):
+            fn = getattr(self, name, None)
+            if callable(fn): return fn(inb)
+        try:
+            fn = _scorer_resolve("_build_features", "build_features", "features_build", "build_features_core")
+            return fn(inb)
+        except NameError:
+            if callable(_orig_sbf): return _orig_sbf(self, inb)
+            raise
+    Scorer.score_build_features = _sbf
+    # 2) score_aggregate
+    _orig_sag = getattr(Scorer, "score_aggregate", None)
+    def _sag(self, feat, group, cfg):
+        weights = cfg.weights.g if group == "G" else cfg.weights.d
+        for name in ("_aggregate", "aggregate_scores_core", "aggregate_core"):
+            fn = getattr(self, name, None)
+            if callable(fn): return fn(feat, weights)
+        try:
+            fn = _scorer_resolve("_aggregate", "aggregate_scores", "aggregate_scores_core", "aggregate_core")
+            return fn(feat, weights)
+        except NameError:
+            if callable(_orig_sag): return _orig_sag(self, feat, group, cfg)
+            raise
+    Scorer.score_aggregate = _sag
+    # 3) filter_candidates
+    _orig_flt = getattr(Scorer, "filter_candidates", None)
+    def _flt(self, inb, scores, group, cfg):
+        for name in ("_apply_filters", "apply_filters_core", "filters_apply"):
+            fn = getattr(self, name, None)
+            if callable(fn): return fn(inb, scores, group, cfg)
+        try:
+            fn = _scorer_resolve("_apply_filters", "apply_filters", "apply_filters_core", "filters_apply")
+            return fn(inb, scores, group, cfg)
+        except NameError:
+            if callable(_orig_flt): return _orig_flt(self, inb, scores, group, cfg)
+            raise
+    Scorer.filter_candidates = _flt
+    # 4) select_diversified
+    _orig_sel = getattr(Scorer, "select_diversified", None)
+    def _sel(self, scores, group, cfg, n_target, **kw):
+        for name in ("_select_diversified_core", "select_diversified_core", "_select_core"):
+            fn = getattr(self, name, None)
+            if callable(fn): return fn(scores, n_target, **kw)
+        try:
+            fn = _scorer_resolve("_select_diversified_core", "select_diversified_core", "_select_core")
+            return fn(scores, n_target, **kw)
+        except NameError:
+            if callable(_orig_sel): return _orig_sel(self, scores, group, cfg, n_target, **kw)
+            raise
+    Scorer.select_diversified = _sel
 
 # ========================== end of adapter append ===============================
