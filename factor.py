@@ -403,6 +403,7 @@ class Output:
     # --- 表示（元 display_results のロジックそのまま） ---
     def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
                         init_G, init_D, top_G, top_D, **kwargs):
+        import pandas as pd
         pd.set_option('display.float_format','{:.3f}'.format)
         print("📈 ファクター分散最適化の結果")
         if self.miss_df is not None and not self.miss_df.empty:
@@ -468,46 +469,57 @@ class Output:
                 self.d_table = pd.concat([self.d_table, near_tbl], axis=0)
         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
 
-        # --- D Near-Miss (Top5): D未採用から上位5銘柄 ---
+        # --- D Near-Miss (Top5)：D未採用から上位5（降順）。失敗しても落とさない ---
         def _as_series(x):
             if isinstance(x, pd.DataFrame):
-                return x.iloc[:, 0] if x.shape[1] else pd.Series(dtype=float)
+                prefer = None
+                for name in ("DSC", "GSC", "score", "SCORE"):
+                    if name in x.columns:
+                        prefer = name
+                        break
+                return x[prefer] if prefer else (x.iloc[:, 0] if x.shape[1] else pd.Series(dtype=float))
             return x
         try:
-            d_all = _as_series(agg_D if agg_D is not None else d_score_all)
+            d_all = _as_series(d_score_all)
             if hasattr(d_all, "index") and len(top_D) > 0:
                 mask_sel = d_all.index.isin(list(top_D))
-                near = d_all.loc[~mask_sel].astype(float).sort_values(ascending=False).head(5)
+                near = pd.to_numeric(d_all.loc[~mask_sel], errors="coerce")\
+                         .dropna()\
+                         .sort_values(ascending=False)\
+                         .head(5)
                 if hasattr(near, "empty") and not near.empty:
-                    self.buffer = getattr(self, "buffer", "") + "Near Miss (D top5)\n```" + near.to_frame("SCORE").to_string() + "```\n"
+                    self.buffer = getattr(self, "buffer", "") + "Near Miss (D top5)\n```" \
+                                   + near.to_frame("SCORE").to_string() + "```\n"
         except Exception:
-            pass
+            pass  # 表示だけの補助情報なので落とさない
 
-        # --- Changes: 前回集合(init_*) と今回集合(top_*) の差分 ---
-        try:
-            gs_full = _as_series(agg_G if agg_G is not None else g_score)
-            ds_full = _as_series(agg_D if agg_D is not None else d_score_all)
-            prevG, prevD = list(init_G or []), list(init_D or [])
-            curG,  curD  = list(top_G or []),  list(top_D or [])
+        # --- 2) Changes：前回集合(init_*) vs 今回集合(top_*) から“必ず”再構築 ---
+        _cur_table = getattr(self, "io_table", None)
+        if (_cur_table is None) or (hasattr(_cur_table, "empty") and _cur_table.empty):
+            try:
+                gs = _as_series(g_score)
+                ds = _as_series(d_score_all)
+                prevG, prevD = list(init_G or []), list(init_D or [])
+                curG,  curD  = list(top_G or []),  list(top_D or [])
 
-            def _mk(prev, cur):
-                prev, cur = set(prev), set(cur)
-                ins, outs = sorted(cur - prev), sorted(prev - cur)
-                rows = []
-                n = max(len(ins), len(outs))
-                for i in range(n):
-                    inn = ins[i] if i < len(ins) else ""
-                    out = outs[i] if i < len(outs) else ""
-                    gsc = (round(float(gs_full.get(inn)), 3) if inn and hasattr(gs_full, "get") and inn in getattr(gs_full, "index", []) else "")
-                    dsc = (round(float(ds_full.get(inn)), 3) if inn and hasattr(ds_full, "get") and inn in getattr(ds_full, "index", []) else "")
-                    rows.append([inn, out, gsc, dsc])
-                return rows
+                def _mk(prev, cur):
+                    prev, cur = set(prev), set(cur)
+                    ins, outs = sorted(cur - prev), sorted(prev - cur)
+                    rows = []
+                    n = max(len(ins), len(outs))
+                    for i in range(n):
+                        inn = ins[i] if i < len(ins) else ""
+                        out = outs[i] if i < len(outs) else ""
+                        gsc = (round(float(gs.get(inn)), 3) if inn and hasattr(gs, "get") and inn in getattr(gs, "index", []) else "")
+                        dsc = (round(float(ds.get(inn)), 3) if inn and hasattr(ds, "get") and inn in getattr(ds, "index", []) else "")
+                        rows.append([inn, out, gsc, dsc])
+                    return rows
 
-            rows = _mk(prevG, curG) + _mk(prevD, curD)
-            df_changes = pd.DataFrame(rows, columns=["IN", "OUT", "GSC", "DSC"])
-            self.io_table = None if df_changes.empty else df_changes
-        except Exception:
-            self.io_table = None
+                rows = _mk(prevG, curG) + _mk(prevD, curD)
+                df_changes = pd.DataFrame(rows, columns=["IN", "OUT", "GSC", "DSC"])
+                self.io_table = None if df_changes.empty else df_changes
+            except Exception:
+                self.io_table = None  # 失敗時は非表示（クラッシュ回避）
 
         if self.io_table is not None:
             print("Changes:")
@@ -555,6 +567,8 @@ class Output:
         if not SLACK_WEBHOOK_URL:
             raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
         buf = getattr(self, "buffer", "")
+        if buf and not buf.endswith("\n"):
+            buf += "\n"
         # エラー時など g_table が無ければバッファのみ送信
         if self.g_table is None or self.d_table is None:
             if buf:
