@@ -523,6 +523,14 @@ class Output:
     def notify_slack(self):
         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
         if not SLACK_WEBHOOK_URL: raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+        buf = getattr(self, "buffer", None)
+        if buf:
+            payload = {"text": buf}
+            try:
+                resp = requests.post(SLACK_WEBHOOK_URL, json=payload); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
+            except Exception as e:
+                print(f"⚠️ Slack通知エラー: {e}")
+            return
         message = "📈 ファクター分散最適化の結果\n"
         if self.miss_df is not None and not self.miss_df.empty: message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
         message += self.g_title + "\n```" + self.g_table.to_string(formatters=self.g_formatters) + "```\n"
@@ -541,7 +549,8 @@ class Output:
         payload = {"text": message}
         try:
             resp = requests.post(SLACK_WEBHOOK_URL, json=payload); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
-        except Exception as e: print(f"⚠️ Slack通知エラー: {e}")
+        except Exception as e:
+            print(f"⚠️ Slack通知エラー: {e}")
 
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
@@ -599,7 +608,7 @@ def io_build_input_bundle() -> InputBundle:
     )
 
 def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
-              n_target: int, prev_json_path: str) -> tuple[list, float, float, float]:
+              n_target: int, prev_json_path: str, exclude_tickers: list[str] | None = None) -> tuple[list, float, float, float]:
     """
     G/Dを同一手順で処理：採点→フィルター→選定（相関低減込み）。
     戻り値：(pick, avg_res_corr, sum_score, objective)
@@ -653,6 +662,18 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
             )
         pick = res["tickers"]; avg_r = res["avg_res_corr"]
         sum_sc = res["sum_score"]; obj = res["objective"]
+    if exclude_tickers:
+        ex = set(exclude_tickers)
+        if ex:
+            sel = [t for t in list(pick) if t not in ex]
+            if len(sel) < n_target:
+                for t in agg.sort_values(ascending=False).index:
+                    if t in ex or t in sel:
+                        continue
+                    sel.append(t)
+                    if len(sel) >= n_target:
+                        break
+            pick = sel[:n_target]
     # --- Near-Miss: 惜しくも選ばれなかった上位5を保持（Slack表示用） ---
     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
     try:
@@ -674,6 +695,18 @@ def run_pipeline() -> SelectionBundle:
     Slack文言・丸め・順序は既存の Output を用いて変更しない。
     """
     inb = io_build_input_bundle()
+    # --- 必要最小限の取得ガード：pxが空/全NaNなら即停止（補填しない） ---
+    px = getattr(inb, "px", None)
+    try:
+        _empty_like = (px is None) or (px.empty) or px.dropna(how="all").empty
+    except Exception:
+        _empty_like = True
+    if _empty_like:
+        out = Output(); out.buffer = "❌ price data not available. aborting.\n"
+        try:
+            out.notify_slack()
+        finally:
+            import sys; sys.exit(2)
     cfg = PipelineConfig(
         weights=WeightsConfig(g=g_weights, d=D_weights),
         drrs=DRRSParams(corrM=corrM, shrink=DRRS_SHRINK,
@@ -682,7 +715,7 @@ def run_pipeline() -> SelectionBundle:
     )
     sc = Scorer()
     top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G, G_PREV_JSON)
-    top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D, D_PREV_JSON)
+    top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D, D_PREV_JSON, exclude_tickers=top_G)
     fb = getattr(sc, "_feat", None)
     near_G = getattr(sc, "_near_G", [])
     selected12 = list(top_G)
