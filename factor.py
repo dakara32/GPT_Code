@@ -383,40 +383,14 @@ class Selector:
 
 # ===== Output：出力整形と送信（表示・Slack） =====
 class Output:
-    SHOW_NEW_DIV_BREAKDOWN = False
 
     def __init__(self, debug=False):
         self.debug = debug
         self.miss_df = self.g_table = self.d_table = self.io_table = self.df_metrics_fmt = self.debug_table = None
         self.g_title = self.d_title = ""
-        self.div_details = {}
         self.g_formatters = self.d_formatters = {}
         # 低スコア（GSC+DSC）Top10 表示/送信用
         self.low10_table = None
-
-    # --- メトリクス補助（Output専用） ---
-    @staticmethod
-    def _avg_offdiag(A: np.ndarray) -> float:
-        n = A.shape[0]; return np.nan if n<2 else float((A.sum()-np.trace(A))/(n*(n-1)))
-
-    @classmethod
-    def _resid_avg_rho(cls, ret_df: pd.DataFrame, n_pc=3, shrink=DRRS_SHRINK) -> float:
-        Rdf = ret_df.dropna()
-        if Rdf.shape[0]<10 or Rdf.shape[1]<2: return np.nan
-        Z = (Rdf - Rdf.mean())/(Rdf.std(ddof=0)+1e-9); U,S,_ = np.linalg.svd(Z.values, full_matrices=False)
-        F = U[:,:n_pc]*S[:n_pc]; B = np.linalg.lstsq(F, Z.values, rcond=None)[0]; E = Z.values - F@B; C = np.corrcoef(E, rowvar=False)
-        return cls._avg_offdiag(C)
-
-    @staticmethod
-    def _raw_avg_rho(ret_df: pd.DataFrame) -> float:
-        Rdf = ret_df.dropna()
-        return np.nan if Rdf.shape[1]<2 else float(Output._avg_offdiag(Rdf.corr().values))
-
-    @staticmethod
-    def _cross_block_raw_rho(ret_df: pd.DataFrame, left: list, right: list) -> float:
-        R = ret_df[left+right].dropna()
-        if len(left)<1 or len(right)<1 or R.shape[0]<10: return np.nan
-        C = R.corr().loc[left,right].values; return float(np.nanmean(C))
 
     # --- 表示（元 display_results のロジックそのまま） ---
     def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
@@ -427,16 +401,35 @@ class Output:
             print("Missing Data:")
             print(self.miss_df.to_string(index=False))
 
-        sc = getattr(self, "_sc", None)
-        if isinstance(getattr(sc, "_agg_G", None), pd.Series):
-            g_score = getattr(sc, "_agg_G")
-        if isinstance(getattr(sc, "_agg_D", None), pd.Series):
-            d_score_all = getattr(sc, "_agg_D")
+        # ---- 表示用：Changes/Near-Miss のスコア源を“最終集計”に統一するプロキシ ----
+        try:
+            sc = getattr(self, "_sc", None)
+            agg_G = getattr(sc, "_agg_G", None)
+            agg_D = getattr(sc, "_agg_D", None)
+        except Exception:
+            sc = agg_G = agg_D = None
+        class _SeriesProxy:
+            __slots__ = ("primary", "fallback")
+            def __init__(self, primary, fallback): self.primary, self.fallback = primary, fallback
+            def get(self, key, default=None):
+                try:
+                    v = self.primary.get(key) if hasattr(self.primary, "get") else None
+                    if v is not None and not (isinstance(v, float) and v != v):
+                        return v
+                except Exception:
+                    pass
+                try:
+                    return self.fallback.get(key) if hasattr(self.fallback, "get") else default
+                except Exception:
+                    return default
+        g_score = _SeriesProxy(agg_G, g_score)
+        d_score_all = _SeriesProxy(agg_D, d_score_all)
         near_G = getattr(sc, "_near_G", []) if sc else []
         near_D = getattr(sc, "_near_D", []) if sc else []
 
         extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
-        self.g_table = pd.concat([df_z.loc[G_UNI,['GRW','MOM','TRD','VOL']], g_score[G_UNI].rename('GSC')], axis=1)
+        gsc_series = pd.Series({t: g_score.get(t) for t in G_UNI}, name='GSC')
+        self.g_table = pd.concat([df_z.loc[G_UNI,['GRW','MOM','TRD','VOL']], gsc_series], axis=1)
         self.g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
         self.g_formatters = {col:"{:.2f}".format for col in ['GRW','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
         self.g_title = (f"[G枠 / {N_G} / GRW{int(g_weights['GRW']*100)} MOM{int(g_weights['MOM']*100)} TRD{int(g_weights['TRD']*100)} VOL{int(g_weights['VOL']*100)} / corrM={corrM} / "
@@ -444,14 +437,15 @@ class Output:
         if near_G:
             add = [t for t in near_G if t not in set(G_UNI)][:5]
             if add:
-                near_tbl = pd.concat([df_z.loc[add,['GRW','MOM','TRD','VOL']], g_score[add].rename('GSC')], axis=1)
+                near_tbl = pd.concat([df_z.loc[add,['GRW','MOM','TRD','VOL']], pd.Series({t: g_score.get(t) for t in add}, name='GSC')], axis=1)
                 self.g_table = pd.concat([self.g_table, near_tbl], axis=0)
         print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
 
         extra_D = [t for t in init_D if t not in top_D][:5]; D_UNI = top_D + extra_D
         cols_D = ['QAL','YLD','VOL','TRD']; d_disp = pd.DataFrame(index=D_UNI)
         d_disp['QAL'], d_disp['YLD'], d_disp['VOL'], d_disp['TRD'] = df_z.loc[D_UNI,'D_QAL'], df_z.loc[D_UNI,'D_YLD'], df_z.loc[D_UNI,'D_VOL_RAW'], df_z.loc[D_UNI,'D_TRD']
-        self.d_table = pd.concat([d_disp, d_score_all[D_UNI].rename('DSC')], axis=1); self.d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
+        dsc_series = pd.Series({t: d_score_all.get(t) for t in D_UNI}, name='DSC')
+        self.d_table = pd.concat([d_disp, dsc_series], axis=1); self.d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
         self.d_formatters = {col:"{:.2f}".format for col in cols_D}; self.d_formatters['DSC']="{:.3f}".format
         import scorer
         dw_eff = scorer.D_WEIGHTS_EFF
@@ -462,7 +456,7 @@ class Output:
             if add:
                 d_disp2 = pd.DataFrame(index=add)
                 d_disp2['QAL'], d_disp2['YLD'], d_disp2['VOL'], d_disp2['TRD'] = df_z.loc[add,'D_QAL'], df_z.loc[add,'D_YLD'], df_z.loc[add,'D_VOL_RAW'], df_z.loc[add,'D_TRD']
-                near_tbl = pd.concat([d_disp2, d_score_all[add].rename('DSC')], axis=1)
+                near_tbl = pd.concat([d_disp2, pd.Series({t: d_score_all.get(t) for t in add}, name='DSC')], axis=1)
                 self.d_table = pd.concat([self.d_table, near_tbl], axis=0)
         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
 
@@ -470,24 +464,12 @@ class Output:
         in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
         out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
 
-        gsc_full = g_score
-        dsc_full = d_score_all
-
         self.io_table = pd.DataFrame({
             'IN': pd.Series(in_list),
             '/ OUT': pd.Series(out_list)
         })
-        g_list, d_list = [], []
-        for t in in_list:
-            gv = gsc_full.get(t)
-            dv = dsc_full.get(t)
-            g_list.append(f"{gv:.3f}" if pd.notna(gv) else '—')
-            if pd.notna(dv):
-                d_list.append(f"{dv:.3f}")
-            elif pd.notna(gv):
-                d_list.append(f"{gv:.3f}")
-            else:
-                d_list.append('—')
+        g_list = [f"{g_score.get(t):.3f}" if pd.notna(g_score.get(t)) else '—' for t in out_list]
+        d_list = [f"{d_score_all.get(t):.3f}" if pd.notna(d_score_all.get(t)) else '—' for t in out_list]
         self.io_table['GSC'] = pd.Series(g_list)
         self.io_table['DSC'] = pd.Series(d_list)
 
@@ -507,18 +489,12 @@ class Output:
                 RESID_rho = float((C_resid.sum()-np.trace(C_resid))/(C_resid.shape[0]*(C_resid.shape[0]-1)))
             else: RAW_rho = RESID_rho = np.nan
             metrics[name] = {'RET':ann_ret,'VOL':ann_vol,'SHP':sharpe,'MDD':drawdown,'RAWρ':RAW_rho,'RESIDρ':RESID_rho}
-        ticks_G, ticks_D, ret_1y = list(top_G), list(top_D), ret
-        self.div_details = {"NEW_rawρ":self._raw_avg_rho(ret_1y[ticks_G+ticks_D]),"NEW_residρ":self._resid_avg_rho(ret_1y, n_pc=max(DRRS_G["n_pc"],DRRS_D["n_pc"])),"G_rawρ":self._raw_avg_rho(ret_1y[ticks_G]),"D_rawρ":self._raw_avg_rho(ret_1y[ticks_D]),"G↔D_rawρ":self._cross_block_raw_rho(ret_1y, ticks_G, ticks_D)}
         df_metrics = pd.DataFrame(metrics).T; df_metrics_pct = df_metrics.copy()
         for col in ['RET','VOL','MDD']: df_metrics_pct[col] = df_metrics_pct[col]*100
         cols_order = ['RET','VOL','SHP','MDD','RAWρ','RESIDρ']; df_metrics_pct = df_metrics_pct.reindex(columns=cols_order)
         def _fmt_row(s):
             return pd.Series({'RET':f"{s['RET']:.1f}%",'VOL':f"{s['VOL']:.1f}%",'SHP':f"{s['SHP']:.1f}",'MDD':f"{s['MDD']:.1f}%",'RAWρ':(f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"),'RESIDρ':(f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN")})
         self.df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1); print("Performance Comparison:"); print(self.df_metrics_fmt.to_string())
-        if getattr(self, "SHOW_NEW_DIV_BREAKDOWN", False):
-            print("Diversification (NEW breakdown):")
-            for k,v in self.div_details.items():
-                print(f"  {k}: {np.nan if v is None else round(v,3)}")
         if self.debug:
             self.debug_table = pd.concat([df_z[['TR','EPS','REV','ROE','BETA','DIV','FCF','RS','TR_str','DIV_STREAK']], g_score.rename('GSC'), d_score_all.rename('DSC')], axis=1).round(3)
             print("Debug Data:"); print(self.debug_table.to_string())
@@ -548,8 +524,6 @@ class Output:
         if self.low10_table is not None:
             message += "Low Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
-        if getattr(self, "SHOW_NEW_DIV_BREAKDOWN", False):
-            message += "\nDiversification (NEW breakdown):\n```" + "\n".join([f"{k}: {np.nan if v is None else round(v,3)}" for k,v in self.div_details.items()]) + "```"
         if self.debug and self.debug_table is not None: message += "\nDebug Data\n```" + self.debug_table.to_string() + "```"
         payload = {"text": message}
         try:
@@ -671,13 +645,12 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         pick = res["tickers"]; avg_r = res["avg_res_corr"]
         sum_sc = res["sum_score"]; obj = res["objective"]
     # --- Near-Miss: 惜しくも選ばれなかった上位5を保持（Slack表示用） ---
-    # 5) Near-Miss と最終集計Seriesを保持（表示専用／計算へ影響なし）
+    # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
     try:
         pool = agg.drop(index=[t for t in pick if t in agg.index], errors="ignore")
         near5 = list(pool.sort_values(ascending=False).head(5).index)
         setattr(sc, f"_near_{group}", near5)
         setattr(sc, f"_agg_{group}", agg)
-        setattr(sc, f"_mask_{group}", locals().get("mask"))
     except Exception:
         pass
 
@@ -731,7 +704,7 @@ def run_pipeline() -> SelectionBundle:
         pass
 
     out = Output(debug=debug_mode)
-    # 表示側から選定時の集計へアクセスできるように保持（表示専用）
+    # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
     try: out._sc = sc
     except Exception: pass
     if hasattr(sc, "_feat"):
