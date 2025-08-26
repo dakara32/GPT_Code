@@ -6,8 +6,7 @@
 # 【このファイルだけ読めば分かるポイント】
 # - 入力(InputBundle)は「価格/出来高/ベンチ/基本情報/EPS/FCF/リターン」を含むDTO
 # - 出力(FeatureBundle)は「raw特徴量 df」「標準化 df_z」「G/D スコア」「欠損ログ」
-# - 重み等のコンフィグ(PipelineConfig)は外部から渡されればそれを優先
-#   渡されない場合は本ファイルの DEFAULT_CONFIG を使用（単体実行OK）
+# - コンフィグ(PipelineConfig)は factor から必須渡し（デフォルトなし）
 # - 旧カラム名は Scorer 内で自動リネームして受け入れ（後方互換）
 #   例) eps_ttm -> EPS_TTM, eps_q_recent -> EPS_Q_LastQ, fcf_ttm -> FCF_TTM
 #
@@ -27,13 +26,14 @@
 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
 # =============================================================================
 
-import requests
 import numpy as np
 import pandas as pd
-import yfinance as yf
-from dataclasses import dataclass
-from typing import Dict, List, Optional
 from scipy.stats import zscore
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - hints only
+    from factor import InputBundle, FeatureBundle, PipelineConfig
 
 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
 def winsorize_s(s: pd.Series, p=0.02):
@@ -53,73 +53,19 @@ def _safe_last(series: pd.Series, default=np.nan):
     try: return float(series.iloc[-1])
     except Exception: return default
 
-# ---- DTO & Config（単体実行でも動くよう最小限を内包） -----------------------
-@dataclass(frozen=True)
-class InputBundle:
-    cand: List[str]
-    tickers: List[str]
-    bench: str
-    data: pd.DataFrame
-    px: pd.DataFrame
-    spx: pd.Series
-    tickers_bulk: object
-    info: Dict[str, dict]
-    eps_df: pd.DataFrame
-    fcf_df: pd.DataFrame
-    returns: pd.DataFrame
 
-@dataclass(frozen=True)
-class FeatureBundle:
-    df: pd.DataFrame
-    df_z: pd.DataFrame
-    g_score: pd.Series
-    d_score_all: pd.Series
-    missing_logs: pd.DataFrame
-
-@dataclass(frozen=True)
-class WeightsConfig:
-    g: Dict[str, float]
-    d: Dict[str, float]
-
-@dataclass(frozen=True)
-class DRRSParams:
-    corrM: int
-    shrink: float
-    G: Dict[str, float]
-    D: Dict[str, float]
-    cross_mu_gd: float
-
-@dataclass(frozen=True)
-class PipelineConfig:
-    weights: WeightsConfig
-    drrs: DRRSParams
-    price_max: float
-
-# ---- デフォルト設定（外部が渡せばそれを優先） -------------------------------
-DEFAULT_G_WEIGHTS = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
-DEFAULT_D_WEIGHTS = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
-DEFAULT_DRRS = DRRSParams(
-    corrM=45, shrink=0.10,
-    G=dict(lookback=252, n_pc=3, gamma=1.2, lam=0.68, eta=0.8),
-    D=dict(lookback=504, n_pc=4, gamma=0.8, lam=0.85, eta=0.5),
-    cross_mu_gd=0.40
-)
-DEFAULT_CONFIG = PipelineConfig(
-    weights=WeightsConfig(g=DEFAULT_G_WEIGHTS, d=DEFAULT_D_WEIGHTS),
-    drrs=DEFAULT_DRRS,
-    price_max=400.0
-)
+def _require_cfg(cfg):
+    if cfg is None:
+        raise RuntimeError("scorer requires cfg from factor (no DEFAULT_CONFIG here)")
+    return cfg
 
 # NOTE: scorerはユーティリティ専用。環境依存の設定は外部で管理する。
-D_BETA_MAX = 0.9
-FINNHUB_API_KEY = None
-D_WEIGHTS_EFF = None  # 出力表示互換のため
 
 # ---- Scorer 本体 -------------------------------------------------------------
 class Scorer:
     """
     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
-    - cfg を省略 or None の場合は DEFAULT_CONFIG を使用。
+    - cfg は必須。デフォルト設定は持たない。
     - 旧カラム名を自動リネームして新スキーマに吸収します。
     """
 
@@ -129,7 +75,7 @@ class Scorer:
 
     # === スキーマ簡易チェック（最低限） ===
     @staticmethod
-    def _validate_ib_for_scorer(ib: InputBundle):
+    def _validate_ib_for_scorer(ib: 'InputBundle'):
         must_attrs = ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"]
         miss = [a for a in must_attrs if not hasattr(ib, a) or getattr(ib, a) is None]
         if miss: raise ValueError(f"InputBundle is missing required attributes for Scorer: {miss}")
@@ -187,57 +133,9 @@ class Scorer:
         except Exception: return np.nan
 
     @staticmethod
-    def ev_fallback(info_t: dict, tk: yf.Ticker) -> float:
-        ev = info_t.get('enterpriseValue', np.nan)
-        if pd.notna(ev) and ev>0: return float(ev)
-        mc, debt, cash = info_t.get('marketCap', np.nan), np.nan, np.nan
-        try:
-            bs = tk.quarterly_balance_sheet
-            if bs is not None and not bs.empty:
-                c = bs.columns[0]
-                for k in ("Total Debt","Long Term Debt","Short Long Term Debt"):
-                    if k in bs.index: debt = float(bs.loc[k,c]); break
-                for k in ("Cash And Cash Equivalents","Cash And Cash Equivalents And Short Term Investments","Cash"):
-                    if k in bs.index: cash = float(bs.loc[k,c]); break
-        except Exception: pass
-        if pd.notna(mc): return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
-        return np.nan
+    def div_streak(*_args, **_kwargs):
+        return 0
 
-    @staticmethod
-    def dividend_status(ticker: str) -> str:
-        t = yf.Ticker(ticker)
-        try:
-            if not t.dividends.empty: return "has"
-        except Exception: return "unknown"
-        try:
-            a = t.actions
-            if a is not None and not a.empty and "Stock Splits" in a.columns and a["Stock Splits"].abs().sum()>0: return "none_confident"
-        except Exception: pass
-        try:
-            fi = t.fast_info
-            if any(getattr(fi,k,None) for k in ("last_dividend_date","dividend_rate","dividend_yield")): return "maybe_missing"
-        except Exception: pass
-        return "unknown"
-
-    @staticmethod
-    def div_streak(t):
-        try:
-            divs = yf.Ticker(t).dividends.dropna(); ann = divs.groupby(divs.index.year).sum(); ann = ann[ann.index<pd.Timestamp.today().year]
-            years, streak = sorted(ann.index), 0
-            for i in range(len(years)-1,0,-1):
-                if ann[years[i]] > ann[years[i-1]]: streak += 1
-                else: break
-            return streak
-        except Exception: return 0
-
-    @staticmethod
-    def fetch_finnhub_metrics(symbol):
-        if not FINNHUB_API_KEY: return {}
-        url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":FINNHUB_API_KEY}
-        try:
-            r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
-            return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.get('enterpriseValue') else None}
-        except Exception: return {}
 
     @staticmethod
     def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
@@ -248,16 +146,16 @@ class Scorer:
         return np.nan if var==0 else cov/var
 
     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
-    def aggregate_scores(self, ib: InputBundle, cfg: Optional[PipelineConfig]=None) -> FeatureBundle:
+    def aggregate_scores(self, ib: 'InputBundle', cfg: 'PipelineConfig') -> 'FeatureBundle':
         self._validate_ib_for_scorer(ib)
-        cfg = cfg or DEFAULT_CONFIG  # 外部優先だが、無ければデフォルトで自走
+        cfg = _require_cfg(cfg)
 
         px, spx, tickers = ib.px, ib.spx, ib.tickers
         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
 
         df, missing_logs = pd.DataFrame(index=tickers), []
         for t in tickers:
-            d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
+            d, s = info[t], px[t]; ev = d.get('enterpriseValue', np.nan)
             # --- 基本特徴 ---
             df.loc[t,'TR']   = self.trend(s)
             df.loc[t,'EPS']  = eps_df.loc[t,'EPS_TTM'] if t in eps_df.index else np.nan
@@ -265,15 +163,8 @@ class Scorer:
             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
 
-            # --- 配当（欠損補完含む） ---
+            # --- 配当 ---
             div = d.get('dividendYield') if d.get('dividendYield') is not None else d.get('trailingAnnualDividendYield')
-            if div is None or pd.isna(div):
-                try:
-                    divs = yf.Ticker(t).dividends
-                    if divs is not None and not divs.empty:
-                        last_close = s.iloc[-1]; div_1y = divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum()
-                        if last_close and last_close>0: div = float(div_1y/last_close)
-                except Exception: pass
             df.loc[t,'DIV'] = 0.0 if (div is None or pd.isna(div)) else float(div)
 
             # --- FCF/EV ---
@@ -321,19 +212,6 @@ class Scorer:
 
             # --- 配当の詳細系 ---
             DIV_TTM_PS=DIV_VAR5=DIV_YOY=DIV_FCF_COVER=np.nan
-            try:
-                divs = yf.Ticker(t).dividends.dropna()
-                if not divs.empty:
-                    last_close = s.iloc[-1]; div_1y = float(divs[divs.index >= (divs.index.max()-pd.Timedelta(days=365))].sum())
-                    DIV_TTM_PS = div_1y if div_1y>0 else np.nan
-                    ann = divs.groupby(divs.index.year).sum()
-                    if len(ann)>=2 and ann.iloc[-2]!=0: DIV_YOY = float(ann.iloc[-1]/ann.iloc[-2]-1.0)
-                    tail = ann.iloc[-5:] if len(ann)>=5 else ann
-                    if len(tail)>=3 and tail.mean()!=0: DIV_VAR5 = float(tail.std(ddof=1)/abs(tail.mean()))
-                so = d.get('sharesOutstanding',None)
-                if so and pd.notna(DIV_TTM_PS) and pd.notna(fcf_val) and fcf_val!=0:
-                    DIV_FCF_COVER = float((fcf_val)/(DIV_TTM_PS*float(so)))
-            except Exception: pass
             df.loc[t,'DIV_TTM_PS'], df.loc[t,'DIV_VAR5'], df.loc[t,'DIV_YOY'], df.loc[t,'DIV_FCF_COVER'] = DIV_TTM_PS, DIV_VAR5, DIV_YOY, DIV_FCF_COVER
 
             # --- 財務安定性 ---
@@ -465,20 +343,9 @@ class Scorer:
             df.loc[t,'DIV_STREAK'] = self.div_streak(t)
 
             # --- 欠損メモ ---
-            fin_cols = ['REV','ROE','BETA','DIV','FCF']
-            need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t,col])]
-            if need_finnhub:
-                fin_data = self.fetch_finnhub_metrics(t)
-                for col in need_finnhub:
-                    val = fin_data.get(col)
-                    if val is not None and not pd.isna(val): df.loc[t,col] = val
-            for col in fin_cols + ['EPS','RS','TR_str','DIV_STREAK']:
+            for col in ['REV','ROE','BETA','DIV','FCF','EPS','RS','TR_str','DIV_STREAK']:
                 if pd.isna(df.loc[t,col]):
-                    if col=='DIV':
-                        status = self.dividend_status(t)
-                        if status!='none_confident': missing_logs.append({'Ticker':t,'Column':col,'Status':status})
-                    else:
-                        missing_logs.append({'Ticker':t,'Column':col})
+                    missing_logs.append({'Ticker':t,'Column':col})
 
         # === Z化と合成 ===
         for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
@@ -532,7 +399,6 @@ class Scorer:
             'TRD': df_z['D_TRD']
         }, axis=1)
         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
-        globals()['D_WEIGHTS_EFF'] = dw.copy()
         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
 
         # ② テンプレ判定（既存ロジックそのまま）
@@ -566,17 +432,12 @@ class Scorer:
         df_z['GSC'] = g_score_all
         df_z['DSC'] = d_score_all
 
-        # --- D枠のβフィルタ（採用可視化） ---
-        d_pass_beta = df['BETA'] < D_BETA_MAX
-        df_z['D_PASS_BETA'] = d_pass_beta.astype(float)          # 1/0 フラグ
-        df_z['DSC_DPASS']   = d_score_all.where(d_pass_beta, np.nan)  # β基準未満は NaN
-
         try:
             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
         except Exception:
             pass
 
-        return FeatureBundle(
+        return SimpleNamespace(
             df=df,
             df_z=df_z,
             g_score=g_score,
