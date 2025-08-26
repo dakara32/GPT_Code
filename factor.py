@@ -527,11 +527,13 @@ class Output:
         if self.miss_df is not None and not self.miss_df.empty: message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
         message += self.g_title + "\n```" + self.g_table.to_string(formatters=self.g_formatters) + "```\n"
         message += self.d_title + "\n```" + self.d_table.to_string(formatters=self.d_formatters) + "```\n"
-        # robust: io_table が None（= 変化なし等）でも落ちないようにする
-        _tbl = getattr(self, "io_table", None)
-        _txt = _tbl.to_string(index=False) if (hasattr(_tbl, "to_string")) else ""
-        message += "Changes\n```" + _txt + "```\n"
-        message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
+        # safe stringify（dfがNoneでも空文字にして体裁は維持）
+        def _tostr(df, **kw):
+            return df.to_string(**kw) if hasattr(df, "to_string") else ""
+        # Changes（None耐性）
+        message += "Changes\n```" + _tostr(getattr(self, "io_table", None), index=False) + "```\n"
+        # Performance Comparison（None耐性）
+        message += "Performance Comparison:\n```" + _tostr(getattr(self, "df_metrics_fmt", None)) + "```"
         # 低スコアTOP10（GSC+DSC）
         if self.low10_table is not None:
             message += "\nLow Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
