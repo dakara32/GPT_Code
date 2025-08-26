@@ -468,21 +468,50 @@ class Output:
                 self.d_table = pd.concat([self.d_table, near_tbl], axis=0)
         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
 
-        # === Changes（IN の GSC/DSC を表示。OUT は銘柄名のみ） ===
-        in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
-        out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
+        # --- D Near-Miss (Top5): D未採用から上位5銘柄 ---
+        def _as_series(x):
+            if isinstance(x, pd.DataFrame):
+                return x.iloc[:, 0] if x.shape[1] else pd.Series(dtype=float)
+            return x
+        try:
+            d_all = _as_series(agg_D if agg_D is not None else d_score_all)
+            if hasattr(d_all, "index") and len(top_D) > 0:
+                mask_sel = d_all.index.isin(list(top_D))
+                near = d_all.loc[~mask_sel].astype(float).sort_values(ascending=False).head(5)
+                if hasattr(near, "empty") and not near.empty:
+                    self.buffer = getattr(self, "buffer", "") + "Near Miss (D top5)\n```" + near.to_frame("SCORE").to_string() + "```\n"
+        except Exception:
+            pass
 
-        self.io_table = pd.DataFrame({
-            'IN': pd.Series(in_list),
-            '/ OUT': pd.Series(out_list)
-        })
-        g_list = [f"{g_score.get(t):.3f}" if pd.notna(g_score.get(t)) else '—' for t in out_list]
-        d_list = [f"{d_score_all.get(t):.3f}" if pd.notna(d_score_all.get(t)) else '—' for t in out_list]
-        self.io_table['GSC'] = pd.Series(g_list)
-        self.io_table['DSC'] = pd.Series(d_list)
+        # --- Changes: 前回集合(init_*) と今回集合(top_*) の差分 ---
+        try:
+            gs_full = _as_series(agg_G if agg_G is not None else g_score)
+            ds_full = _as_series(agg_D if agg_D is not None else d_score_all)
+            prevG, prevD = list(init_G or []), list(init_D or [])
+            curG,  curD  = list(top_G or []),  list(top_D or [])
 
-        print("Changes:")
-        print(self.io_table.to_string(index=False))
+            def _mk(prev, cur):
+                prev, cur = set(prev), set(cur)
+                ins, outs = sorted(cur - prev), sorted(prev - cur)
+                rows = []
+                n = max(len(ins), len(outs))
+                for i in range(n):
+                    inn = ins[i] if i < len(ins) else ""
+                    out = outs[i] if i < len(outs) else ""
+                    gsc = (round(float(gs_full.get(inn)), 3) if inn and hasattr(gs_full, "get") and inn in getattr(gs_full, "index", []) else "")
+                    dsc = (round(float(ds_full.get(inn)), 3) if inn and hasattr(ds_full, "get") and inn in getattr(ds_full, "index", []) else "")
+                    rows.append([inn, out, gsc, dsc])
+                return rows
+
+            rows = _mk(prevG, curG) + _mk(prevD, curD)
+            df_changes = pd.DataFrame(rows, columns=["IN", "OUT", "GSC", "DSC"])
+            self.io_table = None if df_changes.empty else df_changes
+        except Exception:
+            self.io_table = None
+
+        if self.io_table is not None:
+            print("Changes:")
+            print(self.io_table.to_string(index=False))
 
         all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
@@ -519,36 +548,47 @@ class Output:
             print(f"[warn] low-score ranking failed: {e}")
             self.low10_table = None
 
-    # --- Slack送信（元 notify_slack のロジックそのまま） ---
+    # --- Slack送信 ---
     def notify_slack(self):
+        import requests
         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-        if not SLACK_WEBHOOK_URL: raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-        buf = getattr(self, "buffer", None)
-        if buf:
-            payload = {"text": buf}
-            try:
-                resp = requests.post(SLACK_WEBHOOK_URL, json=payload); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
-            except Exception as e:
-                print(f"⚠️ Slack通知エラー: {e}")
+        if not SLACK_WEBHOOK_URL:
+            raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+        buf = getattr(self, "buffer", "")
+        # エラー時など g_table が無ければバッファのみ送信
+        if self.g_table is None or self.d_table is None:
+            if buf:
+                try:
+                    resp = requests.post(SLACK_WEBHOOK_URL, json={"text": buf}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
+                except Exception as e:
+                    print(f"⚠️ Slack通知エラー: {e}")
             return
-        message = "📈 ファクター分散最適化の結果\n"
-        if self.miss_df is not None and not self.miss_df.empty: message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
+
+        # セクションは“中身がある時だけ”付け足す（空なら見出しを出さない）
+        def _section(title: str, df, **kw) -> str:
+            try:
+                if df is None or (hasattr(df, "empty") and df.empty):
+                    return ""
+                body = df.to_string(**kw) if hasattr(df, "to_string") else str(df)
+                if not str(body).strip():
+                    return ""
+                return f"{title}\n```{body}```\n"
+            except Exception:
+                return ""
+
+        message = buf + "📈 ファクター分散最適化の結果\n"
+        if self.miss_df is not None and not self.miss_df.empty:
+            message += _section("Missing Data", self.miss_df, index=False)
         message += self.g_title + "\n```" + self.g_table.to_string(formatters=self.g_formatters) + "```\n"
         message += self.d_title + "\n```" + self.d_table.to_string(formatters=self.d_formatters) + "```\n"
-        # safe stringify（dfがNoneでも空文字にして体裁は維持）
-        def _tostr(df, **kw):
-            return df.to_string(**kw) if hasattr(df, "to_string") else ""
-        # Changes（None耐性）
-        message += "Changes\n```" + _tostr(getattr(self, "io_table", None), index=False) + "```\n"
-        # Performance Comparison（None耐性）
-        message += "Performance Comparison:\n```" + _tostr(getattr(self, "df_metrics_fmt", None)) + "```"
-        # 低スコアTOP10（GSC+DSC）
+        message += _section("Changes", getattr(self, "io_table", None), index=False)
+        message += _section("Performance Comparison:", getattr(self, "df_metrics_fmt", None))
         if self.low10_table is not None:
-            message += "\nLow Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
-        if self.debug and self.debug_table is not None: message += "\nDebug Data\n```" + self.debug_table.to_string() + "```"
-        payload = {"text": message}
+            message += _section("Low Score Candidates (GSC+DSC bottom 10)", self.low10_table)
+        if self.debug and self.debug_table is not None:
+            message += _section("Debug Data", self.debug_table)
         try:
-            resp = requests.post(SLACK_WEBHOOK_URL, json=payload); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
+            resp = requests.post(SLACK_WEBHOOK_URL, json={"text": message}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
         except Exception as e:
             print(f"⚠️ Slack通知エラー: {e}")
 
