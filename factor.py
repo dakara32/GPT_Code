@@ -22,6 +22,8 @@ N_G, N_D = 12, 13  # G/D枠サイズ
 g_weights = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.9"))
 D_weights = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
+EXCLUSIVE_BETWEEN_GROUPS = bool(int(os.environ.get("EXCLUSIVE_BETWEEN_GROUPS", "0")))
+EXCLUSIVE_PRIMARY_GROUP = os.environ.get("EXCLUSIVE_PRIMARY_GROUP", "G").upper()
 
 # DRRS 初期プール・各種パラメータ
 corrM = 45
@@ -473,20 +475,16 @@ class Output:
         # --- D Near-Miss (Top5)：D未採用から上位5（降順）。失敗しても落とさない ---
         def _as_series(x):
             if isinstance(x, pd.DataFrame):
-                # 優先列があれば使う（なければ先頭列）
-                for c in ("DSC", "GSC", "score", "SCORE"):
-                    if c in x.columns:
-                        return x[c]
+                # 優先列があれば使う（無ければ先頭列）
+                for name in ("DSC", "GSC", "score", "SCORE"):
+                    if name in x.columns: return x[name]
                 return x.iloc[:, 0] if x.shape[1] else pd.Series(dtype=float)
             return x
         try:
             d_all = _as_series(d_score_all)
             if hasattr(d_all, "index") and len(top_D) > 0:
                 mask_sel = d_all.index.isin(list(top_D))
-                near = pd.to_numeric(d_all.loc[~mask_sel], errors="coerce")\
-                         .dropna()\
-                         .sort_values(ascending=False)\
-                         .head(5)
+                near = pd.to_numeric(d_all.loc[~mask_sel], errors="coerce").dropna().sort_values(ascending=False).head(5)
                 if hasattr(near, "empty") and not near.empty:
                     self.buffer += "Near Miss (D top5)\n```" + near.to_frame("SCORE").to_string() + "```\n"
         except Exception:
@@ -565,52 +563,54 @@ class Output:
         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
         if not SLACK_WEBHOOK_URL:
             raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-        parts = []
-        buf = self.buffer
-        if buf and not buf.endswith("\n"):
-            buf += "\n"
-        if buf:
-            parts.append(buf)
+        # 末尾改行を保証（コードブロック直後に後続が食われないように）
+        msg = (self.buffer or "")
+        if msg and not msg.endswith("\n"): msg += "\n"
 
+        # セクションは“中身がある時だけ”
         def _section(title: str, df, **kw) -> str:
             try:
                 if df is None or (hasattr(df, "empty") and df.empty):
                     return ""
                 body = df.to_string(**kw) if hasattr(df, "to_string") else str(df)
-                body = str(body)
-                if not body.strip():
+                if not str(body).strip():
                     return ""
                 return f"{title}\n```{body}```\n"
             except Exception:
                 return ""
+        # 本文
+        parts = [msg] if msg else []
+        # Changes / Performance
+        ch = _section("Changes", getattr(self, "io_table", None), index=False)
+        if ch: parts.append(ch)
+        pf = _section("Performance Comparison:", getattr(self, "df_metrics_fmt", None))
+        if pf: parts.append(pf)
+        # エラー（あれば）
+        err = getattr(self, "err_log", "")
+        if isinstance(err, str) and err.strip():
+            parts.append("⚠️ Internal errors\n```" + err.strip() + "```\n")
 
-        s_changes = _section("Changes", getattr(self, "io_table", None), index=False)
-        if s_changes:
-            parts.append(s_changes)
-        s_perf = _section("Performance Comparison:", getattr(self, "df_metrics_fmt", None))
-        if s_perf:
-            parts.append(s_perf)
-
-        msg = "".join(parts)
+        # 長文は分割送信（Slackの切り捨て回避）
+        text = "".join(parts)
         MAXLEN = 35000
-        if len(msg) <= MAXLEN:
+        if len(text) <= MAXLEN:
             try:
-                resp = requests.post(SLACK_WEBHOOK_URL, json={"text": msg}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
+                resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
             except Exception as e:
                 print(f"⚠️ Slack通知エラー: {e}")
         else:
-            chunk = ""
+            acc = ""
             for p in parts:
-                if len(chunk) + len(p) > MAXLEN and chunk:
+                if len(acc) + len(p) > MAXLEN and acc:
                     try:
-                        resp = requests.post(SLACK_WEBHOOK_URL, json={"text": chunk}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
+                        resp = requests.post(SLACK_WEBHOOK_URL, json={"text": acc}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
                     except Exception as e:
                         print(f"⚠️ Slack通知エラー: {e}")
-                    chunk = ""
-                chunk += p
-            if chunk:
+                    acc = ""
+                acc += p
+            if acc:
                 try:
-                    resp = requests.post(SLACK_WEBHOOK_URL, json={"text": chunk}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
+                    resp = requests.post(SLACK_WEBHOOK_URL, json={"text": acc}); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
                 except Exception as e:
                     print(f"⚠️ Slack通知エラー: {e}")
 
@@ -776,8 +776,33 @@ def run_pipeline() -> SelectionBundle:
         price_max=CAND_PRICE_MAX
     )
     sc = Scorer()
-    top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G, G_PREV_JSON)
-    top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D, D_PREV_JSON, exclude_tickers=top_G)
+    # --- 選定実行（D側で落ちても全体は流す。エラーはSlack末尾に表示） ---
+    err_msgs = []
+    if EXCLUSIVE_BETWEEN_GROUPS and EXCLUSIVE_PRIMARY_GROUP == "G":
+        top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G, G_PREV_JSON)
+        try:
+            top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D, D_PREV_JSON, exclude_tickers=set(top_G))
+        except Exception as e:
+            top_D, avgD, sumD, objD = [], 0.0, 0.0, 0.0
+            err_msgs.append(f"D group failed: {e.__class__.__name__}: {e}")
+    elif EXCLUSIVE_BETWEEN_GROUPS and EXCLUSIVE_PRIMARY_GROUP == "D":
+        top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D, D_PREV_JSON)
+        try:
+            top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G, G_PREV_JSON, exclude_tickers=set(top_D))
+        except Exception as e:
+            top_G, avgG, sumG, objG = [], 0.0, 0.0, 0.0
+            err_msgs.append(f"G group failed: {e.__class__.__name__}: {e}")
+    else:
+        try:
+            top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G, G_PREV_JSON)
+        except Exception as e:
+            top_G, avgG, sumG, objG = [], 0.0, 0.0, 0.0
+            err_msgs.append(f"G group failed: {e.__class__.__name__}: {e}")
+        try:
+            top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D, D_PREV_JSON)
+        except Exception as e:
+            top_D, avgD, sumD, objD = [], 0.0, 0.0, 0.0
+            err_msgs.append(f"D group failed: {e.__class__.__name__}: {e}")
     fb = getattr(sc, "_feat", None)
     near_G = getattr(sc, "_near_G", [])
     selected12 = list(top_G)
@@ -808,6 +833,8 @@ def run_pipeline() -> SelectionBundle:
         pass
 
     out = Output(debug=debug_mode)
+    # 上の例外をSlack末尾に載せる（None/空なら無視される）
+    out.err_log = "\n".join(err_msgs) if err_msgs else ""
     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
     try: out._sc = sc
     except Exception: pass
