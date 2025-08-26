@@ -793,7 +793,7 @@ def _scorer_resolve(*names):
 # NOTE: モジュール関数（build_features 等）を**ここで定義しない**。
 #       既存実装の名前空間を汚さず、衝突を避けるため。
 
-# ---- 互換レイヤ（既存クラスがあれば尊重）。上書きはしない：未実装メソッドだけ“後付け” ----
+# ---- 互換レイヤ（既存クラスがあれば尊重）。上書きしない：未実装メソッドだけ“後付け” ----
 try:
     Scorer  # 既存クラスがある場合
 except NameError:
@@ -801,85 +801,81 @@ except NameError:
     class Scorer:
         def score_build_features(self, inb):
             # 1) self の private 実装を優先
-            for name in ("_build_features", "features_build", "build_features_core"):
+            for name in ("_build_features", "features_build", "build_features_core", "build_features"):
                 fn = getattr(self, name, None)
                 if callable(fn): return fn(inb)
-            # 2) モジュール内の既存実装へ
-            fn = _scorer_resolve("_build_features", "build_features", "features_build", "build_features_core")
-            return fn(inb)
+            # 2) モジュール内の既存実装（存在すれば）
+            for n in ("_build_features", "build_features_core", "features_build", "build_features"):
+                fn = globals().get(n)
+                if callable(fn): return fn(inb)
+            raise AttributeError("score_build_features implementation not found")
         def score_aggregate(self, feat, group, cfg):
             weights = cfg.weights.g if group == "G" else cfg.weights.d
-            for name in ("_aggregate", "aggregate_scores_core", "aggregate_core"):
+            for name in ("_aggregate", "aggregate_scores_core", "aggregate_core", "aggregate_scores"):
                 fn = getattr(self, name, None)
                 if callable(fn): return fn(feat, weights)
-            fn = _scorer_resolve("_aggregate", "aggregate_scores", "aggregate_scores_core", "aggregate_core")
-            return fn(feat, weights)
+            for n in ("_aggregate", "aggregate_scores_core", "aggregate_core", "aggregate_scores"):
+                fn = globals().get(n)
+                if callable(fn): return fn(feat, weights)
+            raise AttributeError("score_aggregate implementation not found")
         def filter_candidates(self, inb, scores, group, cfg):
-            for name in ("_apply_filters", "apply_filters_core", "filters_apply"):
+            for name in ("_apply_filters", "apply_filters_core", "filters_apply", "apply_filters"):
                 fn = getattr(self, name, None)
                 if callable(fn): return fn(inb, scores, group, cfg)
-            fn = _scorer_resolve("_apply_filters", "apply_filters", "apply_filters_core", "filters_apply")
-            return fn(inb, scores, group, cfg)
+            for n in ("_apply_filters", "apply_filters_core", "filters_apply", "apply_filters"):
+                fn = globals().get(n)
+                if callable(fn): return fn(inb, scores, group, cfg)
+            raise AttributeError("filter_candidates implementation not found")
         def select_diversified(self, scores, group, cfg, n_target, **kw):
             for name in ("_select_diversified_core", "select_diversified_core", "_select_core"):
                 fn = getattr(self, name, None)
                 if callable(fn): return fn(scores, n_target, **kw)
-            fn = _scorer_resolve("_select_diversified_core", "select_diversified_core", "_select_core")
-            return fn(scores, n_target, **kw)
+            for n in ("_select_diversified_core", "select_diversified_core", "_select_core"):
+                fn = globals().get(n)
+                if callable(fn): return fn(scores, n_target, **kw)
+            raise AttributeError("select_diversified implementation not found")
 else:
-    # 既存メソッドが既にある場合でも、**安全ラッパで横取り**する（元の実装には最後にフォールバック）
-    # 1) score_build_features
-    _orig_sbf = getattr(Scorer, "score_build_features", None)
-    def _sbf(self, inb):
-        for name in ("_build_features", "features_build", "build_features_core"):
-            fn = getattr(self, name, None)
-            if callable(fn): return fn(inb)
-        try:
-            fn = _scorer_resolve("_build_features", "build_features", "features_build", "build_features_core")
-            return fn(inb)
-        except NameError:
-            if callable(_orig_sbf): return _orig_sbf(self, inb)
-            raise
-    Scorer.score_build_features = _sbf
-    # 2) score_aggregate
-    _orig_sag = getattr(Scorer, "score_aggregate", None)
-    def _sag(self, feat, group, cfg):
-        weights = cfg.weights.g if group == "G" else cfg.weights.d
-        for name in ("_aggregate", "aggregate_scores_core", "aggregate_core"):
-            fn = getattr(self, name, None)
-            if callable(fn): return fn(feat, weights)
-        try:
-            fn = _scorer_resolve("_aggregate", "aggregate_scores", "aggregate_scores_core", "aggregate_core")
-            return fn(feat, weights)
-        except NameError:
-            if callable(_orig_sag): return _orig_sag(self, feat, group, cfg)
-            raise
-    Scorer.score_aggregate = _sag
-    # 3) filter_candidates
-    _orig_flt = getattr(Scorer, "filter_candidates", None)
-    def _flt(self, inb, scores, group, cfg):
-        for name in ("_apply_filters", "apply_filters_core", "filters_apply"):
-            fn = getattr(self, name, None)
-            if callable(fn): return fn(inb, scores, group, cfg)
-        try:
-            fn = _scorer_resolve("_apply_filters", "apply_filters", "apply_filters_core", "filters_apply")
-            return fn(inb, scores, group, cfg)
-        except NameError:
-            if callable(_orig_flt): return _orig_flt(self, inb, scores, group, cfg)
-            raise
-    Scorer.filter_candidates = _flt
-    # 4) select_diversified
-    _orig_sel = getattr(Scorer, "select_diversified", None)
-    def _sel(self, scores, group, cfg, n_target, **kw):
-        for name in ("_select_diversified_core", "select_diversified_core", "_select_core"):
-            fn = getattr(self, name, None)
-            if callable(fn): return fn(scores, n_target, **kw)
-        try:
-            fn = _scorer_resolve("_select_diversified_core", "select_diversified_core", "_select_core")
-            return fn(scores, n_target, **kw)
-        except NameError:
-            if callable(_orig_sel): return _orig_sel(self, scores, group, cfg, n_target, **kw)
-            raise
-    Scorer.select_diversified = _sel
+    # 既存メソッドが “既にある” 場合は一切触らない（＝上書きしない）。未実装のものだけ後付けする。
+    if not hasattr(Scorer, "score_build_features"):
+        def score_build_features(self, inb):
+            for name in ("_build_features", "features_build", "build_features_core", "build_features"):
+                fn = getattr(self, name, None)
+                if callable(fn): return fn(inb)
+            for n in ("_build_features", "build_features_core", "features_build", "build_features"):
+                fn = globals().get(n)
+                if callable(fn): return fn(inb)
+            raise AttributeError("score_build_features implementation not found")
+        Scorer.score_build_features = score_build_features
+    if not hasattr(Scorer, "score_aggregate"):
+        def score_aggregate(self, feat, group, cfg):
+            weights = cfg.weights.g if group == "G" else cfg.weights.d
+            for name in ("_aggregate", "aggregate_scores_core", "aggregate_core", "aggregate_scores"):
+                fn = getattr(self, name, None)
+                if callable(fn): return fn(feat, weights)
+            for n in ("_aggregate", "aggregate_scores_core", "aggregate_core", "aggregate_scores"):
+                fn = globals().get(n)
+                if callable(fn): return fn(feat, weights)
+            raise AttributeError("score_aggregate implementation not found")
+        Scorer.score_aggregate = score_aggregate
+    if not hasattr(Scorer, "filter_candidates"):
+        def filter_candidates(self, inb, scores, group, cfg):
+            for name in ("_apply_filters", "apply_filters_core", "filters_apply", "apply_filters"):
+                fn = getattr(self, name, None)
+                if callable(fn): return fn(inb, scores, group, cfg)
+            for n in ("_apply_filters", "apply_filters_core", "filters_apply", "apply_filters"):
+                fn = globals().get(n)
+                if callable(fn): return fn(inb, scores, group, cfg)
+            raise AttributeError("filter_candidates implementation not found")
+        Scorer.filter_candidates = filter_candidates
+    if not hasattr(Scorer, "select_diversified"):
+        def select_diversified(self, scores, group, cfg, n_target, **kw):
+            for name in ("_select_diversified_core", "select_diversified_core", "_select_core"):
+                fn = getattr(self, name, None)
+                if callable(fn): return fn(scores, n_target, **kw)
+            for n in ("_select_diversified_core", "select_diversified_core", "_select_core"):
+                fn = globals().get(n)
+                if callable(fn): return fn(scores, n_target, **kw)
+            raise AttributeError("select_diversified implementation not found")
+        Scorer.select_diversified = select_diversified
 
 # ========================== end of adapter append ===============================
