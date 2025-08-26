@@ -14,9 +14,24 @@ from typing import Dict, List
 from scorer import Scorer
 import os
 import requests
+from time import perf_counter
+
+
+class T:
+    t = perf_counter()
+
+    @staticmethod
+    def log(tag: str):
+        now = perf_counter()
+        print(f"[T] {tag}: {now - T.t:.2f}s")
+        T.t = now
+
+
+T.log("start")
 
 # ===== ユニバースと定数（冒頭に固定） =====
 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
+T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
 CAND_PRICE_MAX, bench = 400, '^GSPC'  # 価格上限・ベンチマーク
 N_G, N_D = 12, 13  # G/D枠サイズ
 g_weights = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
@@ -242,7 +257,10 @@ class Input:
         return pd.DataFrame(rows).set_index("ticker")
 
     def compute_fcf_with_fallback(self, tickers: list[str], finnhub_api_key: str|None=None) -> pd.DataFrame:
-        yf_df, fh_df = self.fetch_cfo_capex_ttm_yf(tickers), self.fetch_cfo_capex_ttm_finnhub(tickers, api_key=finnhub_api_key)
+        yf_df = self.fetch_cfo_capex_ttm_yf(tickers)
+        T.log("financials (yf) done")
+        fh_df = self.fetch_cfo_capex_ttm_finnhub(tickers, api_key=finnhub_api_key)
+        T.log("financials (finnhub) done")
         df = yf_df.join(fh_df, how="outer")
         df["cfo_ttm"]  = df["cfo_ttm_yf"].where(df["cfo_ttm_yf"].notna(), df["cfo_ttm_fh"])
         df["capex_ttm"] = df["capex_ttm_yf"].where(df["capex_ttm_yf"].notna(), df["capex_ttm_fh"])
@@ -277,8 +295,11 @@ class Input:
             try: cand_prices[t] = cand_info.tickers[t].fast_info.get("lastPrice", np.inf)
             except Exception as e: print(f"{t}: price fetch failed ({e})"); cand_prices[t] = np.inf
         cand_f = [t for t,p in cand_prices.items() if p<=self.price_max]
+        T.log("price cap filter done (CAND_PRICE_MAX)")
         tickers = sorted(set(self.exist + cand_f))
+        T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
         data = yf.download(tickers + [self.bench], period="600d", auto_adjust=True, progress=False)
+        T.log("yf.download done")
         px, spx = data["Close"], data["Close"][self.bench]
         tickers_bulk, info = yf.Tickers(" ".join(tickers)), {}
         for t in tickers:
@@ -286,7 +307,9 @@ class Input:
             except Exception as e: print(f"{t}: info fetch failed ({e})"); info[t] = {}
         eps_df = self._build_eps_df(tickers, tickers_bulk, info)
         fcf_df = self.compute_fcf_with_fallback(tickers, finnhub_api_key=self.api_key)
+        T.log("eps/fcf prep done")
         returns = px[tickers].pct_change()
+        T.log("price prep/returns done")
         return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
 
 
@@ -628,9 +651,15 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
 
     if hasattr(sc, "score_build_features"):
         feat = sc.score_build_features(inb)
+        if not hasattr(sc, "_feat_logged"):
+            T.log("features built (scorer)")
+            sc._feat_logged = True
         agg = sc.score_aggregate(feat, group, cfg) if hasattr(sc, "score_aggregate") else feat
     else:
         fb = sc.aggregate_scores(inb, cfg)
+        if not hasattr(sc, "_feat_logged"):
+            T.log("features built (scorer)")
+            sc._feat_logged = True
         sc._feat = fb
         agg = fb.g_score if group == "G" else fb.d_score_all
         if group == "D" and hasattr(fb, "df"):
@@ -672,7 +701,9 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
             )
         pick = res["tickers"]; avg_r = res["avg_res_corr"]
         sum_sc = res["sum_score"]; obj = res["objective"]
-        if group == "D": _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
+        if group == "D":
+            _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
+            T.log("selection finalized (G/D)")
     # --- Near-Miss: 惜しくも選ばれなかった上位5を保持（Slack表示用） ---
     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
     try:
@@ -684,6 +715,8 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         pass
 
     _save_sel(prev_json_path, pick, avg_r, sum_sc, obj)
+    if group == "D":
+        T.log("save done")
     if group == "G":
         sc._top_G = pick
     return pick, avg_r, sum_sc, obj
