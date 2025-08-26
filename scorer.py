@@ -774,3 +774,64 @@ if __name__ == "__main__":
         print(fb.missing_logs.to_string(index=False))
     else:
         print("(none)")
+
+# ====== adapter append (DO NOT REMOVE EXISTING CODE ABOVE) =====================
+# このブロックは既存実装に “委譲するだけ”。新しい数式やI/Oは一切書かない。
+
+def _scorer_resolve(*names):
+    """
+    既存モジュール内の実装名の“揺れ”に対応して、最初に見つかった callale を返す。
+    候補に無ければ NameError。既存の関数/メソッド名に応じて候補を足してOK。
+    """
+    g = globals()
+    for n in names:
+        fn = g.get(n)
+        if callable(fn):
+            return fn
+    raise NameError("[scorer adapter] implementation not found for any of: " + ", ".join(names))
+
+# ---- module-level utility（純関数・I/O禁止）: 既存 private 実装へ“委譲のみ” ----------
+def build_features(inb):
+    # 候補は必要に応じて増やしてOK（既存の関数名に合わせる）
+    return _scorer_resolve("_build_features", "build_features", "features_build")(inb)
+
+def aggregate_scores(feat, weights):
+    return _scorer_resolve("_aggregate", "aggregate_scores", "score_aggregate_core")(feat, weights)
+
+def apply_filters(inb, scores, group, cfg):
+    return _scorer_resolve("_apply_filters", "apply_filters", "filter_candidates_core")(inb, scores, group, cfg)
+
+def select_diversified_core(scores, n_target, **kw):
+    # kw には selector, prev_tickers, corrM, shrink, cross_mu などが入る想定（既存そのまま）
+    return _scorer_resolve("_select_diversified_core", "select_diversified_core", "_select_core")(scores, n_target, **kw)
+
+# ---- 互換レイヤ（既存クラスがあれば尊重）。上書きはしない：未実装メソッドだけ“後付け” ----
+try:
+    Scorer  # 既存クラスがある場合
+except NameError:
+    # クラスが無い環境だけ、薄い互換クラスを定義（既存挙動に忠実に委譲）
+    class Scorer:
+        def score_build_features(self, inb): return build_features(inb)
+        def score_aggregate(self, feat, group, cfg):
+            weights = cfg.weights.g if group == "G" else cfg.weights.d
+            return aggregate_scores(feat, weights)
+        def filter_candidates(self, inb, scores, group, cfg): return apply_filters(inb, scores, group, cfg)
+        def select_diversified(self, scores, group, cfg, n_target, **kw): return select_diversified_core(scores, n_target, **kw)
+else:
+    # 既存の Scorer クラスがある場合：未実装の公開メソッドだけ“生やす”。既存は尊重（上書きしない）
+    if not hasattr(Scorer, "score_build_features"):
+        def score_build_features(self, inb): return build_features(inb)
+        Scorer.score_build_features = score_build_features
+    if not hasattr(Scorer, "score_aggregate"):
+        def score_aggregate(self, feat, group, cfg):
+            weights = cfg.weights.g if group == "G" else cfg.weights.d
+            return aggregate_scores(feat, weights)
+        Scorer.score_aggregate = score_aggregate
+    if not hasattr(Scorer, "filter_candidates"):
+        def filter_candidates(self, inb, scores, group, cfg): return apply_filters(inb, scores, group, cfg)
+        Scorer.filter_candidates = filter_candidates
+    if not hasattr(Scorer, "select_diversified"):
+        def select_diversified(self, scores, group, cfg, n_target, **kw): return select_diversified_core(scores, n_target, **kw)
+        Scorer.select_diversified = select_diversified
+
+# ========================== end of adapter append ===============================
