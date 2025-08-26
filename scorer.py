@@ -6,8 +6,7 @@
 # 【このファイルだけ読めば分かるポイント】
 # - 入力(InputBundle)は「価格/出来高/ベンチ/基本情報/EPS/FCF/リターン」を含むDTO
 # - 出力(FeatureBundle)は「raw特徴量 df」「標準化 df_z」「G/D スコア」「欠損ログ」
-# - 重み等のコンフィグ(PipelineConfig)は外部から渡されればそれを優先
-#   渡されない場合は本ファイルの DEFAULT_CONFIG を使用（単体実行OK）
+# - 重み等のコンフィグ(PipelineConfig)は factor から渡す（cfg 必須）
 # - 旧カラム名は Scorer 内で自動リネームして受け入れ（後方互換）
 #   例) eps_ttm -> EPS_TTM, eps_q_recent -> EPS_Q_LastQ, fcf_ttm -> FCF_TTM
 #
@@ -27,13 +26,16 @@
 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
 # =============================================================================
 
+import os
 import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, TYPE_CHECKING
 from scipy.stats import zscore
+
+if TYPE_CHECKING:
+    from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
 
 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
 def winsorize_s(s: pd.Series, p=0.02):
@@ -53,73 +55,13 @@ def _safe_last(series: pd.Series, default=np.nan):
     try: return float(series.iloc[-1])
     except Exception: return default
 
-# ---- DTO & Config（単体実行でも動くよう最小限を内包） -----------------------
-@dataclass(frozen=True)
-class InputBundle:
-    cand: List[str]
-    tickers: List[str]
-    bench: str
-    data: pd.DataFrame
-    px: pd.DataFrame
-    spx: pd.Series
-    tickers_bulk: object
-    info: Dict[str, dict]
-    eps_df: pd.DataFrame
-    fcf_df: pd.DataFrame
-    returns: pd.DataFrame
-
-@dataclass(frozen=True)
-class FeatureBundle:
-    df: pd.DataFrame
-    df_z: pd.DataFrame
-    g_score: pd.Series
-    d_score_all: pd.Series
-    missing_logs: pd.DataFrame
-
-@dataclass(frozen=True)
-class WeightsConfig:
-    g: Dict[str, float]
-    d: Dict[str, float]
-
-@dataclass(frozen=True)
-class DRRSParams:
-    corrM: int
-    shrink: float
-    G: Dict[str, float]
-    D: Dict[str, float]
-    cross_mu_gd: float
-
-@dataclass(frozen=True)
-class PipelineConfig:
-    weights: WeightsConfig
-    drrs: DRRSParams
-    price_max: float
-
-# ---- デフォルト設定（外部が渡せばそれを優先） -------------------------------
-DEFAULT_G_WEIGHTS = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
-DEFAULT_D_WEIGHTS = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
-DEFAULT_DRRS = DRRSParams(
-    corrM=45, shrink=0.10,
-    G=dict(lookback=252, n_pc=3, gamma=1.2, lam=0.68, eta=0.8),
-    D=dict(lookback=504, n_pc=4, gamma=0.8, lam=0.85, eta=0.5),
-    cross_mu_gd=0.40
-)
-DEFAULT_CONFIG = PipelineConfig(
-    weights=WeightsConfig(g=DEFAULT_G_WEIGHTS, d=DEFAULT_D_WEIGHTS),
-    drrs=DEFAULT_DRRS,
-    price_max=400.0
-)
-
-# NOTE: scorerはユーティリティ専用。環境依存の設定は外部で管理する。
-D_BETA_MAX = 0.9
-FINNHUB_API_KEY = None
 D_WEIGHTS_EFF = None  # 出力表示互換のため
 
 # ---- Scorer 本体 -------------------------------------------------------------
 class Scorer:
     """
     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
-    - cfg を省略 or None の場合は DEFAULT_CONFIG を使用。
+    - cfg は必須（factor.PipelineConfig を渡す）。
     - 旧カラム名を自動リネームして新スキーマに吸収します。
     """
 
@@ -129,7 +71,7 @@ class Scorer:
 
     # === スキーマ簡易チェック（最低限） ===
     @staticmethod
-    def _validate_ib_for_scorer(ib: InputBundle):
+    def _validate_ib_for_scorer(ib: Any):
         must_attrs = ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"]
         miss = [a for a in must_attrs if not hasattr(ib, a) or getattr(ib, a) is None]
         if miss: raise ValueError(f"InputBundle is missing required attributes for Scorer: {miss}")
@@ -232,8 +174,9 @@ class Scorer:
 
     @staticmethod
     def fetch_finnhub_metrics(symbol):
-        if not FINNHUB_API_KEY: return {}
-        url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":FINNHUB_API_KEY}
+        api_key = os.environ.get("FINNHUB_API_KEY")
+        if not api_key: return {}
+        url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":api_key}
         try:
             r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.get('enterpriseValue') else None}
@@ -248,9 +191,10 @@ class Scorer:
         return np.nan if var==0 else cov/var
 
     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
-    def aggregate_scores(self, ib: InputBundle, cfg: Optional[PipelineConfig]=None) -> FeatureBundle:
+    def aggregate_scores(self, ib: Any, cfg):
+        if cfg is None:
+            raise ValueError("cfg is required; pass factor.PipelineConfig")
         self._validate_ib_for_scorer(ib)
-        cfg = cfg or DEFAULT_CONFIG  # 外部優先だが、無ければデフォルトで自走
 
         px, spx, tickers = ib.px, ib.spx, ib.tickers
         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
@@ -566,16 +510,12 @@ class Scorer:
         df_z['GSC'] = g_score_all
         df_z['DSC'] = d_score_all
 
-        # --- D枠のβフィルタ（採用可視化） ---
-        d_pass_beta = df['BETA'] < D_BETA_MAX
-        df_z['D_PASS_BETA'] = d_pass_beta.astype(float)          # 1/0 フラグ
-        df_z['DSC_DPASS']   = d_score_all.where(d_pass_beta, np.nan)  # β基準未満は NaN
-
         try:
             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
         except Exception:
             pass
 
+        from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
         return FeatureBundle(
             df=df,
             df_z=df_z,
