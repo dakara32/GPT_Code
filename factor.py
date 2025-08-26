@@ -1,3 +1,15 @@
+"""
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ ROLE of factor.py                                     ┃
+┃  - Orchestration ONLY                                 ┃
+┃  - I/O (CSV/API/ENV/Slack) & SSOT constants           ┃
+┃  - Slack formatting/output                            ┃
+┃ DO NOT: implement scoring/filters/DRRS here           ┃
+┃ IF REQUEST says:                                      ┃
+┃   •「スコア/フィルタ/相関低減を変更」→ scorer.py へ   ┃
+┃   •「Slack文言/見た目/JSON保存」→ ここ（factor.py）  ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+"""
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
 import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
 from scipy.stats import zscore
