@@ -119,6 +119,29 @@ def _save_sel(path: str, tickers: list[str], avg_r: float, sum_score: float, obj
     with open(path,"w") as f:
         json.dump({"tickers":tickers,"avg_res_corr":round(avg_r,6),"sum_score":round(sum_score,6),"objective":round(objective,6)}, f, indent=2)
 
+def _disjoint_keepG(top_G, top_D, poolD):
+    """
+    Gに含まれる銘柄をDから除去し、DはpoolD（次点）で補充する。
+    - 引数:
+        top_G: List[str]  … G最終12銘柄
+        top_D: List[str]  … D最終13銘柄（重複を含む可能性あり）
+        poolD: List[str]  … D候補の順位リスト（top_Dを含む上位拡張）
+    - 戻り値: (top_G, top_D_disjoint)
+    - 挙動:
+        1) DにG重複があれば順に置換
+        2) 置換候補は poolD から、既使用(G∪D)を避けて前から採用
+        3) 補充分が尽きた場合は元の銘柄を残す（安全フォールバック）
+    """
+    used, D = set(top_G), list(top_D)
+    i = 0
+    for j, t in enumerate(D):
+        if t in used:
+            while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
+                i += 1
+            if i < len(poolD):
+                D[j] = poolD[i]; used.add(D[j]); i += 1
+    return top_G, D
+
 
 # ===== Input：外部I/Oと前処理（CSV/API・欠損補完） =====
 class Input:
@@ -648,6 +671,7 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
             )
         pick = res["tickers"]; avg_r = res["avg_res_corr"]
         sum_sc = res["sum_score"]; obj = res["objective"]
+        if group == "D": _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
     # --- Near-Miss: 惜しくも選ばれなかった上位5を保持（Slack表示用） ---
     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
     try:
