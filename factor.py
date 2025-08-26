@@ -1,13 +1,9 @@
 """
 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃ ROLE of factor.py                                     ┃
-┃  - Orchestration ONLY                                 ┃
-┃  - I/O (CSV/API/ENV/Slack) & SSOT constants           ┃
-┃  - Slack formatting/output                            ┃
-┃ DO NOT: implement scoring/filters/DRRS here           ┃
-┃ IF REQUEST says:                                      ┃
-┃   •「スコア/フィルタ/相関低減を変更」→ scorer.py へ   ┃
-┃   •「Slack文言/見た目/JSON保存」→ ここ（factor.py）  ┃
+┃  - Orchestration ONLY（外部I/O・SSOT・Slack出力）     ┃
+┃  - 計算ロジック（採点/フィルタ/相関低減）は scorer.py ┃
+┃  - ここでロジックを実装/変更しない                   ┃
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 """
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
@@ -606,11 +602,9 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
     """
     sc.cfg = cfg
 
-    feat_fn = getattr(sc, "score_build_features", None)
-    agg_fn = getattr(sc, "score_aggregate", None)
-    if callable(feat_fn):
-        feat = feat_fn(inb)
-        agg = agg_fn(feat, group, cfg) if callable(agg_fn) else feat
+    if hasattr(sc, "score_build_features"):
+        feat = sc.score_build_features(inb)
+        agg = sc.score_aggregate(feat, group, cfg) if hasattr(sc, "score_aggregate") else feat
     else:
         fb = sc.aggregate_scores(inb, cfg)
         sc._feat = fb
@@ -618,16 +612,14 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         if group == "D" and hasattr(fb, "df"):
             agg = agg[fb.df['BETA'] < D_BETA_MAX]
 
-    flt_fn = getattr(sc, "filter_candidates", None)
-    if callable(flt_fn):
-        mask = flt_fn(inb, agg, group, cfg)
+    if hasattr(sc, "filter_candidates"):
+        mask = sc.filter_candidates(inb, agg, group, cfg)
         agg = agg[mask]
 
     selector = Selector()
     prev = _load_prev(prev_json_path)
-    sel_fn = getattr(sc, "select_diversified", None)
-    if callable(sel_fn):
-        pick, avg_r, sum_sc, obj = sel_fn(
+    if hasattr(sc, "select_diversified"):
+        pick, avg_r, sum_sc, obj = sc.select_diversified(
             agg, group, cfg, n_target,
             selector=selector, prev_tickers=prev,
             corrM=cfg.drrs.corrM, shrink=cfg.drrs.shrink,
