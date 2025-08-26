@@ -527,7 +527,10 @@ class Output:
         if self.miss_df is not None and not self.miss_df.empty: message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
         message += self.g_title + "\n```" + self.g_table.to_string(formatters=self.g_formatters) + "```\n"
         message += self.d_title + "\n```" + self.d_table.to_string(formatters=self.d_formatters) + "```\n"
-        message += "Changes\n```" + self.io_table.to_string(index=False) + "```\n"
+        # robust: io_table が None（= 変化なし等）でも落ちないようにする
+        _tbl = getattr(self, "io_table", None)
+        _txt = _tbl.to_string(index=False) if (hasattr(_tbl, "to_string")) else ""
+        message += "Changes\n```" + _txt + "```\n"
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
         # 低スコアTOP10（GSC+DSC）
         if self.low10_table is not None:
