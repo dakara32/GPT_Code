@@ -259,9 +259,17 @@ class Input:
     def compute_fcf_with_fallback(self, tickers: list[str], finnhub_api_key: str|None=None) -> pd.DataFrame:
         yf_df = self.fetch_cfo_capex_ttm_yf(tickers)
         T.log("financials (yf) done")
-        fh_df = self.fetch_cfo_capex_ttm_finnhub(tickers, api_key=finnhub_api_key)
-        T.log("financials (finnhub) done")
-        df = yf_df.join(fh_df, how="outer")
+        miss_mask = yf_df[["cfo_ttm_yf","capex_ttm_yf","fcf_ttm_yf_direct"]].isna().any(axis=1)
+        need = yf_df.index[miss_mask].tolist(); print(f"[T] yf financials missing: {len(need)} {need[:10]}{'...' if len(need)>10 else ''}")
+        if need:
+            fh_df = self.fetch_cfo_capex_ttm_finnhub(need, api_key=finnhub_api_key)
+            df = yf_df.join(fh_df, how="left")
+            for col_yf, col_fh in [("cfo_ttm_yf","cfo_ttm_fh"),("capex_ttm_yf","capex_ttm_fh")]:
+                df[col_yf] = df[col_yf].fillna(df[col_fh])
+            print("[T] financials (finnhub) done (fallback only)")
+        else:
+            df = yf_df.assign(cfo_ttm_fh=np.nan, capex_ttm_fh=np.nan)
+            print("[T] financials (finnhub) skipped (no missing)")
         df["cfo_ttm"]  = df["cfo_ttm_yf"].where(df["cfo_ttm_yf"].notna(), df["cfo_ttm_fh"])
         df["capex_ttm"] = df["capex_ttm_yf"].where(df["capex_ttm_yf"].notna(), df["capex_ttm_fh"])
         cfo, capex = pd.to_numeric(df["cfo_ttm"], errors="coerce"), pd.to_numeric(df["capex_ttm"], errors="coerce").abs()
