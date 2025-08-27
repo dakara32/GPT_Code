@@ -194,19 +194,38 @@ class Input:
         vals = s.dropna().astype(float); return vals.iloc[0] if not vals.empty else None
 
     def fetch_cfo_capex_ttm_yf(self, tickers: list[str]) -> pd.DataFrame:
-        rows=[]
-        for t in tickers:
-            tk = yf.Ticker(t); qcf = tk.quarterly_cashflow
-            cfo_q, capex_q = self._pick_row(qcf,self._CF_ALIASES["cfo"]), self._pick_row(qcf,self._CF_ALIASES["capex"])
-            fcf_q = self._pick_row(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
-            cfo_ttm, capex_ttm, fcf_ttm_direct = self._sum_last_n(cfo_q,4), self._sum_last_n(capex_q,4), self._sum_last_n(fcf_q,4)
-            if cfo_ttm is None or capex_ttm is None or fcf_ttm_direct is None:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from threading import local
+        tls = local()
+        pick, sumn, latest, aliases = self._pick_row, self._sum_last_n, self._latest, self._CF_ALIASES
+
+        def sess():
+            if getattr(tls, "s", None) is None:
+                import requests; tls.s = requests.Session()
+            return tls.s
+
+        def one(t: str):
+            tk = yf.Ticker(t, session=sess())
+            qcf = tk.quarterly_cashflow
+            cfo_q, capex_q = pick(qcf, aliases["cfo"]), pick(qcf, aliases["capex"])
+            fcf_q = pick(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
+            cfo_ttm, capex_ttm, fcf_ttm = sumn(cfo_q,4), sumn(capex_q,4), sumn(fcf_q,4)
+
+            if cfo_ttm is None or capex_ttm is None or fcf_ttm is None:
                 acf = tk.cashflow
-                cfo_a, capex_a, fcf_a = self._pick_row(acf,self._CF_ALIASES["cfo"]), self._pick_row(acf,self._CF_ALIASES["capex"]), self._pick_row(acf,["Free Cash Flow","FreeCashFlow","Free cash flow"])
-                if cfo_ttm is None: cfo_ttm = self._latest(cfo_a)
-                if capex_ttm is None: capex_ttm = self._latest(capex_a)
-                if fcf_ttm_direct is None: fcf_ttm_direct = self._latest(fcf_a)
-            rows.append({"ticker":t,"cfo_ttm_yf":cfo_ttm if cfo_ttm is not None else np.nan,"capex_ttm_yf":capex_ttm if capex_ttm is not None else np.nan,"fcf_ttm_yf_direct":fcf_ttm_direct if fcf_ttm_direct is not None else np.nan})
+                if cfo_ttm   is None: cfo_ttm   = latest(pick(acf, aliases["cfo"]))
+                if capex_ttm is None: capex_ttm = latest(pick(acf, aliases["capex"]))
+                if fcf_ttm   is None: fcf_ttm   = latest(pick(acf, ["Free Cash Flow","FreeCashFlow","Free cash flow"]))
+
+            n = np.nan
+            return {"ticker":t,
+                    "cfo_ttm_yf":   n if cfo_ttm   is None else cfo_ttm,
+                    "capex_ttm_yf": n if capex_ttm is None else capex_ttm,
+                    "fcf_ttm_yf_direct": n if fcf_ttm is None else fcf_ttm}
+
+        rows, mw = [], int(os.getenv("FIN_THREADS","8"))
+        with ThreadPoolExecutor(max_workers=mw) as ex:
+            for f in as_completed(ex.submit(one,t) for t in tickers): rows.append(f.result())
         return pd.DataFrame(rows).set_index("ticker")
 
     _FINN_CFO_KEYS = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
