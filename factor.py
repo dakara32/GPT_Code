@@ -16,6 +16,21 @@ import os
 import requests
 from time import perf_counter
 
+CACHE_DIR = os.getenv("CACHE_DIR", ".cache"); os.makedirs(f"{CACHE_DIR}/yf_fin", exist_ok=True)
+YF_FIN_TTL_DAYS = int(os.getenv("YF_FIN_TTL_DAYS", "90"))
+def _cache_path(t): return f"{CACHE_DIR}/yf_fin/{t}.json"
+def _load_fin(t):
+    p=_cache_path(t)
+    if os.path.exists(p):
+        try:
+            o=json.load(open(p))
+            if time.time()-float(o.get("_ts",0)) < YF_FIN_TTL_DAYS*86400: o.pop("_ts",None); return o
+        except Exception: pass
+    return None
+def _save_fin(t,obj):
+    try: o=dict(obj); o["_ts"]=time.time(); json.dump(o, open(_cache_path(t),"w"))
+    except Exception: pass  # キャッシュ失敗は黙殺（本処理は継続）
+
 
 class T:
     t = perf_counter()
@@ -198,6 +213,7 @@ class Input:
         pick, sumn, latest, aliases = self._pick_row, self._sum_last_n, self._latest, self._CF_ALIASES
 
         def one(t: str):
+            if (c := _load_fin(t)): return c
             try:
                 tk = yf.Ticker(t)  # ★ セッションは渡さない（YFがcurl_cffiで管理）
                 qcf = tk.quarterly_cashflow
@@ -211,11 +227,11 @@ class Input:
                     if fcf   is None: fcf   = latest(pick(acf, ["Free Cash Flow","FreeCashFlow","Free cash flow"]))
             except Exception as e:
                 print(f"[warn] yf financials error: {t}: {e}"); cfo=capex=fcf=None
-            n=np.nan
-            return {"ticker":t,
+            n=np.nan; res={"ticker":t,
                     "cfo_ttm_yf":   n if cfo   is None else cfo,
                     "capex_ttm_yf": n if capex is None else capex,
                     "fcf_ttm_yf_direct": n if fcf is None else fcf}
+            _save_fin(t, res); return res
 
         rows, mw = [], int(os.getenv("FIN_THREADS","8"))
         with ThreadPoolExecutor(max_workers=mw) as ex:
@@ -311,17 +327,16 @@ class Input:
 
     def prepare_data(self):
         """Fetch price and fundamental data for all tickers."""
-        cand_info = yf.Tickers(" ".join(self.cand)); cand_prices = {}
-        for t in self.cand:
-            try: cand_prices[t] = cand_info.tickers[t].fast_info.get("lastPrice", np.inf)
-            except Exception as e: print(f"{t}: price fetch failed ({e})"); cand_prices[t] = np.inf
-        cand_f = [t for t,p in cand_prices.items() if p<=self.price_max]
-        T.log("price cap filter done (CAND_PRICE_MAX)")
-        tickers = sorted(set(self.exist + cand_f))
-        T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
-        data = yf.download(tickers + [self.bench], period="600d", auto_adjust=True, progress=False)
+        tickers_dl = sorted(set(self.exist + self.cand))
+        data = yf.download(tickers_dl + [self.bench], period="600d", auto_adjust=True, progress=False)
         T.log("yf.download done")
         px, spx = data["Close"], data["Close"][self.bench]
+        cand = list(self.cand); last_px = px.ffill().iloc[-1]
+        if CAND_PRICE_MAX:
+            cand = [t for t in cand if (p:=last_px.get(t, np.nan))!=p or float(p) <= CAND_PRICE_MAX]
+        T.log("price cap filter done (CAND_PRICE_MAX)")
+        tickers = sorted(set(self.exist + cand))
+        T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
         if clip_days > 0:
             px  = px.tail(clip_days + 1)
@@ -338,7 +353,7 @@ class Input:
         T.log("eps/fcf prep done")
         returns = px[tickers].pct_change()
         T.log("price prep/returns done")
-        return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
+        return dict(cand=cand, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
 
 
 # ===== Selector：相関低減・選定（スコア＆リターンだけ読む） =====
