@@ -195,33 +195,27 @@ class Input:
 
     def fetch_cfo_capex_ttm_yf(self, tickers: list[str]) -> pd.DataFrame:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from threading import local
-        tls = local()
         pick, sumn, latest, aliases = self._pick_row, self._sum_last_n, self._latest, self._CF_ALIASES
 
-        def sess():
-            if getattr(tls, "s", None) is None:
-                import requests; tls.s = requests.Session()
-            return tls.s
-
         def one(t: str):
-            tk = yf.Ticker(t, session=sess())
-            qcf = tk.quarterly_cashflow
-            cfo_q, capex_q = pick(qcf, aliases["cfo"]), pick(qcf, aliases["capex"])
-            fcf_q = pick(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
-            cfo_ttm, capex_ttm, fcf_ttm = sumn(cfo_q,4), sumn(capex_q,4), sumn(fcf_q,4)
-
-            if cfo_ttm is None or capex_ttm is None or fcf_ttm is None:
-                acf = tk.cashflow
-                if cfo_ttm   is None: cfo_ttm   = latest(pick(acf, aliases["cfo"]))
-                if capex_ttm is None: capex_ttm = latest(pick(acf, aliases["capex"]))
-                if fcf_ttm   is None: fcf_ttm   = latest(pick(acf, ["Free Cash Flow","FreeCashFlow","Free cash flow"]))
-
-            n = np.nan
+            try:
+                tk = yf.Ticker(t)  # ★ セッションは渡さない（YFがcurl_cffiで管理）
+                qcf = tk.quarterly_cashflow
+                cfo_q, capex_q = pick(qcf, aliases["cfo"]), pick(qcf, aliases["capex"])
+                fcf_q = pick(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
+                cfo, capex, fcf = sumn(cfo_q,4), sumn(capex_q,4), sumn(fcf_q,4)
+                if any(v is None for v in (cfo, capex, fcf)):
+                    acf = tk.cashflow
+                    if cfo   is None: cfo   = latest(pick(acf, aliases["cfo"]))
+                    if capex is None: capex = latest(pick(acf, aliases["capex"]))
+                    if fcf   is None: fcf   = latest(pick(acf, ["Free Cash Flow","FreeCashFlow","Free cash flow"]))
+            except Exception as e:
+                print(f"[warn] yf financials error: {t}: {e}"); cfo=capex=fcf=None
+            n=np.nan
             return {"ticker":t,
-                    "cfo_ttm_yf":   n if cfo_ttm   is None else cfo_ttm,
-                    "capex_ttm_yf": n if capex_ttm is None else capex_ttm,
-                    "fcf_ttm_yf_direct": n if fcf_ttm is None else fcf_ttm}
+                    "cfo_ttm_yf":   n if cfo   is None else cfo,
+                    "capex_ttm_yf": n if capex is None else capex,
+                    "fcf_ttm_yf_direct": n if fcf is None else fcf}
 
         rows, mw = [], int(os.getenv("FIN_THREADS","8"))
         with ThreadPoolExecutor(max_workers=mw) as ex:
