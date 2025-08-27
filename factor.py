@@ -7,7 +7,7 @@
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 """
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
-import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
+import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json, hashlib
 from scipy.stats import zscore
 from dataclasses import dataclass
 from typing import Dict, List
@@ -30,6 +30,58 @@ def _load_fin(t):
 def _save_fin(t,obj):
     try: o=dict(obj); o["_ts"]=time.time(); json.dump(o, open(_cache_path(t),"w"))
     except Exception: pass  # キャッシュ失敗は黙殺（本処理は継続）
+
+os.makedirs(f"{CACHE_DIR}/yf_px", exist_ok=True)
+PX_TTL = int(os.getenv("YF_PX_TTL_S", "21600"))          # 価格キャッシュTTL(秒) 既定=6h
+PX_MAX_LAG = int(os.getenv("YF_PX_MAX_LAG_DAYS", "1"))   # 許容ラグ(暦日) 既定=1日
+
+def _px_key(tickers, kw):
+    T = tickers if isinstance(tickers,(list,tuple,set)) else [tickers]
+    return hashlib.sha1((','.join(sorted(T))+json.dumps(kw, sort_keys=True)).encode()).hexdigest()
+
+def _px_path(tickers, kw): return f"{CACHE_DIR}/yf_px/{_px_key(tickers,kw)}.parquet"
+
+def _yf_fresh(tickers, kw):
+    kw = dict(kw)                     # 呼び出し元 kw を汚染しない
+    kw.setdefault('group_by','column')
+    kw.setdefault('progress', False)
+    df = yf.download(tickers, **kw)
+    try: df.to_parquet(_px_path(tickers,kw))
+    except Exception: pass             # 失敗は黙殺（本処理は継続）
+    return df
+
+def yf_download_cached(tickers, **kw):
+    p = _px_path(tickers, kw)
+    # 1) TTL
+    if not os.path.exists(p) or time.time()-os.path.getmtime(p) > PX_TTL:
+        return _yf_fresh(tickers, kw)
+    df = pd.read_parquet(p)
+    if df is None or len(df)==0:
+        return _yf_fresh(tickers, kw)
+    # 2) ラグ（簡易：暦日差。必要なら営業日判定へ拡張可能）
+    last = pd.to_datetime(df.index[-1]).date()
+    today = pd.Timestamp.now(tz='US/Eastern').date()
+    if (today - last).days > PX_MAX_LAG:
+        return _yf_fresh(tickers, kw)
+    # 3) 直近の再調整検知（分割・大配当）
+    try:
+        rkw = {'period':'5d','group_by':'column','progress':False,
+               'auto_adjust': kw.get('auto_adjust', True),
+               'interval': kw.get('interval','1d')}
+        recent = yf.download(tickers, **rkw)
+        # 'Adj Close' 優先、無ければ 'Close'
+        lvl0_df = df.columns.get_level_values(0) if isinstance(df.columns,pd.MultiIndex) else pd.Index(df.columns)
+        lvl0_rc = recent.columns.get_level_values(0) if isinstance(recent.columns,pd.MultiIndex) else pd.Index(recent.columns)
+        col = 'Adj Close' if 'Adj Close' in lvl0_df and 'Adj Close' in lvl0_rc else ('Close' if 'Close' in lvl0_df and 'Close' in lvl0_rc else None)
+        if col:
+            old = df[col].tail(len(recent)).to_numpy()
+            new = recent[col].to_numpy()
+            if old.shape == new.shape and np.isfinite(old).any() and np.isfinite(new).any():
+                if np.median(np.abs(old/new - 1.0)) > 0.02:   # 2%閾値
+                    return _yf_fresh(tickers, kw)
+    except Exception:
+        pass
+    return df
 
 
 class T:
@@ -330,7 +382,7 @@ class Input:
     def prepare_data(self):
         """Fetch price and fundamental data for all tickers."""
         tickers_dl = sorted(set(self.exist + self.cand))
-        data = yf.download(tickers_dl + [self.bench], period="600d", auto_adjust=True, progress=False)
+        data = yf_download_cached(tickers_dl + [self.bench], period="600d", auto_adjust=True, progress=False)
         T.log("yf.download done")
         px, spx = data["Close"], data["Close"][self.bench]
         cand = list(self.cand); last_px = px.ffill().iloc[-1]
@@ -582,7 +634,7 @@ class Output:
         print("Changes:")
         print(self.io_table.to_string(index=False))
 
-        all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
+        all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf_download_cached(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
         for name,ticks in portfolios.items():
             pr = ret[ticks].mean(axis=1, skipna=True).dropna(); cum = (1+pr).cumprod()-1; n = len(pr)
