@@ -322,6 +322,10 @@ class Input:
         data = yf.download(tickers + [self.bench], period="600d", auto_adjust=True, progress=False)
         T.log("yf.download done")
         px, spx = data["Close"], data["Close"][self.bench]
+        need = max(DRRS_G["lookback"], DRRS_D["lookback"]) + 10  # safety buffer
+        px  = px.tail(need + 1)   # pct_change用に +1 本
+        spx = spx.tail(need + 1)
+        print(f"[T] price window clipped to {len(px)} rows")
         tickers_bulk, info = yf.Tickers(" ".join(tickers)), {}
         for t in tickers:
             try: info[t] = tickers_bulk.tickers[t].info
