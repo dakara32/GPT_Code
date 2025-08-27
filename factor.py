@@ -231,7 +231,9 @@ class Input:
                     "cfo_ttm_yf":   n if cfo   is None else cfo,
                     "capex_ttm_yf": n if capex is None else capex,
                     "fcf_ttm_yf_direct": n if fcf is None else fcf}
-            _save_fin(t, res); return res
+            vals = [res.get("cfo_ttm_yf"), res.get("capex_ttm_yf"), res.get("fcf_ttm_yf_direct")]
+            if not all(pd.isna(v) for v in vals): _save_fin(t, res)
+            return res
 
         rows, mw = [], int(os.getenv("FIN_THREADS","8"))
         with ThreadPoolExecutor(max_workers=mw) as ex:
@@ -335,6 +337,12 @@ class Input:
         if CAND_PRICE_MAX:
             cand = [t for t in cand if (p:=last_px.get(t, np.nan))!=p or float(p) <= CAND_PRICE_MAX]
         T.log("price cap filter done (CAND_PRICE_MAX)")
+        px = data['Close']
+        all_nan = px.reindex(columns=cand).isna().all()
+        rm = [t for t,v in all_nan.items() if v]
+        if rm:
+            cand = [t for t in cand if t not in rm]
+            T.log(f"price coverage filter (all-NaN drop): {len(rm)} removed")
         tickers = sorted(set(self.exist + cand))
         T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
