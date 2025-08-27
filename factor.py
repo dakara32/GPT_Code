@@ -322,10 +322,13 @@ class Input:
         data = yf.download(tickers + [self.bench], period="600d", auto_adjust=True, progress=False)
         T.log("yf.download done")
         px, spx = data["Close"], data["Close"][self.bench]
-        need = max(DRRS_G["lookback"], DRRS_D["lookback"]) + 10  # safety buffer
-        px  = px.tail(need + 1)   # pct_change用に +1 本
-        spx = spx.tail(need + 1)
-        print(f"[T] price window clipped to {len(px)} rows")
+        clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
+        if clip_days > 0:
+            px  = px.tail(clip_days + 1)
+            spx = spx.tail(clip_days + 1)
+            print(f"[T] price window clipped by env: {len(px)} rows (PRICE_CLIP_DAYS={clip_days})")
+        else:
+            print(f"[T] price window clip skipped; rows={len(px)}")
         tickers_bulk, info = yf.Tickers(" ".join(tickers)), {}
         for t in tickers:
             try: info[t] = tickers_bulk.tickers[t].info
