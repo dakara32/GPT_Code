@@ -599,6 +599,19 @@ class Output:
     def notify_slack(self):
         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
         if not SLACK_WEBHOOK_URL: raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+        def _filter_suffix_from(spec: dict, group: str) -> str:
+            g = spec.get(group, {})
+            parts = [str(m) for m in g.get("pre_mask", [])]
+            for k, v in (g.get("pre_filter", {}) or {}).items():
+                base, op = (k[:-4], "<") if k.endswith("_max") else ((k[:-4], ">") if k.endswith("_min") else (k, "="))
+                name = {"beta": "β"}.get(base, base)
+                try: val = f"{float(v):g}"
+                except: val = str(v)
+                parts.append(f"{name}{op}{val}")
+            return "" if not parts else " / filter:" + " & ".join(parts)
+        def _inject_filter_suffix(title: str, group: str) -> str:
+            suf = _filter_suffix_from(FILTER_SPEC, group)
+            return f"{title[:-1]}{suf}]" if suf and title.endswith("]") else (title + suf)
         def _blk(title, tbl, fmt=None, drop=()):
             if tbl is None or getattr(tbl,'empty',False): return f"{title}\n(選定なし)\n"
             if drop and hasattr(tbl,'columns'):
@@ -606,11 +619,13 @@ class Output:
                 tbl, fmt = tbl[keep], {k:v for k,v in (fmt or {}).items() if k in keep}
             return f"{title}\n```{tbl.to_string(formatters=fmt)}```\n"
 
+        g_title = _inject_filter_suffix(self.g_title, "G")
+        d_title = _inject_filter_suffix(self.d_title, "D")
         message  = "📈 ファクター分散最適化の結果\n"
         if self.miss_df is not None and not self.miss_df.empty:
             message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
-        message += _blk(self.g_title, self.g_table, self.g_formatters, drop=('TRD',))
-        message += _blk(self.d_title, self.d_table, self.d_formatters)
+        message += _blk(g_title, self.g_table, self.g_formatters, drop=("TRD",))
+        message += _blk(d_title, self.d_table, self.d_formatters)
         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table,'empty',False) else f"```{self.io_table.to_string(index=False)}```\n")
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
         if self.low10_table is not None:
