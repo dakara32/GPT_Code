@@ -136,6 +136,15 @@ def _save_sel(path: str, tickers: list[str], avg_r: float, sum_score: float, obj
     with open(path,"w") as f:
         json.dump({"tickers":tickers,"avg_res_corr":round(avg_r,6),"sum_score":round(sum_score,6),"objective":round(objective,6)}, f, indent=2)
 
+def _slack(message, code=False):
+    url = os.getenv("SLACK_WEBHOOK_URL")
+    if not url:
+        print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+    try:
+        requests.post(url, json={"text": f"```{message}```" if code else message}).raise_for_status()
+    except Exception as e:
+        print(f"⚠️ Slack通知エラー: {e}")
+
 def _disjoint_keepG(top_G, top_D, poolD):
     """
     Gに含まれる銘柄をDから除去し、DはpoolD（次点）で補充する。
@@ -573,7 +582,7 @@ class Output:
                 RESID_rho = float((C_resid.sum()-np.trace(C_resid))/(C_resid.shape[0]*(C_resid.shape[0]-1)))
             else: RAW_rho = RESID_rho = np.nan
             metrics[name] = {'RET':ann_ret,'VOL':ann_vol,'SHP':sharpe,'MDD':drawdown,'RAWρ':RAW_rho,'RESIDρ':RESID_rho}
-        df_metrics = pd.DataFrame(metrics).T; df_metrics_pct = df_metrics.copy()
+        df_metrics = pd.DataFrame(metrics).T; df_metrics_pct = df_metrics.copy(); self.df_metrics = df_metrics
         for col in ['RET','VOL','MDD']: df_metrics_pct[col] = df_metrics_pct[col]*100
         cols_order = ['RET','VOL','SHP','MDD','RAWρ','RESIDρ']; df_metrics_pct = df_metrics_pct.reindex(columns=cols_order)
         def _fmt_row(s):
@@ -841,6 +850,25 @@ def run_pipeline() -> SelectionBundle:
         except Exception:
             pass
     out.notify_slack()
+
+    if debug_mode:
+        try:
+            dbg = []
+            df_metrics = getattr(out, "df_metrics", None)
+            if df_metrics is not None:
+                try: new_resid_p = float(df_metrics.at['NEW', 'RESIDρ'])
+                except Exception: new_resid_p = np.nan
+                try: new_rawp = float(df_metrics.at['NEW', 'RAWρ'])
+                except Exception: new_rawp = np.nan
+                if not np.isnan(new_resid_p): dbg.append(f"NEW_residρ: {round(new_resid_p,3)}")
+                if not np.isnan(new_rawp): dbg.append(f"NEW_rawρ: {round(new_rawp,3)}")
+            dbg.append(f"G_avg_residρ: {round(avgG,3)}")
+            dbg.append(f"D_avg_residρ: {round(avgD,3)}")
+            if fb is not None and hasattr(fb, 'df_z'):
+                dbg.append("\nDebug Data\n" + fb.df_z.round(3).to_string())
+            _slack("\n".join(dbg), code=True)
+        except Exception as e:
+            print(f"⚠️ debug slack error: {e}")
 
     return SelectionBundle(
         resG={"tickers": top_G, "avg_res_corr": avgG,
