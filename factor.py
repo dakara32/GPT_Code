@@ -34,7 +34,7 @@ exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_ticker
 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
 CAND_PRICE_MAX, bench = 400, '^GSPC'  # 価格上限・ベンチマーク
 N_G, N_D = 12, 13  # G/D枠サイズ
-g_weights = {'GRW':0.40,'MOM':0.40,'TRD':0.00,'VOL':-0.20}
+g_weights = {'GRW':0.40,'MOM':0.40,'VOL':-0.20}
 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
 D_weights = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}

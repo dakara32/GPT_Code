@@ -424,6 +424,20 @@ class Scorer:
                     else:
                         missing_logs.append({'Ticker':t,'Column':col})
 
+        def _trend_template_pass(row, rs_alpha_thresh=0.10):
+            c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
+            c2 = (row.get('MA150_OVER_200', np.nan) > 0)
+            c3 = (row.get('MA200_SLOPE_1M', np.nan) > 0)
+            c4 = (row.get('MA50_OVER_150', np.nan) > 0) and (row.get('MA50_OVER_200', np.nan) > 0)
+            c5 = (row.get('TR_str', np.nan) > 0)
+            c6 = (row.get('P_OVER_LOW52', np.nan) >= 0.30)
+            c7 = (row.get('NEAR_52W_HIGH', np.nan) >= -0.25)
+            c8 = (row.get('RS', np.nan) >= 0.10)
+            return bool(c1 and c2 and c3 and c4 and c5 and c6 and c7 and c8)
+
+        if 'trend_template' not in df.columns: df['trend_template'] = df.apply(_trend_template_pass, axis=1).fillna(False)
+        assert 'trend_template' in df.columns
+
         # === Z化と合成 ===
         for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
 
@@ -480,19 +494,7 @@ class Scorer:
         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
 
         # ② テンプレ判定（既存ロジックそのまま）
-        def _trend_template_pass(row, rs_alpha_thresh=0.10):
-            c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
-            c2 = (row.get('MA150_OVER_200', np.nan) > 0)
-            c3 = (row.get('MA200_SLOPE_1M', np.nan) > 0)
-            c4 = (row.get('MA50_OVER_150', np.nan) > 0) and (row.get('MA50_OVER_200', np.nan) > 0)
-            c5 = (row.get('TR_str', np.nan) > 0)
-            c6 = (row.get('P_OVER_LOW52', np.nan) >= 0.30)
-            c7 = (row.get('NEAR_52W_HIGH', np.nan) >= -0.25)
-            c8 = (row.get('RS', np.nan) >= 0.10)
-            return bool(c1 and c2 and c3 and c4 and c5 and c6 and c7 and c8)
-
-        mask = df.apply(_trend_template_pass, axis=1).fillna(False)
-
+        mask = df['trend_template']
         if not bool(mask.any()):
             mask = (
                 (df.get('P_OVER_LOW52', np.nan) >= 0.25) &
@@ -504,6 +506,7 @@ class Scorer:
                 (df.get('MA50_OVER_150', np.nan) > 0) & (df.get('MA50_OVER_200', np.nan) > 0) &
                 (df.get('TR_str', np.nan) > 0)
             ).fillna(False)
+            df['trend_template'] = mask
 
         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
         g_score = g_score_all.loc[mask]
