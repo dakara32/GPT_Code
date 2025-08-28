@@ -38,6 +38,7 @@ g_weights = {'GRW':0.40,'MOM':0.40,'VOL':-0.20}
 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
 D_weights = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
+def _fmt_w(w): return " ".join(f"{k}{int(v*100)}" for k,v in w.items())
 
 # DRRS 初期プール・各種パラメータ
 corrM = 45
@@ -515,7 +516,7 @@ class Output:
         self.g_table = pd.concat([df_z.loc[G_UNI,['GRW','MOM','TRD','VOL']], gsc_series], axis=1)
         self.g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
         self.g_formatters = {col:"{:.2f}".format for col in ['GRW','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
-        self.g_title = (f"[G枠 / {N_G} / GRW{int(g_weights['GRW']*100)} MOM{int(g_weights['MOM']*100)} TRD{int(g_weights['TRD']*100)} VOL{int(g_weights['VOL']*100)} / corrM={corrM} / "
+        self.g_title = (f"[G枠 / {N_G} / {_fmt_w(g_weights)} / corrM={corrM} / "
                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
         if near_G:
             add = [t for t in near_G if t not in set(G_UNI)][:5]
@@ -532,7 +533,7 @@ class Output:
         self.d_formatters = {col:"{:.2f}".format for col in cols_D}; self.d_formatters['DSC']="{:.3f}".format
         import scorer
         dw_eff = scorer.D_WEIGHTS_EFF
-        self.d_title = (f"[D枠 / {N_D} / QAL{int(dw_eff['QAL']*100)} YLD{int(dw_eff['YLD']*100)} VOL{int(dw_eff['VOL']*100)} TRD{int(dw_eff['TRD']*100)} / corrM={corrM} / "
+        self.d_title = (f"[D枠 / {N_D} / {_fmt_w(dw_eff)} / corrM={corrM} / "
                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
         if near_D:
             add = [t for t in near_D if t not in set(D_UNI)][:5]
@@ -598,20 +599,19 @@ class Output:
     def notify_slack(self):
         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
         if not SLACK_WEBHOOK_URL: raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-        def _blk(title, tbl, fmt, drop_trd=False):
-            if tbl is None or getattr(tbl, "empty", False): return f"{title}\n(選定なし)\n"
-            if drop_trd and "TRD" in tbl.columns:
-                cols = [c for c in tbl.columns if c != "TRD"]
-                tbl  = tbl[cols]
-                fmt  = {k:v for k,v in (fmt or {}).items() if k != "TRD"}
+        def _blk(title, tbl, fmt=None, drop=()):
+            if tbl is None or getattr(tbl,'empty',False): return f"{title}\n(選定なし)\n"
+            if drop and hasattr(tbl,'columns'):
+                keep = [c for c in tbl.columns if c not in drop]
+                tbl, fmt = tbl[keep], {k:v for k,v in (fmt or {}).items() if k in keep}
             return f"{title}\n```{tbl.to_string(formatters=fmt)}```\n"
 
         message  = "📈 ファクター分散最適化の結果\n"
         if self.miss_df is not None and not self.miss_df.empty:
             message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
-        message += _blk(self.g_title, self.g_table, self.g_formatters, drop_trd=True)
-        message += _blk(self.d_title, self.d_table, self.d_formatters, drop_trd=False)
-        message += "Changes\n```" + self.io_table.to_string(index=False) + "```\n"
+        message += _blk(self.g_title, self.g_table, self.g_formatters, drop=('TRD',))
+        message += _blk(self.d_title, self.d_table, self.d_formatters)
+        message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table,'empty',False) else f"```{self.io_table.to_string(index=False)}```\n")
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
         if self.low10_table is not None:
             message += "\nLow Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
