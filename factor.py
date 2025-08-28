@@ -136,6 +136,10 @@ def _save_sel(path: str, tickers: list[str], avg_r: float, sum_score: float, obj
     with open(path,"w") as f:
         json.dump({"tickers":tickers,"avg_res_corr":round(avg_r,6),"sum_score":round(sum_score,6),"objective":round(objective,6)}, f, indent=2)
 
+def _env_true(name: str, default=False):
+    v = os.getenv(name)
+    return default if v is None else v.strip().lower() == "true"
+
 def _slack(message, code=False):
     url = os.getenv("SLACK_WEBHOOK_URL")
     if not url:
@@ -144,6 +148,72 @@ def _slack(message, code=False):
         requests.post(url, json={"text": f"```{message}```" if code else message}).raise_for_status()
     except Exception as e:
         print(f"⚠️ Slack通知エラー: {e}")
+
+def _slack_debug(text: str, chunk=2800):
+    url=os.getenv("SLACK_WEBHOOK_URL")
+    if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+    i=0
+    while i<len(text):
+        j=min(len(text), i+chunk); k=text.rfind("\n", i, j); j=k if k>i+100 else j
+        blk={"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}
+        try: requests.post(url, json={"blocks":[blk]}).raise_for_status()
+        except Exception as e: print(f"⚠️ Slack通知エラー: {e}")
+        i=j
+
+def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
+    # ---- 列選択：既定は最小列、DEBUG_ALL_COLS=True で全列に ----
+    want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
+    all_cols = _env_true("DEBUG_ALL_COLS", False)
+    cols = list(fb.df_z.columns if all_cols else [c for c in want if c in fb.df_z.columns])
+
+    # ---- 差分（入替）----
+    Gp, Dp = set(prevG or []), set(prevD or [])
+    g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
+    d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
+
+    # ---- 次点5（フラグで有無切替）----
+    show_near = _env_true("DEBUG_NEAR5", True)
+    gs = getattr(fb,"g_score",None); ds = getattr(fb,"d_score_all",None)
+    gs = gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None
+    ds = ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None
+    g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:5]) if gs is not None else []
+    d_excl = set((sb.top_G or [])+(sb.top_D or []))
+    d_miss = ([t for t in ds.index if t not in d_excl][:5]) if ds is not None else []
+
+    # ---- 行選択：既定は入替+採用+次点、DEBUG_ALL_ROWS=True で全銘柄 ----
+    all_rows = _env_true("DEBUG_ALL_ROWS", False)
+    focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))
+    focus = focus[:max_rows]
+
+    # ---- ヘッダ（フィルター条件を明示）----
+    def _fmt_near(lbl, ser, lst):
+        if ser is None: return f"{lbl}: off"
+        parts=[]
+        for t in lst:
+            x=ser.get(t, float("nan"))
+            parts.append(f"{t}:{x:.3f}" if pd.notna(x) else f"{t}:nan")
+        return f"{lbl}: "+(", ".join(parts) if parts else "-")
+    head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
+          _fmt_near("G near5", gs, g_miss),
+          _fmt_near("D near5", ds, d_miss),
+          f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
+          f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
+
+    # ---- テーブル ----
+    if fb.df_z.empty or not cols:
+        tbl="(df_z or columns not available)"
+    else:
+        idx=[t for t in focus if t in fb.df_z.index]
+        tbl=fb.df_z.loc[idx, cols].round(3).to_string(max_rows=None, max_cols=None)
+
+    # ---- 欠損ログ（フラグで有無切替）----
+    miss_txt=""
+    if _env_true("DEBUG_MISSING_LOGS", False):
+        miss=getattr(fb,"missing_logs",None)
+        if miss is not None and not miss.empty:
+            miss_txt="\nMissing data (head)\n"+miss.head(10).to_string(index=False)
+
+    return "\n".join(head+["\nChanged/Selected (+ Near Miss)", tbl])+miss_txt
 
 def _disjoint_keepG(top_G, top_D, poolD):
     """
@@ -850,33 +920,22 @@ def run_pipeline() -> SelectionBundle:
         except Exception:
             pass
     out.notify_slack()
-
-    if debug_mode:
-        try:
-            dbg = []
-            df_metrics = getattr(out, "df_metrics", None)
-            if df_metrics is not None:
-                try: new_resid_p = float(df_metrics.at['NEW', 'RESIDρ'])
-                except Exception: new_resid_p = np.nan
-                try: new_rawp = float(df_metrics.at['NEW', 'RAWρ'])
-                except Exception: new_rawp = np.nan
-                if not np.isnan(new_resid_p): dbg.append(f"NEW_residρ: {round(new_resid_p,3)}")
-                if not np.isnan(new_rawp): dbg.append(f"NEW_rawρ: {round(new_rawp,3)}")
-            dbg.append(f"G_avg_residρ: {round(avgG,3)}")
-            dbg.append(f"D_avg_residρ: {round(avgD,3)}")
-            if fb is not None and hasattr(fb, 'df_z'):
-                dbg.append("\nDebug Data\n" + fb.df_z.round(3).to_string())
-            _slack("\n".join(dbg), code=True)
-        except Exception as e:
-            print(f"⚠️ debug slack error: {e}")
-
-    return SelectionBundle(
+    sb = SelectionBundle(
         resG={"tickers": top_G, "avg_res_corr": avgG,
               "sum_score": sumG, "objective": objG},
         resD={"tickers": top_D, "avg_res_corr": avgD,
               "sum_score": sumD, "objective": objD},
         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D
     )
+
+    if debug_mode:
+        prevG, prevD = _load_prev(G_PREV_JSON), _load_prev(D_PREV_JSON)
+        try:
+            _slack_debug(_compact_debug(fb, sb, prevG, prevD))
+        except Exception as e:
+            print(f"[debug skipped] {e}")
+
+    return sb
 
 if __name__ == "__main__":
     run_pipeline()
