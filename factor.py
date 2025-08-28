@@ -594,7 +594,7 @@ class Output:
         gsc_series = pd.Series({t: g_score.get(t) for t in G_UNI}, name='GSC')
         self.g_table = pd.concat([df_z.loc[G_UNI,['GRW','MOM','TRD','VOL']], gsc_series], axis=1)
         self.g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
-        self.g_formatters = {col:"{:.2f}".format for col in ['GRW','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
+        self.g_formatters = {**{'GRW':"{:.3f}".format}, **{c:"{:.2f}".format for c in ['MOM','TRD','VOL','GSC']}}
         self.g_title = (f"[G枠 / {N_G} / {_fmt_w(g_weights)} / corrM={corrM} / "
                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
         if near_G:
