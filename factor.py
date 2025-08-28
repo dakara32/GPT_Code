@@ -787,6 +787,15 @@ def run_pipeline() -> SelectionBundle:
     )
     sc = Scorer()
     top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G, G_PREV_JSON)
+    poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False).index)
+    alpha = Scorer.spx_to_alpha(inb.spx)
+    sectors = {t: (inb.info.get(t, {}).get("sector") or "U") for t in poolG}
+    scores = {t: Scorer.g_score.get(t, 0.0) for t in poolG}
+    top_G = Scorer.pick_top_softcap(scores, sectors, N=N_G, cap=2, alpha=alpha, hard=5)
+    sc._top_G = top_G
+    base = sum(Scorer.g_score.get(t,0.0) for t in poolG[:N_G])
+    effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
+    print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
     top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D, D_PREV_JSON)
     fb = getattr(sc, "_feat", None)
     near_G = getattr(sc, "_near_G", [])
