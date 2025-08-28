@@ -96,44 +96,62 @@ def _scalar(row, col):
         return float("nan")
 
 
+def _is_strict_down(seq):
+    """数列が厳密に連続で切り下がっているか（len>=4を想定）。NaN含みはFalse。"""
+    try:
+        xs = [float(x) for x in seq]
+        if any(pd.isna(x) for x in xs) or len(xs) < 4:
+            return False
+        return all(b < a for a, b in zip(xs[:-1], xs[1:]))
+    except Exception:
+        return False
+
+
 def _signals_for_day(df, idx):
     """df.loc[idx] 1日分に対しシグナル配列を返す（値動き/出来高ベースのみ）。"""
-    sig = []
-    d = df.loc[idx]
-    close = _scalar(d, "Close")
-    open_ = _scalar(d, "Open")
-    ma20 = _scalar(d, "ma20")
-    ma50 = _scalar(d, "ma50")
-    vol = _scalar(d, "Volume")
-    vol50 = _scalar(df.iloc[-1], "vol50")
-    if any(pd.isna(x) for x in (close, open_, vol, vol50)):
+    try:
+        sig = []
+        d = df.loc[idx]
+        close = _scalar(d, "Close")
+        open_ = _scalar(d, "Open")
+        ma20 = _scalar(d, "ma20")
+        ma50 = _scalar(d, "ma50")
+        vol = _scalar(d, "Volume")
+        vol50 = _scalar(df.iloc[-1], "vol50")
+        if any(pd.isna(x) for x in (close, open_, vol, vol50)):
+            return sig
+        if pd.notna(ma20) and close < ma20:
+            sig.append("20DMA↓")
+        if pd.notna(ma50) and close < ma50 and vol > 1.5 * vol50:
+            sig.append("50DMA↓(大商い)")
+
+        last4 = df.loc[:idx].tail(4)
+        lows_desc = _is_strict_down(last4["Low"].tolist())
+        last10 = df.loc[:idx].tail(10)
+        reds = int((last10["Close"] < last10["Open"]).sum())
+        if lows_desc or reds > 5:
+            sig.append("連続安値/陰線優勢")
+
+        ups = int((last10["Close"] > last10["Open"]).sum())
+        if ups >= 7:
+            sig.append("上げ偏重(>70%)")
+
+        last15 = df.loc[:idx].tail(15)
+        base0 = _scalar(last15.iloc[0], "Close") if len(last15) > 0 else float("nan")
+        if pd.notna(base0) and base0 != 0 and (close / base0 - 1) >= 0.25:
+            sig.append("+25%/15日内")
+
+        if len(df.loc[:idx]) >= 2:
+            t1, t0 = df.loc[:idx].iloc[-2], df.loc[:idx].iloc[-1]
+            t1_high = _scalar(t1, "High")
+            t0_open = _scalar(t0, "Open")
+            t0_close = _scalar(t0, "Close")
+            if all(pd.notna(x) for x in (t1_high, t0_open, t0_close)):
+                if (t0_open > t1_high * 1.02) and (t0_close < t0_open):
+                    sig.append("GU→陰線")
         return sig
-    if pd.notna(ma20) and close < ma20:
-        sig.append("20DMA↓")
-    if pd.notna(ma50) and close < ma50 and vol > 1.5 * vol50:
-        sig.append("50DMA↓(大商い)")
-    last4 = df.loc[:idx].tail(4)
-    lows_desc = bool((last4["Low"].diff().dropna() < 0).all())
-    last10 = df.loc[:idx].tail(10)
-    reds = int((last10["Close"] < last10["Open"]).sum())
-    if lows_desc or reds > 5:
-        sig.append("連続安値/陰線優勢")
-    ups = int((last10["Close"] > last10["Open"]).sum())
-    if ups >= 7:
-        sig.append("上げ偏重(>70%)")
-    last15 = df.loc[:idx].tail(15)
-    base0 = _scalar(last15.iloc[0], "Close") if len(last15) > 0 else float("nan")
-    if pd.notna(base0) and base0 != 0 and (close / base0 - 1) >= 0.25:
-        sig.append("+25%/15日内")
-    if len(df.loc[:idx]) >= 2:
-        t1, t0 = df.loc[:idx].iloc[-2], df.loc[:idx].iloc[-1]
-        t1_high = _scalar(t1, "High")
-        t0_open = _scalar(t0, "Open")
-        t0_close = _scalar(t0, "Close")
-        if all(pd.notna(x) for x in (t1_high, t0_open, t0_close)):
-            if (t0_open > t1_high * 1.02) and (t0_close < t0_open):
-                sig.append("GU→陰線")
-    return sig
+    except Exception:
+        return []
 
 
 def scan_sell_signals(symbols, lookback_days=5):
