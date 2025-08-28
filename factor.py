@@ -598,16 +598,25 @@ class Output:
     def notify_slack(self):
         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
         if not SLACK_WEBHOOK_URL: raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-        message = "📈 ファクター分散最適化の結果\n"
-        if self.miss_df is not None and not self.miss_df.empty: message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
-        message += self.g_title + "\n```" + self.g_table.to_string(formatters=self.g_formatters) + "```\n"
-        message += self.d_title + "\n```" + self.d_table.to_string(formatters=self.d_formatters) + "```\n"
+        def _blk(title, tbl, fmt, drop_trd=False):
+            if tbl is None or getattr(tbl, "empty", False): return f"{title}\n(選定なし)\n"
+            if drop_trd and "TRD" in tbl.columns:
+                cols = [c for c in tbl.columns if c != "TRD"]
+                tbl  = tbl[cols]
+                fmt  = {k:v for k,v in (fmt or {}).items() if k != "TRD"}
+            return f"{title}\n```{tbl.to_string(formatters=fmt)}```\n"
+
+        message  = "📈 ファクター分散最適化の結果\n"
+        if self.miss_df is not None and not self.miss_df.empty:
+            message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
+        message += _blk(self.g_title, self.g_table, self.g_formatters, drop_trd=True)
+        message += _blk(self.d_title, self.d_table, self.d_formatters, drop_trd=False)
         message += "Changes\n```" + self.io_table.to_string(index=False) + "```\n"
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
-        # 低スコアTOP10（GSC+DSC）
         if self.low10_table is not None:
             message += "\nLow Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
-        if self.debug and self.debug_table is not None: message += "\nDebug Data\n```" + self.debug_table.to_string() + "```"
+        if self.debug and self.debug_table is not None:
+            message += "\nDebug Data\n```" + self.debug_table.to_string() + "```"
         payload = {"text": message}
         try:
             resp = requests.post(SLACK_WEBHOOK_URL, json=payload); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
