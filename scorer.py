@@ -190,6 +190,54 @@ class Scorer:
         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
         return np.nan if var==0 else cov/var
 
+    @staticmethod
+    def spx_to_alpha(spx: pd.Series, bands=(0.03,0.10), w=(0.6,0.4),
+                     span=5, q=(0.20,0.40), alphas=(0.05,0.08,0.10)) -> float:
+        """
+        S&P500指数のみから擬似breadthを作り、履歴分位でαを段階決定。
+        bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
+        """
+        ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
+        b50  = ((spx/ma50 - 1) + bands[0])/(2*bands[0])
+        b200 = ((spx/ma200 - 1) + bands[1])/(2*bands[1])
+        hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
+        b = float(hist.iloc[-1])
+        lo, mid = float(hist.quantile(q[0])), float(hist.quantile(q[1]))
+        return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
+
+    @staticmethod
+    def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
+        """
+        同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
+        戻り値は降順ソート済み。
+        """
+        s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
+        cnt, pen = {}, {}
+        for t in order:
+            sec = sectors.get(t, "U")
+            k = cnt.get(sec, 0) + 1
+            pen[t] = alpha * max(0, k - cap)
+            cnt[sec] = k
+        return (s - pd.Series(pen)).sort_values(ascending=False)
+
+    @staticmethod
+    def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08, hard: int|None=5) -> list[str]:
+        """
+        soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
+        """
+        eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
+        if not hard:
+            return list(eff.head(N).index)
+        pick, used = [], {}
+        for t in eff.index:
+            s = sectors.get(t, "U")
+            if used.get(s, 0) < hard:
+                pick.append(t)
+                used[s] = used.get(s, 0) + 1
+            if len(pick) == N:
+                break
+        return pick
+
     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
     def aggregate_scores(self, ib: Any, cfg):
         if cfg is None:
@@ -511,6 +559,7 @@ class Scorer:
 
         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
         g_score = g_score_all.loc[mask]
+        Scorer.g_score = g_score
         df_z['GSC'] = g_score_all
         df_z['DSC'] = d_score_all
 
