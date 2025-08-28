@@ -66,8 +66,9 @@ def fetch_vix_ma5():
         return float("nan")
 
 
-# === Minervini-like sell signals (値動きベース) ===
+# === Minervini-like sell signals ===
 def _yf_df(sym, period="6mo"):
+    """日足/MA/出来高平均を取得。欠損時は None。"""
     try:
         df = yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False)
         if df is None or df.empty:
@@ -81,43 +82,77 @@ def _yf_df(sym, period="6mo"):
         return None
 
 
-def _sig_minervini(sym):
-    """Return list[str] of triggered sell-signal tags for symbol."""
-    df = _yf_df(sym)
+def _scalar(row, col):
+    """Series/npスカラ→Pythonスカラ化（NaNはNaNのまま）"""
+    try:
+        v = row[col]
+        if hasattr(v, "item"):
+            try:
+                v = v.item()
+            except Exception:
+                pass
+        return v
+    except Exception:
+        return float("nan")
+
+
+def _signals_for_day(df, idx):
+    """df.loc[idx] 1日分に対しシグナル配列を返す（値動き/出来高ベースのみ）。"""
     sig = []
-    if df is None or len(df) < 60:
+    d = df.loc[idx]
+    close = _scalar(d, "Close")
+    open_ = _scalar(d, "Open")
+    ma20 = _scalar(d, "ma20")
+    ma50 = _scalar(d, "ma50")
+    vol = _scalar(d, "Volume")
+    vol50 = _scalar(df.iloc[-1], "vol50")
+    if any(pd.isna(x) for x in (close, open_, vol, vol50)):
         return sig
-    d = df.iloc[-1]
-    last10 = df.tail(10)
-    last15 = df.tail(15)
-    last4 = df.tail(4)
-    if pd.notna(d.ma20) and d.Close < d.ma20:
+    if pd.notna(ma20) and close < ma20:
         sig.append("20DMA↓")
-    if pd.notna(d.ma50) and d.Close < d.ma50 and d.Volume > (1.5 * df.vol50.iloc[-1]):
+    if pd.notna(ma50) and close < ma50 and vol > 1.5 * vol50:
         sig.append("50DMA↓(大商い)")
-    lows_desc = all(last4.Low.diff().dropna() < 0)
-    reds = int((last10.Close < last10.Open).sum())
+    last4 = df.loc[:idx].tail(4)
+    lows_desc = bool((last4["Low"].diff().dropna() < 0).all())
+    last10 = df.loc[:idx].tail(10)
+    reds = int((last10["Close"] < last10["Open"]).sum())
     if lows_desc or reds > 5:
         sig.append("連続安値/陰線優勢")
-    ups = int((last10.Close > last10.Open).sum())
+    ups = int((last10["Close"] > last10["Open"]).sum())
     if ups >= 7:
         sig.append("上げ偏重(>70%)")
-    base = float(last15.Close.iloc[0])
-    if base and (d.Close / base - 1) >= 0.25:
+    last15 = df.loc[:idx].tail(15)
+    base0 = _scalar(last15.iloc[0], "Close") if len(last15) > 0 else float("nan")
+    if pd.notna(base0) and base0 != 0 and (close / base0 - 1) >= 0.25:
         sig.append("+25%/15日内")
-    t1, t0 = df.iloc[-2], df.iloc[-1]
-    if t0.Open > t1.High * 1.02 and t0.Close < t0.Open:
-        sig.append("GU→陰線")
+    if len(df.loc[:idx]) >= 2:
+        t1, t0 = df.loc[:idx].iloc[-2], df.loc[:idx].iloc[-1]
+        t1_high = _scalar(t1, "High")
+        t0_open = _scalar(t0, "Open")
+        t0_close = _scalar(t0, "Close")
+        if all(pd.notna(x) for x in (t1_high, t0_open, t0_close)):
+            if (t0_open > t1_high * 1.02) and (t0_close < t0_open):
+                sig.append("GU→陰線")
     return sig
 
 
-def scan_sell_signals(symbols):
-    """Return dict: {symbol: [signals,...]} for alerts only."""
+def scan_sell_signals(symbols, lookback_days=5):
+    """
+    直近 lookback_days 日のうち一度でもシグナルが出たら {sym: [(date,[signals]),...]} を返す。
+    日付は YYYY-MM-DD。Slackで列挙する。
+    """
     out = {}
     for s in symbols:
-        a = _sig_minervini(s)
-        if a:
-            out[s] = a
+        df = _yf_df(s)
+        if df is None or len(df) < 60:
+            continue
+        alerts = []
+        for idx in df.tail(lookback_days).index:
+            tags = _signals_for_day(df, idx)
+            if tags:
+                alerts.append((idx.strftime("%Y-%m-%d"), tags))
+        if alerts:
+            out[s] = alerts
     return out
 
 
@@ -259,30 +294,36 @@ def send_debug(debug_text):
 def main():
     portfolio = load_portfolio()
     symbols = [r["symbol"] for r in portfolio]
-    sell_alerts = scan_sell_signals(symbols)
+    sell_alerts = scan_sell_signals(symbols, lookback_days=5)
     vix_ma5, drift_threshold = compute_threshold()
     df, total_value, total_drift_abs = build_dataframe(portfolio)
     df, alert, new_total_value, simulated_total_drift_abs = simulate(
         df, total_value, total_drift_abs, drift_threshold
     )
     df_small = prepare_summary(df, total_drift_abs, alert)
-    if not df_small.empty:
-        col_sym = "sym" if "sym" in df_small.columns else "symbol"
-        df_small.insert(0, "⚠", df_small[col_sym].apply(lambda x: "🔴" if x in sell_alerts else ""))
-        df_small[col_sym] = df_small[col_sym].apply(lambda x: f"*{x}*" if x in sell_alerts else x)
+    if 'df_small' in locals() and isinstance(df_small, pd.DataFrame) and not df_small.empty:
+        col_sym = "sym" if "sym" in df_small.columns else ("symbol" if "symbol" in df_small.columns else None)
+        if col_sym:
+            df_small.insert(0, "⚠", df_small[col_sym].apply(lambda x: "🔴" if x in sell_alerts else ""))
     formatters = formatters_for(alert)
     header = build_header(
         vix_ma5, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
     )
     if sell_alerts:
-        hit = ", ".join([f"*{t}*（" + "・".join(v) + "）" for t, v in sell_alerts.items()])
+        def fmt_pair(date_tags):
+            date, tags = date_tags
+            return f"{date}:" + "・".join(tags)
+        listed = []
+        for t, arr in sell_alerts.items():
+            listed.append(f"*{t}*（" + ", ".join(fmt_pair(x) for x in arr) + "）")
+        hits = ", ".join(listed)
         if "✅ アラートなし" in header:
             header = header.replace(
                 "✅ アラートなし",
-                f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hit}",
+                f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hits}",
             )
         else:
-            header += f"\n🟥 {hit}"
+            header += f"\n🟥 {hits}"
     table_text = df_small.to_string(formatters=formatters, index=False)
     send_slack(header + "\n```" + table_text + "```")
 
