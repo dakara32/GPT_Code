@@ -1,11 +1,10 @@
-import pandas as pd
+import pandas as pd, yfinance as yf
 import numpy as np
 import requests
 import os
 import csv
 import time
 from pathlib import Path
-import yfinance as yf
 
 # Debug flag
 debug_mode = False  # set to True for detailed output
@@ -65,6 +64,61 @@ def fetch_vix_ma5():
         return vix.mean().item()
     except Exception:
         return float("nan")
+
+
+# === Minervini-like sell signals (値動きベース) ===
+def _yf_df(sym, period="6mo"):
+    try:
+        df = yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False)
+        if df is None or df.empty:
+            return None
+        return df.dropna().assign(
+            ma20=lambda d: d["Close"].rolling(20).mean(),
+            ma50=lambda d: d["Close"].rolling(50).mean(),
+            vol50=lambda d: d["Volume"].rolling(50).mean(),
+        )
+    except Exception:
+        return None
+
+
+def _sig_minervini(sym):
+    """Return list[str] of triggered sell-signal tags for symbol."""
+    df = _yf_df(sym)
+    sig = []
+    if df is None or len(df) < 60:
+        return sig
+    d = df.iloc[-1]
+    last10 = df.tail(10)
+    last15 = df.tail(15)
+    last4 = df.tail(4)
+    if pd.notna(d.ma20) and d.Close < d.ma20:
+        sig.append("20DMA↓")
+    if pd.notna(d.ma50) and d.Close < d.ma50 and d.Volume > (1.5 * df.vol50.iloc[-1]):
+        sig.append("50DMA↓(大商い)")
+    lows_desc = all(last4.Low.diff().dropna() < 0)
+    reds = int((last10.Close < last10.Open).sum())
+    if lows_desc or reds > 5:
+        sig.append("連続安値/陰線優勢")
+    ups = int((last10.Close > last10.Open).sum())
+    if ups >= 7:
+        sig.append("上げ偏重(>70%)")
+    base = float(last15.Close.iloc[0])
+    if base and (d.Close / base - 1) >= 0.25:
+        sig.append("+25%/15日内")
+    t1, t0 = df.iloc[-2], df.iloc[-1]
+    if t0.Open > t1.High * 1.02 and t0.Close < t0.Open:
+        sig.append("GU→陰線")
+    return sig
+
+
+def scan_sell_signals(symbols):
+    """Return dict: {symbol: [signals,...]} for alerts only."""
+    out = {}
+    for s in symbols:
+        a = _sig_minervini(s)
+        if a:
+            out[s] = a
+    return out
 
 
 def load_portfolio():
@@ -204,16 +258,31 @@ def send_debug(debug_text):
 
 def main():
     portfolio = load_portfolio()
+    symbols = [r["symbol"] for r in portfolio]
+    sell_alerts = scan_sell_signals(symbols)
     vix_ma5, drift_threshold = compute_threshold()
     df, total_value, total_drift_abs = build_dataframe(portfolio)
     df, alert, new_total_value, simulated_total_drift_abs = simulate(
         df, total_value, total_drift_abs, drift_threshold
     )
     df_small = prepare_summary(df, total_drift_abs, alert)
+    if not df_small.empty:
+        col_sym = "sym" if "sym" in df_small.columns else "symbol"
+        df_small.insert(0, "⚠", df_small[col_sym].apply(lambda x: "🔴" if x in sell_alerts else ""))
+        df_small[col_sym] = df_small[col_sym].apply(lambda x: f"*{x}*" if x in sell_alerts else x)
     formatters = formatters_for(alert)
     header = build_header(
         vix_ma5, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
     )
+    if sell_alerts:
+        hit = ", ".join([f"*{t}*（" + "・".join(v) + "）" for t, v in sell_alerts.items()])
+        if "✅ アラートなし" in header:
+            header = header.replace(
+                "✅ アラートなし",
+                f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hit}",
+            )
+        else:
+            header += f"\n🟥 {hit}"
     table_text = df_small.to_string(formatters=formatters, index=False)
     send_slack(header + "\n```" + table_text + "```")
 
