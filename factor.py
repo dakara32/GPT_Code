@@ -11,7 +11,7 @@ import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
 from scipy.stats import zscore
 from dataclasses import dataclass
 from typing import Dict, List
-from scorer import Scorer
+from scorer import Scorer, ttm_div_yield_portfolio
 import os
 import requests
 from time import perf_counter
@@ -641,21 +641,6 @@ class Output:
 
         all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
-        def _ttm_div_yield(tickers):
-            ys=[]
-            for t in tickers:
-                try:
-                    tk=yf.Ticker(t)
-                    div=tk.dividends
-                    if not div.empty:
-                        y=div[div.index>=(pd.Timestamp.today()-pd.Timedelta(days=365))].sum()/tk.history(period="1d")["Close"].iloc[-1]
-                    else:
-                        y=0.0
-                except Exception:
-                    y=0.0
-                ys.append(y)
-            return sum(ys)/len(ys) if ys else 0.0
-
         for name,ticks in portfolios.items():
             pr = ret[ticks].mean(axis=1, skipna=True).dropna(); cum = (1+pr).cumprod()-1; n = len(pr)
             if n>=252: ann_ret, ann_vol = (1+cum.iloc[-1])**(252/n)-1, pr.std()*np.sqrt(252)
@@ -666,7 +651,7 @@ class Output:
                 R = ret[ticks].dropna().to_numpy(); C_resid = Selector.residual_corr(R, n_pc=3, shrink=DRRS_SHRINK)
                 RESID_rho = float((C_resid.sum()-np.trace(C_resid))/(C_resid.shape[0]*(C_resid.shape[0]-1)))
             else: RAW_rho = RESID_rho = np.nan
-            divy = _ttm_div_yield(ticks); metrics[name] = {'RET':ann_ret,'VOL':ann_vol,'SHP':sharpe,'MDD':drawdown,'RAWρ':RAW_rho,'RESIDρ':RESID_rho,'DIVY':divy}
+            divy = ttm_div_yield_portfolio(ticks); metrics[name] = {'RET':ann_ret,'VOL':ann_vol,'SHP':sharpe,'MDD':drawdown,'RAWρ':RAW_rho,'RESIDρ':RESID_rho,'DIVY':divy}
         df_metrics = pd.DataFrame(metrics).T; df_metrics_pct = df_metrics.copy(); self.df_metrics = df_metrics
         for col in ['RET','VOL','MDD','DIVY']: df_metrics_pct[col] = df_metrics_pct[col]*100
         cols_order = ['RET','VOL','SHP','MDD','RAWρ','RESIDρ','DIVY']; df_metrics_pct = df_metrics_pct.reindex(columns=cols_order)
