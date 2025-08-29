@@ -37,6 +37,38 @@ from scipy.stats import zscore
 if TYPE_CHECKING:
     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
 
+# ---- Dividend Helpers -------------------------------------------------------
+def _last_close(t, price_map=None):
+    if price_map and (c := price_map.get(t)) is not None:
+        return float(c)
+    try:
+        h = yf.Ticker(t).history(period="5d")["Close"].dropna()
+        return float(h.iloc[-1]) if len(h) else np.nan
+    except Exception:
+        return np.nan
+
+def _ttm_div_sum(t, lookback_days=400):
+    try:
+        div = yf.Ticker(t).dividends
+        if div is None or len(div) == 0:
+            return 0.0
+        cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
+        ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
+        return ttm if ttm > 0 else float(div.tail(4).sum())
+    except Exception:
+        return 0.0
+
+def ttm_div_yield_portfolio(tickers, price_map=None):
+    ys = []
+    for t in tickers:
+        c = _last_close(t, price_map)
+        if not np.isfinite(c) or c <= 0:
+            ys.append(0.0)
+            continue
+        s = _ttm_div_sum(t)
+        ys.append(s / c if s > 0 else 0.0)
+    return float(np.mean(ys)) if ys else 0.0
+
 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
 def winsorize_s(s: pd.Series, p=0.02):
     if s is None or s.dropna().empty: return s
