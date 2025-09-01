@@ -1,23 +1,102 @@
 # factor.py 詳細設計書
 
 ## 概要
-- ファクタースコアと相関低減を組み合わせた銘柄選定パイプライン。
-- 入力データの取得からスコア算出、G/D枠の選定、結果出力までを一体化。
+- 既存ポートフォリオの銘柄と検討中の銘柄群を同時に扱う銘柄選定パイプライン。
+- 価格・財務データを取り込みスコアリングとDRRS選定を行うことで、以下のアウトプットを得る。
+  - 採用銘柄と惜しくも漏れた銘柄のスコア一覧
+  - IN/OUTのティッカーリストとOUT側の低スコア銘柄
+  - 新旧ポートフォリオの比較表
+  - 検討中銘柄の低スコアランキング（整理用）
+
+## 全体フロー
+1. **Input** – `current_tickers.csv`と`candidate_tickers.csv`を読み込み、yfinanceやFinnhubのAPIから価格・財務データを収集して`InputBundle`を整備。
+2. **Score Calculation** – Scorerが特徴量を計算し因子スコアを合成して`FeatureBundle`を生成。
+3. **Correlation Reduction & Selection** – SelectorがDRRSロジックで相関を抑えつつG/D銘柄を選定し`SelectionBundle`を得る。
+4. **Output** – 採用結果と周辺情報を表・Slack通知として出力。
+
+```mermaid
+flowchart LR
+  A[Input\nAPI & 前処理] --> B[Score Calculation\n特徴量・因子合成]
+  B --> C[Correlation Reduction\nDRRS選定]
+  C --> D[Output\nSlack通知]
+```
 
 ## 定数・設定
-- `current_tickers.csv`/`candidate_tickers.csv`から既存銘柄と候補銘柄を読み込む。
-- 価格上限`CAND_PRICE_MAX`、ベンチマーク`bench`、枠サイズ`N_G`/`N_D`を定義。
-- ファクター重み`g_weights`/`D_weights`、DRRS関連パラメータ`corrM`、`DRRS_G`/`DRRS_D`、
-  残差相関シュリンク`DRRS_SHRINK`、G-D間ペナルティ`CROSS_MU_GD`を保持。
-- 選定結果は`results/`配下にJSONとして保存。
+| 変数 | 内容 | 主な用途 |
+| --- | --- | --- |
+| `exist` / `cand` | 現行ポートフォリオと検討中銘柄のティッカーリスト | スコア対象ユニバースの構成、候補整理 |
+| `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
+| `CAND_PRICE_MAX` | 候補銘柄の許容価格上限 | 高額銘柄の事前除外 |
+| `N_G` / `N_D` | G/D採用枠の件数 | 最終的に選ぶ銘柄数の制約 |
+| `g_weights` / `D_weights` | 各因子の重みdict | G/Dスコア合成 |
+| `D_BETA_MAX` | Dバケットの許容β上限 | 高β銘柄の除外フィルタ |
+| `FILTER_SPEC` | G/Dごとの前処理フィルタ | トレンドマスクやβ上限設定 |
+| `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
+| `DRRS_G` / `DRRS_D` | DRRSパラメータdict | バケット別の相関低減設定 |
+| `DRRS_SHRINK` | 残差相関の対角シュリンク率 | `residual_corr`の安定化 |
+| `CROSS_MU_GD` | G-D間クロス相関ペナルティμ | 2バケット同時最適化で相関抑制 |
+| `RESULTS_DIR` | 選定結果保存ディレクトリ | `_save_sel`/`_load_prev`の入出力 |
+
+選定結果は`results/`配下にJSONとして保存し、次回実行時に`_load_prev`で読み込んで選定条件に反映。
 
 ## DTO/Config
-- **InputBundle**: Scorerへ渡す生データ一式。
-- **FeatureBundle**: Scorerから返される特徴量・スコア・欠損ログ。
-- **SelectionBundle**: Selectorから返される選定結果。
-- **WeightsConfig**: G/Dファクターの重み。
-- **DRRSParams**: DRRSのパラメータ群。
-- **PipelineConfig**: 上記設定を束ねるコンテナ。
+各ステップ間で受け渡すデータ構造と設定値。変数の意味合いと利用箇所を以下に示す。
+
+### InputBundle（Input → Scorer）
+| 変数 | 内容 | 主な用途 |
+| --- | --- | --- |
+| `cand` | 候補銘柄ティッカーのリスト | OUTテーブルや低スコアランキング対象の母集団 |
+| `tickers` | 現行+候補を合わせたティッカー一覧 | 価格・出来高ダウンロード、リターン計算 |
+| `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
+| `data` | yfinanceのダウンロード結果（階層列） | `px`/`spx`/リターン等の基礎データ |
+| `px` | `data['Close']`だけを抜き出した価格系列 | 指標計算・リターン生成 |
+| `spx` | `data['Close'][bench]` のSeries | `rs`や`calc_beta`の基準指数 |
+| `tickers_bulk` | `yf.Tickers`オブジェクト | `info`等の一括取得 |
+| `info` | ティッカー別のyfinance情報dict | セクター判定やEPS補完 |
+| `eps_df` | EPS TTM/直近EPS等をまとめた表 | 成長指標の算出 |
+| `fcf_df` | CFO・CapEx・FCF TTMと情報源フラグ | FCF/EVや配当カバレッジ |
+| `returns` | `px.pct_change()`のリターン表 | 相関行列・DRRS計算 |
+
+### FeatureBundle（Scorer → Selector）
+| 変数 | 内容 | 主な用途 |
+| --- | --- | --- |
+| `df` | 計算済み指標の生値テーブル | デバッグ・出力表示 |
+| `df_z` | ウィンザー後Zスコア化した指標表 | 因子スコア合成、選定基準 |
+| `g_score` | Gバケット総合スコア | G選定、IN/OUT比較 |
+| `d_score_all` | Dバケット総合スコア（全銘柄） | D選定、低スコアランキング |
+| `missing_logs` | 欠損指標と補完状況のログ | データ品質チェック |
+
+### SelectionBundle（Selector → Output）
+| 変数 | 内容 | 主な用途 |
+| --- | --- | --- |
+| `resG` | G選定結果の詳細dict（`tickers`、目的値等） | 結果保存・平均相関などの指標表示 |
+| `resD` | D選定結果の詳細dict | 同上 |
+| `top_G` | 最終採用Gティッカー | 新ポートフォリオ構築 |
+| `top_D` | 最終採用Dティッカー | 同上 |
+| `init_G` | DRRS前のG初期候補 | 惜しくも外れた銘柄表示 |
+| `init_D` | DRRS前のD初期候補 | 同上 |
+
+### WeightsConfig
+| 変数 | 内容 | 主な用途 |
+| --- | --- | --- |
+| `g` | G因子（GRW/MOM/VOL）の重みdict | `g_score`合成 |
+| `d` | D因子（D_QAL/D_YLD/D_VOL_RAW/D_TRD）の重みdict | `d_score_all`合成 |
+
+### DRRSParams
+| 変数 | 内容 | 主な用途 |
+| --- | --- | --- |
+| `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
+| `shrink` | 残差相関のシュリンク率 | `residual_corr`の対角強調 |
+| `G` | Gバケット用パラメータdict（`lookback`等） | `select_bucket_drrs`設定 |
+| `D` | Dバケット用パラメータdict | 同上 |
+| `cross_mu_gd` | G-Dクロス相関ペナルティ係数μ | `select_buckets`の目的関数 |
+
+### PipelineConfig
+| 変数 | 内容 | 主な用途 |
+| --- | --- | --- |
+| `weights` | `WeightsConfig`のインスタンス | スコア合成の重み参照 |
+| `drrs` | `DRRSParams`のインスタンス | 選定ステップの設定値 |
+| `price_max` | 候補銘柄の許容価格上限 | Input段階でのフィルタ |
 
 ## 共通ユーティリティ
 - `winsorize_s` / `robust_z` : 外れ値処理とZスコア化。
@@ -25,29 +104,113 @@
 - `_load_prev` / `_save_sel` : 選定結果の読み書き。
 
 ## クラス設計
-### Input
-外部I/Oと前処理を担当し、`prepare_data`で`InputBundle`を生成。
+### Step1: Input
+`current_tickers.csv`の現行銘柄と`candidate_tickers.csv`の検討中銘柄を起点にデータを集約する。外部I/Oと前処理を担当し、`prepare_data`で`InputBundle`を生成。価格・財務データの取得は**yfinanceを優先し、欠損がある指標のみFinnhub APIで補完**する。
 主なメソッド:
-- `impute_eps_ttm` : 四半期EPSからTTMを補完。
-- `fetch_cfo_capex_ttm_yf` : yfinanceからCFO/CapEx TTMを取得。
-- `fetch_cfo_capex_ttm_finnhub` : Finnhub APIから同値を取得。
-- `compute_fcf_with_fallback` : 上記情報を統合しFCFを計算。
-- `_build_eps_df` : EPS関連データフレーム構築。
-- `prepare_data` : 価格・財務・EPS・FCF・リターンをまとめる。
+- `impute_eps_ttm` : 四半期EPS×4でTTMを推定し欠損時のみ差し替え。
+- `fetch_cfo_capex_ttm_yf` : yfinanceの四半期/年次キャッシュフローからCFO・CapEx・FCF TTMを算出。
+- `fetch_cfo_capex_ttm_finnhub` : yfinanceで欠けた銘柄のみFinnhub APIで補完。
+- `compute_fcf_with_fallback` : yfinance値を基準にFinnhub値で穴埋めし、CFO/CapEx/FCFと情報源フラグを返す。
+- `_build_eps_df` : `info`や`quarterly_earnings`からEPS TTMと直近EPSを計算し、`impute_eps_ttm`で補完。
+- `prepare_data` :
+    0. CSVから現行銘柄と候補銘柄のティッカー一覧を読み込む。
+    1. 候補銘柄の現在値を取得し価格上限でフィルタ。
+    2. 既存+候補から対象ティッカーを決定し、価格・出来高を一括ダウンロード（yfinance）。
+    3. yfinance値を基にEPS/FCFテーブルやベンチマーク系列、リターンを構築し、欠損セルはFinnhub呼び出しで穴埋め。
+    4. 上記を`InputBundle`に格納して返す。
 
-### Scorer
+### Step2: Score Calculation (Scorer)
 特徴量計算とスコア合成を担当し、`FeatureBundle`を返す。
-補助メソッドに`trend`、`rs`、`tr_str`、`rs_line_slope`、`ev_fallback`、
-`dividend_status`、`div_streak`、`fetch_finnhub_metrics`、`calc_beta`などがある。
-`aggregate_scores`の流れ:
-1. 各銘柄について価格系列・財務情報・配当履歴を読み込み、トレンド指標（移動平均や52週高安）、相対強さ、ベータ、下方リスク、EPS/売上成長率、FCFなど多数の生指標を計算。欠損があればFinnhub API等で補完。
-2. 主要指標を`winsorize_s`で外れ値処理後、`robust_z`でZスコア化し`df_z`に格納。サイズ・流動性の対数変換もここで行う。
-3. 正規化された指標から、成長`GRW`、モメンタム`MOM`、トレンド`TRD`、ボラティリティ`VOL`の4因子を組み合わせ、`cfg.weights.g`の重みで合成して`g_score`を生成。
-4. 同様に、守備的バケット用に`D_QAL`(FCFや財務健全性)、`D_YLD`(配当利回り/継続性)、`D_VOL_RAW`(ダウンサイド指標)、`D_TRD`(長期トレンド)を作り、`cfg.weights.d`で加重して`d_score_all`を算出。
-5. 各指標が取得できなかった銘柄・項目は`missing_logs`として記録し後段で確認できるようにする。
 
-### Selector
-DRRSアルゴリズムで相関を抑えた銘柄選定を行い、`SelectionBundle`を返す。
+#### 補助関数
+- `trend(s)` : 50/150/200日移動平均や52週レンジから-0.5〜0.5で構成されたトレンド指標。
+- `rs(s,b)` / `tr_str(s)` / `rs_line_slope(s,b,win)` : 相対強さや短期トレンド、RS回帰傾きを算出。
+- `ev_fallback` : `enterpriseValue`欠損時に負債・現金からEVを推定。
+- `dividend_status` / `div_streak` : 配当未設定状況の判定と増配年数カウント。
+- `fetch_finnhub_metrics` : Finnhub APIからEPS成長・ROE・βなど不足指標を取得。
+- `calc_beta` : ベンチマークとの共分散からβを算出。
+- `spx_to_alpha` : S&P500の位置情報からDRRSで用いるαを推定。
+- `soft_cap_effective_scores` / `pick_top_softcap` : セクターソフトキャップ付きスコア調整と上位抽出。
+
+**補助関数と生成指標**
+
+| 補助関数 | 生成指標 | 略称 |
+| --- | --- | --- |
+| `trend` | トレンド総合値 | `TR` |
+| `rs` | 相対強さ | `RS` |
+| `tr_str` | 価格と50日線の乖離 | `TR_str` |
+| `rs_line_slope` | RS線の回帰傾き | `RS_SLOPE_*` |
+| `calc_beta` | β | `BETA` |
+| `div_streak` | 連続増配年数 | `DIV_STREAK` |
+
+#### `aggregate_scores` 詳細
+1. 各銘柄の価格系列や`info`を基に以下を算出。
+   - **トレンド/モメンタム**: `TR`、`RS`、`TR_str`、多様な移動平均比、`RS_SLOPE_*`など。
+   - **リスク**: `BETA`、`DOWNSIDE_DEV`、`MDD_1Y`、`RESID_VOL`、`DOWN_OUTPERF`、`EXT_200`等。
+   - **配当**: `DIV`、`DIV_TTM_PS`、`DIV_VAR5`、`DIV_YOY`、`DIV_FCF_COVER`、`DIV_STREAK`。
+   - **財務・成長**: `EPS`、`REV`、`ROE`、`FCF/EV`、`REV_Q_YOY`、`EPS_Q_YOY`、`REV_YOY_ACC`、`REV_YOY_VAR`、`REV_ANN_STREAK`、`RULE40`、`FCF_MGN` 等。
+   - **安定性/サイズ**: `DEBT2EQ`、`CURR_RATIO`、`MARKET_CAP`、`ADV60_USD`、`EPS_VAR_8Q`など。
+2. 指標欠損はFinnhub API等で補完し、未取得項目を`missing_logs`に記録。
+3. `winsorize_s`→`robust_z`で標準化し`df_z`へ保存。サイズ・流動性は対数変換。
+4. 正規化済指標から因子スコアを合成。
+   - 各因子の構成と重みは以下の通り。
+     - **GRW**: 0.30×`REV` + 0.20×`EPS_Q_YOY` + 0.15×`REV_Q_YOY` + 0.15×`REV_YOY_ACC` + 0.10×`RULE40` + 0.10×`FCF_MGN` + 0.10×`REV_ANN_STREAK` − 0.05×`REV_YOY_VAR`。
+     - **MOM**: 0.40×`RS` + 0.15×`TR_str` + 0.15×`RS_SLOPE_6W` + 0.15×`RS_SLOPE_13W` + 0.10×`MA200_SLOPE_5M` + 0.10×`MA200_UP_STREAK_D`。
+     - **VOL**: `BETA`単体を使用。
+     - **QAL**: 0.60×`FCF_W` + 0.40×`ROE_W`で作成。
+     - **YLD**: 0.30×`DIV` + 0.70×`DIV_STREAK`。
+     - **D_QAL**: 0.35×`QAL` + 0.20×`FCF` + 0.15×`CURR_RATIO` − 0.15×`DEBT2EQ` − 0.15×`EPS_VAR_8Q`。
+     - **D_YLD**: 0.45×`DIV` + 0.25×`DIV_STREAK` + 0.20×`DIV_FCF_COVER` − 0.10×`DIV_VAR5`。
+     - **D_VOL_RAW**: 0.40×`DOWNSIDE_DEV` + 0.22×`RESID_VOL` + 0.18×`MDD_1Y` − 0.10×`DOWN_OUTPERF` − 0.05×`EXT_200` − 0.08×`SIZE` − 0.10×`LIQ` + 0.10×`BETA`。
+     - **D_TRD**: 0.40×`MA200_SLOPE_5M` − 0.30×`EXT_200` + 0.15×`NEAR_52W_HIGH` + 0.15×`TR`。
+    - 主な指標の略称と意味:
+
+      | 略称 | 補助関数 | 概要 |
+      | --- | --- | --- |
+      | TR | `trend` | 50/150/200日移動平均と52週レンジを組み合わせたトレンド総合値 |
+      | RS | `rs` | ベンチマークに対する相対強さ（12M/1Mリターン差） |
+      | TR_str | `tr_str` | 価格と50日移動平均の乖離 |
+      | RS_SLOPE_6W | `rs_line_slope` | 相対強さ線の6週回帰傾き |
+      | RS_SLOPE_13W | `rs_line_slope` | 相対強さ線の13週回帰傾き |
+      | MA200_SLOPE_5M | - | 200日移動平均の5か月騰落率 |
+      | MA200_UP_STREAK_D | - | 200日線が連続で上向いた日数 |
+      | BETA | `calc_beta` | ベンチマークに対するβ |
+      | DOWNSIDE_DEV | - | 下方リターンのみの年率化標準偏差 |
+      | RESID_VOL | - | βで調整した残差リターンの年率化標準偏差 |
+      | MDD_1Y | - | 過去1年の最大ドローダウン |
+      | DOWN_OUTPERF | - | 市場下落日に対する平均超過リターン |
+      | EXT_200 | - | 200日移動平均からの絶対乖離率 |
+      | NEAR_52W_HIGH | - | 52週高値までの下方距離（0=高値） |
+      | FCF_W | - | ウィンザー処理後のFCF/EV |
+      | ROE_W | - | ウィンザー処理後のROE |
+      | FCF | - | FCF/EV |
+      | QAL | - | FCF_WとROE_Wを組み合わせた品質スコア |
+      | CURR_RATIO | - | 流動比率 |
+      | DEBT2EQ | - | 負債資本倍率 |
+      | EPS_VAR_8Q | - | EPSの8四半期標準偏差 |
+      | DIV | - | 年率換算配当利回り |
+      | DIV_STREAK | `div_streak` | 連続増配年数 |
+      | DIV_FCF_COVER | - | 配当のFCFカバレッジ |
+      | DIV_VAR5 | - | 5年配当変動率 |
+      | DIV_TTM_PS | - | 1株当たりTTM配当 |
+      | DIV_YOY | - | 前年比配当成長率 |
+      | REV | - | 売上成長率TTM |
+      | EPS_Q_YOY | - | 四半期EPSの前年同期比 |
+      | REV_Q_YOY | - | 四半期売上の前年同期比 |
+      | REV_YOY_ACC | - | 売上成長率の加速分 |
+      | RULE40 | - | 売上成長率とFCFマージンの合計 |
+      | FCF_MGN | - | FCFマージン |
+      | REV_ANN_STREAK | - | 年次売上成長の連続年数 |
+      | REV_YOY_VAR | - | 年次売上成長率の変動性 |
+      | SIZE | - | 時価総額の対数値 |
+      | LIQ | - | 60日平均出来高ドルの対数値 |
+   - Gバケット: `GRW`、`MOM`、`VOL`を`cfg.weights.g`（0.40/0.45/-0.15）で加重し`g_score`を得る。
+   - Dバケット: `D_QAL`、`D_YLD`、`D_VOL_RAW`、`D_TRD`を`cfg.weights.d`（0.15/0.15/-0.45/0.25）で加重し`d_score_all`を算出。
+   - セクターcapによる`soft_cap_effective_scores`を適用し、G採用銘柄にはトレンドテンプレートフィルタを適用。
+5. `_apply_growth_entry_flags`でブレイクアウト/押し目発火状況を付加し、`FeatureBundle`を返す。
+
+### Step3: Correlation Reduction & Selection (Selector)
+DRRSアルゴリズムで相関を抑えた銘柄選定を行い、`SelectionBundle`を返す。`results/`に保存された前回選定（`G_selection.json` / `D_selection.json`）を`_load_prev`で読み込み、目的値が大きく悪化しない限り維持する。新しい採用集合は`_save_sel`でJSONに書き出し次回以降の入力に備える。
 主なメソッド:
 - `residual_corr` : 収益率行列をZスコア化し、上位主成分を除去した残差から相関行列を求め、平均相関に応じてシュリンク。
 - `rrqr_like_det` : スコアを重み付けしたQR分解風の手順で初期候補をk件抽出し、スコアの高い非相関な集合を得る。
@@ -55,16 +218,37 @@ DRRSアルゴリズムで相関を抑えた銘柄選定を行い、`SelectionBun
 - `select_bucket_drrs` : プール銘柄とスコアから残差相関を計算し、上記2段階(初期選択→入れ替え)でk銘柄を決定。過去採用銘柄との比較で目的値が劣化しなければ維持する。
 - `select_buckets` : Gバケットを選定後、その結果を除いた候補からDバケットを選ぶ。D選定時はGとの相関ペナルティμを付与し、両バケットの分散を制御する。
 
-### Output
-結果整形と出力を担当。
+#### 相関低減ロジック詳細
+1. **残差相関行列の構築 (`residual_corr`)**
+   - リターン行列`R`をZスコア化。
+   - SVDで上位`n_pc`主成分`F`を求め、最小二乗で係数`B`を算出し残差`E = Z - F@B`を得る。
+   - `E`の相関行列`C`を計算し、平均絶対相関に応じてシュリンク量`shrink_eff`を補正して対角を強調。
+2. **初期候補の抽出 (`rrqr_like_det`)**
+   - スコアを0-1正規化した重み`w`とし、`Z*(1+γw)`で列ノルムを強調。
+   - 残差ノルム最大の列を逐次選び、QRライクなデフレーションを行って非相関かつ高スコアな`k`銘柄集合`S0`を得る。
+3. **局所探索 (`swap_local_det` / `swap_local_det_cross`)**
+   - 目的関数`Σz_score − λ·within_corr − μ·cross_corr`を最大化。
+   - 選択集合の各銘柄を他候補と入れ替え、改善がなくなるまでまたは`max_pass`回まで探索。
+   - `swap_local_det_cross`はGバケットとのクロス相関行列`C_cross`を使用し、ペナルティ`μ`を付与。
+4. **過去採用の維持とクロスペナルティ (`select_bucket_drrs` / `select_buckets`)**
+   - 局所探索結果`S`と過去集合`P`の目的値を比較し、`S`が`P`より`η`未満の改善なら`P`を維持。
+   - `select_buckets`ではGを先に決定し、D選定時にGとの相関ペナルティ`μ`を加えてクロス分散を抑制。
+
+### Step4: Output
+選定結果を可視化し共有する工程。以下の内容をテーブル化して標準出力とSlackへ送る。
+- 採用銘柄と惜しくも選外となった銘柄のスコア一覧
+- IN/OUTリストとOUT銘柄のスコア（低得点銘柄を確認しやすく）
+- 新旧ポートフォリオの比較表（組入れ・除外、スコア変化）
+- 検討中銘柄の低スコアランキング
+
 主なメソッド:
-- `display_results` : G/Dテーブル、IN/OUTリスト、パフォーマンス指標、分散化指標を表示。
+- `display_results` : 上記テーブルに加えパフォーマンス指標や分散化指標を表示。
 - `notify_slack` : Slack Webhookへ同内容を送信。
 - 補助:`_avg_offdiag`、`_resid_avg_rho`、`_raw_avg_rho`、`_cross_block_raw_rho`。
 
 ## エントリポイント
 1. `PipelineConfig`を構築。
-2. `Input.prepare_data`で`InputBundle`を生成。
-3. `Scorer.aggregate_scores`で`FeatureBundle`を取得。
-4. `Selector.select_buckets`で`SelectionBundle`を算出。
-5. `Output.display_results`と`notify_slack`で結果を出力。
+2. **Step1** `Input.prepare_data`で`InputBundle`を生成。
+3. **Step2** `Scorer.aggregate_scores`で`FeatureBundle`を取得。
+4. **Step3** `Selector.select_buckets`で`SelectionBundle`を算出。
+5. **Step4** `Output.display_results`と`notify_slack`で結果を出力。
