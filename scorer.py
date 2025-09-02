@@ -89,24 +89,30 @@ def _safe_last(series: pd.Series, default=np.nan):
     try: return float(series.iloc[-1])
     except Exception: return default
 
-
-def _apply_d_trend_bonus(df, bonus=D_TREND_BONUS):
-    """
-    D群でトレンドテンプレート通過銘柄にTRDボーナスを与える。
-    列が無い/条件が満たせない場合は何もしない安全設計。
-    """
+def _d_tt_mask(df):
+    """D群かつトレンドテンプレート通過を検出。列が無い場合は全False。"""
     try:
-        if bonus <= 0: return df
-        cols = {c.lower(): c for c in df.columns}
-        gcol = next((cols[c] for c in ("group","grp","bucket","barbell") if c in cols), None)
-        tcol = next((cols[c] for c in ("trend_template","trend_ok","trend_mask") if c in cols), None)
-        trd  = next((cols[c] for c in ("trd","trd_score","trend_score") if c in cols), None)
-        if not all((gcol, tcol, trd)): return df
-        m = df[gcol].astype(str).str.lower().str.startswith("d") & df[tcol].fillna(False)
-        if m.any(): df.loc[m, trd] = df.loc[m, trd] + bonus
+        cols={c.lower():c for c in df.columns}
+        g=next((cols[c] for c in("group","grp","bucket","barbell") if c in cols),None)
+        t=next((cols[c] for c in("trend_template","trend_ok","trend_mask") if c in cols),None)
+        if not (g and t): return pd.Series(False,index=df.index)
+        return df[g].astype(str).str.lower().str.startswith("d") & df[t].fillna(False)
     except Exception:
-        pass
-    return df
+        return pd.Series(False,index=df.index)
+
+def _trd_bonus_inplace(df, bonus=D_TREND_BONUS):
+    """TRD列に +bonus を加える。対象行ゼロ/列欠如なら無処理。"""
+    try:
+        if bonus<=0: return 0
+        cols={c.lower():c for c in df.columns}
+        trd=next((cols[c] for c in("trd","trd_score","trend_score") if c in cols),None)
+        if not trd: return 0
+        m=_d_tt_mask(df)
+        if not m.any(): return 0
+        df.loc[m,trd]=df.loc[m,trd]+bonus
+        return int(m.sum())
+    except Exception:
+        return 0
 
 D_WEIGHTS_EFF = None  # 出力表示互換のため
 
@@ -591,6 +597,13 @@ class Scorer:
             'VOL': df_z['D_VOL_RAW'],
             'TRD': df_z['D_TRD']
         }, axis=1)
+        meta_cols = [c for c in ['group','trend_template'] if c in df.columns]
+        if meta_cols:
+            d_comp = d_comp.join(df[meta_cols])
+        applied = _trd_bonus_inplace(d_comp)
+        d_comp = d_comp[['QAL','YLD','VOL','TRD']]
+        if applied:
+            df_z['D_TRD'] = d_comp['TRD']
         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
         globals()['D_WEIGHTS_EFF'] = dw.copy()
         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
@@ -620,8 +633,6 @@ class Scorer:
             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
         except Exception:
             pass
-
-        df = _apply_d_trend_bonus(df)
 
         from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
         return FeatureBundle(
