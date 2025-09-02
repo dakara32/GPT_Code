@@ -34,6 +34,8 @@ import yfinance as yf
 from typing import Any, TYPE_CHECKING
 from scipy.stats import zscore
 
+D_TREND_BONUS = float(os.getenv("D_TREND_BONUS", "0.15"))
+
 if TYPE_CHECKING:
     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
 
@@ -86,6 +88,25 @@ def _safe_div(a, b):
 def _safe_last(series: pd.Series, default=np.nan):
     try: return float(series.iloc[-1])
     except Exception: return default
+
+
+def _apply_d_trend_bonus(df, bonus=D_TREND_BONUS):
+    """
+    D群でトレンドテンプレート通過銘柄にTRDボーナスを与える。
+    列が無い/条件が満たせない場合は何もしない安全設計。
+    """
+    try:
+        if bonus <= 0: return df
+        cols = {c.lower(): c for c in df.columns}
+        gcol = next((cols[c] for c in ("group","grp","bucket","barbell") if c in cols), None)
+        tcol = next((cols[c] for c in ("trend_template","trend_ok","trend_mask") if c in cols), None)
+        trd  = next((cols[c] for c in ("trd","trd_score","trend_score") if c in cols), None)
+        if not all((gcol, tcol, trd)): return df
+        m = df[gcol].astype(str).str.lower().str.startswith("d") & df[tcol].fillna(False)
+        if m.any(): df.loc[m, trd] = df.loc[m, trd] + bonus
+    except Exception:
+        pass
+    return df
 
 D_WEIGHTS_EFF = None  # 出力表示互換のため
 
@@ -599,6 +620,8 @@ class Scorer:
             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
         except Exception:
             pass
+
+        df = _apply_d_trend_bonus(df)
 
         from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
         return FeatureBundle(
