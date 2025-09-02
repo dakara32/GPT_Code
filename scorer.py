@@ -90,26 +90,41 @@ def _safe_last(series: pd.Series, default=np.nan):
     except Exception: return default
 
 def _d_tt_mask(df):
-    """D群かつトレンドテンプレート通過を検出。列が無い場合は全False。"""
+    """
+    D群かつ trend_template 通過判定。
+    判定条件は (trend_template==True) または (GSC が数値で '–' でない)。
+    列が無ければ全Falseを返す。
+    """
     try:
-        cols={c.lower():c for c in df.columns}
-        g=next((cols[c] for c in("group","grp","bucket","barbell") if c in cols),None)
-        t=next((cols[c] for c in("trend_template","trend_ok","trend_mask") if c in cols),None)
-        if not (g and t): return pd.Series(False,index=df.index)
-        return df[g].astype(str).str.lower().str.startswith("d") & df[t].fillna(False)
+        cols = {c.lower(): c for c in df.columns}
+        g = next((cols.get(c) for c in ("group", "grp", "bucket", "barbell") if c in cols), None)
+        t = next((cols.get(c) for c in ("trend_template", "trend_ok", "trend_mask") if c in cols), None)
+        gsc = next((cols.get(c) for c in ("gsc", "growth_score") if c in cols), None)
+        is_d = df[g].astype(str).str.lower().str.startswith("d") if g else False
+        tt = df[t].fillna(False) if t else False
+        tt2 = df[gsc].notna() if gsc else False
+        mask = is_d & (tt | tt2)
+        return mask if hasattr(mask, "any") else pd.Series(False, index=df.index)
     except Exception:
-        return pd.Series(False,index=df.index)
+        return pd.Series(False, index=df.index)
 
 def _trd_bonus_inplace(df, bonus=D_TREND_BONUS):
-    """TRD列に +bonus を加える。対象行ゼロ/列欠如なら無処理。"""
+    """
+    TRD列に +bonus を加える。
+    加点先カラムは ('TRD','trd_score','trend_score','TR_str') のいずれか。
+    列が無い場合や対象ゼロなら無処理。
+    """
     try:
-        if bonus<=0: return 0
-        cols={c.lower():c for c in df.columns}
-        trd=next((cols[c] for c in("trd","trd_score","trend_score") if c in cols),None)
-        if not trd: return 0
-        m=_d_tt_mask(df)
-        if not m.any(): return 0
-        df.loc[m,trd]=df.loc[m,trd]+bonus
+        if bonus <= 0:
+            return 0
+        cols = {c.lower(): c for c in df.columns}
+        trd = next((cols.get(c) for c in ("trd", "trd_score", "trend_score", "tr_str") if c in cols), None)
+        if not trd:
+            return 0
+        m = _d_tt_mask(df)
+        if not getattr(m, "any", lambda: False)():
+            return 0
+        df.loc[m, trd] = df.loc[m, trd] + bonus
         return int(m.sum())
     except Exception:
         return 0
@@ -595,7 +610,8 @@ class Scorer:
             'QAL': df_z['D_QAL'],
             'YLD': df_z['D_YLD'],
             'VOL': df_z['D_VOL_RAW'],
-            'TRD': df_z['D_TRD']
+            'TRD': df_z['D_TRD'],
+            'GSC': g_score_all,
         }, axis=1)
         meta_cols = [c for c in ['group','trend_template'] if c in df.columns]
         if meta_cols:
