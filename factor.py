@@ -16,6 +16,8 @@ import os
 import requests
 from time import perf_counter
 
+NEAR_MISS_N = int(os.getenv("NEAR_MISS_N", "10"))
+
 
 class T:
     t = perf_counter()
@@ -171,14 +173,14 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
 
-    # ---- 次点5（フラグで有無切替）----
+    # ---- 次点N（フラグで有無切替）----
     show_near = _env_true("DEBUG_NEAR5", True)
     gs = getattr(fb,"g_score",None); ds = getattr(fb,"d_score_all",None)
     gs = gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None
     ds = ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None
-    g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:5]) if gs is not None else []
+    g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:NEAR_MISS_N]) if gs is not None else []
     d_excl = set((sb.top_G or [])+(sb.top_D or []))
-    d_miss = ([t for t in ds.index if t not in d_excl][:5]) if ds is not None else []
+    d_miss = ([t for t in ds.index if t not in d_excl][:NEAR_MISS_N]) if ds is not None else []
 
     # ---- 行選択：既定は入替+採用+次点、DEBUG_ALL_ROWS=True で全銘柄 ----
     all_rows = _env_true("DEBUG_ALL_ROWS", False)
@@ -194,8 +196,8 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
             parts.append(f"{t}:{x:.3f}" if pd.notna(x) else f"{t}:nan")
         return f"{lbl}: "+(", ".join(parts) if parts else "-")
     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
-          _fmt_near("G near5", gs, g_miss),
-          _fmt_near("D near5", ds, d_miss),
+          _fmt_near(f"G near{NEAR_MISS_N}", gs, g_miss),
+          _fmt_near(f"D near{NEAR_MISS_N}", ds, d_miss),
           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
 
@@ -590,7 +592,7 @@ class Output:
         near_G = getattr(sc, "_near_G", []) if sc else []
         near_D = getattr(sc, "_near_D", []) if sc else []
 
-        extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
+        extra_G = [t for t in init_G if t not in top_G][:NEAR_MISS_N]; G_UNI = top_G + extra_G
         gsc_series = pd.Series({t: g_score.get(t) for t in G_UNI}, name='GSC')
         self.g_table = pd.concat([df_z.loc[G_UNI,['GRW','MOM','TRD','VOL']], gsc_series], axis=1)
         self.g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
@@ -598,13 +600,13 @@ class Output:
         self.g_title = (f"[G枠 / {N_G} / {_fmt_w(g_weights)} / corrM={corrM} / "
                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
         if near_G:
-            add = [t for t in near_G if t not in set(G_UNI)][:5]
+            add = [t for t in near_G if t not in set(G_UNI)][:NEAR_MISS_N]
             if add:
                 near_tbl = pd.concat([df_z.loc[add,['GRW','MOM','TRD','VOL']], pd.Series({t: g_score.get(t) for t in add}, name='GSC')], axis=1)
                 self.g_table = pd.concat([self.g_table, near_tbl], axis=0)
         print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
 
-        extra_D = [t for t in init_D if t not in top_D][:5]; D_UNI = top_D + extra_D
+        extra_D = [t for t in init_D if t not in top_D][:NEAR_MISS_N]; D_UNI = top_D + extra_D
         cols_D = ['QAL','YLD','VOL','TRD']; d_disp = pd.DataFrame(index=D_UNI)
         d_disp['QAL'], d_disp['YLD'], d_disp['VOL'], d_disp['TRD'] = df_z.loc[D_UNI,'D_QAL'], df_z.loc[D_UNI,'D_YLD'], df_z.loc[D_UNI,'D_VOL_RAW'], df_z.loc[D_UNI,'D_TRD']
         dsc_series = pd.Series({t: d_score_all.get(t) for t in D_UNI}, name='DSC')
@@ -615,7 +617,7 @@ class Output:
         self.d_title = (f"[D枠 / {N_D} / {_fmt_w(dw_eff)} / corrM={corrM} / "
                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
         if near_D:
-            add = [t for t in near_D if t not in set(D_UNI)][:5]
+            add = [t for t in near_D if t not in set(D_UNI)][:NEAR_MISS_N]
             if add:
                 d_disp2 = pd.DataFrame(index=add)
                 d_disp2['QAL'], d_disp2['YLD'], d_disp2['VOL'], d_disp2['TRD'] = df_z.loc[add,'D_QAL'], df_z.loc[add,'D_YLD'], df_z.loc[add,'D_VOL_RAW'], df_z.loc[add,'D_TRD']
@@ -717,14 +719,14 @@ class Output:
         except Exception as e: print(f"⚠️ Slack通知エラー: {e}")
 
 
-def _infer_g_universe(feature_df, selected12=None, near5=None):
+def _infer_g_universe(feature_df, selected12=None, near=None):
     try:
         out = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
         if out: return out
     except Exception:
         pass
     base = set()
-    for lst in (selected12 or []), (near5 or []):
+    for lst in (selected12 or []), (near or []):
         for x in (lst or []): base.add(x)
     return list(base) if base else list(feature_df.index)
 
@@ -835,12 +837,12 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         if group == "D":
             _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
             T.log("selection finalized (G/D)")
-    # --- Near-Miss: 惜しくも選ばれなかった上位5を保持（Slack表示用） ---
+    # --- Near-Miss: 惜しくも選ばれなかった上位Nを保持（Slack表示用） ---
     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
     try:
         pool = agg.drop(index=[t for t in pick if t in agg.index], errors="ignore")
-        near5 = list(pool.sort_values(ascending=False).head(5).index)
-        setattr(sc, f"_near_{group}", near5)
+        near = list(pool.sort_values(ascending=False).head(NEAR_MISS_N).index)
+        setattr(sc, f"_near_{group}", near)
         setattr(sc, f"_agg_{group}", agg)
     except Exception:
         pass
@@ -891,7 +893,7 @@ def run_pipeline() -> SelectionBundle:
         "【G枠レポート｜週次モニタ（直近5営業日）】",
         "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
         f"選定12: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else "選定12: なし",
-        f"次点5: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点5: なし",
+        f"次点{NEAR_MISS_N}: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else f"次点{NEAR_MISS_N}: なし",
     ]
     if fire_recent:
         fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
