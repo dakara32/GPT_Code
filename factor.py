@@ -171,14 +171,14 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
 
-    # ---- 次点5（フラグで有無切替）----
+    # ---- 次点10（フラグで有無切替）----
     show_near = _env_true("DEBUG_NEAR5", True)
     gs = getattr(fb,"g_score",None); ds = getattr(fb,"d_score_all",None)
     gs = gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None
     ds = ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None
-    g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:5]) if gs is not None else []
+    g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
     d_excl = set((sb.top_G or [])+(sb.top_D or []))
-    d_miss = ([t for t in ds.index if t not in d_excl][:5]) if ds is not None else []
+    d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
 
     # ---- 行選択：既定は入替+採用+次点、DEBUG_ALL_ROWS=True で全銘柄 ----
     all_rows = _env_true("DEBUG_ALL_ROWS", False)
@@ -194,8 +194,8 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
             parts.append(f"{t}:{x:.3f}" if pd.notna(x) else f"{t}:nan")
         return f"{lbl}: "+(", ".join(parts) if parts else "-")
     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
-          _fmt_near("G near5", gs, g_miss),
-          _fmt_near("D near5", ds, d_miss),
+          _fmt_near("G near10", gs, g_miss),
+          _fmt_near("D near10", ds, d_miss),
           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
 
@@ -598,7 +598,7 @@ class Output:
         self.g_title = (f"[G枠 / {N_G} / {_fmt_w(g_weights)} / corrM={corrM} / "
                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
         if near_G:
-            add = [t for t in near_G if t not in set(G_UNI)][:5]
+            add = [t for t in near_G if t not in set(G_UNI)][:10]
             if add:
                 near_tbl = pd.concat([df_z.loc[add,['GRW','MOM','TRD','VOL']], pd.Series({t: g_score.get(t) for t in add}, name='GSC')], axis=1)
                 self.g_table = pd.concat([self.g_table, near_tbl], axis=0)
@@ -615,7 +615,7 @@ class Output:
         self.d_title = (f"[D枠 / {N_D} / {_fmt_w(dw_eff)} / corrM={corrM} / "
                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
         if near_D:
-            add = [t for t in near_D if t not in set(D_UNI)][:5]
+            add = [t for t in near_D if t not in set(D_UNI)][:10]
             if add:
                 d_disp2 = pd.DataFrame(index=add)
                 d_disp2['QAL'], d_disp2['YLD'], d_disp2['VOL'], d_disp2['TRD'] = df_z.loc[add,'D_QAL'], df_z.loc[add,'D_YLD'], df_z.loc[add,'D_VOL_RAW'], df_z.loc[add,'D_TRD']
@@ -835,12 +835,12 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         if group == "D":
             _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
             T.log("selection finalized (G/D)")
-    # --- Near-Miss: 惜しくも選ばれなかった上位5を保持（Slack表示用） ---
+    # --- Near-Miss: 惜しくも選ばれなかった上位10を保持（Slack表示用） ---
     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
     try:
         pool = agg.drop(index=[t for t in pick if t in agg.index], errors="ignore")
-        near5 = list(pool.sort_values(ascending=False).head(5).index)
-        setattr(sc, f"_near_{group}", near5)
+        near10 = list(pool.sort_values(ascending=False).head(10).index)
+        setattr(sc, f"_near_{group}", near10)
         setattr(sc, f"_agg_{group}", agg)
     except Exception:
         pass
@@ -891,7 +891,7 @@ def run_pipeline() -> SelectionBundle:
         "【G枠レポート｜週次モニタ（直近5営業日）】",
         "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
         f"選定12: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else "選定12: なし",
-        f"次点5: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点5: なし",
+        f"次点10: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点10: なし",
     ]
     if fire_recent:
         fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
