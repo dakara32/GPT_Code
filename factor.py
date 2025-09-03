@@ -599,6 +599,21 @@ class Output:
                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
         if near_G:
             add = [t for t in near_G if t not in set(G_UNI)][:10]
+            if len(add) < 10:
+                try:
+                    aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False)
+                    out_now = sorted(set(exist) - set(top_G + top_D))  # 今回 OUT
+                    used = set(G_UNI + add)
+                    def _push(lst):
+                        nonlocal add, used
+                        for t in lst:
+                            if len(add) == 10: break
+                            if t in aggG.index and t not in used:
+                                add.append(t); used.add(t)
+                    _push(out_now)           # ① 今回 OUT を優先
+                    _push(list(aggG.index))  # ② まだ足りなければ上位で充填
+                except Exception:
+                    pass
             if add:
                 near_tbl = pd.concat([df_z.loc[add,['GRW','MOM','TRD','VOL']], pd.Series({t: g_score.get(t) for t in add}, name='GSC')], axis=1)
                 self.g_table = pd.concat([self.g_table, near_tbl], axis=0)
@@ -872,6 +887,11 @@ def run_pipeline() -> SelectionBundle:
     scores = {t: Scorer.g_score.get(t, 0.0) for t in poolG}
     top_G = Scorer.pick_top_softcap(scores, sectors, N=N_G, cap=2, alpha=alpha, hard=5)
     sc._top_G = top_G
+    try:
+        aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False)
+        sc._near_G = [t for t in aggG.index if t not in set(top_G)][:10]
+    except Exception:
+        pass
     base = sum(Scorer.g_score.get(t,0.0) for t in poolG[:N_G])
     effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
