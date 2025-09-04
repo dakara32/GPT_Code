@@ -72,6 +72,7 @@ class InputBundle:
     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
     returns: pd.DataFrame           # px[tickers].pct_change()
+    price_map: Dict[str, float]     # EOD last prices
 
 @dataclass(frozen=True)
 class FeatureBundle:
@@ -409,6 +410,34 @@ class Input:
             print(f"[T] price window clipped by env: {len(px)} rows (PRICE_CLIP_DAYS={clip_days})")
         else:
             print(f"[T] price window clip skipped; rows={len(px)}")
+
+        # --- EOD fix: drop today's bar if present (safe: needs >=2 rows) ---
+        from datetime import datetime
+        try:
+            from zoneinfo import ZoneInfo  # py>=3.9
+            _ET = ZoneInfo("America/New_York")
+        except Exception:
+            _ET = None
+        if px is not None and len(px) >= 2:
+            _idx = px.index
+            try:
+                if getattr(_idx, "tz", None) is None and _ET:
+                    _idx_et = _idx.tz_localize(_ET)
+                elif _ET:
+                    _idx_et = _idx.tz_convert(_ET)
+                else:
+                    _idx_et = _idx
+                _today_et = (datetime.now(_ET).date() if _ET else datetime.utcnow().date())
+                if hasattr(_idx_et[-1], "date") and _idx_et[-1].date() == _today_et:
+                    px = px.iloc[:-1]
+            except Exception:
+                # Do not crash on timezone quirks; better keep px as-is than fail.
+                pass
+        spx = spx.loc[px.index]
+
+        # EOD last prices to prevent intraday fetch in scorer
+        price_map = px[tickers].iloc[-1].to_dict()
+
         tickers_bulk, info = yf.Tickers(" ".join(tickers)), {}
         for t in tickers:
             try: info[t] = tickers_bulk.tickers[t].info
@@ -418,7 +447,9 @@ class Input:
         T.log("eps/fcf prep done")
         returns = px[tickers].pct_change()
         T.log("price prep/returns done")
-        return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
+        return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx,
+                    tickers_bulk=tickers_bulk, info=info, eps_df=eps_df,
+                    fcf_df=fcf_df, returns=returns, price_map=price_map)
 
 
 # ===== Selector：相関低減・選定（スコア＆リターンだけ読む） =====
@@ -559,6 +590,7 @@ class Output:
     def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
                         init_G, init_D, top_G, top_D, **kwargs):
         pd.set_option('display.float_format','{:.3f}'.format)
+        price_map = kwargs.get("price_map")
         print("📈 ファクター分散最適化の結果")
         if self.miss_df is not None and not self.miss_df.empty:
             print("Missing Data:")
@@ -666,7 +698,7 @@ class Output:
                 R = ret[ticks].dropna().to_numpy(); C_resid = Selector.residual_corr(R, n_pc=3, shrink=DRRS_SHRINK)
                 RESID_rho = float((C_resid.sum()-np.trace(C_resid))/(C_resid.shape[0]*(C_resid.shape[0]-1)))
             else: RAW_rho = RESID_rho = np.nan
-            divy = ttm_div_yield_portfolio(ticks); metrics[name] = {'RET':ann_ret,'VOL':ann_vol,'SHP':sharpe,'MDD':drawdown,'RAWρ':RAW_rho,'RESIDρ':RESID_rho,'DIVY':divy}
+            divy = ttm_div_yield_portfolio(ticks, price_map=price_map); metrics[name] = {'RET':ann_ret,'VOL':ann_vol,'SHP':sharpe,'MDD':drawdown,'RAWρ':RAW_rho,'RESIDρ':RESID_rho,'DIVY':divy}
         df_metrics = pd.DataFrame(metrics).T; df_metrics_pct = df_metrics.copy(); self.df_metrics = df_metrics
         for col in ['RET','VOL','MDD','DIVY']: df_metrics_pct[col] = df_metrics_pct[col]*100
         cols_order = ['RET','VOL','SHP','MDD','RAWρ','RESIDρ','DIVY']; df_metrics_pct = df_metrics_pct.reindex(columns=cols_order)
@@ -781,7 +813,7 @@ def io_build_input_bundle() -> InputBundle:
         data=state["data"], px=state["px"], spx=state["spx"],
         tickers_bulk=state["tickers_bulk"], info=state["info"],
         eps_df=state["eps_df"], fcf_df=state["fcf_df"],
-        returns=state["returns"]
+        returns=state["returns"], price_map=state["price_map"]
     )
 
 def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
@@ -933,7 +965,8 @@ def run_pipeline() -> SelectionBundle:
             out.display_results(
                 exist=exist, bench=bench, df_z=sc._feat.df_z,
                 g_score=sc._feat.g_score, d_score_all=sc._feat.d_score_all,
-                init_G=top_G, init_D=top_D, top_G=top_G, top_D=top_D
+                init_G=top_G, init_D=top_D, top_G=top_G, top_D=top_D,
+                price_map=inb.price_map
             )
         except Exception:
             pass
