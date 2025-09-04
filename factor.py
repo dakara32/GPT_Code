@@ -955,7 +955,10 @@ def run_pipeline() -> SelectionBundle:
               .head(10)
               .round(3)
         )
-        _slack("Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string())
+        _slack(
+            "Low Score Candidates (GSC+DSC bottom 10)\n"
+            + "```" + _low_df.to_string(index=False) + "```"
+        )
     except Exception as _e:
         _slack(f"Low Score Candidates: 作成失敗: {_e}")
 
