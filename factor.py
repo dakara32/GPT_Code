@@ -722,8 +722,6 @@ class Output:
         message += _blk(d_title, self.d_table, self.d_formatters)
         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table,'empty',False) else f"```{self.io_table.to_string(index=False)}```\n")
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
-        if self.low10_table is not None:
-            message += "\nLow Score Candidates (GSC+DSC bottom 10)\n```" + self.low10_table.to_string() + "```\n"
         if self.debug and self.debug_table is not None:
             message += "\nDebug Data\n```" + self.debug_table.to_string() + "```"
         payload = {"text": message}
@@ -947,6 +945,19 @@ def run_pipeline() -> SelectionBundle:
               "sum_score": sumD, "objective": objD},
         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D
     )
+
+    # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
+    try:
+        _low_df = (
+            pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
+              .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
+              .sort_values("G_plus_D")
+              .head(10)
+              .round(3)
+        )
+        _slack("Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string())
+    except Exception as _e:
+        _slack(f"Low Score Candidates: 作成失敗: {_e}")
 
     if debug_mode:
         prevG, prevD = _load_prev(G_PREV_JSON), _load_prev(D_PREV_JSON)
