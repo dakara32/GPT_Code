@@ -955,14 +955,10 @@ def run_pipeline() -> SelectionBundle:
               .head(10)
               .round(3)
         )
-        _slack("```Low Score Candidates (GSC+DSC bottom 10)\n"
-               + _low_df.rename_axis("TICKER").reset_index().to_string(index=False)
-               + "\n```"
-               + "\n\n[COPY]\n"
-               + _low_df.rename_axis("TICKER").reset_index().to_csv(index=False))
-        if os.getenv("LOW_SCORE_MIRROR", "0") == "1":
-            _slack("Low Score Candidates (GSC+DSC bottom 10)\n"
-                   + _low_df.rename_axis("TICKER").to_string())
+        _slack("Low Score Candidates (GSC+DSC bottom 10)\n"
+               "```"
+               + _low_df.to_string(index=True, index_names=False)
+               + "\n```")
     except Exception as _e:
         _slack(f"Low Score Candidates: 作成失敗: {_e}")
 
