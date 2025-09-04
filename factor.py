@@ -15,6 +15,7 @@ from scorer import Scorer, ttm_div_yield_portfolio
 import os
 import requests
 from time import perf_counter
+from pathlib import Path
 
 
 class T:
@@ -237,6 +238,24 @@ def _disjoint_keepG(top_G, top_D, poolD):
             if i < len(poolD):
                 D[j] = poolD[i]; used.add(D[j]); i += 1
     return top_G, D
+
+
+def _emit_low_score_candidates(g_scores, d_scores):
+    try:
+        import pandas as pd
+        low = (pd.DataFrame({"GSC": g_scores, "DSC": d_scores})
+               .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
+               .sort_values("G_plus_D")
+               .head(10)
+               .round(3))
+        _slack("Low Score Candidates (GSC+DSC bottom 10)\n" + low.to_string())
+        try:
+            Path("results").mkdir(exist_ok=True)
+            low.to_csv("results/low_score_candidates.csv")
+        except Exception:
+            pass
+    except Exception as e:
+        _slack(f"Low Score Candidates: 作成に失敗しました: {e}")
 
 
 # ===== Input：外部I/Oと前処理（CSV/API・欠損補完） =====
@@ -897,6 +916,8 @@ def run_pipeline() -> SelectionBundle:
     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
     top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D, D_PREV_JSON)
     fb = getattr(sc, "_feat", None)
+    if fb is not None:
+        _emit_low_score_candidates(fb.g_score, fb.d_score_all)
     near_G = getattr(sc, "_near_G", [])
     selected12 = list(top_G)
     df = fb.df if fb is not None else pd.DataFrame()
