@@ -779,6 +779,9 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         if group == "D" and hasattr(fb, "df"):
             agg = agg[fb.df['BETA'] < D_BETA_MAX]
 
+    # ---- ② スコア Series を group 判定ごとに処理 ----
+    agg = agg.sort_values(ascending=False)  # ★ NEW: スコアを必ず降順に並べ替え
+
     if hasattr(sc, "filter_candidates"):
         mask = sc.filter_candidates(inb, agg, group, cfg)
         agg = agg[mask]
