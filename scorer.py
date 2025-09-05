@@ -26,13 +26,16 @@
 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
 # =============================================================================
 
-import os
+import os, sys, warnings
 import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from typing import Any, TYPE_CHECKING
 from scipy.stats import zscore
+
+# factor.py の定数を優先。見つからなければ 0.4 でフォールバック
+k = float(getattr(sys.modules.get("factor"), "BONUS_COEFF", 0.4))
 
 if TYPE_CHECKING:
     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
@@ -594,6 +597,25 @@ class Scorer:
         Scorer.g_score = g_score
         df_z['GSC'] = g_score_all
         df_z['DSC'] = d_score_all
+
+        try:
+            current = (
+                pd.read_csv("current_tickers.csv")
+                  .iloc[:, 0]
+                  .str.upper()
+                  .tolist()
+            )
+        except FileNotFoundError:
+            warnings.warn("current_tickers.csv not found — bonus skipped")
+            current = []
+
+        mask_bonus = g_score.index.isin(current)
+        if mask_bonus.any():
+            bonus_g = round(k * g_score.std(), 3)
+            g_score.loc[mask_bonus] += bonus_g
+            Scorer.g_score = g_score
+            bonus_d = round(k * d_score_all.std(), 3)
+            d_score_all.loc[d_score_all.index.isin(current)] += bonus_d
 
         try:
             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)

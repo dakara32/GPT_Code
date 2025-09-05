@@ -7,13 +7,12 @@
 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
 """
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
-import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
+BONUS_COEFF = 0.4   # 攻め=0.3 / 中庸=0.4 / 守り=0.5
+import yfinance as yf, pandas as pd, numpy as np, os, requests, time
 from scipy.stats import zscore
 from dataclasses import dataclass
 from typing import Dict, List
 from scorer import Scorer, ttm_div_yield_portfolio
-import os
-import requests
 from time import perf_counter
 
 
@@ -50,7 +49,7 @@ try: CROSS_MU_GD
 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
 
 # 出力関連
-RESULTS_DIR, G_PREV_JSON, D_PREV_JSON = "results", os.path.join("results","G_selection.json"), os.path.join("results","D_selection.json")
+RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # その他
@@ -127,14 +126,6 @@ def _safe_div(a, b):
 def _safe_last(series: pd.Series, default=np.nan):
     try: return float(series.iloc[-1])
     except Exception: return default
-
-def _load_prev(path: str):
-    try: return json.load(open(path)).get("tickers")
-    except Exception: return None
-
-def _save_sel(path: str, tickers: list[str], avg_r: float, sum_score: float, objective: float):
-    with open(path,"w") as f:
-        json.dump({"tickers":tickers,"avg_res_corr":round(avg_r,6),"sum_score":round(sum_score,6),"objective":round(objective,6)}, f, indent=2)
 
 def _env_true(name: str, default=False):
     v = os.getenv(name)
@@ -493,7 +484,7 @@ class Selector:
         return float((P.sum()-np.trace(P))/(k*(k-1)+1e-12))
 
     @classmethod
-    def select_bucket_drrs(cls, returns_df: pd.DataFrame, score_ser: pd.Series, pool_tickers: list[str], k: int, *, n_pc: int, gamma: float, lam: float, eta: float, lookback: int, prev_tickers: list[str]|None, shrink: float=0.10, g_fixed_tickers: list[str]|None=None, mu: float=0.0):
+    def select_bucket_drrs(cls, returns_df: pd.DataFrame, score_ser: pd.Series, pool_tickers: list[str], k: int, *, n_pc: int, gamma: float, lam: float, lookback: int, shrink: float=0.10, g_fixed_tickers: list[str]|None=None, mu: float=0.0):
         g_fixed = [t for t in (g_fixed_tickers or []) if t in returns_df.columns]
         union = [t for t in pool_tickers if t in returns_df.columns]
         for t in g_fixed:
@@ -509,41 +500,10 @@ class Selector:
             g_pos = [col_pos[t] for t in g_eff]; C_cross = C_all[np.ix_(pool_pos,g_pos)]
         R_pool = Rdf_all[pool_eff].to_numpy(); S0 = cls.rrqr_like_det(R_pool, score, k, gamma=gamma)
         S, Jn = (cls.swap_local_det_cross(C_within, C_cross, score, S0, lam=lam, mu=mu, max_pass=15) if C_cross is not None else cls.swap_local_det(C_within, score, S0, lam=lam, max_pass=15))
-        if prev_tickers:
-            prev_idx = [pool_eff.index(t) for t in prev_tickers if t in pool_eff]
-            if len(prev_idx)==min(k,len(pool_eff)):
-                Jp = (cls._obj_with_cross(C_within,C_cross,score,prev_idx,lam,mu) if C_cross is not None else cls._obj(C_within,score,prev_idx,lam))
-                if Jn < Jp + eta: S, Jn = sorted(prev_idx), Jp
         selected_tickers = [pool_eff[i] for i in S]
         return dict(idx=S, tickers=selected_tickers, avg_res_corr=cls.avg_corr(C_within,S), sum_score=float(score[S].sum()), objective=float(Jn))
 
     # ---- 選定（スコア Series / returns だけを受ける）----
-    def select_buckets(self, returns_df: pd.DataFrame, g_score: pd.Series, d_score_all: pd.Series, cfg: PipelineConfig) -> SelectionBundle:
-        init_G = g_score.nlargest(min(cfg.drrs.corrM, len(g_score))).index.tolist(); prevG = _load_prev(G_PREV_JSON)
-        resG = self.select_bucket_drrs(returns_df=returns_df, score_ser=g_score, pool_tickers=init_G, k=N_G,
-                                       n_pc=cfg.drrs.G.get("n_pc",3), gamma=cfg.drrs.G.get("gamma",1.2),
-                                       lam=cfg.drrs.G.get("lam",0.68), eta=cfg.drrs.G.get("eta",0.8),
-                                       lookback=cfg.drrs.G.get("lookback",252), prev_tickers=prevG,
-                                       shrink=cfg.drrs.shrink, g_fixed_tickers=None, mu=0.0)
-        top_G = resG["tickers"]
-
-        # df_z に依存せず、スコアの index から D プールを構成（機能は同等）
-        d_score = d_score_all.drop(top_G, errors='ignore')
-        D_pool_index = d_score.index
-        init_D = d_score.loc[D_pool_index].nlargest(min(cfg.drrs.corrM, len(D_pool_index))).index.tolist(); prevD = _load_prev(D_PREV_JSON)
-        mu = cfg.drrs.cross_mu_gd
-        resD = self.select_bucket_drrs(returns_df=returns_df, score_ser=d_score_all, pool_tickers=init_D, k=N_D,
-                                       n_pc=cfg.drrs.D.get("n_pc",4), gamma=cfg.drrs.D.get("gamma",0.8),
-                                       lam=cfg.drrs.D.get("lam",0.85), eta=cfg.drrs.D.get("eta",0.5),
-                                       lookback=cfg.drrs.D.get("lookback",504), prev_tickers=prevD,
-                                       shrink=cfg.drrs.shrink, g_fixed_tickers=top_G, mu=mu)
-        top_D = resD["tickers"]
-
-        _save_sel(G_PREV_JSON, top_G, resG["avg_res_corr"], resG["sum_score"], resG["objective"])
-        _save_sel(D_PREV_JSON, top_D, resD["avg_res_corr"], resD["sum_score"], resD["objective"])
-        return SelectionBundle(resG=resG, resD=resD, top_G=top_G, top_D=top_D, init_G=init_G, init_D=init_D)
-
-
 # ===== Output：出力整形と送信（表示・Slack） =====
 class Output:
 
@@ -785,7 +745,7 @@ def io_build_input_bundle() -> InputBundle:
     )
 
 def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
-              n_target: int, prev_json_path: str) -> tuple[list, float, float, float]:
+              n_target: int) -> tuple[list, float, float, float]:
     """
     G/Dを同一手順で処理：採点→フィルター→選定（相関低減込み）。
     戻り値：(pick, avg_res_corr, sum_score, objective)
@@ -814,11 +774,10 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         agg = agg[mask]
 
     selector = Selector()
-    prev = _load_prev(prev_json_path)
     if hasattr(sc, "select_diversified"):
         pick, avg_r, sum_sc, obj = sc.select_diversified(
             agg, group, cfg, n_target,
-            selector=selector, prev_tickers=prev,
+            selector=selector, prev_tickers=None,
             corrM=cfg.drrs.corrM, shrink=cfg.drrs.shrink,
             cross_mu=cfg.drrs.cross_mu_gd
         )
@@ -828,8 +787,8 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
             res = selector.select_bucket_drrs(
                 returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
                 n_pc=cfg.drrs.G.get("n_pc", 3), gamma=cfg.drrs.G.get("gamma", 1.2),
-                lam=cfg.drrs.G.get("lam", 0.68), eta=cfg.drrs.G.get("eta", 0.8),
-                lookback=cfg.drrs.G.get("lookback", 252), prev_tickers=prev,
+                lam=cfg.drrs.G.get("lam", 0.68),
+                lookback=cfg.drrs.G.get("lookback", 252),
                 shrink=cfg.drrs.shrink, g_fixed_tickers=None, mu=0.0
             )
         else:
@@ -838,8 +797,8 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
             res = selector.select_bucket_drrs(
                 returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
                 n_pc=cfg.drrs.D.get("n_pc", 4), gamma=cfg.drrs.D.get("gamma", 0.8),
-                lam=cfg.drrs.D.get("lam", 0.85), eta=cfg.drrs.D.get("eta", 0.5),
-                lookback=cfg.drrs.D.get("lookback", 504), prev_tickers=prev,
+                lam=cfg.drrs.D.get("lam", 0.85),
+                lookback=cfg.drrs.D.get("lookback", 504),
                 shrink=cfg.drrs.shrink, g_fixed_tickers=g_fixed,
                 mu=cfg.drrs.cross_mu_gd
             )
@@ -858,7 +817,6 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
     except Exception:
         pass
 
-    _save_sel(prev_json_path, pick, avg_r, sum_sc, obj)
     if group == "D":
         T.log("save done")
     if group == "G":
@@ -878,7 +836,7 @@ def run_pipeline() -> SelectionBundle:
         price_max=CAND_PRICE_MAX
     )
     sc = Scorer()
-    top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G, G_PREV_JSON)
+    top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G)
     poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False).index)
     alpha = Scorer.spx_to_alpha(inb.spx)
     sectors = {t: (inb.info.get(t, {}).get("sector") or "U") for t in poolG}
@@ -893,7 +851,7 @@ def run_pipeline() -> SelectionBundle:
     base = sum(Scorer.g_score.get(t,0.0) for t in poolG[:N_G])
     effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
-    top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D, D_PREV_JSON)
+    top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D)
     fb = getattr(sc, "_feat", None)
     near_G = getattr(sc, "_near_G", [])
     selected12 = list(top_G)
@@ -963,9 +921,8 @@ def run_pipeline() -> SelectionBundle:
         _slack(f"Low Score Candidates: 作成失敗: {_e}")
 
     if debug_mode:
-        prevG, prevD = _load_prev(G_PREV_JSON), _load_prev(D_PREV_JSON)
         try:
-            _slack_debug(_compact_debug(fb, sb, prevG, prevD))
+            _slack_debug(_compact_debug(fb, sb, [], []))
         except Exception as e:
             print(f"[debug skipped] {e}")
 
