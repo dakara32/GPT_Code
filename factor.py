@@ -545,14 +545,21 @@ class Output:
                     return self.fallback.get(key) if hasattr(self.fallback, "get") else default
                 except Exception:
                     return default
-        g_score = _SeriesProxy(agg_G, g_score)
+        # g_score は「有効スコア」を第一候補、raw をフォールバックにする
+        g_score = _SeriesProxy(g_score, agg_G)
         d_score_all = _SeriesProxy(agg_D, d_score_all)
         near_G = getattr(sc, "_near_G", []) if sc else []
         near_D = getattr(sc, "_near_D", []) if sc else []
 
         extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
         gsc_series = pd.Series({t: g_score.get(t) for t in G_UNI}, name='GSC')
-        self.g_table = pd.concat([df_z.loc[G_UNI,['GRW','MOM','TRD','VOL']], gsc_series], axis=1)
+        # 必要なら df_z["GSC"] も有効スコアで上書きしておく
+        # （デバッグ出力で数値が揃う）
+        # df_z.loc[g_score.index, 'GSC'] = [g_score.get(t) for t in g_score.index]
+        self.g_table = pd.concat(
+            [df_z.loc[G_UNI, ['GRW', 'MOM', 'TRD', 'VOL']], gsc_series],
+            axis=1
+        )
         self.g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
         self.g_formatters = {col:"{:.2f}".format for col in ['GRW','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
         self.g_title = (f"[G枠 / {N_G} / {_fmt_w(g_weights)} / corrM={corrM} / "
