@@ -1,0 +1,329 @@
+```text
+    from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
+L633         return FeatureBundle(
+L634             df=df,
+L635             df_z=df_z,
+L636             g_score=g_score,
+L637             d_score_all=d_score_all,
+L638             missing_logs=pd.DataFrame(missing_logs)
+L639         )
+L640
+L641
+L642 def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_pullback=5):
+L643     """
+L644     G枠ユニバースに対し、ブレイクアウト確定/押し目反発の「直近N営業日内の発火」を判定し、
+L645     次の列を feature_df に追加する（index=ticker）。
+L646       - G_BREAKOUT_recent_5d : bool
+L647       - G_BREAKOUT_last_date : str "YYYY-MM-DD"
+L648       - G_PULLBACK_recent_5d : bool
+L649       - G_PULLBACK_last_date : str "YYYY-MM-DD"
+L650       - G_PIVOT_price        : float
+L651     失敗しても例外は握り潰し、既存処理を阻害しない。
+L652     """
+L653     try:
+L654         px   = bundle.px                      # 終値 DataFrame
+L655         hi   = bundle.data['High']
+L656         lo   = bundle.data['Low']
+L657         vol  = bundle.data['Volume']
+L658         bench= bundle.spx                     # ベンチマーク Series
+L659
+L660         # Gユニバース推定：self.g_universe 優先 → feature_df['group']=='G' → 全銘柄
+L661         g_universe = getattr(self_obj, "g_universe", None)
+L662         if g_universe is None:
+L663             try:
+L664                 g_universe = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
+L665             except Exception:
+L666                 g_universe = list(feature_df.index)
+L667         if not g_universe:
+L668             return feature_df
+L669
+L670         # 指標
+L671         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
+L672         ma50  = px[g_universe].rolling(50).mean()
+L673         ma150 = px[g_universe].rolling(150).mean()
+L674         ma200 = px[g_universe].rolling(200).mean()
+L675         atr20 = (hi[g_universe] - lo[g_universe]).rolling(20).mean()
+L676         vol20 = vol[g_universe].rolling(20).mean()
+L677         vol50 = vol[g_universe].rolling(50).mean()
+L678
+L679         # トレンドテンプレート合格
+L680         trend_template_ok = (px[g_universe] > ma50) & (px[g_universe] > ma150) & (px[g_universe] > ma200) \
+L681                             & (ma150 > ma200) & (ma200.diff() > 0)
+L682
+L683         # 汎用ピボット：直近65営業日の高値（当日除外）
+L684         pivot_price = hi[g_universe].rolling(65).max().shift(1)
+L685
+L686         # 相対力：年内高値更新
+L687         bench_aligned = bench.reindex(px.index).ffill()
+L688         rs = px[g_universe].div(bench_aligned, axis=0)
+L689         rs_high = rs.rolling(252).max().shift(1)
+L690
+L691         # ブレイクアウト「発生日」：条件立ち上がり
+L692         breakout_today = trend_template_ok & (px[g_universe] > pivot_price) \
+L693                          & (vol[g_universe] >= 1.5 * vol50) & (rs > rs_high)
+L694         breakout_event = breakout_today & ~breakout_today.shift(1).fillna(False)
+L695
+L696         # 押し目反発「発生日」：EMA21帯×出来高ドライアップ×前日高値越え×終値EMA21上
+L697         near_ema21_band = px[g_universe].between(ema21 - atr20, ema21 + atr20)
+L698         volume_dryup = (vol20 / vol50) <= 1.0
+L699         pullback_bounce_confirmed = (px[g_universe] > hi[g_universe].shift(1)) & (px[g_universe] > ema21)
+L700         pullback_today = trend_template_ok & near_ema21_band & volume_dryup & pullback_bounce_confirmed
+L701         pullback_event = pullback_today & ~pullback_today.shift(1).fillna(False)
+L702
+L703         # 直近N営業日内の発火 / 最終発生日
+L704         rows = []
+L705         for t in g_universe:
+L706             def _recent_and_date(s, win):
+L707                 sw = s[t].iloc[-win:]
+L708                 if sw.any():
+L709                     d = sw[sw].index[-1]
+L710                     return True, d.strftime("%Y-%m-%d")
+L711                 return False, ""
+L712             br_recent, br_date = _recent_and_date(breakout_event, win_breakout)
+L713             pb_recent, pb_date = _recent_and_date(pullback_event, win_pullback)
+L714             rows.append((t, {
+L715                 "G_BREAKOUT_recent_5d": br_recent,
+L716                 "G_BREAKOUT_last_date": br_date,
+L717                 "G_PULLBACK_recent_5d": pb_recent,
+L718                 "G_PULLBACK_last_date": pb_date,
+L719                 "G_PIVOT_price": float(pivot_price[t].iloc[-1]) if t in pivot_price.columns else float('nan'),
+L720             }))
+L721         flags = pd.DataFrame({k: v for k, v in rows}).T
+L722
+L723         # 列を作成・上書き
+L724         cols = ["G_BREAKOUT_recent_5d","G_BREAKOUT_last_date","G_PULLBACK_recent_5d","G_PULLBACK_last_date","G_PIVOT_price"]
+L725         for c in cols:
+L726             if c not in feature_df.columns:
+L727                 feature_df[c] = np.nan
+L728         feature_df.loc[flags.index, flags.columns] = flags
+L729
+L730     except Exception:
+L731         pass
+L732     return feature_df
+L733
+L734
+L735
+```
+
+## <.github/workflows/weekly-report.yml>
+```text
+L1 name: Weekly Stock Report
+L2
+L3 on:
+L4   push:
+L5     branches: [ main ]
+L6     paths-ignore:
+L7       - 'CodeForChat/**'
+L8   schedule:
+L9     - cron: '0 0 * * 6'  # UTC 00:00 → JST 09:00（土）
+L10   workflow_dispatch:
+L11
+L12 jobs:
+L13   build-and-report:
+L14     runs-on: ubuntu-latest
+L15
+L16     steps:
+L17       - name: Debug start
+L18         run: echo '🚀 DEBUGstarted'
+L19               
+L20       - name: Checkout repository
+L21         uses: actions/checkout@v3
+L22
+L23       - name: Setup Python
+L24         uses: actions/setup-python@v5
+L25         with:
+L26           python-version: '3.x'                # （必要最小限のまま。固定したければ '3.13'）
+L27           cache: 'pip'                         # ★ pipキャッシュを有効化
+L28           cache-dependency-path: requirements.txt  # ★ 依存ファイルをキャッシュキーに
+L29
+L30       - name: Install dependencies
+L31         run: pip install -r requirements.txt
+L32
+L33       - name: Prepare results directory
+L34         run: mkdir -p results
+L35
+L36       - name: Run factor & scoring
+L37         env:
+L38           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+L39           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+L40           FIN_THREADS: "8"
+L41         run: python factor.py
+```
+
+## <documents/README.md>
+```text
+L1 # 運用ルール
+L2
+L3 ## 基本構成
+L4 - 25銘柄を均等配分（現金を除き1銘柄あたり4%）
+L5 - moomoo証券で運用
+L6
+L7 ## Barbell Growth-Defense方針
+L8 - Growth枠12銘柄：高成長で乖離源となる攻めの銘柄
+L9 - Defense枠13銘柄：低ボラで安定成長し配当を増やす守りの銘柄
+L10 - 「猛烈に伸びる攻め × 着実に稼ぐ盾」の組合せで乖離→半戻しプレミアムを狙う
+L11
+L12 ## 現金比率（VIX 5日移動平均で判定）
+L13 - VIX MA5 < 20: 5%
+L14 - 20 ≤ VIX MA5 < 26: 7.5%
+L15 - VIX MA5 ≥ 27: 12%（高VIX緊急モード）
+L16
+L17 ## ドリフト閾値
+L18 - VIX MA5 < 20: 10%
+L19 - 20 ≤ VIX MA5 < 26: 12%
+L20 - VIX MA5 ≥ 27: 高VIX緊急モードへ移行
+L21
+L22 ## 通常モードの運用
+L23 - 毎営業日、①90日経過 or ②ドリフトが閾値超過で半戻し
+L24 - 半戻し：乖離の50%を中央へ寄せ、現金比率を上表どおりに調整
+L25 - 全銘柄のトレーリングストップ(TS)を再設定
+L26 - ドリフト＝Σ|現在比率−4%|（端数切り捨て）
+L27
+L28 ## 高VIX緊急モード（MA5 > 27で発動）
+L29 1. 全25銘柄を各4%へ全戻し
+L30 2. 現金比率12%へ引上げ
+L31 3. 全銘柄のTSを再設定し以降の売買とドリフト計算を停止
+L32
+L33 ## 高VIX緊急モードの解除
+L34 - MA5 < 23 または30営業日経過で解除
+L35 - 緊急モード中にTS発動で減少した銘柄を補充し25銘柄×4%にリバランス
+L36 - 通常モードの日次チェックを再開
+L37
+L38 ## 段階的トレーリングストップ
+L39 - Growth: 基本25%
+L40 - Defense: 基本20%
+L41 - 含み益が40/60/80%に達したらTSを3/5/8ポイントずつ引き上げ
+L42 - TS発動で減少した銘柄は翌日以降に補充（緊急モード中は補充しない）
+L43
+L44 ## 入替銘柄選定
+L45 - Oxfordキャピタル／インカム、Alpha Investor、Motley Fool Stock Advisor、moomooスクリーニング等を参考にchatGPTで検討
+L46 - 年間NISA枠はGrowth群の中から低ボラ銘柄を選定し利用。長期保持にはこだわらない。
+L47
+L48 ## 実行タイミング
+L49 - 判定：米国市場終値直後
+L50 - 執行：翌営業日の米国寄付き成行
+L51
+L52 ## VIX早見表
+L53 | VIX MA5 | ドリフト閾値 | 現金比率 | モード |
+L54 |--------|--------------|---------|-------|
+L55 | <20    | 10           | 5%      | 通常 |
+L56 | 20–26  | 12           | 7.5%    | 通常 |
+L57 | ≥27    | –            | 12%     | 高VIX緊急 |
+```
+
+## <documents/factor_design.md>
+```text
+L1 # factor.py 詳細設計書
+L2
+L3 ## 概要
+L4 - 既存ポートフォリオの銘柄と検討中の銘柄群を同時に扱う銘柄選定パイプライン。
+L5 - 価格・財務データを取り込みスコアリングとDRRS選定を行うことで、以下のアウトプットを得る。
+L6   - 採用銘柄と惜しくも漏れた銘柄のスコア一覧
+L7   - IN/OUTのティッカーリストとOUT側の低スコア銘柄
+L8   - 新旧ポートフォリオの比較表
+L9   - 検討中銘柄の低スコアランキング（整理用）
+L10
+L11 ## 全体フロー
+L12 1. **Input** – `current_tickers.csv`と`candidate_tickers.csv`を読み込み、yfinanceやFinnhubのAPIから価格・財務データを収集して`InputBundle`を整備。
+L13 2. **Score Calculation** – Scorerが特徴量を計算し因子スコアを合成して`FeatureBundle`を生成。
+L14 3. **Correlation Reduction & Selection** – SelectorがDRRSロジックで相関を抑えつつG/D銘柄を選定し`SelectionBundle`を得る。
+L15 4. **Output** – 採用結果と周辺情報を表・Slack通知として出力。
+L16
+L17 ```mermaid
+L18 flowchart LR
+L19   A[Input\nAPI & 前処理] --> B[Score Calculation\n特徴量・因子合成]
+L20   B --> C[Correlation Reduction\nDRRS選定]
+L21   C --> D[Output\nSlack通知]
+L22 ```
+L23
+L24 ## 定数・設定
+L25 | 変数 | 内容 | 主な用途 |
+L26 | --- | --- | --- |
+L27 | `exist` / `cand` | 現行ポートフォリオと検討中銘柄のティッカーリスト | スコア対象ユニバースの構成、候補整理 |
+L28 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
+L29 | `CAND_PRICE_MAX` | 候補銘柄の許容価格上限 | 高額銘柄の事前除外 |
+L30 | `N_G` / `N_D` | G/D採用枠の件数 | 最終的に選ぶ銘柄数の制約 |
+L31 | `g_weights` / `D_weights` | 各因子の重みdict | G/Dスコア合成 |
+L32 | `D_BETA_MAX` | Dバケットの許容β上限 | 高β銘柄の除外フィルタ |
+L33 | `FILTER_SPEC` | G/Dごとの前処理フィルタ | トレンドマスクやβ上限設定 |
+L34 | `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
+L35 | `DRRS_G` / `DRRS_D` | DRRSパラメータdict | バケット別の相関低減設定 |
+L36 | `DRRS_SHRINK` | 残差相関の対角シュリンク率 | `residual_corr`の安定化 |
+L37 | `CROSS_MU_GD` | G-D間クロス相関ペナルティμ | 2バケット同時最適化で相関抑制 |
+L38 | `RESULTS_DIR` | 選定結果保存ディレクトリ | `_save_sel`/`_load_prev`の入出力 |
+L39
+L40 選定結果は`results/`配下にJSONとして保存し、次回実行時に`_load_prev`で読み込んで選定条件に反映。
+L41
+L42 ## DTO/Config
+L43 各ステップ間で受け渡すデータ構造と設定値。変数の意味合いと利用箇所を以下に示す。
+L44
+L45 ### InputBundle（Input → Scorer）
+L46 | 変数 | 内容 | 主な用途 |
+L47 | --- | --- | --- |
+L48 | `cand` | 候補銘柄ティッカーのリスト | OUTテーブルや低スコアランキング対象の母集団 |
+L49 | `tickers` | 現行+候補を合わせたティッカー一覧 | 価格・出来高ダウンロード、リターン計算 |
+L50 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
+L51 | `data` | yfinanceのダウンロード結果（階層列） | `px`/`spx`/リターン等の基礎データ |
+L52 | `px` | `data['Close']`だけを抜き出した価格系列 | 指標計算・リターン生成 |
+L53 | `spx` | `data['Close'][bench]` のSeries | `rs`や`calc_beta`の基準指数 |
+L54 | `tickers_bulk` | `yf.Tickers`オブジェクト | `info`等の一括取得 |
+L55 | `info` | ティッカー別のyfinance情報dict | セクター判定やEPS補完 |
+L56 | `eps_df` | EPS TTM/直近EPS等をまとめた表 | 成長指標の算出 |
+L57 | `fcf_df` | CFO・CapEx・FCF TTMと情報源フラグ | FCF/EVや配当カバレッジ |
+L58 | `returns` | `px.pct_change()`のリターン表 | 相関行列・DRRS計算 |
+L59
+L60 ### FeatureBundle（Scorer → Selector）
+L61 | 変数 | 内容 | 主な用途 |
+L62 | --- | --- | --- |
+L63 | `df` | 計算済み指標の生値テーブル | デバッグ・出力表示 |
+L64 | `df_z` | ウィンザー後Zスコア化した指標表 | 因子スコア合成、選定基準 |
+L65 | `g_score` | Gバケット総合スコア | G選定、IN/OUT比較 |
+L66 | `d_score_all` | Dバケット総合スコア（全銘柄） | D選定、低スコアランキング |
+L67 | `missing_logs` | 欠損指標と補完状況のログ | データ品質チェック |
+L68
+L69 ### SelectionBundle（Selector → Output）
+L70 | 変数 | 内容 | 主な用途 |
+L71 | --- | --- | --- |
+L72 | `resG` | G選定結果の詳細dict（`tickers`、目的値等） | 結果保存・平均相関などの指標表示 |
+L73 | `resD` | D選定結果の詳細dict | 同上 |
+L74 | `top_G` | 最終採用Gティッカー | 新ポートフォリオ構築 |
+L75 | `top_D` | 最終採用Dティッカー | 同上 |
+L76 | `init_G` | DRRS前のG初期候補 | 惜しくも外れた銘柄表示 |
+L77 | `init_D` | DRRS前のD初期候補 | 同上 |
+L78
+L79 ### WeightsConfig
+L80 | 変数 | 内容 | 主な用途 |
+L81 | --- | --- | --- |
+L82 | `g` | G因子（GRW/MOM/VOL）の重みdict | `g_score`合成 |
+L83 | `d` | D因子（D_QAL/D_YLD/D_VOL_RAW/D_TRD）の重みdict | `d_score_all`合成 |
+L84
+L85 ### DRRSParams
+L86 | 変数 | 内容 | 主な用途 |
+L87 | --- | --- | --- |
+L88 | `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
+L89 | `shrink` | 残差相関のシュリンク率 | `residual_corr`の対角強調 |
+L90 | `G` | Gバケット用パラメータdict（`lookback`等） | `select_bucket_drrs`設定 |
+L91 | `D` | Dバケット用パラメータdict | 同上 |
+L92 | `cross_mu_gd` | G-Dクロス相関ペナルティ係数μ | `select_buckets`の目的関数 |
+L93
+L94 ### PipelineConfig
+L95 | 変数 | 内容 | 主な用途 |
+L96 | --- | --- | --- |
+L97 | `weights` | `WeightsConfig`のインスタンス | スコア合成の重み参照 |
+L98 | `drrs` | `DRRSParams`のインスタンス | 選定ステップの設定値 |
+L99 | `price_max` | 候補銘柄の許容価格上限 | Input段階でのフィルタ |
+L100
+L101 ## 共通ユーティリティ
+L102 - `winsorize_s` / `robust_z` : 外れ値処理とZスコア化。
+L103 - `_safe_div` / `_safe_last` : 例外を潰した分割・末尾取得。
+L104 - `_load_prev` / `_save_sel` : 選定結果の読み書き。
+L105
+L106 ## クラス設計
+L107 ### Step1: Input
+L108 `current_tickers.csv`の現行銘柄と`candidate_tickers.csv`の検討中銘柄を起点にデータを集約する。外部I/Oと前処理を担当し、`prepare_data`で`InputBundle`を生成。価格・財務データの取得は**yfinanceを優先し、欠損がある指標のみFinnhub APIで補完**する。
+L109 主なメソッド:
+L110 - `impute_eps_ttm` : 四半期EPS×4でTTMを推定し欠損時のみ差し替え。
+L111 - `fetch_cfo_capex_ttm_yf` : yfinanceの四半期/年次キャッシュフローからCFO・CapEx・FCF TTMを算出。
+L112 - `fetch_cfo_capex_ttm_finnhub` : yfinanceで欠けた銘柄のみFinnhub APIで補完。
+L113 - `compute_fcf_
+```

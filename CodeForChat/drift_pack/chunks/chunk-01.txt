@@ -1,0 +1,326 @@
+```text
+# === Chat Paste Pack ===
+# Repo: dakara32/GPT_Code @ main
+# Files: drift.py, .github/workflows/daily-report.yml, documents/README.md, documents/drift_design.md
+# 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
+# 注記: 各ファイルは個別に L1.. で行番号付与。
+---
+
+## <drift.py>
+```text
+L1 import pandas as pd, yfinance as yf
+L2 import numpy as np
+L3 import requests
+L4 import os
+L5 import csv
+L6 import time
+L7 from pathlib import Path
+L8
+L9 # Debug flag
+L10 debug_mode = False  # set to True for detailed output
+L11
+L12 # --- Finnhub settings & helper ---
+L13 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+L14 if not FINNHUB_API_KEY:
+L15     raise ValueError("FINNHUB_API_KEY not set (環境変数が未設定です)")
+L16
+L17 RATE_LIMIT = 55  # requests per minute (free tier is 60)
+L18 call_times = []
+L19
+L20
+L21 def finnhub_get(endpoint, params):
+L22     """Call Finnhub API with basic rate limiting."""
+L23     now = time.time()
+L24     cutoff = now - 60
+L25     while call_times and call_times[0] < cutoff:
+L26         call_times.pop(0)
+L27     if len(call_times) >= RATE_LIMIT:
+L28         sleep_time = 60 - (now - call_times[0])
+L29         time.sleep(sleep_time)
+L30     params = {**params, "token": FINNHUB_API_KEY}
+L31     try:
+L32         resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params)
+L33         resp.raise_for_status()
+L34         data = resp.json()
+L35     except requests.exceptions.JSONDecodeError as e:
+L36         print(f"⚠️ Finnhub API JSON decode error: {e}")
+L37         return {}
+L38     except Exception as e:
+L39         print(f"⚠️ Finnhub API error: {e}")
+L40         return {}
+L41     call_times.append(time.time())
+L42     return data
+L43
+L44
+L45 def fetch_price(symbol):
+L46     try:
+L47         data = finnhub_get("quote", {"symbol": symbol})
+L48         price = data.get("c")
+L49         return float(price) if price not in (None, 0) else float("nan")
+L50     except Exception:
+L51         return float("nan")
+L52
+L53
+L54 def fetch_vix_ma5():
+L55     """Retrieve VIX 5-day moving average via yfinance."""
+L56     try:
+L57         vix = (
+L58             yf.download("^VIX", period="7d", interval="1d", progress=False, auto_adjust=False)["Close"]
+L59             .dropna()
+L60             .tail(5)
+L61         )
+L62         if len(vix) < 5:
+L63             return float("nan")
+L64         return vix.mean().item()
+L65     except Exception:
+L66         return float("nan")
+L67
+L68
+L69 # === Minervini-like sell signals ===
+L70 def _yf_df(sym, period="6mo"):
+L71     """日足/MA/出来高平均を取得。欠損時は None。"""
+L72     try:
+L73         df = yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False)
+L74         if df is None or df.empty:
+L75             return None
+L76         return df.dropna().assign(
+L77             ma20=lambda d: d["Close"].rolling(20).mean(),
+L78             ma50=lambda d: d["Close"].rolling(50).mean(),
+L79             vol50=lambda d: d["Volume"].rolling(50).mean(),
+L80         )
+L81     except Exception:
+L82         return None
+L83
+L84
+L85 def _scalar(row, col):
+L86     """Series/npスカラ→Pythonスカラ化（NaNはNaNのまま）"""
+L87     try:
+L88         v = row[col]
+L89         if hasattr(v, "item"):
+L90             try:
+L91                 v = v.item()
+L92             except Exception:
+L93                 pass
+L94         return v
+L95     except Exception:
+L96         return float("nan")
+L97
+L98
+L99 def _is_strict_down(seq):
+L100     """数列が厳密に連続で切り下がっているか（len>=4を想定）。NaN含みはFalse。"""
+L101     try:
+L102         xs = [float(x) for x in seq]
+L103         if any(pd.isna(x) for x in xs) or len(xs) < 4:
+L104             return False
+L105         return all(b < a for a, b in zip(xs[:-1], xs[1:]))
+L106     except Exception:
+L107         return False
+L108
+L109
+L110 def _signals_for_day(df, idx):
+L111     """df.loc[idx] 1日分に対しシグナル配列を返す（値動き/出来高ベースのみ）。"""
+L112     try:
+L113         sig = []
+L114         d = df.loc[idx]
+L115         close = _scalar(d, "Close")
+L116         open_ = _scalar(d, "Open")
+L117         ma20 = _scalar(d, "ma20")
+L118         ma50 = _scalar(d, "ma50")
+L119         vol = _scalar(d, "Volume")
+L120         vol50 = _scalar(df.iloc[-1], "vol50")
+L121         if any(pd.isna(x) for x in (close, open_, vol, vol50)):
+L122             return sig
+L123         if pd.notna(ma20) and close < ma20:
+L124             sig.append("20DMA↓")
+L125         if pd.notna(ma50) and close < ma50 and vol > 1.5 * vol50:
+L126             sig.append("50DMA↓(大商い)")
+L127
+L128         last4 = df.loc[:idx].tail(4)
+L129         lows_desc = _is_strict_down(last4["Low"].tolist())
+L130         last10 = df.loc[:idx].tail(10)
+L131         reds = int((last10["Close"] < last10["Open"]).sum())
+L132         if lows_desc or reds > 5:
+L133             sig.append("連続安値/陰線優勢")
+L134
+L135         ups = int((last10["Close"] > last10["Open"]).sum())
+L136         if ups >= 7:
+L137             sig.append("上げ偏重(>70%)")
+L138
+L139         last15 = df.loc[:idx].tail(15)
+L140         base0 = _scalar(last15.iloc[0], "Close") if len(last15) > 0 else float("nan")
+L141         if pd.notna(base0) and base0 != 0 and (close / base0 - 1) >= 0.25:
+L142             sig.append("+25%/15日内")
+L143
+L144         if len(df.loc[:idx]) >= 2:
+L145             t1, t0 = df.loc[:idx].iloc[-2], df.loc[:idx].iloc[-1]
+L146             t1_high = _scalar(t1, "High")
+L147             t0_open = _scalar(t0, "Open")
+L148             t0_close = _scalar(t0, "Close")
+L149             if all(pd.notna(x) for x in (t1_high, t0_open, t0_close)):
+L150                 if (t0_open > t1_high * 1.02) and (t0_close < t0_open):
+L151                     sig.append("GU→陰線")
+L152         return sig
+L153     except Exception:
+L154         return []
+L155
+L156
+L157 def scan_sell_signals(symbols, lookback_days=5):
+L158     """
+L159     直近 lookback_days 日のうち一度でもシグナルが出たら {sym: [(date,[signals]),...]} を返す。
+L160     日付は YYYY-MM-DD。Slackで列挙する。
+L161     """
+L162     out = {}
+L163     for s in symbols:
+L164         df = _yf_df(s)
+L165         if df is None or len(df) < 60:
+L166             continue
+L167         alerts = []
+L168         for idx in df.tail(lookback_days).index:
+L169             tags = _signals_for_day(df, idx)
+L170             if tags:
+L171                 alerts.append((idx.strftime("%Y-%m-%d"), tags))
+L172         if alerts:
+L173             out[s] = alerts
+L174     return out
+L175
+L176
+L177 def load_portfolio():
+L178     tickers_path = Path(__file__).with_name("current_tickers.csv")
+L179     with tickers_path.open() as f:
+L180         reader = list(csv.reader(f))
+L181     return [
+L182         {"symbol": sym.strip().upper(), "shares": int(qty), "target_ratio": 1 / len(reader)}
+L183         for sym, qty in reader
+L184     ]
+L185
+L186
+L187 def compute_threshold():
+L188     vix_ma5 = fetch_vix_ma5()
+L189     drift_threshold = 10 if vix_ma5 < 20 else 12 if vix_ma5 < 26 else float("inf")
+L190     return vix_ma5, drift_threshold
+L191
+L192
+L193 def build_dataframe(portfolio):
+L194     for stock in portfolio:
+L195         price = fetch_price(stock["symbol"])
+L196         stock["price"] = price
+L197         stock["value"] = price * stock["shares"]
+L198
+L199     df = pd.DataFrame(portfolio)
+L200     total_value = df["value"].sum()
+L201     df["current_ratio"] = df["value"] / total_value
+L202     df["drift"] = df["current_ratio"] - df["target_ratio"]
+L203     df["drift_abs"] = df["drift"].abs()
+L204     total_drift_abs = df["drift_abs"].sum()
+L205     df["adjusted_ratio"] = df["current_ratio"] - df["drift"] / 2
+L206     df["adjustable"] = (
+L207         (df["adjusted_ratio"] * total_value) >= df["price"]
+L208     ) & df["price"].notna() & df["price"].gt(0)
+L209     return df, total_value, total_drift_abs
+L210
+L211
+L212 def simulate(df, total_value, total_drift_abs, drift_threshold):
+L213     alert = drift_threshold != float("inf") and total_drift_abs * 100 > drift_threshold
+L214     if alert:
+L215         df["trade_shares"] = df.apply(
+L216             lambda r: int(round(((r["adjusted_ratio"] * total_value) - r["value"]) / r["price"]))
+L217             if r["adjustable"] and r["price"] > 0 else 0,
+L218             axis=1,
+L219         )
+L220         df["new_shares"] = df["shares"] + df["trade_shares"]
+L221         df["new_value"] = df["new_shares"] * df["price"]
+L222         new_total_value = df["new_value"].sum()
+L223         df["simulated_ratio"] = df["new_value"] / new_total_value
+L224         df["simulated_drift_abs"] = (df["simulated_ratio"] - df["target_ratio"]).abs()
+L225         simulated_total_drift_abs = df["simulated_drift_abs"].sum()
+L226     else:
+L227         df["trade_shares"] = np.nan
+L228         df["new_shares"] = np.nan
+L229         df["new_value"] = np.nan
+L230         new_total_value = np.nan
+L231         df["simulated_ratio"] = np.nan
+L232         df["simulated_drift_abs"] = np.nan
+L233         simulated_total_drift_abs = np.nan
+L234     return df, alert, new_total_value, simulated_total_drift_abs
+L235
+L236
+L237 def prepare_summary(df, total_drift_abs, alert):
+L238     summary = {
+L239         "symbol": "合計",
+L240         "shares": df["shares"].sum(),
+L241         "value": df["value"].sum(),
+L242         "current_ratio": np.nan,
+L243         "drift_abs": total_drift_abs,
+L244     }
+L245     if alert:
+L246         summary["trade_shares"] = np.nan
+L247     # Sort details by evaluation value descending before appending summary
+L248     df = df.sort_values(by="value", ascending=False)
+L249     df = pd.concat([df, pd.DataFrame([summary])], ignore_index=True)
+L250     if alert:
+L251         cols = ["symbol", "shares", "value", "current_ratio", "drift_abs", "trade_shares"]
+L252         df_small = df[cols].copy()
+L253         df_small.columns = ["sym", "qty", "val", "now", "|d|", "Δqty"]
+L254     else:
+L255         cols = ["symbol", "shares", "value", "current_ratio", "drift_abs"]
+L256         df_small = df[cols].copy()
+L257         df_small.columns = ["sym", "qty", "val", "now", "|d|"]
+L258     return df_small
+L259
+L260
+L261 def currency(x):
+L262     return f"${x:,.0f}" if pd.notnull(x) else ""
+L263
+L264
+L265 def formatters_for(alert):
+L266     formatters = {"val": currency, "now": "{:.2%}".format, "|d|": "{:.2%}".format}
+L267     if alert:
+L268         formatters["Δqty"] = "{:.0f}".format
+L269     return formatters
+L270
+L271
+L272 def build_header(vix_ma5, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs):
+L273     header = (
+L274         f"*📈 VIX MA5:* {vix_ma5:.2f}\n"
+L275         f"*📊 ドリフト閾値:* {'🔴(高VIX)' if drift_threshold == float('inf') else str(drift_threshold)+'%'}\n"
+L276         f"*📉 現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
+L277     )
+L278     if alert:
+L279         header += f"*🔁 半戻し後ドリフト合計(想定):* {simulated_total_drift_abs * 100:.2f}%\n"
+L280         header += "🚨 *アラート: 発生！！ Δqtyのマイナス銘柄を売却、任意の銘柄を買い増してバランスを取りましょう！*\n"
+L281     else:
+L282         header += "✅ アラートなし\n"
+L283     return header
+L284
+L285
+L286 def send_slack(text):
+L287     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+L288     if not SLACK_WEBHOOK_URL:
+L289         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+L290     payload = {"text": text}
+L291     try:
+L292         resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
+L293         resp.raise_for_status()
+L294         print("✅ Slack（Webhook）へ送信しました")
+L295     except Exception as e:
+L296         print(f"⚠️ Slack通知エラー: {e}")
+L297
+L298
+L299 def send_debug(debug_text):
+L300     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+L301     if not SLACK_WEBHOOK_URL:
+L302         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+L303     debug_payload = {"text": "```" + debug_text + "```"}
+L304     try:
+L305         resp = requests.post(SLACK_WEBHOOK_URL, json=debug_payload)
+L306         resp.raise_for_status()
+L307         print("✅ Debug情報をSlackに送信しました")
+L308     except Exception as e:
+L309         print(f"⚠️ Slack通知エラー: {e}")
+L310
+L311
+L312 def main():
+L313     portfolio = load_portfolio()
+L314     symbols = [r["symbol"] for r in portfolio]
+L315     sell_alerts = scan_sell_signals(symbols, lookback
+```

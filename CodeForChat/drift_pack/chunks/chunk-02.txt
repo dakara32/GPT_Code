@@ -1,0 +1,229 @@
+```text
+_days=5)
+L316     vix_ma5, drift_threshold = compute_threshold()
+L317     df, total_value, total_drift_abs = build_dataframe(portfolio)
+L318     df, alert, new_total_value, simulated_total_drift_abs = simulate(
+L319         df, total_value, total_drift_abs, drift_threshold
+L320     )
+L321     df_small = prepare_summary(df, total_drift_abs, alert)
+L322     if 'df_small' in locals() and isinstance(df_small, pd.DataFrame) and not df_small.empty:
+L323         col_sym = "sym" if "sym" in df_small.columns else ("symbol" if "symbol" in df_small.columns else None)
+L324         if col_sym:
+L325             df_small.insert(0, "⚠", df_small[col_sym].apply(lambda x: "🔴" if x in sell_alerts else ""))
+L326     formatters = formatters_for(alert)
+L327     header = build_header(
+L328         vix_ma5, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
+L329     )
+L330     if sell_alerts:
+L331         def fmt_pair(date_tags):
+L332             date, tags = date_tags
+L333             return f"{date}:" + "・".join(tags)
+L334         listed = []
+L335         for t, arr in sell_alerts.items():
+L336             listed.append(f"*{t}*（" + ", ".join(fmt_pair(x) for x in arr) + "）")
+L337         hits = ", ".join(listed)
+L338         if "✅ アラートなし" in header:
+L339             header = header.replace(
+L340                 "✅ アラートなし",
+L341                 f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hits}",
+L342             )
+L343         else:
+L344             header += f"\n🟥 {hits}"
+L345     table_text = df_small.to_string(formatters=formatters, index=False)
+L346     send_slack(header + "\n```" + table_text + "```")
+L347
+L348     if debug_mode:
+L349         debug_cols = [
+L350             "symbol",
+L351             "shares",
+L352             "price",
+L353             "value",
+L354             "current_ratio",
+L355             "drift",
+L356             "drift_abs",
+L357             "adjusted_ratio",
+L358             "adjustable",
+L359             "trade_shares",
+L360             "new_shares",
+L361             "new_value",
+L362             "simulated_ratio",
+L363             "simulated_drift_abs",
+L364         ]
+L365         debug_text = (
+L366             "=== DEBUG: full dataframe ===\n"
+L367             + df[debug_cols].to_string()
+L368             + f"\n\ntotal_value={total_value}, new_total_value={new_total_value}\n"
+L369             + f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}"
+L370         )
+L371         print("\n" + debug_text)
+L372         send_debug(debug_text)
+L373
+L374
+L375 if __name__ == "__main__":
+L376     main()
+L377
+```
+
+## <.github/workflows/daily-report.yml>
+```text
+L1 name: Daily Stock Report
+L2
+L3 on:
+L4   push:
+L5     branches: [ main ]
+L6     paths-ignore:
+L7       - 'CodeForChat/**'
+L8   schedule:
+L9     - cron: '30 23 * * 2-6'  # UTC 23:30 → JST 08:30（火〜土）
+L10   workflow_dispatch:
+L11
+L12 jobs:
+L13   build-and-report:
+L14     runs-on: ubuntu-latest
+L15
+L16     steps:
+L17       - name: Debug start
+L18         run: echo '🚀 DEBUGstarted'
+L19               
+L20       - name: Checkout repository
+L21         uses: actions/checkout@v3
+L22
+L23       - name: Setup Python
+L24         uses: actions/setup-python@v4
+L25         with:
+L26           python-version: '3.x'
+L27
+L28       - name: Install dependencies
+L29         run: pip install -r requirements.txt
+L30
+L31       - name: Prepare results directory
+L32         run: mkdir -p results
+L33
+L34       - name: Run drift.py
+L35         env:
+L36           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+L37           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+L38         run: python drift.py
+```
+
+## <documents/README.md>
+```text
+L1 # 運用ルール
+L2
+L3 ## 基本構成
+L4 - 25銘柄を均等配分（現金を除き1銘柄あたり4%）
+L5 - moomoo証券で運用
+L6
+L7 ## Barbell Growth-Defense方針
+L8 - Growth枠12銘柄：高成長で乖離源となる攻めの銘柄
+L9 - Defense枠13銘柄：低ボラで安定成長し配当を増やす守りの銘柄
+L10 - 「猛烈に伸びる攻め × 着実に稼ぐ盾」の組合せで乖離→半戻しプレミアムを狙う
+L11
+L12 ## 現金比率（VIX 5日移動平均で判定）
+L13 - VIX MA5 < 20: 5%
+L14 - 20 ≤ VIX MA5 < 26: 7.5%
+L15 - VIX MA5 ≥ 27: 12%（高VIX緊急モード）
+L16
+L17 ## ドリフト閾値
+L18 - VIX MA5 < 20: 10%
+L19 - 20 ≤ VIX MA5 < 26: 12%
+L20 - VIX MA5 ≥ 27: 高VIX緊急モードへ移行
+L21
+L22 ## 通常モードの運用
+L23 - 毎営業日、①90日経過 or ②ドリフトが閾値超過で半戻し
+L24 - 半戻し：乖離の50%を中央へ寄せ、現金比率を上表どおりに調整
+L25 - 全銘柄のトレーリングストップ(TS)を再設定
+L26 - ドリフト＝Σ|現在比率−4%|（端数切り捨て）
+L27
+L28 ## 高VIX緊急モード（MA5 > 27で発動）
+L29 1. 全25銘柄を各4%へ全戻し
+L30 2. 現金比率12%へ引上げ
+L31 3. 全銘柄のTSを再設定し以降の売買とドリフト計算を停止
+L32
+L33 ## 高VIX緊急モードの解除
+L34 - MA5 < 23 または30営業日経過で解除
+L35 - 緊急モード中にTS発動で減少した銘柄を補充し25銘柄×4%にリバランス
+L36 - 通常モードの日次チェックを再開
+L37
+L38 ## 段階的トレーリングストップ
+L39 - Growth: 基本25%
+L40 - Defense: 基本20%
+L41 - 含み益が40/60/80%に達したらTSを3/5/8ポイントずつ引き上げ
+L42 - TS発動で減少した銘柄は翌日以降に補充（緊急モード中は補充しない）
+L43
+L44 ## 入替銘柄選定
+L45 - Oxfordキャピタル／インカム、Alpha Investor、Motley Fool Stock Advisor、moomooスクリーニング等を参考にchatGPTで検討
+L46 - 年間NISA枠はGrowth群の中から低ボラ銘柄を選定し利用。長期保持にはこだわらない。
+L47
+L48 ## 実行タイミング
+L49 - 判定：米国市場終値直後
+L50 - 執行：翌営業日の米国寄付き成行
+L51
+L52 ## VIX早見表
+L53 | VIX MA5 | ドリフト閾値 | 現金比率 | モード |
+L54 |--------|--------------|---------|-------|
+L55 | <20    | 10           | 5%      | 通常 |
+L56 | 20–26  | 12           | 7.5%    | 通常 |
+L57 | ≥27    | –            | 12%     | 高VIX緊急 |
+```
+
+## <documents/drift_design.md>
+```text
+L1 # drift.py 詳細設計書
+L2
+L3 ## 概要
+L4 - 25銘柄ポートフォリオのドリフトを日次監視し、閾値超過時に半戻し案をSlack通知するスクリプト。
+L5 - Finnhubとyfinanceから価格・VIX情報を取得し、現況比率と調整案を計算。
+L6
+L7 ## 定数・設定
+L8 - `FINNHUB_API_KEY` / `SLACK_WEBHOOK_URL` を環境変数から取得。
+L9 - 無料枠を考慮したAPIレート制限: `RATE_LIMIT = 55`。
+L10 - デバッグ出力用フラグ `debug_mode`。
+L11
+L12 ## 主な関数
+L13 ### finnhub_get
+L14 - 基本的なレート制限付きでFinnhub APIを呼び出し、JSONレスポンスを辞書で返す。
+L15
+L16 ### fetch_price
+L17 - `quote` エンドポイントで株価を取得し、失敗時は `NaN` を返す。
+L18
+L19 ### fetch_vix_ma5
+L20 - yfinanceでVIX終値を取得し、直近5営業日の移動平均を算出。
+L21
+L22 ### load_portfolio
+L23 - `current_tickers.csv` から銘柄と保有株数を読み込み、目標比率4%を付与したリストを生成。
+L24
+L25 ### compute_threshold
+L26 - VIX MA5に応じてドリフト閾値を10%/12%/高VIXモード(∞)に設定。
+L27
+L28 ### build_dataframe
+L29 - 各銘柄の評価額や現在比率、ドリフト、半戻し後比率(`adjusted_ratio`)を計算しDataFrame化。
+L30
+L31 ### simulate
+L32 - ドリフト合計が閾値を超えた場合、半戻し後の売買株数と新比率を試算し、シミュレート後ドリフトを返す。
+L33
+L34 ### prepare_summary
+L35 - 評価額順に並べ替えた後、合計行を付与してSlack表示用テーブルを作成。
+L36
+L37 ### formatters_for / currency
+L38 - 通貨・比率・株数の表示フォーマットを定義。
+L39
+L40 ### build_header
+L41 - VIX・閾値・ドリフト値およびアラート有無をSlackメッセージ用ヘッダに整形。
+L42
+L43 ### send_slack / send_debug
+L44 - 通常通知およびデバッグ詳細をSlack Webhookへ送信。
+L45
+L46 ### main
+L47 - 上記関数を順に呼び出し、日次ドリフトチェックの一連処理を実行。
+L48
+L49 ## 実行フロー
+L50 1. `load_portfolio` で現ポートフォリオを読み込む。
+L51 2. `compute_threshold` でVIX MA5とドリフト閾値を決定。
+L52 3. `build_dataframe` で現在比率とドリフトを計算。
+L53 4. `simulate` で閾値超過時の半戻し案を試算。
+L54 5. `prepare_summary` と `build_header` で通知本文とテーブルを構築。
+L55 6. `send_slack` で結果を送信。`debug_mode` がTrueなら `send_debug` も併用。
+```
+
+```
