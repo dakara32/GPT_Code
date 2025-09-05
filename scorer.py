@@ -552,6 +552,32 @@ class Scorer:
         ).clip(-3.0,3.0)
         df_z['VOL'] = robust_z(df['BETA'])
         df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
+
+        # === begin: BIO LOSS PENALTY =====================================
+        try:
+            penalty_z = float(os.getenv("BIO_LOSS_PENALTY_Z", "0.8"))
+        except Exception:
+            penalty_z = 0.8
+
+        def _is_bio_like(t: str) -> bool:
+            inf = info.get(t, {}) if isinstance(info, dict) else {}
+            sec = str(inf.get("sector", "")).lower()
+            ind = str(inf.get("industry", "")).lower()
+            if "health" not in sec:
+                return False
+            keys = ("biotech", "biopharma", "pharma")
+            return any(k in ind for k in keys)
+
+        tickers_s = pd.Index(df_z.index)
+        is_bio = pd.Series({t: _is_bio_like(t) for t in tickers_s})
+        is_loss = pd.Series({t: (pd.notna(df.loc[t,"EPS"]) and df.loc[t,"EPS"] <= 0) for t in tickers_s})
+        mask_bio_loss = (is_bio & is_loss).reindex(df_z.index).fillna(False)
+
+        if bool(mask_bio_loss.any()) and penalty_z > 0:
+            df_z.loc[mask_bio_loss, "GRW"] = df_z.loc[mask_bio_loss, "GRW"] - penalty_z
+            df_z["GRW"] = df_z["GRW"].clip(-3.0, 3.0)
+        # === end: BIO LOSS PENALTY =======================================
+
         df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
 
