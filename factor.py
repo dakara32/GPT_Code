@@ -551,7 +551,10 @@ class Output:
         near_G = getattr(sc, "_near_G", []) if sc else []
         near_D = getattr(sc, "_near_D", []) if sc else []
 
-        extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
+        extra_G = [t for t in init_G if t not in top_G][:5]
+        # ── 表示順を GSC 降順に統一 ──
+        order_G = sorted(top_G, key=lambda t: g_score.get(t, float("-inf")), reverse=True)
+        G_UNI = order_G + extra_G
         gsc_series = pd.Series({t: g_score.get(t) for t in G_UNI}, name='GSC')
         # 必要なら df_z["GSC"] も有効スコアで上書きしておく
         # （デバッグ出力で数値が揃う）
