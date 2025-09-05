@@ -34,9 +34,6 @@ import yfinance as yf
 from typing import Any, TYPE_CHECKING
 from scipy.stats import zscore
 
-# factor.py の定数を優先。見つからなければ 0.4 でフォールバック
-k = float(getattr(sys.modules.get("factor"), "BONUS_COEFF", 0.4))
-
 if TYPE_CHECKING:
     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
 
@@ -611,10 +608,20 @@ class Scorer:
 
         mask_bonus = g_score.index.isin(current)
         if mask_bonus.any():
-            bonus_g = round(k * g_score.std(), 3)
+            # 1) factor.BONUS_COEFF から k を決め、無ければ 0.4
+            k = float(getattr(sys.modules.get("factor"), "BONUS_COEFF", 0.4))
+            # 2) g 側の σ を取り、NaN なら 0 に丸める
+            sigma_g = g_score.std()
+            if pd.isna(sigma_g):
+                sigma_g = 0.0
+            bonus_g = round(k * sigma_g, 3)
             g_score.loc[mask_bonus] += bonus_g
             Scorer.g_score = g_score
-            bonus_d = round(k * d_score_all.std(), 3)
+            # 3) D 側も同様に σ の NaN をケア
+            sigma_d = d_score_all.std()
+            if pd.isna(sigma_d):
+                sigma_d = 0.0
+            bonus_d = round(k * sigma_d, 3)
             d_score_all.loc[d_score_all.index.isin(current)] += bonus_d
 
         try:
