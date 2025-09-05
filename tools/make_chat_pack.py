@@ -6,12 +6,11 @@ make_chat_pack.py
 - 各ファイルに L1.. の行番号を付与
 - 1つの巨大テキストに連結し、指定文字数で安全に分割
 - 出力:
-    chat_build/factor_pack/chat-pack.txt
-    chat_build/factor_pack/chunks/chunk-XX.txt
-    chat_build/drift_pack/chat-pack.txt
-    chat_build/drift_pack/chunks/chunk-XX.txt
-    chat_build/INDEX.txt（両方の目次）
-- Actions の Job Summary にも簡易ガイドを出力
+    CodeForChat/factor_pack/chat-pack.txt
+    CodeForChat/factor_pack/chunks/chunk-XX.txt
+    CodeForChat/drift_pack/chat-pack.txt
+    CodeForChat/drift_pack/chunks/chunk-XX.txt
+    CodeForChat/INDEX.txt（両方の目次）
 """
 
 import os, sys, textwrap, hashlib
@@ -82,7 +81,7 @@ def chunkify(s: str, n: int):
     return chunks
 
 def main():
-    root_out = "chat_build"
+    root_out = "CodeForChat"
     os.makedirs(root_out, exist_ok=True)
 
     # グローバルINDEXの見出し
@@ -122,24 +121,6 @@ def main():
     # ルートのINDEX.txt
     with open(os.path.join(root_out, "INDEX.txt"), "w", encoding="utf-8") as w:
         w.write("\n".join(global_index))
-
-    # Actions の Job Summary（両方ぶんまとめて）
-    step_summary = os.getenv("GITHUB_STEP_SUMMARY")
-    if step_summary:
-        guide = textwrap.dedent(f"""\
-        ### Chat Paste Pack (multi)
-        - Output Root: chat_build/
-        - Packs:
-          - factor_pack/: chat-pack.txt, chunks/, INDEX.txt
-          - drift_pack/:  chat-pack.txt, chunks/, INDEX.txt
-
-        **How to use**
-        1) Open the 'chat-paste-pack' artifact
-        2) Choose 'factor_pack' or 'drift_pack'
-        3) Copy 'chat-pack.txt' (or the files under 'chunks/') into ChatGPT
-        """)
-        with open(step_summary, "a", encoding="utf-8") as s:
-            s.write(guide)
 
 if __name__ == "__main__":
     sys.exit(main())
