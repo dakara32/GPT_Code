@@ -278,7 +278,6 @@ class Scorer:
 
         px, spx, tickers = ib.px, ib.spx, ib.tickers
         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
-        families = set(getattr(cfg.weights,'g',{})) | set(getattr(cfg.weights,'d',{}))
 
         df, missing_logs = pd.DataFrame(index=tickers), []
         for t in tickers:
