@@ -533,13 +533,14 @@ class Scorer:
         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
         df_z['GROWTH_F']  = robust_z(
-              0.30*df_z['REV']
+              0.25*df_z['REV']          # ↓0.30→0.25
             + 0.20*df_z['EPS_Q_YOY']
             + 0.15*df_z['REV_Q_YOY']
             + 0.15*df_z['REV_YOY_ACC']
             + 0.10*df_z['RULE40']
             + 0.10*df_z['FCF_MGN']
-            + 0.10*df_z['REV_ANN_STREAK']
+            + 0.10*df_z['EPS']          # ★追加：黒字優遇／赤字減点
+            + 0.05*df_z['REV_ANN_STREAK']
             - 0.05*df_z['REV_YOY_VAR']
         ).clip(-3.0,3.0)
         df_z['MOM_F'] = robust_z(
