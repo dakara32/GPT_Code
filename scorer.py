@@ -89,6 +89,35 @@ def _safe_last(series: pd.Series, default=np.nan):
 
 D_WEIGHTS_EFF = None  # 出力表示互換のため
 
+# ---- Theme-specific penalty/soft-cap settings ---------------------------------
+THEME_PENALTY = {
+    "biotech": {
+        "sector_kw": ("biotechnology", "biotech", "life sciences"),
+        "penalty_loss": -0.80,
+        "penalty_profit": -0.25,
+    },
+}
+
+THEME_SOFTCAP = {
+    "biotech": {"cap": 1, "soft": True},
+}
+
+def apply_theme_penalties(score_series: pd.Series, info: dict[str, dict]) -> pd.Series:
+    """score_series にテーマ別ペナルティを加算して返す"""
+    s = score_series.copy()
+    for theme, spec in THEME_PENALTY.items():
+        kw = spec["sector_kw"]
+        pen_loss = spec["penalty_loss"]
+        pen_profit = spec["penalty_profit"]
+        mask_theme = s.index.map(
+            lambda t: str(info.get(t, {}).get("sector", "")).lower().startswith(kw) if isinstance(kw, str)
+            else any(k in str(info.get(t, {}).get("sector", "")).lower() for k in kw)
+        )
+        for t in s.index[mask_theme]:
+            prof = info.get(t, {}).get("profitMargins")
+            s[t] += pen_loss if (prof is None or prof < 0) else pen_profit
+    return s
+
 # ---- Scorer 本体 -------------------------------------------------------------
 class Scorer:
     """
@@ -238,26 +267,72 @@ class Scorer:
         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
 
     @staticmethod
-    def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
+    def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08,
+                                  *_, theme_id: dict[str, str]|None=None,
+                                  theme_count: dict[str, int]|None=None, **__) -> pd.Series:
         """
         同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
+        テーマ別 soft-cap にも対応（THEME_SOFTCAP）。
         戻り値は降順ソート済み。
         """
-        s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
-        cnt, pen = {}, {}
+        s = pd.Series(scores, dtype=float)
+        order = s.sort_values(ascending=False).index
+        cnt, pen_sec = {}, {}
+        theme_pen, removed = {}, []
+        theme_count = theme_count or {}
+
+        if theme_id is None:
+            theme_id = {}
+            for t in s.index:
+                sec_low = str(sectors.get(t, "")).lower()
+                for th, spec in THEME_PENALTY.items():
+                    kw = spec["sector_kw"]
+                    match = sec_low.startswith(kw) if isinstance(kw, str) else any(k in sec_low for k in kw)
+                    if match:
+                        theme_id[t] = th
+                        break
+
         for t in order:
             sec = sectors.get(t, "U")
             k = cnt.get(sec, 0) + 1
-            pen[t] = alpha * max(0, k - cap)
+            pen_sec[t] = alpha * max(0, k - cap)
             cnt[sec] = k
-        return (s - pd.Series(pen)).sort_values(ascending=False)
+
+            theme = theme_id.get(t)
+            if theme:
+                rk = theme_count.get(theme, 0) + 1
+                theme_count[theme] = rk
+                spec = THEME_SOFTCAP.get(theme)
+                if spec and rk > spec.get("cap", 0):
+                    if spec.get("soft", True):
+                        theme_pen[t] = alpha * max(0, rk - spec.get("cap", 0))
+                    else:
+                        removed.append(t)
+
+        s = s - pd.Series(pen_sec) - pd.Series(theme_pen)
+        if removed:
+            s = s.drop(removed, errors="ignore")
+        return s.sort_values(ascending=False)
 
     @staticmethod
-    def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08, hard: int|None=5) -> list[str]:
+    def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08,
+                         hard: int|None=5) -> list[str]:
         """
         soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
+        テーマ別 soft-cap も内部で自動判定。
         """
-        eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
+        theme_id = {}
+        for t, sec in sectors.items():
+            sec_low = str(sec).lower()
+            for th, spec in THEME_PENALTY.items():
+                kw = spec["sector_kw"]
+                match = sec_low.startswith(kw) if isinstance(kw, str) else any(k in sec_low for k in kw)
+                if match:
+                    theme_id[t] = th
+                    break
+
+        eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha,
+                                               theme_id=theme_id, theme_count={})
         if not hard:
             return list(eff.head(N).index)
         pick, used = [], {}
@@ -574,6 +649,9 @@ class Scorer:
         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
         globals()['D_WEIGHTS_EFF'] = dw.copy()
         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
+
+        g_score_all = apply_theme_penalties(g_score_all, info)
+        d_score_all = apply_theme_penalties(d_score_all, info)
 
         # ② テンプレ判定（既存ロジックそのまま）
         mask = df['trend_template']

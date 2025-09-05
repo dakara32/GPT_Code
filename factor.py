@@ -163,7 +163,7 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
 
     # ---- 次点10（フラグで有無切替）----
-    show_near = _env_true("DEBUG_NEAR5", True)
+    show_near = _env_true("DEBUG_NEARMISS", True)
     gs = getattr(fb,"g_score",None); ds = getattr(fb,"d_score_all",None)
     gs = gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None
     ds = ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None
