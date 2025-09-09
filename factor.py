@@ -8,7 +8,8 @@
 """
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
 BONUS_COEFF = 0.4   # 攻め=0.3 / 中庸=0.4 / 守り=0.5
-import yfinance as yf, pandas as pd, numpy as np, os, requests, time
+import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
+from concurrent.futures import ThreadPoolExecutor
 from scipy.stats import zscore
 from dataclasses import dataclass
 from typing import Dict, List
@@ -213,6 +214,72 @@ def _disjoint_keepG(top_G, top_D, poolD):
             if i < len(poolD):
                 D[j] = poolD[i]; used.add(D[j]); i += 1
     return top_G, D
+
+# --- Breadth mode state I/O（mode のみ永続） ---
+def _state_path():
+    return os.path.join(RESULTS_DIR, "breadth_state.json")
+
+def load_mode(default: str="NORMAL") -> str:
+    try:
+        with open(_state_path(), "r") as f:
+            m = json.loads(f.read()).get("mode", default)
+            return m if m in ("EMERG","CAUTION","NORMAL") else default
+    except Exception:
+        return default
+
+def save_mode(mode: str):
+    try:
+        with open(_state_path(), "w") as f:
+            f.write(json.dumps({"mode": mode}))
+    except Exception:
+        pass
+
+# --- Breadth→自動しきい値→ヒステリシス→Slack先頭行を作成 ---
+def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
+    """
+    返り値: (lead_lines, mode)
+    - lead_lines: Slack冒頭3行
+    - mode: "EMERG" / "CAUTION" / "NORMAL"
+    例外は上位で握る（既存出力は継続）
+    """
+    win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
+    C_ts = Scorer.trend_template_breadth_series(inb.px[inb.tickers], inb.spx, win_days=win)
+    if C_ts.empty:
+        raise RuntimeError("breadth series empty")
+    C_full = int(C_ts.iloc[-1])
+    q05 = int(np.nan_to_num(C_ts.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
+    q20 = int(np.nan_to_num(C_ts.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
+    q60 = int(np.nan_to_num(C_ts.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
+    # 運用“床”（N_G, 1.5*N_G, 3*N_G）とのmax
+    th_in_rec   = max(N_G, q05)
+    th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
+    th_norm_rec = max(3*N_G, q60)
+    # 採用（自動 or 手動）
+    use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
+    if use_calib:
+        th_in, th_out, th_norm, th_src = th_in_rec, th_out_rec, th_norm_rec, "自動"
+    else:
+        th_in   = int(os.getenv("GTT_EMERG_IN",    str(N_G)))
+        th_out  = int(os.getenv("GTT_EMERG_OUT",   str(int(1.5*N_G))))
+        th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3*N_G)))
+        th_src  = "手動"
+    # ヒステリシス
+    prev = load_mode("NORMAL")
+    if prev == "EMERG":
+        mode = "EMERG" if (C_full < th_out) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+    elif prev == "CAUTION":
+        mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
+    else:
+        mode = "EMERG" if (C_full < th_in) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+    save_mode(mode)
+    _MODE_JA = {"EMERG":"緊急", "CAUTION":"警戒", "NORMAL":"通常"}
+    mode_ja = _MODE_JA.get(mode, mode)
+    lead_lines = [
+        f"テンプレ合格本数: {C_full}本 → モード {mode_ja}",
+        f"現在のしきい値（{th_src}）: 緊急入り<{th_in}本 / 解除≥{th_out}本 / 通常復帰≥{th_norm}本",
+        f"参考指標（過去~{win}営業日）: 下位5%={q05}本 / 下位20%={q20}本 / 60%分位={q60}本",
+    ]
+    return lead_lines, mode
 
 
 # ===== Input：外部I/Oと前処理（CSV/API・欠損補完） =====
@@ -848,17 +915,35 @@ def run_pipeline() -> SelectionBundle:
                           (str(df.at[t, "G_PULLBACK_recent_5d"]) == "True")]
     except Exception:
         fire_recent = []
+
+    # --- Breadth行を並列で先行計算（InputBundleのみ依存） ---
+    breadth_fut = None
+    try:
+        ex = ThreadPoolExecutor(max_workers=2)
+        breadth_fut = ex.submit(_build_breadth_lead_lines, inb)
+    except Exception:
+        breadth_fut = None
+
     lines = [
         "【G枠レポート｜週次モニタ（直近5営業日）】",
         "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
         f"選定12: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else "選定12: なし",
         f"次点10: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点10: なし",
     ]
+    # --- 並列結果をここで合流（失敗しても既存の出力は継続） ---
+    if breadth_fut is not None:
+        try:
+            lead_lines, _mode = breadth_fut.result()
+            lines = lead_lines + lines
+        except Exception as _e:
+            lines = [f"Breadth計算エラー: {_e}"] + lines
+
     if fire_recent:
         fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
         lines.append(f"過去5営業日の検知: {fire_list}")
     else:
         lines.append("過去5営業日の検知: なし")
+
     try:
         webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
         if webhook:
