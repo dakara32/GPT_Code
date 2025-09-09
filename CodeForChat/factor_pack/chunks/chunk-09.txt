@@ -1,5 +1,168 @@
 ```text
-/VOL）の重みdict | `g_score`合成 |
+     run: echo '🚀 DEBUGstarted'
+L21               
+L22       - name: Checkout repository
+L23         uses: actions/checkout@v3
+L24
+L25       - name: Setup Python
+L26         uses: actions/setup-python@v5
+L27         with:
+L28           python-version: '3.x'                # （必要最小限のまま。固定したければ '3.13'）
+L29           cache: 'pip'                         # ★ pipキャッシュを有効化
+L30           cache-dependency-path: requirements.txt  # ★ 依存ファイルをキャッシュキーに
+L31
+L32       - name: Install dependencies
+L33         run: pip install -r requirements.txt
+L34
+L35       - name: Prepare results directory
+L36         run: mkdir -p results
+L37
+L38       - name: Run factor & scoring
+L39         env:
+L40           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+L41           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+L42           FIN_THREADS: "8"
+L43         run: python factor.py
+L44       - name: Persist breadth mode (if changed)
+L45         run: |
+L46           git config user.name "github-actions[bot]"
+L47           git config user.email "github-actions[bot]@users.noreply.github.com"
+L48           git add results/breadth_state.json || true
+L49           if ! git diff --cached --quiet; then
+L50             git commit -m "chore: update breadth_state.json [skip ci]" || true
+L51             git push || true
+L52           else
+L53             echo "No breadth_state.json changes."
+L54           fi
+```
+
+## <documents/README.md>
+```text
+L1 # 運用ルール
+L2
+L3 ## 基本構成
+L4 - 25銘柄を均等配分（現金を除き1銘柄あたり4%）
+L5 - moomoo証券で運用
+L6
+L7 ## Barbell Growth-Defense方針
+L8 - Growth枠12銘柄：高成長で乖離源となる攻めの銘柄
+L9 - Defense枠13銘柄：低ボラで安定成長し配当を増やす守りの銘柄
+L10 - 「猛烈に伸びる攻め × 着実に稼ぐ盾」の組合せで乖離→半戻しプレミアムを狙う
+L11
+L12 ## レジーム判定（trend_template 合格“本数”で判定）
+L13 - 合格本数 = current+candidate 全体のうち、trend_template 条件を満たした銘柄の**本数(C)**
+L14 - しきい値は過去~600営業日の分布から**毎回自動採用**（分位点と運用“床”のmax）
+L15   - 緊急入り: `max(q05, 12本)`（= N_G）
+L16   - 緊急解除: `max(q20, 18本)`（= 1.5×N_G）
+L17   - 通常復帰: `max(q60, 36本)`（= 3×N_G）
+L18 - ヒステリシス: 前回モードに依存（EMERG→解除は18本以上、CAUTION→通常は36本以上）
+L19
+L20 ## レジーム別の現金・ドリフト
+L21 - **通常(NORMAL)** : 現金 **10%** / ドリフト閾値 **10%**
+L22 - **警戒(CAUTION)** : 現金 **12.5%** / ドリフト閾値 **12%**
+L23 - **緊急(EMERG)** : 現金 **20%** / **ドリフト売買停止**（25×4%に全戻しのみ）
+L24
+L25 ## トレーリングストップ（統一）
+L26 - G/D 共通の **基本TS=15%**
+L27 - 含み益が **+20% / +40% / +60%** 到達で TS を **12% / 9% / 7%** に段階引き上げ
+L28 - TS発動で減少した銘柄は翌日以降に補充（※緊急モード中は補充しない）
+L29
+L30 ## 入替銘柄選定
+L31 - Oxfordキャピタル／インカム、Alpha Investor、Motley Fool Stock Advisor、moomooスクリーニング等を参考にchatGPTで検討
+L32 - 年間NISA枠はGrowth群の中から低ボラ銘柄を選定し利用。長期保持にはこだわらない。
+L33
+L34 ## 再エントリー（クールダウン）
+L35 - TSヒット後の同銘柄再INは **8営業日** のクールダウンを設ける（期間中は再IN禁止）
+L36
+L37 ## 実行タイミング
+L38 - 判定：米国市場終値直後
+L39 - 執行：翌営業日の米国寄付き成行
+```
+
+## <documents/factor_design.md>
+```text
+L1 # factor.py 詳細設計書
+L2
+L3 ## 概要
+L4 - 既存ポートフォリオの銘柄と検討中の銘柄群を同時に扱う銘柄選定パイプライン。
+L5 - 価格・財務データを取り込みスコアリングとDRRS選定を行うことで、以下のアウトプットを得る。
+L6   - 採用銘柄と惜しくも漏れた銘柄のスコア一覧
+L7   - IN/OUTのティッカーリストとOUT側の低スコア銘柄
+L8   - 新旧ポートフォリオの比較表
+L9   - 検討中銘柄の低スコアランキング（整理用）
+L10
+L11 ## 全体フロー
+L12 1. **Input** – `current_tickers.csv`と`candidate_tickers.csv`を読み込み、yfinanceやFinnhubのAPIから価格・財務データを収集して`InputBundle`を整備。
+L13 2. **Score Calculation** – Scorerが特徴量を計算し因子スコアを合成して`FeatureBundle`を生成。
+L14 3. **Correlation Reduction & Selection** – SelectorがDRRSロジックで相関を抑えつつG/D銘柄を選定し`SelectionBundle`を得る。
+L15 4. **Output** – 採用結果と周辺情報を表・Slack通知として出力。
+L16
+L17 ```mermaid
+L18 flowchart LR
+L19   A[Input\nAPI & 前処理] --> B[Score Calculation\n特徴量・因子合成]
+L20   B --> C[Correlation Reduction\nDRRS選定]
+L21   C --> D[Output\nSlack通知]
+L22 ```
+L23
+L24 ## 定数・設定
+L25 | 変数 | 内容 | 主な用途 |
+L26 | --- | --- | --- |
+L27 | `exist` / `cand` | 現行ポートフォリオと検討中銘柄のティッカーリスト | スコア対象ユニバースの構成、候補整理 |
+L28 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
+L29 | `CAND_PRICE_MAX` | 候補銘柄の許容価格上限 | 高額銘柄の事前除外 |
+L30 | `N_G` / `N_D` | G/D採用枠の件数 | 最終的に選ぶ銘柄数の制約 |
+L31 | `g_weights` / `D_weights` | 各因子の重みdict | G/Dスコア合成 |
+L32 | `D_BETA_MAX` | Dバケットの許容β上限 | 高β銘柄の除外フィルタ |
+L33 | `FILTER_SPEC` | G/Dごとの前処理フィルタ | トレンドマスクやβ上限設定 |
+L34 | `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
+L35 | `DRRS_G` / `DRRS_D` | DRRSパラメータdict | バケット別の相関低減設定 |
+L36 | `DRRS_SHRINK` | 残差相関の対角シュリンク率 | `residual_corr`の安定化 |
+L37 | `CROSS_MU_GD` | G-D間クロス相関ペナルティμ | 2バケット同時最適化で相関抑制 |
+L38 | `RESULTS_DIR` | 選定結果保存ディレクトリ | `_save_sel`/`_load_prev`の入出力 |
+L39
+L40 選定結果は`results/`配下にJSONとして保存し、次回実行時に`_load_prev`で読み込んで選定条件に反映。
+L41
+L42 ## DTO/Config
+L43 各ステップ間で受け渡すデータ構造と設定値。変数の意味合いと利用箇所を以下に示す。
+L44
+L45 ### InputBundle（Input → Scorer）
+L46 | 変数 | 内容 | 主な用途 |
+L47 | --- | --- | --- |
+L48 | `cand` | 候補銘柄ティッカーのリスト | OUTテーブルや低スコアランキング対象の母集団 |
+L49 | `tickers` | 現行+候補を合わせたティッカー一覧 | 価格・出来高ダウンロード、リターン計算 |
+L50 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
+L51 | `data` | yfinanceのダウンロード結果（階層列） | `px`/`spx`/リターン等の基礎データ |
+L52 | `px` | `data['Close']`だけを抜き出した価格系列 | 指標計算・リターン生成 |
+L53 | `spx` | `data['Close'][bench]` のSeries | `rs`や`calc_beta`の基準指数 |
+L54 | `tickers_bulk` | `yf.Tickers`オブジェクト | `info`等の一括取得 |
+L55 | `info` | ティッカー別のyfinance情報dict | セクター判定やEPS補完 |
+L56 | `eps_df` | EPS TTM/直近EPS等をまとめた表 | 成長指標の算出 |
+L57 | `fcf_df` | CFO・CapEx・FCF TTMと情報源フラグ | FCF/EVや配当カバレッジ |
+L58 | `returns` | `px.pct_change()`のリターン表 | 相関行列・DRRS計算 |
+L59
+L60 ### FeatureBundle（Scorer → Selector）
+L61 | 変数 | 内容 | 主な用途 |
+L62 | --- | --- | --- |
+L63 | `df` | 計算済み指標の生値テーブル | デバッグ・出力表示 |
+L64 | `df_z` | ウィンザー後Zスコア化した指標表 | 因子スコア合成、選定基準 |
+L65 | `g_score` | Gバケット総合スコア | G選定、IN/OUT比較 |
+L66 | `d_score_all` | Dバケット総合スコア（全銘柄） | D選定、低スコアランキング |
+L67 | `missing_logs` | 欠損指標と補完状況のログ | データ品質チェック |
+L68
+L69 ### SelectionBundle（Selector → Output）
+L70 | 変数 | 内容 | 主な用途 |
+L71 | --- | --- | --- |
+L72 | `resG` | G選定結果の詳細dict（`tickers`、目的値等） | 結果保存・平均相関などの指標表示 |
+L73 | `resD` | D選定結果の詳細dict | 同上 |
+L74 | `top_G` | 最終採用Gティッカー | 新ポートフォリオ構築 |
+L75 | `top_D` | 最終採用Dティッカー | 同上 |
+L76 | `init_G` | DRRS前のG初期候補 | 惜しくも外れた銘柄表示 |
+L77 | `init_D` | DRRS前のD初期候補 | 同上 |
+L78
+L79 ### WeightsConfig
+L80 | 変数 | 内容 | 主な用途 |
+L81 | --- | --- | --- |
+L82 | `g` | G因子（GRW/MOM/VOL）の重みdict | `g_score`合成 |
 L83 | `d` | D因子（D_QAL/D_YLD/D_VOL_RAW/D_TRD）の重みdict | `d_score_all`合成 |
 L84
 L85 ### DRRSParams
@@ -124,54 +287,5 @@ L203       | REV_ANN_STREAK | - | 年次売上成長の連続年数 |
 L204       | REV_YOY_VAR | - | 年次売上成長率の変動性 |
 L205       | SIZE | - | 時価総額の対数値 |
 L206       | LIQ | - | 60日平均出来高ドルの対数値 |
-L207    - Gバケット: `GRW`、`MOM`、`VOL`を`cfg.weights.g`（0.40/0.45/-0.15）で加重し`g_score`を得る。
-L208    - Dバケット: `D_QAL`、`D_YLD`、`D_VOL_RAW`、`D_TRD`を`cfg.weights.d`（0.15/0.15/-0.45/0.25）で加重し`d_score_all`を算出。
-L209    - セクターcapによる`soft_cap_effective_scores`を適用し、G採用銘柄にはトレンドテンプレートフィルタを適用。
-L210 5. `_apply_growth_entry_flags`でブレイクアウト/押し目発火状況を付加し、`FeatureBundle`を返す。
-L211
-L212 ### Step3: Correlation Reduction & Selection (Selector)
-L213 DRRSアルゴリズムで相関を抑えた銘柄選定を行い、`SelectionBundle`を返す。`results/`に保存された前回選定（`G_selection.json` / `D_selection.json`）を`_load_prev`で読み込み、目的値が大きく悪化しない限り維持する。新しい採用集合は`_save_sel`でJSONに書き出し次回以降の入力に備える。
-L214 主なメソッド:
-L215 - `residual_corr` : 収益率行列をZスコア化し、上位主成分を除去した残差から相関行列を求め、平均相関に応じてシュリンク。
-L216 - `rrqr_like_det` : スコアを重み付けしたQR分解風の手順で初期候補をk件抽出し、スコアの高い非相関な集合を得る。
-L217 - `swap_local_det` / `swap_local_det_cross` : `sum(score) - λ*within_corr - μ*cross_corr`を目的関数として、入れ替え探索で局所的に最適化。
-L218 - `select_bucket_drrs` : プール銘柄とスコアから残差相関を計算し、上記2段階(初期選択→入れ替え)でk銘柄を決定。過去採用銘柄との比較で目的値が劣化しなければ維持する。
-L219 - `select_buckets` : Gバケットを選定後、その結果を除いた候補からDバケットを選ぶ。D選定時はGとの相関ペナルティμを付与し、両バケットの分散を制御する。
-L220
-L221 #### 相関低減ロジック詳細
-L222 1. **残差相関行列の構築 (`residual_corr`)**
-L223    - リターン行列`R`をZスコア化。
-L224    - SVDで上位`n_pc`主成分`F`を求め、最小二乗で係数`B`を算出し残差`E = Z - F@B`を得る。
-L225    - `E`の相関行列`C`を計算し、平均絶対相関に応じてシュリンク量`shrink_eff`を補正して対角を強調。
-L226 2. **初期候補の抽出 (`rrqr_like_det`)**
-L227    - スコアを0-1正規化した重み`w`とし、`Z*(1+γw)`で列ノルムを強調。
-L228    - 残差ノルム最大の列を逐次選び、QRライクなデフレーションを行って非相関かつ高スコアな`k`銘柄集合`S0`を得る。
-L229 3. **局所探索 (`swap_local_det` / `swap_local_det_cross`)**
-L230    - 目的関数`Σz_score − λ·within_corr − μ·cross_corr`を最大化。
-L231    - 選択集合の各銘柄を他候補と入れ替え、改善がなくなるまでまたは`max_pass`回まで探索。
-L232    - `swap_local_det_cross`はGバケットとのクロス相関行列`C_cross`を使用し、ペナルティ`μ`を付与。
-L233 4. **過去採用の維持とクロスペナルティ (`select_bucket_drrs` / `select_buckets`)**
-L234    - 局所探索結果`S`と過去集合`P`の目的値を比較し、`S`が`P`より`η`未満の改善なら`P`を維持。
-L235    - `select_buckets`ではGを先に決定し、D選定時にGとの相関ペナルティ`μ`を加えてクロス分散を抑制。
-L236
-L237 ### Step4: Output
-L238 選定結果を可視化し共有する工程。以下の内容をテーブル化して標準出力とSlackへ送る。
-L239 - 採用銘柄と惜しくも選外となった銘柄のスコア一覧
-L240 - IN/OUTリストとOUT銘柄のスコア（低得点銘柄を確認しやすく）
-L241 - 新旧ポートフォリオの比較表（組入れ・除外、スコア変化）
-L242 - 検討中銘柄の低スコアランキング
-L243
-L244 主なメソッド:
-L245 - `display_results` : 上記テーブルに加えパフォーマンス指標や分散化指標を表示。
-L246 - `notify_slack` : Slack Webhookへ同内容を送信。
-L247 - 補助:`_avg_offdiag`、`_resid_avg_rho`、`_raw_avg_rho`、`_cross_block_raw_rho`。
-L248
-L249 ## エントリポイント
-L250 1. `PipelineConfig`を構築。
-L251 2. **Step1** `Input.prepare_data`で`InputBundle`を生成。
-L252 3. **Step2** `Scorer.aggregate_scores`で`FeatureBundle`を取得。
-L253 4. **Step3** `Selector.select_buckets`で`SelectionBundle`を算出。
-L254 5. **Step4** `Output.display_results`と`notify_slack`で結果を出力。
-```
-
+L207    - Gバケット: `GRW`、`MOM`、`VOL`を`cfg.weights.g`（0.40/0.45/-0.15）で加重し
 ```

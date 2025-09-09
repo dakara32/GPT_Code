@@ -18,262 +18,274 @@ L7 ┗━━━━━━━━━━━━━━━━━━━━━━━━�
 L8 """
 L9 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
 L10 BONUS_COEFF = 0.4   # 攻め=0.3 / 中庸=0.4 / 守り=0.5
-L11 import yfinance as yf, pandas as pd, numpy as np, os, requests, time
-L12 from scipy.stats import zscore
-L13 from dataclasses import dataclass
-L14 from typing import Dict, List
-L15 from scorer import Scorer, ttm_div_yield_portfolio
-L16 from time import perf_counter
-L17
+L11 import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
+L12 from concurrent.futures import ThreadPoolExecutor
+L13 from scipy.stats import zscore
+L14 from dataclasses import dataclass
+L15 from typing import Dict, List
+L16 from scorer import Scorer, ttm_div_yield_portfolio
+L17 from time import perf_counter
 L18
-L19 class T:
-L20     t = perf_counter()
-L21
-L22     @staticmethod
-L23     def log(tag: str):
-L24         now = perf_counter()
-L25         print(f"[T] {tag}: {now - T.t:.2f}s")
-L26         T.t = now
-L27
+L19
+L20 class T:
+L21     t = perf_counter()
+L22
+L23     @staticmethod
+L24     def log(tag: str):
+L25         now = perf_counter()
+L26         print(f"[T] {tag}: {now - T.t:.2f}s")
+L27         T.t = now
 L28
-L29 T.log("start")
-L30
-L31 # ===== ユニバースと定数（冒頭に固定） =====
-L32 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
-L33 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
-L34 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
-L35 N_G, N_D = 12, 13  # G/D枠サイズ
-L36 g_weights = {'GRW':0.40,'MOM':0.45,'VOL':-0.15}
-L37 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
-L38 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
-L39 D_weights = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
-L40 def _fmt_w(w): return " ".join(f"{k}{int(v*100)}" for k,v in w.items())
-L41
-L42 # DRRS 初期プール・各種パラメータ
-L43 corrM = 45
-L44 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
-L45 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
-L46
-L47 # クロス相関ペナルティ（未定義なら設定）
-L48 try: CROSS_MU_GD
-L49 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
-L50
-L51 # 出力関連
-L52 RESULTS_DIR = "results"
-L53 os.makedirs(RESULTS_DIR, exist_ok=True)
-L54
-L55 # その他
-L56 debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
-L57
+L29
+L30 T.log("start")
+L31
+L32 # ===== ユニバースと定数（冒頭に固定） =====
+L33 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
+L34 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
+L35 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
+L36 N_G, N_D = 12, 13  # G/D枠サイズ
+L37 g_weights = {'GRW':0.40,'MOM':0.45,'VOL':-0.15}
+L38 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
+L39 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
+L40 D_weights = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
+L41 def _fmt_w(w): return " ".join(f"{k}{int(v*100)}" for k,v in w.items())
+L42
+L43 # DRRS 初期プール・各種パラメータ
+L44 corrM = 45
+L45 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
+L46 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
+L47
+L48 # クロス相関ペナルティ（未定義なら設定）
+L49 try: CROSS_MU_GD
+L50 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+L51
+L52 # 出力関連
+L53 RESULTS_DIR = "results"
+L54 os.makedirs(RESULTS_DIR, exist_ok=True)
+L55
+L56 # その他
+L57 debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
 L58
-L59 # ===== 共有DTO（クラス間I/O契約）＋ Config =====
-L60 @dataclass(frozen=True)
-L61 class InputBundle:
-L62     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
-L63     cand: List[str]
-L64     tickers: List[str]
-L65     bench: str
-L66     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
-L67     px: pd.DataFrame                # data['Close']
-L68     spx: pd.Series                  # data['Close'][bench]
-L69     tickers_bulk: object            # yfinance.Tickers
-L70     info: Dict[str, dict]           # yfinance info per ticker
-L71     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
-L72     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
-L73     returns: pd.DataFrame           # px[tickers].pct_change()
-L74
-L75 @dataclass(frozen=True)
-L76 class FeatureBundle:
-L77     df: pd.DataFrame
-L78     df_z: pd.DataFrame
-L79     g_score: pd.Series
-L80     d_score_all: pd.Series
-L81     missing_logs: pd.DataFrame
-L82
-L83 @dataclass(frozen=True)
-L84 class SelectionBundle:
-L85     resG: dict
-L86     resD: dict
-L87     top_G: List[str]
-L88     top_D: List[str]
-L89     init_G: List[str]
-L90     init_D: List[str]
-L91
-L92 @dataclass(frozen=True)
-L93 class WeightsConfig:
-L94     g: Dict[str,float]
-L95     d: Dict[str,float]
-L96
-L97 @dataclass(frozen=True)
-L98 class DRRSParams:
-L99     corrM: int
-L100     shrink: float
-L101     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
-L102     D: Dict[str,float]
-L103     cross_mu_gd: float
-L104
-L105 @dataclass(frozen=True)
-L106 class PipelineConfig:
-L107     weights: WeightsConfig
-L108     drrs: DRRSParams
-L109     price_max: float
-L110
+L59
+L60 # ===== 共有DTO（クラス間I/O契約）＋ Config =====
+L61 @dataclass(frozen=True)
+L62 class InputBundle:
+L63     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
+L64     cand: List[str]
+L65     tickers: List[str]
+L66     bench: str
+L67     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
+L68     px: pd.DataFrame                # data['Close']
+L69     spx: pd.Series                  # data['Close'][bench]
+L70     tickers_bulk: object            # yfinance.Tickers
+L71     info: Dict[str, dict]           # yfinance info per ticker
+L72     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
+L73     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
+L74     returns: pd.DataFrame           # px[tickers].pct_change()
+L75
+L76 @dataclass(frozen=True)
+L77 class FeatureBundle:
+L78     df: pd.DataFrame
+L79     df_z: pd.DataFrame
+L80     g_score: pd.Series
+L81     d_score_all: pd.Series
+L82     missing_logs: pd.DataFrame
+L83
+L84 @dataclass(frozen=True)
+L85 class SelectionBundle:
+L86     resG: dict
+L87     resD: dict
+L88     top_G: List[str]
+L89     top_D: List[str]
+L90     init_G: List[str]
+L91     init_D: List[str]
+L92
+L93 @dataclass(frozen=True)
+L94 class WeightsConfig:
+L95     g: Dict[str,float]
+L96     d: Dict[str,float]
+L97
+L98 @dataclass(frozen=True)
+L99 class DRRSParams:
+L100     corrM: int
+L101     shrink: float
+L102     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
+L103     D: Dict[str,float]
+L104     cross_mu_gd: float
+L105
+L106 @dataclass(frozen=True)
+L107 class PipelineConfig:
+L108     weights: WeightsConfig
+L109     drrs: DRRSParams
+L110     price_max: float
 L111
-L112 # ===== 共通ユーティリティ（複数クラスで使用） =====
-L113 # (unused local utils removed – use scorer.py versions if needed)
-L114
-L115 def _env_true(name: str, default=False):
-L116     v = os.getenv(name)
-L117     return default if v is None else v.strip().lower() == "true"
-L118
-L119 def _slack(message, code=False):
-L120     url = os.getenv("SLACK_WEBHOOK_URL")
-L121     if not url:
-L122         print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-L123     try:
-L124         requests.post(url, json={"text": f"```{message}```" if code else message}).raise_for_status()
-L125     except Exception as e:
-L126         print(f"⚠️ Slack通知エラー: {e}")
-L127
-L128 def _slack_debug(text: str, chunk=2800):
-L129     url=os.getenv("SLACK_WEBHOOK_URL")
-L130     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-L131     i=0
-L132     while i<len(text):
-L133         j=min(len(text), i+chunk); k=text.rfind("\n", i, j); j=k if k>i+100 else j
-L134         blk={"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}
-L135         try: requests.post(url, json={"blocks":[blk]}).raise_for_status()
-L136         except Exception as e: print(f"⚠️ Slack通知エラー: {e}")
-L137         i=j
-L138
-L139 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-L140     # ---- 列選択：既定は最小列、DEBUG_ALL_COLS=True で全列に ----
-L141     want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
-L142     all_cols = _env_true("DEBUG_ALL_COLS", False)
-L143     cols = list(fb.df_z.columns if all_cols else [c for c in want if c in fb.df_z.columns])
-L144
-L145     # ---- 差分（入替）----
-L146     Gp, Dp = set(prevG or []), set(prevD or [])
-L147     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
-L148     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
-L149
-L150     # ---- 次点10（フラグで有無切替）----
-L151     show_near = _env_true("DEBUG_NEAR5", True)
-L152     gs = getattr(fb,"g_score",None); ds = getattr(fb,"d_score_all",None)
-L153     gs = gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None
-L154     ds = ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None
-L155     g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
-L156     d_excl = set((sb.top_G or [])+(sb.top_D or []))
-L157     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
-L158
-L159     # ---- 行選択：既定は入替+採用+次点、DEBUG_ALL_ROWS=True で全銘柄 ----
-L160     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-L161     focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))
-L162     focus = focus[:max_rows]
-L163
-L164     # ---- ヘッダ（フィルター条件を明示）----
-L165     def _fmt_near(lbl, ser, lst):
-L166         if ser is None: return f"{lbl}: off"
-L167         parts=[]
-L168         for t in lst:
-L169             x=ser.get(t, float("nan"))
-L170             parts.append(f"{t}:{x:.3f}" if pd.notna(x) else f"{t}:nan")
-L171         return f"{lbl}: "+(", ".join(parts) if parts else "-")
-L172     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
-L173           _fmt_near("G near10", gs, g_miss),
-L174           _fmt_near("D near10", ds, d_miss),
-L175           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
-L176           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
-L177
-L178     # ---- テーブル ----
-L179     if fb.df_z.empty or not cols:
-L180         tbl="(df_z or columns not available)"
-L181     else:
-L182         idx=[t for t in focus if t in fb.df_z.index]
-L183         tbl=fb.df_z.loc[idx, cols].round(3).to_string(max_rows=None, max_cols=None)
-L184
-L185     # ---- 欠損ログ（フラグで有無切替）----
-L186     miss_txt=""
-L187     if _env_true("DEBUG_MISSING_LOGS", False):
-L188         miss=getattr(fb,"missing_logs",None)
-L189         if miss is not None and not miss.empty:
-L190             miss_txt="\nMissing data (head)\n"+miss.head(10).to_string(index=False)
-L191
-L192     return "\n".join(head+["\nChanged/Selected (+ Near Miss)", tbl])+miss_txt
-L193
-L194 def _disjoint_keepG(top_G, top_D, poolD):
-L195     """
-L196     Gに含まれる銘柄をDから除去し、DはpoolD（次点）で補充する。
-L197     - 引数:
-L198         top_G: List[str]  … G最終12銘柄
-L199         top_D: List[str]  … D最終13銘柄（重複を含む可能性あり）
-L200         poolD: List[str]  … D候補の順位リスト（top_Dを含む上位拡張）
-L201     - 戻り値: (top_G, top_D_disjoint)
-L202     - 挙動:
-L203         1) DにG重複があれば順に置換
-L204         2) 置換候補は poolD から、既使用(G∪D)を避けて前から採用
-L205         3) 補充分が尽きた場合は元の銘柄を残す（安全フォールバック）
-L206     """
-L207     used, D = set(top_G), list(top_D)
-L208     i = 0
-L209     for j, t in enumerate(D):
-L210         if t in used:
-L211             while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
-L212                 i += 1
-L213             if i < len(poolD):
-L214                 D[j] = poolD[i]; used.add(D[j]); i += 1
-L215     return top_G, D
-L216
+L112
+L113 # ===== 共通ユーティリティ（複数クラスで使用） =====
+L114 # (unused local utils removed – use scorer.py versions if needed)
+L115
+L116 def _env_true(name: str, default=False):
+L117     v = os.getenv(name)
+L118     return default if v is None else v.strip().lower() == "true"
+L119
+L120 def _slack(message, code=False):
+L121     url = os.getenv("SLACK_WEBHOOK_URL")
+L122     if not url:
+L123         print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+L124     try:
+L125         requests.post(url, json={"text": f"```{message}```" if code else message}).raise_for_status()
+L126     except Exception as e:
+L127         print(f"⚠️ Slack通知エラー: {e}")
+L128
+L129 def _slack_debug(text: str, chunk=2800):
+L130     url=os.getenv("SLACK_WEBHOOK_URL")
+L131     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+L132     i=0
+L133     while i<len(text):
+L134         j=min(len(text), i+chunk); k=text.rfind("\n", i, j); j=k if k>i+100 else j
+L135         blk={"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}
+L136         try: requests.post(url, json={"blocks":[blk]}).raise_for_status()
+L137         except Exception as e: print(f"⚠️ Slack通知エラー: {e}")
+L138         i=j
+L139
+L140 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
+L141     # ---- 列選択：既定は最小列、DEBUG_ALL_COLS=True で全列に ----
+L142     want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
+L143     all_cols = _env_true("DEBUG_ALL_COLS", False)
+L144     cols = list(fb.df_z.columns if all_cols else [c for c in want if c in fb.df_z.columns])
+L145
+L146     # ---- 差分（入替）----
+L147     Gp, Dp = set(prevG or []), set(prevD or [])
+L148     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
+L149     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
+L150
+L151     # ---- 次点10（フラグで有無切替）----
+L152     show_near = _env_true("DEBUG_NEAR5", True)
+L153     gs = getattr(fb,"g_score",None); ds = getattr(fb,"d_score_all",None)
+L154     gs = gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None
+L155     ds = ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None
+L156     g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
+L157     d_excl = set((sb.top_G or [])+(sb.top_D or []))
+L158     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
+L159
+L160     # ---- 行選択：既定は入替+採用+次点、DEBUG_ALL_ROWS=True で全銘柄 ----
+L161     all_rows = _env_true("DEBUG_ALL_ROWS", False)
+L162     focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))
+L163     focus = focus[:max_rows]
+L164
+L165     # ---- ヘッダ（フィルター条件を明示）----
+L166     def _fmt_near(lbl, ser, lst):
+L167         if ser is None: return f"{lbl}: off"
+L168         parts=[]
+L169         for t in lst:
+L170             x=ser.get(t, float("nan"))
+L171             parts.append(f"{t}:{x:.3f}" if pd.notna(x) else f"{t}:nan")
+L172         return f"{lbl}: "+(", ".join(parts) if parts else "-")
+L173     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
+L174           _fmt_near("G near10", gs, g_miss),
+L175           _fmt_near("D near10", ds, d_miss),
+L176           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
+L177           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
+L178
+L179     # ---- テーブル ----
+L180     if fb.df_z.empty or not cols:
+L181         tbl="(df_z or columns not available)"
+L182     else:
+L183         idx=[t for t in focus if t in fb.df_z.index]
+L184         tbl=fb.df_z.loc[idx, cols].round(3).to_string(max_rows=None, max_cols=None)
+L185
+L186     # ---- 欠損ログ（フラグで有無切替）----
+L187     miss_txt=""
+L188     if _env_true("DEBUG_MISSING_LOGS", False):
+L189         miss=getattr(fb,"missing_logs",None)
+L190         if miss is not None and not miss.empty:
+L191             miss_txt="\nMissing data (head)\n"+miss.head(10).to_string(index=False)
+L192
+L193     return "\n".join(head+["\nChanged/Selected (+ Near Miss)", tbl])+miss_txt
+L194
+L195 def _disjoint_keepG(top_G, top_D, poolD):
+L196     """
+L197     Gに含まれる銘柄をDから除去し、DはpoolD（次点）で補充する。
+L198     - 引数:
+L199         top_G: List[str]  … G最終12銘柄
+L200         top_D: List[str]  … D最終13銘柄（重複を含む可能性あり）
+L201         poolD: List[str]  … D候補の順位リスト（top_Dを含む上位拡張）
+L202     - 戻り値: (top_G, top_D_disjoint)
+L203     - 挙動:
+L204         1) DにG重複があれば順に置換
+L205         2) 置換候補は poolD から、既使用(G∪D)を避けて前から採用
+L206         3) 補充分が尽きた場合は元の銘柄を残す（安全フォールバック）
+L207     """
+L208     used, D = set(top_G), list(top_D)
+L209     i = 0
+L210     for j, t in enumerate(D):
+L211         if t in used:
+L212             while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
+L213                 i += 1
+L214             if i < len(poolD):
+L215                 D[j] = poolD[i]; used.add(D[j]); i += 1
+L216     return top_G, D
 L217
-L218 # ===== Input：外部I/Oと前処理（CSV/API・欠損補完） =====
-L219 class Input:
-L220     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
-L221         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
-L222         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
-L223
-L224     # ---- （Input専用）EPS補完・FCF算出系 ----
-L225     @staticmethod
-L226     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
-L227         out_col = out_col or ttm_col; df = df.copy(); df["eps_imputed"] = False
-L228         cand = df[q_col]*4; ok = df[ttm_col].isna() & cand.replace([np.inf,-np.inf], np.nan).notna()
-L229         df.loc[ok, out_col], df.loc[ok,"eps_imputed"] = cand[ok], True; return df
-L230
-L231     _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"], "capex":["Capital Expenditure","Capital Expenditures"]}
-L232
-L233     @staticmethod
-L234     def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series|None:
-L235         if df is None or df.empty: return None
-L236         idx_lower = {str(i).lower(): i for i in df.index}
-L237         for name in names:
-L238             key = name.lower()
-L239             if key in idx_lower: return df.loc[idx_lower[key]]
-L240         return None
-L241
-L242     @staticmethod
-L243     def _sum_last_n(s: pd.Series|None, n: int) -> float|None:
-L244         if s is None or s.empty: return None
-L245         vals = s.dropna().astype(float); return None if vals.empty else vals.iloc[:n].sum()
-L246
-L247     @staticmethod
-L248     def _latest(s: pd.Series|None) -> float|None:
-L249         if s is None or s.empty: return None
-L250         vals = s.dropna().astype(float); return vals.iloc[0] if not vals.empty else None
-L251
-L252     def fetch_cfo_capex_ttm_yf(self, tickers: list[str]) -> pd.DataFrame:
-L253         from concurrent.futures import ThreadPoolExecutor, as_completed
-L254         pick, sumn, latest, aliases = self._pick_row, self._sum_last_n, self._latest, self._CF_ALIASES
-L255
-L256         def one(t: str):
-L257             try:
-L258                 tk = yf.Ticker(t)  # ★ セッションは渡さない（YFがcurl_cffiで管理）
-L259                 qcf = tk.quarterly_cashflow
-L260                 cfo_q, capex_q = pick(qcf, aliases["cfo"]), pick(qcf, aliases["capex"])
-L261                 fcf_q = pick(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
-L262                 cfo, capex, fcf = sumn(cfo_q,4), sumn(capex_q,4), sumn(fcf_q,4)
-L263                 if any(v is None for v in (cfo, capex, fcf)):
-L264                     acf = tk.cashflow
-L265                     if cfo   is None: cfo   = latest(pick(acf, aliases["cfo"]))
-L266                     if capex is None: capex = latest(pick(acf, aliases["capex"]))
-L267                     if fcf   is None: fcf   = latest(pick(acf, ["Free Cash Flow","FreeCashFlow","Free cash flow"]))
-L268             ex
+L218 # --- Breadth mode state I/O（mode のみ永続） ---
+L219 def _state_path():
+L220     return os.path.join(RESULTS_DIR, "breadth_state.json")
+L221
+L222 def load_mode(default: str="NORMAL") -> str:
+L223     try:
+L224         with open(_state_path(), "r") as f:
+L225             m = json.loads(f.read()).get("mode", default)
+L226             return m if m in ("EMERG","CAUTION","NORMAL") else default
+L227     except Exception:
+L228         return default
+L229
+L230 def save_mode(mode: str):
+L231     try:
+L232         with open(_state_path(), "w") as f:
+L233             f.write(json.dumps({"mode": mode}))
+L234     except Exception:
+L235         pass
+L236
+L237 # --- Breadth→自動しきい値→ヒステリシス→Slack先頭行を作成 ---
+L238 def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
+L239     """
+L240     返り値: (lead_lines, mode)
+L241     - lead_lines: Slack冒頭3行
+L242     - mode: "EMERG" / "CAUTION" / "NORMAL"
+L243     例外は上位で握る（既存出力は継続）
+L244     """
+L245     win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
+L246     C_ts = Scorer.trend_template_breadth_series(inb.px[inb.tickers], inb.spx, win_days=win)
+L247     if C_ts.empty:
+L248         raise RuntimeError("breadth series empty")
+L249     C_full = int(C_ts.iloc[-1])
+L250     q05 = int(np.nan_to_num(C_ts.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
+L251     q20 = int(np.nan_to_num(C_ts.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
+L252     q60 = int(np.nan_to_num(C_ts.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
+L253     # 運用“床”（N_G, 1.5*N_G, 3*N_G）とのmax
+L254     th_in_rec   = max(N_G, q05)
+L255     th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
+L256     th_norm_rec = max(3*N_G, q60)
+L257     # 採用（自動 or 手動）
+L258     use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
+L259     if use_calib:
+L260         th_in, th_out, th_norm, th_src = th_in_rec, th_out_rec, th_norm_rec, "自動"
+L261     else:
+L262         th_in   = int(os.getenv("GTT_EMERG_IN",    str(N_G)))
+L263         th_out  = int(os.getenv("GTT_EMERG_OUT",   str(int(1.5*N_G))))
+L264         th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3*N_G)))
+L265         th_src  = "手動"
+L266     # ヒステリシス
+L267     prev = load_mode("NORMAL")
+L268     if prev == "EMERG":
+L269         mode = "EMERG" if (C_full < th_out) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+L270     elif prev == "CAUTION":
+L271         mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
+L272     else:
+L273         mode = "EMERG" if (C_full < th_in) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+L274     save_mode(mode)
+L275     _MODE_JA = {"EMERG":"緊急", "CAUTION":"警戒", "NORMAL":"通常"}
+L276     mode_ja = _MODE_JA.get(mode, mode)
+L277     lead_lines = [
+L278         f"テンプレ合格本数: {C_full}本 → モード {mode_ja}",
+L279         f"現在のしきい値（{th_src}）: 緊急入り<{th_in}本 / 解除≥{th_out}本 / 通常復帰≥{th_norm}本",
+L280         f"参考指標（過去~{w
 ```
