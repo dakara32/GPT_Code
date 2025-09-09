@@ -929,27 +929,20 @@ def run_pipeline() -> SelectionBundle:
     except Exception:
         fire_recent = []
 
-    # --- Breadth行を並列で先行計算（InputBundleのみ依存） ---
-    breadth_fut = None
+    # === 先頭ヘッダ（モード・しきい値・分位）をテキストブロック化して差し込み ===
     try:
-        ex = ThreadPoolExecutor(max_workers=2)
-        breadth_fut = ex.submit(_build_breadth_lead_lines, inb)
+        lead_lines, _mode = _build_breadth_lead_lines(inb)  # 既存の関数（以前の改修で追加済み）
+        head_block = "```" + "\n".join(lead_lines) + "```"
     except Exception:
-        breadth_fut = None
+        head_block = ""  # フェイルセーフ（ヘッダなしでも後続は継続）
 
     lines = [
+        head_block,
         "【G枠レポート｜週次モニタ（直近5営業日）】",
         "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
         f"選定12: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else "選定12: なし",
         f"次点10: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点10: なし",
     ]
-    # --- 並列結果をここで合流（失敗しても既存の出力は継続） ---
-    if breadth_fut is not None:
-        try:
-            lead_lines, _mode = breadth_fut.result()
-            lines = lead_lines + lines
-        except Exception as _e:
-            lines = [f"Breadth計算エラー: {_e}"] + lines
 
     if fire_recent:
         fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
@@ -960,7 +953,8 @@ def run_pipeline() -> SelectionBundle:
     try:
         webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
         if webhook:
-            requests.post(webhook, json={"text": "\n".join(lines)}, timeout=10)
+            # 先頭の head_block を含む複数行をそのまま送信（Slack側で```がコードブロックとして描画）
+            requests.post(webhook, json={"text": "\n".join([s for s in lines if s != ""] )}, timeout=10)
     except Exception:
         pass
 
