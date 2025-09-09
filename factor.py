@@ -238,7 +238,7 @@ def save_mode(mode: str):
 def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
     """
     返り値: (lead_lines, mode)
-    - lead_lines: Slack冒頭3行
+    - lead_lines: Slack冒頭に差し込む複数行テキスト（モード強調＋改行フォーマット）
     - mode: "EMERG" / "CAUTION" / "NORMAL"
     例外は上位で握る（既存出力は継続）
     """
@@ -276,12 +276,21 @@ def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
         mode = "EMERG" if (C_full < th_in) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
     save_mode(mode)
     _MODE_JA = {"EMERG":"緊急", "CAUTION":"警戒", "NORMAL":"通常"}
+    _MODE_EMOJI = {"EMERG":"🚨", "CAUTION":"⚠️", "NORMAL":"🟢"}
     mode_ja = _MODE_JA.get(mode, mode)
+    emoji = _MODE_EMOJI.get(mode, "ℹ️")
     eff_days = len(base)
     lead_lines = [
-        f"テンプレ合格本数: {C_full}本 → モード {mode_ja}",
-        f"現在のしきい値（{th_src}）: 緊急入り<{th_in}本 / 解除≥{th_out}本 / 通常復帰≥{th_norm}本",
-        f"参考指標（過去~{win}営業日, 有効={eff_days}日）: 下位5%={q05}本 / 下位20%={q20}本 / 60%分位={q60}本",
+        f"{emoji} *現在モード: {mode_ja}*",
+        f"テンプレ合格本数: *{C_full}本*",
+        f"しきい値（{th_src}）",
+        f"  ・緊急入り: <{th_in}本",
+        f"  ・緊急解除: ≥{th_out}本",
+        f"  ・通常復帰: ≥{th_norm}本",
+        f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
+        f"  ・下位5%: {q05}本",
+        f"  ・下位20%: {q20}本",
+        f"  ・60%分位: {q60}本",
     ]
     return lead_lines, mode
 
