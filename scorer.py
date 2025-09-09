@@ -59,14 +59,7 @@ def _ttm_div_sum(t, lookback_days=400):
         return 0.0
 
 def ttm_div_yield_portfolio(tickers, price_map=None):
-    ys = []
-    for t in tickers:
-        c = _last_close(t, price_map)
-        if not np.isfinite(c) or c <= 0:
-            ys.append(0.0)
-            continue
-        s = _ttm_div_sum(t)
-        ys.append(s / c if s > 0 else 0.0)
+    ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
     return float(np.mean(ys)) if ys else 0.0
 
 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
@@ -104,23 +97,13 @@ class Scorer:
     # === スキーマ簡易チェック（最低限） ===
     @staticmethod
     def _validate_ib_for_scorer(ib: Any):
-        must_attrs = ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"]
-        miss = [a for a in must_attrs if not hasattr(ib, a) or getattr(ib, a) is None]
+        miss = [a for a in ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"] if not hasattr(ib,a) or getattr(ib,a) is None]
         if miss: raise ValueError(f"InputBundle is missing required attributes for Scorer: {miss}")
-
-        # 後方互換のため、まず rename を試みる
-        if any(c in ib.eps_df.columns for c in Scorer.EPS_RENAME.keys()):
-            ib.eps_df.rename(columns=Scorer.EPS_RENAME, inplace=True)
-        if any(c in ib.fcf_df.columns for c in Scorer.FCF_RENAME.keys()):
-            ib.fcf_df.rename(columns=Scorer.FCF_RENAME, inplace=True)
-
-        # 必須列の存在確認
-        need_eps = {"EPS_TTM","EPS_Q_LastQ"}
-        need_fcf = {"FCF_TTM"}
-        if not need_eps.issubset(set(ib.eps_df.columns)):
-            raise ValueError(f"eps_df must contain columns {need_eps} (accepts old names via auto-rename). Got: {list(ib.eps_df.columns)}")
-        if not need_fcf.issubset(set(ib.fcf_df.columns)):
-            raise ValueError(f"fcf_df must contain columns {need_fcf} (accepts old names via auto-rename). Got: {list(ib.fcf_df.columns)}")
+        if any(c in ib.eps_df.columns for c in Scorer.EPS_RENAME): ib.eps_df.rename(columns=Scorer.EPS_RENAME, inplace=True)
+        if any(c in ib.fcf_df.columns for c in Scorer.FCF_RENAME): ib.fcf_df.rename(columns=Scorer.FCF_RENAME, inplace=True)
+        need_eps, need_fcf = {"EPS_TTM","EPS_Q_LastQ"},{"FCF_TTM"}
+        if not need_eps.issubset(ib.eps_df.columns): raise ValueError(f"eps_df must contain columns {need_eps} (accepts old names via auto-rename). Got: {list(ib.eps_df.columns)}")
+        if not need_fcf.issubset(ib.fcf_df.columns): raise ValueError(f"fcf_df must contain columns {need_fcf} (accepts old names via auto-rename). Got: {list(ib.fcf_df.columns)}")
 
     # ----（Scorer専用）テクニカル・指標系 ----
     @staticmethod
@@ -185,7 +168,7 @@ class Scorer:
         except Exception: return "unknown"
         try:
             a = t.actions
-            if a is not None and not a.empty and "Stock Splits" in a.columns and a["Stock Splits"].abs().sum()>0: return "none_confident"
+            if (a is not None and not a.empty and "Stock Splits" in a.columns and a["Stock Splits"].abs().sum()>0): return "none_confident"
         except Exception: pass
         try:
             fi = t.fast_info

@@ -8,23 +8,21 @@
 """
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
 BONUS_COEFF = 0.4   # 攻め=0.3 / 中庸=0.4 / 守り=0.5
-import yfinance as yf, pandas as pd, numpy as np, os, requests, time, json
-from concurrent.futures import ThreadPoolExecutor
-from scipy.stats import zscore
+import os, json, time, requests
+from time import perf_counter
 from dataclasses import dataclass
 from typing import Dict, List
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from scipy.stats import zscore  # used via scorer
 from scorer import Scorer, ttm_div_yield_portfolio
-from time import perf_counter
 
 
 class T:
     t = perf_counter()
-
-    @staticmethod
-    def log(tag: str):
-        now = perf_counter()
-        print(f"[T] {tag}: {now - T.t:.2f}s")
-        T.t = now
+    log = staticmethod(lambda tag: (lambda now=perf_counter(): (print(f"[T] {tag}: {now - T.t:.2f}s"), setattr(T, "t", now))[-1])())
 
 
 T.log("start")
@@ -115,40 +113,36 @@ class PipelineConfig:
 
 def _env_true(name: str, default=False):
     v = os.getenv(name)
-    return default if v is None else v.strip().lower() == "true"
+    return (v or str(default)).strip().lower() == "true"
 
-def _slack(message, code=False):
+def _post_slack(payload: dict):
     url = os.getenv("SLACK_WEBHOOK_URL")
-    if not url:
+    if not url: 
         print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
     try:
-        requests.post(url, json={"text": f"```{message}```" if code else message}).raise_for_status()
+        requests.post(url, json=payload).raise_for_status()
     except Exception as e:
         print(f"⚠️ Slack通知エラー: {e}")
 
+def _slack(message, code=False):
+    _post_slack({"text": f"```{message}```" if code else message})
+
 def _slack_debug(text: str, chunk=2800):
-    url=os.getenv("SLACK_WEBHOOK_URL")
-    if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-    i=0
-    while i<len(text):
-        j=min(len(text), i+chunk); k=text.rfind("\n", i, j); j=k if k>i+100 else j
-        blk={"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}
-        try: requests.post(url, json={"blocks":[blk]}).raise_for_status()
-        except Exception as e: print(f"⚠️ Slack通知エラー: {e}")
-        i=j
+    i = 0
+    while i < len(text):
+        j = min(len(text), i+chunk); k = text.rfind("\n", i, j); j = k if k > i+100 else j
+        _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}]})
+        i = j
 
 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-    # ---- 列選択：既定は最小列、DEBUG_ALL_COLS=True で全列に ----
     want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
     all_cols = _env_true("DEBUG_ALL_COLS", False)
     cols = list(fb.df_z.columns if all_cols else [c for c in want if c in fb.df_z.columns])
 
-    # ---- 差分（入替）----
     Gp, Dp = set(prevG or []), set(prevD or [])
     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
 
-    # ---- 次点10（フラグで有無切替）----
     show_near = _env_true("DEBUG_NEAR5", True)
     gs = getattr(fb,"g_score",None); ds = getattr(fb,"d_score_all",None)
     gs = gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None
@@ -157,33 +151,25 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     d_excl = set((sb.top_G or [])+(sb.top_D or []))
     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
 
-    # ---- 行選択：既定は入替+採用+次点、DEBUG_ALL_ROWS=True で全銘柄 ----
     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-    focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))
-    focus = focus[:max_rows]
+    focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))[:max_rows]
 
-    # ---- ヘッダ（フィルター条件を明示）----
     def _fmt_near(lbl, ser, lst):
         if ser is None: return f"{lbl}: off"
-        parts=[]
-        for t in lst:
-            x=ser.get(t, float("nan"))
-            parts.append(f"{t}:{x:.3f}" if pd.notna(x) else f"{t}:nan")
+        parts=[f"{t}:{ser.get(t,float('nan')):.3f}" if pd.notna(ser.get(t)) else f"{t}:nan" for t in lst]
         return f"{lbl}: "+(", ".join(parts) if parts else "-")
+
     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
           _fmt_near("G near10", gs, g_miss),
           _fmt_near("D near10", ds, d_miss),
           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
 
-    # ---- テーブル ----
-    if fb.df_z.empty or not cols:
-        tbl="(df_z or columns not available)"
-    else:
+    tbl="(df_z or columns not available)"
+    if not fb.df_z.empty and cols:
         idx=[t for t in focus if t in fb.df_z.index]
         tbl=fb.df_z.loc[idx, cols].round(3).to_string(max_rows=None, max_cols=None)
 
-    # ---- 欠損ログ（フラグで有無切替）----
     miss_txt=""
     if _env_true("DEBUG_MISSING_LOGS", False):
         miss=getattr(fb,"missing_logs",None)
@@ -193,104 +179,55 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     return "\n".join(head+["\nChanged/Selected (+ Near Miss)", tbl])+miss_txt
 
 def _disjoint_keepG(top_G, top_D, poolD):
-    """
-    Gに含まれる銘柄をDから除去し、DはpoolD（次点）で補充する。
-    - 引数:
-        top_G: List[str]  … G最終12銘柄
-        top_D: List[str]  … D最終13銘柄（重複を含む可能性あり）
-        poolD: List[str]  … D候補の順位リスト（top_Dを含む上位拡張）
-    - 戻り値: (top_G, top_D_disjoint)
-    - 挙動:
-        1) DにG重複があれば順に置換
-        2) 置換候補は poolD から、既使用(G∪D)を避けて前から採用
-        3) 補充分が尽きた場合は元の銘柄を残す（安全フォールバック）
-    """
-    used, D = set(top_G), list(top_D)
-    i = 0
+    used, D, i = set(top_G), list(top_D), 0
     for j, t in enumerate(D):
         if t in used:
-            while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
-                i += 1
-            if i < len(poolD):
-                D[j] = poolD[i]; used.add(D[j]); i += 1
+            while i < len(poolD) and (poolD[i] in used or poolD[i] in D): i += 1
+            if i < len(poolD): D[j] = poolD[i]; used.add(D[j]); i += 1
     return top_G, D
 
 # --- Breadth mode state I/O（mode のみ永続） ---
-def _state_path():
-    return os.path.join(RESULTS_DIR, "breadth_state.json")
-
+_state_file = lambda: os.path.join(RESULTS_DIR, "breadth_state.json")
 def load_mode(default: str="NORMAL") -> str:
     try:
-        with open(_state_path(), "r") as f:
-            m = json.loads(f.read()).get("mode", default)
-            return m if m in ("EMERG","CAUTION","NORMAL") else default
-    except Exception:
-        return default
-
+        m = json.loads(open(_state_file()).read()).get("mode", default)
+        return m if m in ("EMERG","CAUTION","NORMAL") else default
+    except Exception: return default
 def save_mode(mode: str):
-    try:
-        with open(_state_path(), "w") as f:
-            f.write(json.dumps({"mode": mode}))
-    except Exception:
-        pass
+    try: open(_state_file(),"w").write(json.dumps({"mode": mode}))
+    except Exception: pass
 
 # --- Breadth→自動しきい値→ヒステリシス→Slack先頭行を作成 ---
 def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
-    """
-    返り値: (lead_lines, mode)
-    - lead_lines: Slack冒頭に差し込む複数行テキスト（モード強調＋改行フォーマット）
-    - mode: "EMERG" / "CAUTION" / "NORMAL"
-    例外は上位で握る（既存出力は継続）
-    """
     win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
     C_ts = Scorer.trend_template_breadth_series(inb.px[inb.tickers], inb.spx, win_days=win)
-    if C_ts.empty:
-        raise RuntimeError("breadth series empty")
-    # ★ 分位点は“ウォームアップ除外後”の期間のみで計算（序盤の未成熟日を排除）
+    if C_ts.empty: raise RuntimeError("breadth series empty")
     warmup = int(os.getenv("BREADTH_WARMUP_DAYS", "252"))
     base = C_ts.iloc[warmup:] if len(C_ts) > warmup else C_ts
     C_full = int(C_ts.iloc[-1])
     q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
     q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
-    # 運用“床”（N_G, 1.5*N_G, 3*N_G）とのmax
-    th_in_rec   = max(N_G, q05)
-    th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
-    th_norm_rec = max(3*N_G, q60)
-    # 採用（自動 or 手動）
+    th_in_rec, th_out_rec, th_norm_rec = max(N_G, q05), max(int(np.ceil(1.5*N_G)), q20), max(3*N_G, q60)
     use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
-    if use_calib:
-        th_in, th_out, th_norm, th_src = th_in_rec, th_out_rec, th_norm_rec, "自動"
-    else:
-        th_in   = int(os.getenv("GTT_EMERG_IN",    str(N_G)))
-        th_out  = int(os.getenv("GTT_EMERG_OUT",   str(int(1.5*N_G))))
-        th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3*N_G)))
-        th_src  = "手動"
-    # ヒステリシス
+    th_in, th_out, th_norm, th_src = (th_in_rec, th_out_rec, th_norm_rec, "自動") if use_calib else (
+        int(os.getenv("GTT_EMERG_IN",    str(N_G))),
+        int(os.getenv("GTT_EMERG_OUT",   str(int(1.5*N_G)))),
+        int(os.getenv("GTT_CAUTION_OUT", str(3*N_G))),
+        "手動"
+    )
     prev = load_mode("NORMAL")
-    if prev == "EMERG":
-        mode = "EMERG" if (C_full < th_out) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-    elif prev == "CAUTION":
-        mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
-    else:
-        mode = "EMERG" if (C_full < th_in) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+    if   prev == "EMERG":  mode = "EMERG" if (C_full < th_out) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+    elif prev == "CAUTION": mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
+    else:                   mode = "EMERG" if (C_full < th_in) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
     save_mode(mode)
-    _MODE_JA = {"EMERG":"緊急", "CAUTION":"警戒", "NORMAL":"通常"}
-    _MODE_EMOJI = {"EMERG":"🚨", "CAUTION":"⚠️", "NORMAL":"🟢"}
-    mode_ja = _MODE_JA.get(mode, mode)
-    emoji = _MODE_EMOJI.get(mode, "ℹ️")
-    eff_days = len(base)
+    _MODE_JA = {"EMERG":"緊急", "CAUTION":"警戒", "NORMAL":"通常"}; _MODE_EMOJI = {"EMERG":"🚨", "CAUTION":"⚠️", "NORMAL":"🟢"}
+    mode_ja, emoji, eff_days = _MODE_JA.get(mode, mode), _MODE_EMOJI.get(mode, "ℹ️"), len(base)
     lead_lines = [
-        f"{emoji} *現在モード: {mode_ja}*",
-        f"テンプレ合格本数: *{C_full}本*",
-        f"しきい値（{th_src}）",
-        f"  ・緊急入り: <{th_in}本",
-        f"  ・緊急解除: ≥{th_out}本",
-        f"  ・通常復帰: ≥{th_norm}本",
+        f"{emoji} *現在モード: {mode_ja}*", f"テンプレ合格本数: *{C_full}本*", "しきい値（{0}）".format(th_src),
+        f"  ・緊急入り: <{th_in}本", f"  ・緊急解除: ≥{th_out}本", f"  ・通常復帰: ≥{th_norm}本",
         f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
-        f"  ・下位5%: {q05}本",
-        f"  ・下位20%: {q20}本",
-        f"  ・60%分位: {q60}本",
+        f"  ・下位5%: {q05}本", f"  ・下位20%: {q20}本", f"  ・60%分位: {q60}本",
     ]
     return lead_lines, mode
 
