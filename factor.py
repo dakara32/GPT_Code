@@ -246,10 +246,13 @@ def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
     C_ts = Scorer.trend_template_breadth_series(inb.px[inb.tickers], inb.spx, win_days=win)
     if C_ts.empty:
         raise RuntimeError("breadth series empty")
+    # ★ 分位点は“ウォームアップ除外後”の期間のみで計算（序盤の未成熟日を排除）
+    warmup = int(os.getenv("BREADTH_WARMUP_DAYS", "252"))
+    base = C_ts.iloc[warmup:] if len(C_ts) > warmup else C_ts
     C_full = int(C_ts.iloc[-1])
-    q05 = int(np.nan_to_num(C_ts.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
-    q20 = int(np.nan_to_num(C_ts.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
-    q60 = int(np.nan_to_num(C_ts.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
+    q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
+    q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
+    q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
     # 運用“床”（N_G, 1.5*N_G, 3*N_G）とのmax
     th_in_rec   = max(N_G, q05)
     th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
@@ -274,10 +277,11 @@ def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
     save_mode(mode)
     _MODE_JA = {"EMERG":"緊急", "CAUTION":"警戒", "NORMAL":"通常"}
     mode_ja = _MODE_JA.get(mode, mode)
+    eff_days = len(base)
     lead_lines = [
         f"テンプレ合格本数: {C_full}本 → モード {mode_ja}",
         f"現在のしきい値（{th_src}）: 緊急入り<{th_in}本 / 解除≥{th_out}本 / 通常復帰≥{th_norm}本",
-        f"参考指標（過去~{win}営業日）: 下位5%={q05}本 / 下位20%={q20}本 / 60%分位={q60}本",
+        f"参考指標（過去~{win}営業日, 有効={eff_days}日）: 下位5%={q05}本 / 下位20%={q20}本 / 60%分位={q60}本",
     ]
     return lead_lines, mode
 
