@@ -270,6 +270,51 @@ class Scorer:
                 break
         return pick
 
+    @staticmethod
+    def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
+        """
+        各営業日の trend_template 合格本数（合格“本数”=C）を返す。
+        - px: 列=ticker（ベンチは含めない）
+        - spx: ベンチマーク Series（px.index に整列）
+        - win_days: 末尾の計算対象営業日数（None→全体、既定600は呼び出し側指定）
+        ベクトル化＆rollingのみで軽量。欠損は False 扱い。
+        """
+        import numpy as np, pandas as pd
+        if px is None or px.empty:
+            return pd.Series(dtype=int)
+        px = px.dropna(how="all", axis=1)
+        if win_days and win_days > 0:
+            px = px.tail(win_days)
+        if px.empty:
+            return pd.Series(dtype=int)
+        spx = spx.reindex(px.index).ffill()
+
+        ma50  = px.rolling(50).mean()
+        ma150 = px.rolling(150).mean()
+        ma200 = px.rolling(200).mean()
+
+        tt = (px > ma150)
+        tt &= (px > ma200)
+        tt &= (ma150 > ma200)
+        tt &= (ma200 - ma200.shift(21) > 0)
+        tt &= (ma50  > ma150)
+        tt &= (ma50  > ma200)
+        tt &= (px    > ma50)
+
+        lo252 = px.rolling(252).min()
+        hi252 = px.rolling(252).max()
+        tt &= (px.divide(lo252).sub(1.0) >= 0.30)   # P_OVER_LOW52 >= 0.30
+        tt &= (px >= (0.75 * hi252))                # NEAR_52W_HIGH >= -0.25
+
+        r12  = px.divide(px.shift(252)).sub(1.0)
+        br12 = spx.divide(spx.shift(252)).sub(1.0)
+        r1   = px.divide(px.shift(22)).sub(1.0)
+        br1  = spx.divide(spx.shift(22)).sub(1.0)
+        rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
+        tt &= (rs >= 0.10)
+
+        return tt.fillna(False).sum(axis=1).astype(int)
+
     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
     def aggregate_scores(self, ib: Any, cfg):
         if cfg is None:
