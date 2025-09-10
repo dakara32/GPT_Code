@@ -7,6 +7,160 @@ import json
 import time
 from pathlib import Path
 
+# --- breadth utilities (factor parity) ---
+BENCH = "^GSPC"
+CAND_PRICE_MAX = 450.0
+RESULTS_DIR = "results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+
+def _state_file():
+    return str(Path(RESULTS_DIR) / "breadth_state.json")
+
+
+def load_mode(default="NORMAL"):
+    try:
+        m = json.loads(open(_state_file()).read()).get("mode", default)
+        return m if m in ("EMERG","CAUTION","NORMAL") else default
+    except Exception:
+        return default
+
+
+def save_mode(mode: str):
+    try:
+        open(_state_file(),"w").write(json.dumps({"mode": mode}))
+    except Exception:
+        pass
+
+
+def _read_csv_list(fname):
+    p = Path(__file__).with_name(fname)
+    if not p.exists(): return []
+    return pd.read_csv(p, header=None).iloc[:,0].astype(str).str.upper().tolist()
+
+
+def _load_universe():
+    # exist + candidate を使用。candidate は価格上限で事前フィルタ
+    exist = _read_csv_list("current_tickers.csv")
+    cand  = _read_csv_list("candidate_tickers.csv")
+    cand_info = yf.Tickers(" ".join(cand)) if cand else None
+    cand_keep = []
+    for t in cand:
+        try:
+            px = cand_info.tickers[t].fast_info.get("lastPrice", float("inf"))
+        except Exception:
+            px = float("inf")
+        if pd.notna(px) and float(px) <= CAND_PRICE_MAX:
+            cand_keep.append(t)
+    tickers = sorted(set(exist + cand_keep))
+    return exist, cand_keep, tickers
+
+
+def _fetch_prices_600d(tickers):
+    data = yf.download(tickers + [BENCH], period="600d", auto_adjust=True, progress=False)
+    px   = data["Close"].dropna(how="all", axis=1)
+    spx  = data["Close"][BENCH].dropna()
+    return px, spx
+
+
+def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
+    # scorer.py の実装をそのまま移植（ベクトル化版）
+    import numpy as np, pandas as pd
+    if px is None or px.empty:
+        return pd.Series(dtype=int)
+    px = px.dropna(how="all", axis=1)
+    if win_days and win_days > 0:
+        px = px.tail(win_days)
+    if px.empty:
+        return pd.Series(dtype=int)
+    spx = spx.reindex(px.index).ffill()
+
+    ma50  = px.rolling(50).mean()
+    ma150 = px.rolling(150).mean()
+    ma200 = px.rolling(200).mean()
+
+    tt = (px > ma150)
+    tt &= (px > ma200)
+    tt &= (ma150 > ma200)
+    tt &= (ma200 - ma200.shift(21) > 0)
+    tt &= (ma50  > ma150)
+    tt &= (ma50  > ma200)
+    tt &= (px    > ma50)
+
+    lo252 = px.rolling(252).min()
+    hi252 = px.rolling(252).max()
+    tt &= (px.divide(lo252).sub(1.0) >= 0.30)
+    tt &= (px >= (0.75 * hi252))
+
+    r12  = px.divide(px.shift(252)).sub(1.0)
+    br12 = spx.divide(spx.shift(252)).sub(1.0)
+    r1   = px.divide(px.shift(22)).sub(1.0)
+    br1  = spx.divide(spx.shift(22)).sub(1.0)
+    rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
+    tt &= (rs >= 0.10)
+
+    return tt.fillna(False).sum(axis=1).astype(int)
+
+
+def build_breadth_header():
+    # factor._build_breadth_lead_lines と同一挙動
+    exist, cand, tickers = _load_universe()
+    if not tickers:
+        return "", "NORMAL", 0
+    px, spx = _fetch_prices_600d(tickers)
+    win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
+    C_ts = trend_template_breadth_series(px, spx, win_days=win)
+    if C_ts.empty:
+        return "", "NORMAL", 0
+    warmup = int(os.getenv("BREADTH_WARMUP_DAYS","252"))
+    base = C_ts.iloc[warmup:] if len(C_ts)>warmup else C_ts
+    C_full = int(C_ts.iloc[-1])
+
+    q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
+    q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
+    q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
+
+    N_G = 12
+    th_in_rec   = max(N_G, q05)
+    th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
+    th_norm_rec = max(3*N_G, q60)
+
+    use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
+    if use_calib:
+        th_in, th_out, th_norm, th_src = th_in_rec, th_out_rec, th_norm_rec, "自動"
+    else:
+        th_in   = int(os.getenv("GTT_EMERG_IN", str(N_G)))
+        th_out  = int(os.getenv("GTT_EMERG_OUT", str(int(1.5*N_G))))
+        th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3*N_G)))
+        th_src = "手動"
+
+    prev = load_mode("NORMAL")
+    if   prev == "EMERG":
+        mode = "EMERG"   if (C_full < th_out)  else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+    elif prev == "CAUTION":
+        mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
+    else:
+        mode = "EMERG"   if (C_full < th_in)   else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+    save_mode(mode)
+
+    _MODE_JA   = {"EMERG":"緊急","CAUTION":"警戒","NORMAL":"通常"}
+    _MODE_EMOJI= {"EMERG":"🚨","CAUTION":"⚠️","NORMAL":"🟢"}
+    mode_ja, emoji = _MODE_JA.get(mode,mode), _MODE_EMOJI.get(mode,"ℹ️")
+    eff_days = len(base)
+
+    lead_lines = [
+        f"{emoji} *現在モード: {mode_ja}*",
+        f"テンプレ合格本数: *{C_full}本*",
+        "しきい値（{0}）".format(th_src),
+        f"  ・緊急入り: <{th_in}本",
+        f"  ・緊急解除: ≥{th_out}本",
+        f"  ・通常復帰: ≥{th_norm}本",
+        f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
+        f"  ・下位5%: {q05}本",
+        f"  ・下位20%: {q20}本",
+        f"  ・60%分位: {q60}本",
+    ]
+    return "```" + "\n".join(lead_lines) + "```", mode, C_full
 # Debug flag
 debug_mode = False  # set to True for detailed output
 
@@ -67,205 +221,6 @@ def fetch_vix_ma5():
         return float("nan")
 
 
-# --- BEGIN: breadth port ---
-RESULTS_DIR = "results"
-os.makedirs(RESULTS_DIR, exist_ok=True)
-
-
-def _breadth_state_file():
-    return os.path.join(RESULTS_DIR, "breadth_state.json")
-
-
-def load_mode(default="NORMAL"):
-    try:
-        with open(_breadth_state_file(), "r") as f:
-            m = json.load(f).get("mode", default)
-        return m if m in ("EMERG", "CAUTION", "NORMAL") else default
-    except Exception:
-        return default
-
-
-def save_mode(mode: str):
-    try:
-        with open(_breadth_state_file(), "w") as f:
-            json.dump({"mode": mode}, f)
-    except Exception:
-        pass
-
-
-def _read_universe_for_breadth():
-    """current + candidate（存在すれば）を合算し、ティッカーのユニークリストを返す"""
-    cur = []
-    try:
-        with Path(__file__).with_name("current_tickers.csv").open() as f:
-            cur = [r[0].strip().upper() for r in csv.reader(f) if r]
-    except Exception:
-        pass
-    cand = []
-    cand_path = Path(__file__).with_name("candidate_tickers.csv")
-    if cand_path.exists():
-        try:
-            with cand_path.open() as f:
-                cand = [r[0].strip().upper() for r in csv.reader(f) if r]
-        except Exception:
-            pass
-    # 空や重複を除去
-    uni = sorted({t for t in (cur + cand) if t and t != "^GSPC"})
-    return uni
-
-
-def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
-    """
-    scorer.py / Scorer.trend_template_breadth_series を移植。
-    各営業日の trend_template 合格“本数”=C を返す（int Series）。
-    """
-    if px is None or px.empty:
-        return pd.Series(dtype=int)
-    px = px.dropna(how="all", axis=1)
-    if win_days and win_days > 0:
-        px = px.tail(win_days)
-    if px.empty:
-        return pd.Series(dtype=int)
-    spx = spx.reindex(px.index).ffill()
-
-    ma50 = px.rolling(50).mean()
-    ma150 = px.rolling(150).mean()
-    ma200 = px.rolling(200).mean()
-
-    tt = (px > ma150)
-    tt &= (px > ma200)
-    tt &= (ma150 > ma200)
-    tt &= (ma200 - ma200.shift(21) > 0)
-    tt &= (ma50 > ma150)
-    tt &= (ma50 > ma200)
-    tt &= (px > ma50)
-
-    lo252 = px.rolling(252).min()
-    hi252 = px.rolling(252).max()
-    tt &= (px.divide(lo252).sub(1.0) >= 0.30)  # P_OVER_LOW52 >= 0.30
-    tt &= (px >= (0.75 * hi252))  # NEAR_52W_HIGH >= -0.25
-
-    r12 = px.divide(px.shift(252)).sub(1.0)
-    br12 = spx.divide(spx.shift(252)).sub(1.0)
-    r1 = px.divide(px.shift(22)).sub(1.0)
-    br1 = spx.divide(spx.shift(22)).sub(1.0)
-    rs = 0.7 * (r12.sub(br12, axis=0)) + 0.3 * (r1.sub(br1, axis=0))
-    tt &= (rs >= 0.10)
-
-    return tt.fillna(False).sum(axis=1).astype(int)
-
-
-def build_breadth_lead_lines() -> tuple[list[str], str]:
-    """
-    旧 factor._build_breadth_lead_lines と同一ロジック。
-    ヘッダの各行(list[str])と決定モード("EMERG"/"CAUTION"/"NORMAL")を返す。
-    """
-    bench = "^GSPC"
-    win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
-    warmup = int(os.getenv("BREADTH_WARMUP_DAYS", "252"))
-    use_calib = (
-        os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
-    )
-
-    tickers = _read_universe_for_breadth()
-    if not tickers:
-        raise RuntimeError("breadth: universe empty")
-
-    data = yf.download(tickers + [bench], period=f"{win}d", auto_adjust=True, progress=False)
-    px, spx = data["Close"][tickers], data["Close"][bench]
-
-    C_ts = trend_template_breadth_series(px, spx, win_days=win)
-    if C_ts.empty:
-        raise RuntimeError("breadth series empty")
-    base = C_ts.iloc[warmup:] if len(C_ts) > warmup else C_ts
-    C_full = int(C_ts.iloc[-1])
-
-    # 分位
-    q05 = int(
-        np.nan_to_num(
-            base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN", "0.05"))),
-            nan=0.0,
-        )
-    )
-    q20 = int(
-        np.nan_to_num(
-            base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))),
-            nan=0.0,
-        )
-    )
-    q60 = int(
-        np.nan_to_num(
-            base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT", "0.60"))),
-            nan=0.0,
-        )
-    )
-
-    # 自動/手動のしきい値
-    N_G = 12
-    th_in_rec = max(N_G, q05)
-    th_out_rec = max(int(np.ceil(1.5 * N_G)), q20)
-    th_norm_rec = max(3 * N_G, q60)
-    if use_calib:
-        th_in, th_out, th_norm, th_src = (
-            th_in_rec,
-            th_out_rec,
-            th_norm_rec,
-            "自動",
-        )
-    else:
-        th_in = int(os.getenv("GTT_EMERG_IN", str(N_G)))
-        th_out = int(os.getenv("GTT_EMERG_OUT", str(int(1.5 * N_G))))
-        th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3 * N_G)))
-        th_src = "手動"
-
-    # ヒステリシス
-    prev = load_mode("NORMAL")
-    if prev == "EMERG":
-        mode = (
-            "EMERG"
-            if (C_full < th_out)
-            else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-        )
-    elif prev == "CAUTION":
-        mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
-    else:
-        mode = (
-            "EMERG"
-            if (C_full < th_in)
-            else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-        )
-    save_mode(mode)
-
-    _MODE_JA = {"EMERG": "緊急", "CAUTION": "警戒", "NORMAL": "通常"}
-    _MODE_EMOJI = {"EMERG": "🚨", "CAUTION": "⚠️", "NORMAL": "🟢"}
-    mode_ja, emoji = _MODE_JA.get(mode, mode), _MODE_EMOJI.get(mode, "ℹ️")
-    eff_days = len(base)
-
-    lead_lines = [
-        f"{emoji} *現在モード: {mode_ja}*",
-        f"テンプレ合格本数: *{C_full}本*",
-        f"しきい値（{th_src}）",
-        f"  ・緊急入り: <{th_in}本",
-        f"  ・緊急解除: ≥{th_out}本",
-        f"  ・通常復帰: ≥{th_norm}本",
-        f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
-        f"  ・下位5%: {q05}本",
-        f"  ・下位20%: {q20}本",
-        f"  ・60%分位: {q60}本",
-    ]
-    return lead_lines, mode
-
-
-def build_breadth_header_block() -> str:
-    """Slack 先頭に差し込むコードブロック文字列を返す。失敗時は空文字。"""
-    try:
-        lines, _mode = build_breadth_lead_lines()
-        return "```" + "\n".join(lines) + "```"
-    except Exception:
-        return ""
-
-
-# --- END: breadth port ---
 
 # === Minervini-like sell signals ===
 def _yf_df(sym, period="6mo"):
@@ -543,9 +498,14 @@ def main():
             )
         else:
             header += f"\n🟥 {hits}"
+    try:
+        breadth_block, _mode, _C = build_breadth_header()
+        if breadth_block:
+            header = breadth_block + "\n" + header
+    except Exception:
+        pass
     table_text = df_small.to_string(formatters=formatters, index=False)
-    breadth_head = build_breadth_header_block()
-    send_slack((breadth_head + "\n" if breadth_head else "") + header + "\n```" + table_text + "```")
+    send_slack(header + "\n```" + table_text + "```")
 
     if debug_mode:
         debug_cols = [
