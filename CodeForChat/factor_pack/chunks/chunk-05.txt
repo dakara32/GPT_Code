@@ -1,25 +1,66 @@
 ```text
-us_D=lambda x: x["GSC"] + x["DSC"])
-L833               .sort_values("G_plus_D")
-L834               .head(10)
-L835               .round(3))
-L836         _slack("Low Score Candidates (GSC+DSC bottom 10)\n"
-L837                "```"
-L838                + _low_df.to_string(index=True, index_names=False)
-L839                + "\n```")
-L840     except Exception as _e:
-L841         _slack(f"Low Score Candidates: 作成失敗: {_e}")
-L842
-L843     if debug_mode:
-L844         try:
-L845             _slack_debug(_compact_debug(fb, sb, [], []))
-L846         except Exception as e:
-L847             print(f"[debug skipped] {e}")
-L848
-L849     return sb
-L850
-L851 if __name__ == "__main__":
-L852     run_pipeline()
+ [
+L827         "【G枠レポート｜週次モニタ（直近5営業日）】",
+L828         "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
+L829         f"選定12: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else "選定12: なし",
+L830         f"次点10: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点10: なし",]
+L831
+L832     if fire_recent:
+L833         fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
+L834         lines.append(f"過去5営業日の検知: {fire_list}")
+L835     else:
+L836         lines.append("過去5営業日の検知: なし")
+L837
+L838     try:
+L839         webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+L840         if webhook:
+L841             requests.post(webhook, json={"text": "\n".join([s for s in lines if s != ""])}, timeout=10)
+L842     except Exception:
+L843         pass
+L844
+L845     out = Output(debug=debug_mode)
+L846     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
+L847     try: out._sc = sc
+L848     except Exception: pass
+L849     if hasattr(sc, "_feat"):
+L850         try:
+L851             out.miss_df = sc._feat.missing_logs
+L852             out.display_results(exist=exist, bench=bench, df_z=sc._feat.df_z,
+L853                 g_score=sc._feat.g_score, d_score_all=sc._feat.d_score_all,
+L854                 init_G=top_G, init_D=top_D, top_G=top_G, top_D=top_D)
+L855         except Exception:
+L856             pass
+L857     out.notify_slack()
+L858     sb = SelectionBundle(resG={"tickers": top_G, "avg_res_corr": avgG,
+L859               "sum_score": sumG, "objective": objG},
+L860         resD={"tickers": top_D, "avg_res_corr": avgD,
+L861               "sum_score": sumD, "objective": objD},
+L862         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
+L863
+L864     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
+L865     try:
+L866         _low_df = (pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
+L867               .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
+L868               .sort_values("G_plus_D")
+L869               .head(10)
+L870               .round(3))
+L871         _slack("Low Score Candidates (GSC+DSC bottom 10)\n"
+L872                "```"
+L873                + _low_df.to_string(index=True, index_names=False)
+L874                + "\n```")
+L875     except Exception as _e:
+L876         _slack(f"Low Score Candidates: 作成失敗: {_e}")
+L877
+L878     if debug_mode:
+L879         try:
+L880             _slack_debug(_compact_debug(fb, sb, [], []))
+L881         except Exception as e:
+L882             print(f"[debug skipped] {e}")
+L883
+L884     return sb
+L885
+L886 if __name__ == "__main__":
+L887     run_pipeline()
 ```
 
 ## <scorer.py>
@@ -213,34 +254,5 @@ L186     @staticmethod
 L187     def fetch_finnhub_metrics(symbol):
 L188         api_key = os.environ.get("FINNHUB_API_KEY")
 L189         if not api_key: return {}
-L190         url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":api_key}
-L191         try:
-L192             r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
-L193             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.get('enterpriseValue') else None}
-L194         except Exception: return {}
-L195
-L196     @staticmethod
-L197     def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
-L198         r, m = series.pct_change().dropna(), market.pct_change().dropna()
-L199         n = min(len(r), len(m), lookback)
-L200         if n<60: return np.nan
-L201         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
-L202         return np.nan if var==0 else cov/var
-L203
-L204     @staticmethod
-L205     def spx_to_alpha(spx: pd.Series, bands=(0.03,0.10), w=(0.6,0.4),
-L206                      span=5, q=(0.20,0.40), alphas=(0.05,0.08,0.10)) -> float:
-L207         """
-L208         S&P500指数のみから擬似breadthを作り、履歴分位でαを段階決定。
-L209         bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
-L210         """
-L211         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
-L212         b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
-L213         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
-L214         b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
-L215         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
-L216
-L217     @staticmethod
-L218     def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
-L21
+L190         url, params = "https://finnhub.i
 ```
