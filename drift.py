@@ -269,32 +269,32 @@ def _signals_for_day(df, idx):
         sig = []
         d = df.loc[idx]
         close = _scalar(d, "Close")
-        open_ = _scalar(d, "Open")
         ma20 = _scalar(d, "ma20")
         ma50 = _scalar(d, "ma50")
         vol = _scalar(d, "Volume")
-        vol50 = _scalar(df.iloc[-1], "vol50")
-        if any(pd.isna(x) for x in (close, open_, vol, vol50)):
-            return sig
-        if pd.notna(ma20) and close < ma20:
+        vol50 = _scalar(d, "vol50")
+
+        if pd.notna(close) and pd.notna(ma20) and close < ma20:
             sig.append("20DMA↓")
-        if pd.notna(ma50) and close < ma50 and vol > 1.5 * vol50:
+
+        if all(pd.notna(x) for x in (close, ma50, vol, vol50)) and close < ma50 and vol > 1.5 * vol50:
             sig.append("50DMA↓(大商い)")
 
         last4 = df.loc[:idx].tail(4)
-        lows_desc = _is_strict_down(last4["Low"].tolist())
         last10 = df.loc[:idx].tail(10)
-        reds = int((last10["Close"] < last10["Open"]).sum())
+
+        lows_desc = _is_strict_down(last4["Low"].tolist()) if last4["Low"].notna().all() else False
+        reds = int((last10["Close"] < last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
         if lows_desc or reds > 5:
             sig.append("連続安値/陰線優勢")
 
-        ups = int((last10["Close"] > last10["Open"]).sum())
+        ups = int((last10["Close"] > last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
         if ups >= 7:
             sig.append("上げ偏重(>70%)")
 
         last15 = df.loc[:idx].tail(15)
         base0 = _scalar(last15.iloc[0], "Close") if len(last15) > 0 else float("nan")
-        if pd.notna(base0) and base0 != 0 and (close / base0 - 1) >= 0.25:
+        if pd.notna(base0) and pd.notna(close) and base0 != 0 and (close / base0 - 1) >= 0.25:
             sig.append("+25%/15日内")
 
         if len(df.loc[:idx]) >= 2:
@@ -490,7 +490,11 @@ def main():
     if 'df_small' in locals() and isinstance(df_small, pd.DataFrame) and not df_small.empty:
         col_sym = "sym" if "sym" in df_small.columns else ("symbol" if "symbol" in df_small.columns else None)
         if col_sym:
-            df_small.insert(0, "⚠", df_small[col_sym].apply(lambda x: "🔴" if x in sell_alerts else ""))
+            alert_keys = {str(k) for k in sell_alerts.keys()}
+            df_small[col_sym] = df_small[col_sym].astype(str)
+            df_small.insert(0, "⚠", df_small[col_sym].map(lambda x: "🔴" if x in alert_keys else ""))
+            latest_tag = {s: " / ".join(sell_alerts[s][-1][1]) for s in sell_alerts}
+            df_small.insert(1, "sig", df_small[col_sym].map(latest_tag).fillna(""))
     formatters = formatters_for(alert)
     header = build_header(
         mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
