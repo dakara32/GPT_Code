@@ -6,6 +6,46 @@ import csv
 import json
 import time
 from pathlib import Path
+from dataclasses import dataclass
+
+STATE_PATH = Path("results/breadth_state.json")
+
+
+@dataclass
+class Regime:
+    name: str  # "NORMAL" | "CAUTION" | "EMERG"
+    cash_pct: float  # 現金保有率（0-1）
+    drift_threshold: float  # 0.10 / 0.12 / inf
+
+
+REGIME_TABLE = {
+    "NORMAL": Regime("NORMAL", 0.10, 0.10),
+    "CAUTION": Regime("CAUTION", 0.125, 0.12),
+    "EMERG": Regime("EMERG", 0.20, float("inf")),
+}
+
+
+def load_current_mode():
+    """
+    results/breadth_state.json から現在モードを読み込む。
+    フォールバックは NORMAL。
+    期待するキー: {"current_mode": "NORMAL" | "CAUTION" | "EMERG"}
+    """
+    try:
+        if STATE_PATH.exists():
+            with STATE_PATH.open() as f:
+                data = json.load(f)
+            mode = str(data.get("current_mode", "NORMAL")).upper()
+            return mode if mode in REGIME_TABLE else "NORMAL"
+    except Exception:
+        pass
+    return "NORMAL"
+
+
+def regime_params():
+    """現在モードに対応する Regime を返す。"""
+    mode = load_current_mode()
+    return REGIME_TABLE[mode]
 
 # --- breadth utilities (factor parity) ---
 BENCH = "^GSPC"
@@ -341,9 +381,15 @@ def load_portfolio():
 
 
 def compute_threshold():
-    vix_ma5 = fetch_vix_ma5()
-    drift_threshold = 10 if vix_ma5 < 20 else 12 if vix_ma5 < 26 else float("inf")
-    return vix_ma5, drift_threshold
+    """
+    モードに基づきドリフト閾値を決定。
+    - NORMAL : 10%
+    - CAUTION: 12%
+    - EMERG  : ∞（ドリフト売買停止）
+    返り値: (regime, drift_threshold)
+    """
+    r = regime_params()
+    return r, r.drift_threshold
 
 
 def build_dataframe(portfolio):
@@ -425,11 +471,16 @@ def formatters_for(alert):
     return formatters
 
 
-def build_header(vix_ma5, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs):
+def build_header(regime, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs):
+    """
+    regime: Regime
+    """
+    mode_jp = {"NORMAL": "通常", "CAUTION": "警戒", "EMERG": "緊急"}.get(regime.name, regime.name)
     header = (
-        f"*📈 VIX MA5:* {vix_ma5:.2f}\n"
-        f"*📊 ドリフト閾値:* {'🔴(高VIX)' if drift_threshold == float('inf') else str(drift_threshold)+'%'}\n"
-        f"*📉 現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
+        f"🟢 *現在モード: {mode_jp}*\n"
+        f"💵 *現金保有率:* {regime.cash_pct*100:.1f}%\n"
+        f"📊 *ドリフト閾値:* {'🔴(高VIX/停止)' if drift_threshold == float('inf') else str(int(drift_threshold*100))+'%'}\n"
+        f"📉 *現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
     )
     if alert:
         header += f"*🔁 半戻し後ドリフト合計(想定):* {simulated_total_drift_abs * 100:.2f}%\n"
@@ -469,20 +520,26 @@ def main():
     portfolio = load_portfolio()
     symbols = [r["symbol"] for r in portfolio]
     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
-    vix_ma5, drift_threshold = compute_threshold()
+
+    regime, drift_threshold = compute_threshold()  # ← モードから決定
     df, total_value, total_drift_abs = build_dataframe(portfolio)
+
     df, alert, new_total_value, simulated_total_drift_abs = simulate(
         df, total_value, total_drift_abs, drift_threshold
     )
     df_small = prepare_summary(df, total_drift_abs, alert)
+
     if 'df_small' in locals() and isinstance(df_small, pd.DataFrame) and not df_small.empty:
         col_sym = "sym" if "sym" in df_small.columns else ("symbol" if "symbol" in df_small.columns else None)
         if col_sym:
             df_small.insert(0, "⚠", df_small[col_sym].apply(lambda x: "🔴" if x in sell_alerts else ""))
+
     formatters = formatters_for(alert)
+
     header = build_header(
-        vix_ma5, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
+        regime, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
     )
+
     if sell_alerts:
         def fmt_pair(date_tags):
             date, tags = date_tags
@@ -498,36 +555,21 @@ def main():
             )
         else:
             header += f"\n🟥 {hits}"
-    try:
-        breadth_block, _mode, _C = build_breadth_header()
-        if breadth_block:
-            header = breadth_block + "\n" + header
-    except Exception:
-        pass
+
     table_text = df_small.to_string(formatters=formatters, index=False)
     send_slack(header + "\n```" + table_text + "```")
 
     if debug_mode:
         debug_cols = [
-            "symbol",
-            "shares",
-            "price",
-            "value",
-            "current_ratio",
-            "drift",
-            "drift_abs",
-            "adjusted_ratio",
-            "adjustable",
-            "trade_shares",
-            "new_shares",
-            "new_value",
-            "simulated_ratio",
-            "simulated_drift_abs",
+            "symbol","shares","price","value","current_ratio","drift","drift_abs",
+            "adjusted_ratio","adjustable","trade_shares","new_shares","new_value",
+            "simulated_ratio","simulated_drift_abs",
         ]
         debug_text = (
             "=== DEBUG: full dataframe ===\n"
             + df[debug_cols].to_string()
-            + f"\n\ntotal_value={total_value}, new_total_value={new_total_value}\n"
+            + f"\n\nregime={regime.name}, cash_pct={regime.cash_pct}, drift_threshold={drift_threshold}\n"
+            + f"total_value={total_value}, new_total_value={new_total_value}\n"
             + f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}"
         )
         print("\n" + debug_text)
