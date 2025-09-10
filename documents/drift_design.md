@@ -2,7 +2,7 @@
 
 ## 概要
 - 25銘柄ポートフォリオのドリフトを日次監視し、閾値超過時に半戻し案をSlack通知するスクリプト。
-- Finnhubとyfinanceから価格・VIX情報を取得し、現況比率と調整案を計算。
+- Finnhubとyfinanceから価格を取得（レジームは trend_template 本数に基づく）。
 
 ## 定数・設定
 - `FINNHUB_API_KEY` / `SLACK_WEBHOOK_URL` を環境変数から取得。
@@ -17,13 +17,13 @@
 - `quote` エンドポイントで株価を取得し、失敗時は `NaN` を返す。
 
 ### fetch_vix_ma5
-- yfinanceでVIX終値を取得し、直近5営業日の移動平均を算出。
+- yfinanceでVIX終値を取得する関数。将来再利用のため残置。
 
 ### load_portfolio
 - `current_tickers.csv` から銘柄と保有株数を読み込み、目標比率4%を付与したリストを生成。
 
-### compute_threshold
-- VIX MA5に応じてドリフト閾値を10%/12%/高VIXモード(∞)に設定。
+### compute_threshold_by_mode
+- モード(NORMAL/CAUTION/EMERG) に応じて 10% / 12% / 停止(∞) を返す。
 
 ### build_dataframe
 - 各銘柄の評価額や現在比率、ドリフト、半戻し後比率(`adjusted_ratio`)を計算しDataFrame化。
@@ -38,7 +38,7 @@
 - 通貨・比率・株数の表示フォーマットを定義。
 
 ### build_header
-- VIX・閾値・ドリフト値およびアラート有無をSlackメッセージ用ヘッダに整形。
+- 現金保有率・閾値・ドリフト値およびアラート有無をSlackメッセージ用ヘッダに整形。
 
 ### send_slack / send_debug
 - 通常通知およびデバッグ詳細をSlack Webhookへ送信。
@@ -48,7 +48,7 @@
 
 ## 実行フロー
 1. `load_portfolio` で現ポートフォリオを読み込む。
-2. `compute_threshold` でVIX MA5とドリフト閾値を決定。
+2. `build_breadth_header` でモードを取得し、`compute_threshold_by_mode` で現金保有率とドリフト閾値を決定。
 3. `build_dataframe` で現在比率とドリフトを計算。
 4. `simulate` で閾値超過時の半戻し案を試算。
 5. `prepare_summary` と `build_header` で通知本文とテーブルを構築。

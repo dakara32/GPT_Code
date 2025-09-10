@@ -346,6 +346,14 @@ def compute_threshold():
     return vix_ma5, drift_threshold
 
 
+def compute_threshold_by_mode(mode: str):
+    """モードに応じて現金保有率とドリフト閾値を返す（README準拠）"""
+    m = (mode or "NORMAL").upper()
+    cash_map = {"NORMAL": 0.10, "CAUTION": 0.125, "EMERG": 0.20}
+    drift_map = {"NORMAL": 10, "CAUTION": 12, "EMERG": float("inf")}
+    return cash_map.get(m, 0.10), drift_map.get(m, 10)
+
+
 def build_dataframe(portfolio):
     for stock in portfolio:
         price = fetch_price(stock["symbol"])
@@ -425,10 +433,10 @@ def formatters_for(alert):
     return formatters
 
 
-def build_header(vix_ma5, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs):
+def build_header(mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs):
     header = (
-        f"*📈 VIX MA5:* {vix_ma5:.2f}\n"
-        f"*📊 ドリフト閾値:* {'🔴(高VIX)' if drift_threshold == float('inf') else str(drift_threshold)+'%'}\n"
+        f"*💼 現金保有率:* {cash_ratio*100:.1f}%\n"
+        f"*📊 ドリフト閾値:* {'🔴(停止)' if drift_threshold == float('inf') else str(drift_threshold)+'%'}\n"
         f"*📉 現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
     )
     if alert:
@@ -469,7 +477,11 @@ def main():
     portfolio = load_portfolio()
     symbols = [r["symbol"] for r in portfolio]
     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
-    vix_ma5, drift_threshold = compute_threshold()
+
+    breadth_block, mode, _C = build_breadth_header()
+
+    cash_ratio, drift_threshold = compute_threshold_by_mode(mode)
+
     df, total_value, total_drift_abs = build_dataframe(portfolio)
     df, alert, new_total_value, simulated_total_drift_abs = simulate(
         df, total_value, total_drift_abs, drift_threshold
@@ -481,8 +493,10 @@ def main():
             df_small.insert(0, "⚠", df_small[col_sym].apply(lambda x: "🔴" if x in sell_alerts else ""))
     formatters = formatters_for(alert)
     header = build_header(
-        vix_ma5, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
+        mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
     )
+    if breadth_block:
+        header = breadth_block + "\n" + header
     if sell_alerts:
         def fmt_pair(date_tags):
             date, tags = date_tags
@@ -498,12 +512,6 @@ def main():
             )
         else:
             header += f"\n🟥 {hits}"
-    try:
-        breadth_block, _mode, _C = build_breadth_header()
-        if breadth_block:
-            header = breadth_block + "\n" + header
-    except Exception:
-        pass
     table_text = df_small.to_string(formatters=formatters, index=False)
     send_slack(header + "\n```" + table_text + "```")
 
