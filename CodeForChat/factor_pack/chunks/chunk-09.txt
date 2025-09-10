@@ -1,57 +1,5 @@
 ```text
-eport
-L2
-L3 on:
-L4   push:
-L5     branches: [ main ]
-L6     paths-ignore:
-L7       - 'CodeForChat/**'
-L8   schedule:
-L9     - cron: '0 0 * * 6'  # UTC 00:00 → JST 09:00（土）
-L10   workflow_dispatch:
-L11
-L12 jobs:
-L13   build-and-report:
-L14     runs-on: ubuntu-latest
-L15     permissions:
-L16       contents: write
-L17
-L18     steps:
-L19       - name: Debug start
-L20         run: echo '🚀 DEBUGstarted'
-L21               
-L22       - name: Checkout repository
-L23         uses: actions/checkout@v3
-L24
-L25       - name: Setup Python
-L26         uses: actions/setup-python@v5
-L27         with:
-L28           python-version: '3.x'                # （必要最小限のまま。固定したければ '3.13'）
-L29           cache: 'pip'                         # ★ pipキャッシュを有効化
-L30           cache-dependency-path: requirements.txt  # ★ 依存ファイルをキャッシュキーに
-L31
-L32       - name: Install dependencies
-L33         run: pip install -r requirements.txt
-L34
-L35       - name: Prepare results directory
-L36         run: mkdir -p results
-L37
-L38       - name: Run factor & scoring
-L39         env:
-L40           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-L41           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
-L42           FIN_THREADS: "8"
-L43         run: python factor.py
-L44       - name: Persist breadth mode (if changed)
-L45         run: |
-L46           git config user.name "github-actions[bot]"
-L47           git config user.email "github-actions[bot]@users.noreply.github.com"
-L48           git add results/breadth_state.json || true
-L49           if ! git diff --cached --quiet; then
-L50             git commit -m "chore: update breadth_state.json [skip ci]" || true
-L51             git push || true
-L52           else
-L53             echo "No breadth_state.json changes."
+   echo "No breadth_state.json changes."
 L54           fi
 ```
 
@@ -298,5 +246,34 @@ L195       | DIV_TTM_PS | - | 1株当たりTTM配当 |
 L196       | DIV_YOY | - | 前年比配当成長率 |
 L197       | REV | - | 売上成長率TTM |
 L198       | EPS_Q_YOY | - | 四半期EPSの前年同期比 |
-L199       | REV_Q_YOY | - | 四半期売上の前年同
+L199       | REV_Q_YOY | - | 四半期売上の前年同期比 |
+L200       | REV_YOY_ACC | - | 売上成長率の加速分 |
+L201       | RULE40 | - | 売上成長率とFCFマージンの合計 |
+L202       | FCF_MGN | - | FCFマージン |
+L203       | REV_ANN_STREAK | - | 年次売上成長の連続年数 |
+L204       | REV_YOY_VAR | - | 年次売上成長率の変動性 |
+L205       | SIZE | - | 時価総額の対数値 |
+L206       | LIQ | - | 60日平均出来高ドルの対数値 |
+L207    - Gバケット: `GRW`、`MOM`、`VOL`を`cfg.weights.g`（0.40/0.45/-0.15）で加重し`g_score`を得る。
+L208    - Dバケット: `D_QAL`、`D_YLD`、`D_VOL_RAW`、`D_TRD`を`cfg.weights.d`（0.15/0.15/-0.45/0.25）で加重し`d_score_all`を算出。
+L209    - セクターcapによる`soft_cap_effective_scores`を適用し、G採用銘柄にはトレンドテンプレートフィルタを適用。
+L210 5. `_apply_growth_entry_flags`でブレイクアウト/押し目発火状況を付加し、`FeatureBundle`を返す。
+L211
+L212 ### Step3: Correlation Reduction & Selection (Selector)
+L213 DRRSアルゴリズムで相関を抑えた銘柄選定を行い、`SelectionBundle`を返す。`results/`に保存された前回選定（`G_selection.json` / `D_selection.json`）を`_load_prev`で読み込み、目的値が大きく悪化しない限り維持する。新しい採用集合は`_save_sel`でJSONに書き出し次回以降の入力に備える。
+L214 主なメソッド:
+L215 - `residual_corr` : 収益率行列をZスコア化し、上位主成分を除去した残差から相関行列を求め、平均相関に応じてシュリンク。
+L216 - `rrqr_like_det` : スコアを重み付けしたQR分解風の手順で初期候補をk件抽出し、スコアの高い非相関な集合を得る。
+L217 - `swap_local_det` / `swap_local_det_cross` : `sum(score) - λ*within_corr - μ*cross_corr`を目的関数として、入れ替え探索で局所的に最適化。
+L218 - `select_bucket_drrs` : プール銘柄とスコアから残差相関を計算し、上記2段階(初期選択→入れ替え)でk銘柄を決定。過去採用銘柄との比較で目的値が劣化しなければ維持する。
+L219 - `select_buckets` : Gバケットを選定後、その結果を除いた候補からDバケットを選ぶ。D選定時はGとの相関ペナルティμを付与し、両バケットの分散を制御する。
+L220
+L221 #### 相関低減ロジック詳細
+L222 1. **残差相関行列の構築 (`residual_corr`)**
+L223    - リターン行列`R`をZスコア化。
+L224    - SVDで上位`n_pc`主成分`F`を求め、最小二乗で係数`B`を算出し残差`E = Z - F@B`を得る。
+L225    - `E`の相関行列`C`を計算し、平均絶対相関に応じてシュリンク量`shrink_eff`を補正して対角を強調。
+L226 2. **初期候補の抽出 (`rrqr_like_det`)**
+L227    - スコアを0-1正規化した重み`w`とし、`Z*(1+γw)`で列ノルムを強調。
+L228    - 残差ノ
 ```
