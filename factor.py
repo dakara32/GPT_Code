@@ -1,11 +1,4 @@
-"""
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃ ROLE of factor.py                                     ┃
-┃  - Orchestration ONLY（外部I/O・SSOT・Slack出力）     ┃
-┃  - 計算ロジック（採点/フィルタ/相関低減）は scorer.py ┃
-┃  - ここでロジックを実装/変更しない                   ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-"""
+'''ROLE: Orchestration ONLY（外部I/O・SSOT・Slack出力）, 計算は scorer.py'''
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
 BONUS_COEFF = 0.4   # 攻め=0.3 / 中庸=0.4 / 守り=0.5
 import os, json, time, requests
@@ -27,7 +20,7 @@ class T:
 
 T.log("start")
 
-# ===== ユニバースと定数（冒頭に固定） =====
+# === ユニバースと定数（冒頭に固定） ===
 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
@@ -36,7 +29,7 @@ g_weights = {'GRW':0.40,'MOM':0.45,'VOL':-0.15}
 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
 D_weights = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
-def _fmt_w(w): return " ".join(f"{k}{int(v*100)}" for k,v in w.items())
+_fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
 
 # DRRS 初期プール・各種パラメータ
 corrM = 45
@@ -55,7 +48,7 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
 
 
-# ===== 共有DTO（クラス間I/O契約）＋ Config =====
+# === 共有DTO（クラス間I/O契約）＋ Config ===
 @dataclass(frozen=True)
 class InputBundle:
     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
@@ -108,31 +101,26 @@ class PipelineConfig:
     price_max: float
 
 
-# ===== 共通ユーティリティ（複数クラスで使用） =====
+# === 共通ユーティリティ（複数クラスで使用） ===
 # (unused local utils removed – use scorer.py versions if needed)
 
-def _env_true(name: str, default=False):
-    v = os.getenv(name)
-    return (v or str(default)).strip().lower() == "true"
+_env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
 
 def _post_slack(payload: dict):
     url = os.getenv("SLACK_WEBHOOK_URL")
-    if not url: 
-        print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+    if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
     try:
         requests.post(url, json=payload).raise_for_status()
     except Exception as e:
         print(f"⚠️ Slack通知エラー: {e}")
 
-def _slack(message, code=False):
-    _post_slack({"text": f"```{message}```" if code else message})
+_slack = lambda message, code=False: _post_slack({"text": f"```{message}```" if code else message})
 
 def _slack_debug(text: str, chunk=2800):
-    i = 0
-    while i < len(text):
-        j = min(len(text), i+chunk); k = text.rfind("\n", i, j); j = k if k > i+100 else j
-        _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}]})
-        i = j
+    i=0
+    while i<len(text):
+        j=min(len(text), i+chunk); k=text.rfind("\n", i, j); j=k if k>i+100 else j
+        _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}]}); i=j
 
 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
@@ -144,9 +132,9 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
 
     show_near = _env_true("DEBUG_NEAR5", True)
-    gs = getattr(fb,"g_score",None); ds = getattr(fb,"d_score_all",None)
-    gs = gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None
-    ds = ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None
+    gs, ds = getattr(fb,"g_score",None), getattr(fb,"d_score_all",None)
+    gs = (gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None)
+    ds = (ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None)
     g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
     d_excl = set((sb.top_G or [])+(sb.top_D or []))
     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
@@ -156,8 +144,9 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
 
     def _fmt_near(lbl, ser, lst):
         if ser is None: return f"{lbl}: off"
-        parts=[f"{t}:{ser.get(t,float('nan')):.3f}" if pd.notna(ser.get(t)) else f"{t}:nan" for t in lst]
-        return f"{lbl}: "+(", ".join(parts) if parts else "-")
+        g = ser.get
+        parts=[f"{t}:{g(t,float('nan')):.3f}" if pd.notna(g(t)) else f"{t}:nan" for t in lst]
+        return f"{lbl}: " + (", ".join(parts) if parts else "-")
 
     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
           _fmt_near("G near10", gs, g_miss),
@@ -194,15 +183,13 @@ def _disjoint_keepG(top_G, top_D, poolD):
     used, D, i = set(top_G), list(top_D), 0
     for j, t in enumerate(D):
         if t in used:
-            while i < len(poolD) and (poolD[i] in used or poolD[i] in D): i += 1
+            while i<len(poolD) and (poolD[i] in used or poolD[i] in D): i+=1
             if i < len(poolD): D[j] = poolD[i]; used.add(D[j]); i += 1
     return top_G, D
 
 _state_file = lambda: os.path.join(RESULTS_DIR, "breadth_state.json")
 def load_mode(default: str="NORMAL") -> str:
-    try:
-        m = json.loads(open(_state_file()).read()).get("mode", default)
-        return m if m in ("EMERG","CAUTION","NORMAL") else default
+    try: m=json.loads(open(_state_file()).read()).get("mode", default); return m if m in ("EMERG","CAUTION","NORMAL") else default
     except Exception: return default
 def save_mode(mode: str):
     try: open(_state_file(),"w").write(json.dumps({"mode": mode}))
@@ -213,27 +200,20 @@ def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
     win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
     C_ts = Scorer.trend_template_breadth_series(inb.px[inb.tickers], inb.spx, win_days=win)
     if C_ts.empty: raise RuntimeError("breadth series empty")
-    warmup = int(os.getenv("BREADTH_WARMUP_DAYS", "252"))
-    base = C_ts.iloc[warmup:] if len(C_ts) > warmup else C_ts
-    C_full = int(C_ts.iloc[-1])
+    warmup=int(os.getenv("BREADTH_WARMUP_DAYS","252")); base=C_ts.iloc[warmup:] if len(C_ts)>warmup else C_ts; C_full=int(C_ts.iloc[-1])
     q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
     q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
     th_in_rec, th_out_rec, th_norm_rec = max(N_G, q05), max(int(np.ceil(1.5*N_G)), q20), max(3*N_G, q60)
     use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
-    th_in, th_out, th_norm, th_src = (th_in_rec, th_out_rec, th_norm_rec, "自動") if use_calib else (
-        int(os.getenv("GTT_EMERG_IN",    str(N_G))),
-        int(os.getenv("GTT_EMERG_OUT",   str(int(1.5*N_G)))),
-        int(os.getenv("GTT_CAUTION_OUT", str(3*N_G))),
-        "手動"
-    )
+    th_in, th_out, th_norm, th_src = (th_in_rec, th_out_rec, th_norm_rec, "自動") if use_calib else (int(os.getenv("GTT_EMERG_IN",str(N_G))), int(os.getenv("GTT_EMERG_OUT",str(int(1.5*N_G)))), int(os.getenv("GTT_CAUTION_OUT",str(3*N_G))), "手動")
     prev = load_mode("NORMAL")
     if   prev == "EMERG":  mode = "EMERG" if (C_full < th_out) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
     elif prev == "CAUTION": mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
     else:                   mode = "EMERG" if (C_full < th_in) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
     save_mode(mode)
-    _MODE_JA = {"EMERG":"緊急", "CAUTION":"警戒", "NORMAL":"通常"}; _MODE_EMOJI = {"EMERG":"🚨", "CAUTION":"⚠️", "NORMAL":"🟢"}
-    mode_ja, emoji, eff_days = _MODE_JA.get(mode, mode), _MODE_EMOJI.get(mode, "ℹ️"), len(base)
+    _MODE_JA={"EMERG":"緊急","CAUTION":"警戒","NORMAL":"通常"}; _MODE_EMOJI={"EMERG":"🚨","CAUTION":"⚠️","NORMAL":"🟢"}
+    mode_ja,emoji,eff_days=_MODE_JA.get(mode,mode),_MODE_EMOJI.get(mode,"ℹ️"),len(base)
     lead_lines = [
         f"{emoji} *現在モード: {mode_ja}*", f"テンプレ合格本数: *{C_full}本*", "しきい値（{0}）".format(th_src),
         f"  ・緊急入り: <{th_in}本", f"  ・緊急解除: ≥{th_out}本", f"  ・通常復帰: ≥{th_norm}本",
@@ -243,7 +223,7 @@ def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
     return lead_lines, mode
 
 
-# ===== Input：外部I/Oと前処理（CSV/API・欠損補完） =====
+# === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
 class Input:
     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
@@ -261,21 +241,21 @@ class Input:
     @staticmethod
     def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series|None:
         if df is None or df.empty: return None
-        idx_lower = {str(i).lower(): i for i in df.index}
-        for name in names:
-            key = name.lower()
-            if key in idx_lower: return df.loc[idx_lower[key]]
+        idx_lower={str(i).lower():i for i in df.index}
+        for n in names:
+            k=n.lower()
+            if k in idx_lower: return df.loc[idx_lower[k]]
         return None
 
     @staticmethod
     def _sum_last_n(s: pd.Series|None, n: int) -> float|None:
         if s is None or s.empty: return None
-        vals = s.dropna().astype(float); return None if vals.empty else vals.iloc[:n].sum()
+        v=s.dropna().astype(float); return None if v.empty else v.iloc[:n].sum()
 
     @staticmethod
     def _latest(s: pd.Series|None) -> float|None:
         if s is None or s.empty: return None
-        vals = s.dropna().astype(float); return vals.iloc[0] if not vals.empty else None
+        v=s.dropna().astype(float); return v.iloc[0] if not v.empty else None
 
     def fetch_cfo_capex_ttm_yf(self, tickers: list[str]) -> pd.DataFrame:
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -303,7 +283,7 @@ class Input:
 
         rows, mw = [], int(os.getenv("FIN_THREADS","8"))
         with ThreadPoolExecutor(max_workers=mw) as ex:
-            for f in as_completed(ex.submit(one,t) for t in tickers): rows.append(f.result())
+            rows=[f.result() for f in as_completed(ex.submit(one,t) for t in tickers)]
         return pd.DataFrame(rows).set_index("ticker")
 
     _FINN_CFO_KEYS = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
@@ -425,7 +405,7 @@ class Input:
         return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
 
 
-# ===== Selector：相関低減・選定（スコア＆リターンだけ読む） =====
+# === Selector：相関低減・選定（スコア＆リターンだけ読む） ===
 class Selector:
     # ---- DRRS helpers（Selector専用） ----
     @staticmethod
@@ -517,7 +497,7 @@ class Selector:
         return dict(idx=S, tickers=selected_tickers, avg_res_corr=cls.avg_corr(C_within,S), sum_score=float(score[S].sum()), objective=float(Jn))
 
     # ---- 選定（スコア Series / returns だけを受ける）----
-# ===== Output：出力整形と送信（表示・Slack） =====
+# === Output：出力整形と送信（表示・Slack） ===
 class Output:
 
     def __init__(self, debug=False):
@@ -739,7 +719,7 @@ def _label_recent_event(t, feature_df):
     return t
 
 
-# ===== パイプライン可視化：G/D共通フロー（出力は不変） ==============================
+# === パイプライン可視化：G/D共通フロー（出力は不変） ===
 
 def io_build_input_bundle() -> InputBundle:
     """
@@ -874,15 +854,13 @@ def run_pipeline() -> SelectionBundle:
         fire_recent = [t for t in guni
                        if (str(df.at[t, "G_BREAKOUT_recent_5d"]) == "True") or
                           (str(df.at[t, "G_PULLBACK_recent_5d"]) == "True")]
-    except Exception:
-        fire_recent = []
+    except Exception: fire_recent = []
 
     # === 先頭ヘッダ（モード・しきい値・分位）をテキストブロック化して差し込み ===
     try:
         lead_lines, _mode = _build_breadth_lead_lines(inb)  # 既存の関数（以前の改修で追加済み）
         head_block = "```" + "\n".join(lead_lines) + "```"
-    except Exception:
-        head_block = ""  # フェイルセーフ（ヘッダなしでも後続は継続）
+    except Exception: head_block = ""  # フェイルセーフ（ヘッダなしでも後続は継続）
 
     lines = [
         head_block,
