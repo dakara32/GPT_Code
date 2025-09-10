@@ -1,6 +1,8 @@
 '''ROLE: Orchestration ONLY（外部I/O・SSOT・Slack出力）, 計算は scorer.py'''
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
-BONUS_COEFF = 0.4   # 攻め=0.3 / 中庸=0.4 / 守り=0.5
+BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
+SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
+SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
 import os, time, requests
 from time import perf_counter
 from dataclasses import dataclass
@@ -176,6 +178,31 @@ def _disjoint_keepG(top_G, top_D, poolD):
             if i < len(poolD):
                 D[j] = poolD[i]; used.add(D[j]); i += 1
     return top_G, D
+
+
+def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
+                         n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
+    import pandas as pd, numpy as np
+    sel = list(pick)
+    if not sel: return sel
+    ranked_sel = agg.reindex(sel).sort_values(ascending=False)
+    kth = ranked_sel.iloc[min(len(sel), n_target)-1]
+    sigma = float(agg.std()) if pd.notna(agg.std()) else 0.0
+    thresh = kth - delta_z * sigma
+    ranked_all = agg.sort_values(ascending=False)
+    cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
+    for t in cand:
+        within_score = (pd.notna(agg[t]) and agg[t] >= thresh)
+        within_rank  = (t in ranked_all.index) and (ranked_all.index.get_loc(t) < n_target + keep_buffer)
+        if within_score or within_rank:
+            non_inc = [x for x in sel if x not in incumbents]
+            if not non_inc: break
+            weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
+            if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
+                sel.remove(weakest); sel.append(t)
+    if len(sel) > n_target:
+        sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
+    return sel
 
 
 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
@@ -735,6 +762,14 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         if group == "D":
             _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
             T.log("selection finalized (G/D)")
+    try:
+        inc = [t for t in exist if t in agg.index]
+        pick = _sticky_keep_current(
+            agg=agg, pick=pick, incumbents=inc, n_target=n_target,
+            delta_z=SWAP_DELTA_Z, keep_buffer=SWAP_KEEP_BUFFER
+        )
+    except Exception as _e:
+        print(f"[warn] sticky_keep_current skipped: {str(_e)}")
     # --- Near-Miss: 惜しくも選ばれなかった上位10を保持（Slack表示用） ---
     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
     try:
