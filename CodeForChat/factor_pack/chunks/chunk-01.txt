@@ -8,260 +8,248 @@
 
 ## <factor.py>
 ```text
-L1 """
-L2 ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-L3 ┃ ROLE of factor.py                                     ┃
-L4 ┃  - Orchestration ONLY（外部I/O・SSOT・Slack出力）     ┃
-L5 ┃  - 計算ロジック（採点/フィルタ/相関低減）は scorer.py ┃
-L6 ┃  - ここでロジックを実装/変更しない                   ┃
-L7 ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-L8 """
-L9 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
-L10 BONUS_COEFF = 0.4   # 攻め=0.3 / 中庸=0.4 / 守り=0.5
-L11 import os, json, time, requests
-L12 from time import perf_counter
-L13 from dataclasses import dataclass
-L14 from typing import Dict, List
-L15 from concurrent.futures import ThreadPoolExecutor
-L16 import numpy as np
-L17 import pandas as pd
-L18 import yfinance as yf
-L19 from scipy.stats import zscore  # used via scorer
-L20 from scorer import Scorer, ttm_div_yield_portfolio
-L21
+L1 '''ROLE: Orchestration ONLY（外部I/O・SSOT・Slack出力）, 計算は scorer.py'''
+L2 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
+L3 BONUS_COEFF = 0.4   # 攻め=0.3 / 中庸=0.4 / 守り=0.5
+L4 import os, json, time, requests
+L5 from time import perf_counter
+L6 from dataclasses import dataclass
+L7 from typing import Dict, List
+L8 from concurrent.futures import ThreadPoolExecutor
+L9 import numpy as np
+L10 import pandas as pd
+L11 import yfinance as yf
+L12 from scipy.stats import zscore  # used via scorer
+L13 from scorer import Scorer, ttm_div_yield_portfolio
+L14
+L15
+L16 class T:
+L17     t = perf_counter()
+L18     log = staticmethod(lambda tag: (lambda now=perf_counter(): (print(f"[T] {tag}: {now - T.t:.2f}s"), setattr(T, "t", now))[-1])())
+L19
+L20
+L21 T.log("start")
 L22
-L23 class T:
-L24     t = perf_counter()
-L25     log = staticmethod(lambda tag: (lambda now=perf_counter(): (print(f"[T] {tag}: {now - T.t:.2f}s"), setattr(T, "t", now))[-1])())
-L26
-L27
-L28 T.log("start")
-L29
-L30 # ===== ユニバースと定数（冒頭に固定） =====
-L31 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
-L32 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
-L33 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
-L34 N_G, N_D = 12, 13  # G/D枠サイズ
-L35 g_weights = {'GRW':0.40,'MOM':0.45,'VOL':-0.15}
-L36 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
-L37 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
-L38 D_weights = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
-L39 def _fmt_w(w): return " ".join(f"{k}{int(v*100)}" for k,v in w.items())
-L40
-L41 # DRRS 初期プール・各種パラメータ
-L42 corrM = 45
-L43 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
-L44 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
-L45
-L46 # クロス相関ペナルティ（未定義なら設定）
-L47 try: CROSS_MU_GD
-L48 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+L23 # === ユニバースと定数（冒頭に固定） ===
+L24 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
+L25 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
+L26 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
+L27 N_G, N_D = 12, 13  # G/D枠サイズ
+L28 g_weights = {'GRW':0.40,'MOM':0.45,'VOL':-0.15}
+L29 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
+L30 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
+L31 D_weights = {'QAL':0.15,'YLD':0.15,'VOL':-0.45,'TRD':0.25}
+L32 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
+L33
+L34 # DRRS 初期プール・各種パラメータ
+L35 corrM = 45
+L36 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
+L37 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
+L38
+L39 # クロス相関ペナルティ（未定義なら設定）
+L40 try: CROSS_MU_GD
+L41 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+L42
+L43 # 出力関連
+L44 RESULTS_DIR = "results"
+L45 os.makedirs(RESULTS_DIR, exist_ok=True)
+L46
+L47 # その他
+L48 debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
 L49
-L50 # 出力関連
-L51 RESULTS_DIR = "results"
-L52 os.makedirs(RESULTS_DIR, exist_ok=True)
-L53
-L54 # その他
-L55 debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
-L56
-L57
-L58 # ===== 共有DTO（クラス間I/O契約）＋ Config =====
-L59 @dataclass(frozen=True)
-L60 class InputBundle:
-L61     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
-L62     cand: List[str]
-L63     tickers: List[str]
-L64     bench: str
-L65     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
-L66     px: pd.DataFrame                # data['Close']
-L67     spx: pd.Series                  # data['Close'][bench]
-L68     tickers_bulk: object            # yfinance.Tickers
-L69     info: Dict[str, dict]           # yfinance info per ticker
-L70     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
-L71     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
-L72     returns: pd.DataFrame           # px[tickers].pct_change()
-L73
-L74 @dataclass(frozen=True)
-L75 class FeatureBundle:
-L76     df: pd.DataFrame
-L77     df_z: pd.DataFrame
-L78     g_score: pd.Series
-L79     d_score_all: pd.Series
-L80     missing_logs: pd.DataFrame
-L81
-L82 @dataclass(frozen=True)
-L83 class SelectionBundle:
-L84     resG: dict
-L85     resD: dict
-L86     top_G: List[str]
-L87     top_D: List[str]
-L88     init_G: List[str]
-L89     init_D: List[str]
-L90
-L91 @dataclass(frozen=True)
-L92 class WeightsConfig:
-L93     g: Dict[str,float]
-L94     d: Dict[str,float]
-L95
-L96 @dataclass(frozen=True)
-L97 class DRRSParams:
-L98     corrM: int
-L99     shrink: float
-L100     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
-L101     D: Dict[str,float]
-L102     cross_mu_gd: float
+L50
+L51 # === 共有DTO（クラス間I/O契約）＋ Config ===
+L52 @dataclass(frozen=True)
+L53 class InputBundle:
+L54     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
+L55     cand: List[str]
+L56     tickers: List[str]
+L57     bench: str
+L58     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
+L59     px: pd.DataFrame                # data['Close']
+L60     spx: pd.Series                  # data['Close'][bench]
+L61     tickers_bulk: object            # yfinance.Tickers
+L62     info: Dict[str, dict]           # yfinance info per ticker
+L63     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
+L64     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
+L65     returns: pd.DataFrame           # px[tickers].pct_change()
+L66
+L67 @dataclass(frozen=True)
+L68 class FeatureBundle:
+L69     df: pd.DataFrame
+L70     df_z: pd.DataFrame
+L71     g_score: pd.Series
+L72     d_score_all: pd.Series
+L73     missing_logs: pd.DataFrame
+L74
+L75 @dataclass(frozen=True)
+L76 class SelectionBundle:
+L77     resG: dict
+L78     resD: dict
+L79     top_G: List[str]
+L80     top_D: List[str]
+L81     init_G: List[str]
+L82     init_D: List[str]
+L83
+L84 @dataclass(frozen=True)
+L85 class WeightsConfig:
+L86     g: Dict[str,float]
+L87     d: Dict[str,float]
+L88
+L89 @dataclass(frozen=True)
+L90 class DRRSParams:
+L91     corrM: int
+L92     shrink: float
+L93     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
+L94     D: Dict[str,float]
+L95     cross_mu_gd: float
+L96
+L97 @dataclass(frozen=True)
+L98 class PipelineConfig:
+L99     weights: WeightsConfig
+L100     drrs: DRRSParams
+L101     price_max: float
+L102
 L103
-L104 @dataclass(frozen=True)
-L105 class PipelineConfig:
-L106     weights: WeightsConfig
-L107     drrs: DRRSParams
-L108     price_max: float
-L109
-L110
-L111 # ===== 共通ユーティリティ（複数クラスで使用） =====
-L112 # (unused local utils removed – use scorer.py versions if needed)
-L113
-L114 def _env_true(name: str, default=False):
-L115     v = os.getenv(name)
-L116     return (v or str(default)).strip().lower() == "true"
-L117
-L118 def _post_slack(payload: dict):
-L119     url = os.getenv("SLACK_WEBHOOK_URL")
-L120     if not url: 
-L121         print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-L122     try:
-L123         requests.post(url, json=payload).raise_for_status()
-L124     except Exception as e:
-L125         print(f"⚠️ Slack通知エラー: {e}")
-L126
-L127 def _slack(message, code=False):
-L128     _post_slack({"text": f"```{message}```" if code else message})
+L104 # === 共通ユーティリティ（複数クラスで使用） ===
+L105 # (unused local utils removed – use scorer.py versions if needed)
+L106
+L107 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
+L108
+L109 def _post_slack(payload: dict):
+L110     url = os.getenv("SLACK_WEBHOOK_URL")
+L111     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+L112     try:
+L113         requests.post(url, json=payload).raise_for_status()
+L114     except Exception as e:
+L115         print(f"⚠️ Slack通知エラー: {e}")
+L116
+L117 _slack = lambda message, code=False: _post_slack({"text": f"```{message}```" if code else message})
+L118
+L119 def _slack_debug(text: str, chunk=2800):
+L120     i=0
+L121     while i<len(text):
+L122         j=min(len(text), i+chunk); k=text.rfind("\n", i, j); j=k if k>i+100 else j
+L123         _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}]}); i=j
+L124
+L125 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
+L126     want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
+L127     all_cols = _env_true("DEBUG_ALL_COLS", False)
+L128     cols = list(fb.df_z.columns if all_cols else [c for c in want if c in fb.df_z.columns])
 L129
-L130 def _slack_debug(text: str, chunk=2800):
-L131     i = 0
-L132     while i < len(text):
-L133         j = min(len(text), i+chunk); k = text.rfind("\n", i, j); j = k if k > i+100 else j
-L134         _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}]})
-L135         i = j
-L136
-L137 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-L138     want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
-L139     all_cols = _env_true("DEBUG_ALL_COLS", False)
-L140     cols = list(fb.df_z.columns if all_cols else [c for c in want if c in fb.df_z.columns])
+L130     Gp, Dp = set(prevG or []), set(prevD or [])
+L131     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
+L132     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
+L133
+L134     show_near = _env_true("DEBUG_NEAR5", True)
+L135     gs, ds = getattr(fb,"g_score",None), getattr(fb,"d_score_all",None)
+L136     gs = (gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None)
+L137     ds = (ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None)
+L138     g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
+L139     d_excl = set((sb.top_G or [])+(sb.top_D or []))
+L140     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
 L141
-L142     Gp, Dp = set(prevG or []), set(prevD or [])
-L143     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
-L144     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
-L145
-L146     show_near = _env_true("DEBUG_NEAR5", True)
-L147     gs = getattr(fb,"g_score",None); ds = getattr(fb,"d_score_all",None)
-L148     gs = gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None
-L149     ds = ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None
-L150     g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
-L151     d_excl = set((sb.top_G or [])+(sb.top_D or []))
-L152     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
-L153
-L154     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-L155     focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))[:max_rows]
+L142     all_rows = _env_true("DEBUG_ALL_ROWS", False)
+L143     focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))[:max_rows]
+L144
+L145     def _fmt_near(lbl, ser, lst):
+L146         if ser is None: return f"{lbl}: off"
+L147         g = ser.get
+L148         parts=[f"{t}:{g(t,float('nan')):.3f}" if pd.notna(g(t)) else f"{t}:nan" for t in lst]
+L149         return f"{lbl}: " + (", ".join(parts) if parts else "-")
+L150
+L151     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
+L152           _fmt_near("G near10", gs, g_miss),
+L153           _fmt_near("D near10", ds, d_miss),
+L154           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
+L155           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
 L156
-L157     def _fmt_near(lbl, ser, lst):
-L158         if ser is None: return f"{lbl}: off"
-L159         parts=[f"{t}:{ser.get(t,float('nan')):.3f}" if pd.notna(ser.get(t)) else f"{t}:nan" for t in lst]
-L160         return f"{lbl}: "+(", ".join(parts) if parts else "-")
+L157     tbl="(df_z or columns not available)"
+L158     if not fb.df_z.empty and cols:
+L159         idx=[t for t in focus if t in fb.df_z.index]
+L160         tbl=fb.df_z.loc[idx, cols].round(3).to_string(max_rows=None, max_cols=None)
 L161
-L162     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
-L163           _fmt_near("G near10", gs, g_miss),
-L164           _fmt_near("D near10", ds, d_miss),
-L165           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
-L166           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
+L162     miss_txt=""
+L163     if _env_true("DEBUG_MISSING_LOGS", False):
+L164         miss=getattr(fb,"missing_logs",None)
+L165         if miss is not None and not miss.empty:
+L166             miss_txt="\nMissing data (head)\n"+miss.head(10).to_string(index=False)
 L167
-L168     tbl="(df_z or columns not available)"
-L169     if not fb.df_z.empty and cols:
-L170         idx=[t for t in focus if t in fb.df_z.index]
-L171         tbl=fb.df_z.loc[idx, cols].round(3).to_string(max_rows=None, max_cols=None)
-L172
-L173     miss_txt=""
-L174     if _env_true("DEBUG_MISSING_LOGS", False):
-L175         miss=getattr(fb,"missing_logs",None)
-L176         if miss is not None and not miss.empty:
-L177             miss_txt="\nMissing data (head)\n"+miss.head(10).to_string(index=False)
-L178
-L179     return "\n".join(head+["\nChanged/Selected (+ Near Miss)", tbl])+miss_txt
-L180
-L181 def _disjoint_keepG(top_G, top_D, poolD):
+L168     return "\n".join(head+["\nChanged/Selected (+ Near Miss)", tbl])+miss_txt
+L169
+L170 def _disjoint_keepG(top_G, top_D, poolD):
+L171     """
+L172     Gに含まれる銘柄をDから除去し、DはpoolD（次点）で補充する。
+L173     - 引数:
+L174         top_G: List[str]  … G最終12銘柄
+L175         top_D: List[str]  … D最終13銘柄（重複を含む可能性あり）
+L176         poolD: List[str]  … D候補の順位リスト（top_Dを含む上位拡張）
+L177     - 戻り値: (top_G, top_D_disjoint)
+L178     - 挙動:
+L179         1) DにG重複があれば順に置換
+L180         2) 置換候補は poolD から、既使用(G∪D)を避けて前から採用
+L181         3) 補充分が尽きた場合は元の銘柄を残す（安全フォールバック）
 L182     """
-L183     Gに含まれる銘柄をDから除去し、DはpoolD（次点）で補充する。
-L184     - 引数:
-L185         top_G: List[str]  … G最終12銘柄
-L186         top_D: List[str]  … D最終13銘柄（重複を含む可能性あり）
-L187         poolD: List[str]  … D候補の順位リスト（top_Dを含む上位拡張）
-L188     - 戻り値: (top_G, top_D_disjoint)
-L189     - 挙動:
-L190         1) DにG重複があれば順に置換
-L191         2) 置換候補は poolD から、既使用(G∪D)を避けて前から採用
-L192         3) 補充分が尽きた場合は元の銘柄を残す（安全フォールバック）
-L193     """
-L194     used, D, i = set(top_G), list(top_D), 0
-L195     for j, t in enumerate(D):
-L196         if t in used:
-L197             while i < len(poolD) and (poolD[i] in used or poolD[i] in D): i += 1
-L198             if i < len(poolD): D[j] = poolD[i]; used.add(D[j]); i += 1
-L199     return top_G, D
-L200
-L201 _state_file = lambda: os.path.join(RESULTS_DIR, "breadth_state.json")
-L202 def load_mode(default: str="NORMAL") -> str:
-L203     try:
-L204         m = json.loads(open(_state_file()).read()).get("mode", default)
-L205         return m if m in ("EMERG","CAUTION","NORMAL") else default
-L206     except Exception: return default
-L207 def save_mode(mode: str):
-L208     try: open(_state_file(),"w").write(json.dumps({"mode": mode}))
-L209     except Exception: pass
-L210
-L211 # --- Breadth→自動しきい値→ヒステリシス→Slack先頭行を作成 ---
-L212 def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
-L213     win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
-L214     C_ts = Scorer.trend_template_breadth_series(inb.px[inb.tickers], inb.spx, win_days=win)
-L215     if C_ts.empty: raise RuntimeError("breadth series empty")
-L216     warmup = int(os.getenv("BREADTH_WARMUP_DAYS", "252"))
-L217     base = C_ts.iloc[warmup:] if len(C_ts) > warmup else C_ts
-L218     C_full = int(C_ts.iloc[-1])
-L219     q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
-L220     q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
-L221     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
-L222     th_in_rec, th_out_rec, th_norm_rec = max(N_G, q05), max(int(np.ceil(1.5*N_G)), q20), max(3*N_G, q60)
-L223     use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
-L224     th_in, th_out, th_norm, th_src = (th_in_rec, th_out_rec, th_norm_rec, "自動") if use_calib else (
-L225         int(os.getenv("GTT_EMERG_IN",    str(N_G))),
-L226         int(os.getenv("GTT_EMERG_OUT",   str(int(1.5*N_G)))),
-L227         int(os.getenv("GTT_CAUTION_OUT", str(3*N_G))),
-L228         "手動"
-L229     )
-L230     prev = load_mode("NORMAL")
-L231     if   prev == "EMERG":  mode = "EMERG" if (C_full < th_out) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-L232     elif prev == "CAUTION": mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
-L233     else:                   mode = "EMERG" if (C_full < th_in) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-L234     save_mode(mode)
-L235     _MODE_JA = {"EMERG":"緊急", "CAUTION":"警戒", "NORMAL":"通常"}; _MODE_EMOJI = {"EMERG":"🚨", "CAUTION":"⚠️", "NORMAL":"🟢"}
-L236     mode_ja, emoji, eff_days = _MODE_JA.get(mode, mode), _MODE_EMOJI.get(mode, "ℹ️"), len(base)
-L237     lead_lines = [
-L238         f"{emoji} *現在モード: {mode_ja}*", f"テンプレ合格本数: *{C_full}本*", "しきい値（{0}）".format(th_src),
-L239         f"  ・緊急入り: <{th_in}本", f"  ・緊急解除: ≥{th_out}本", f"  ・通常復帰: ≥{th_norm}本",
-L240         f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
-L241         f"  ・下位5%: {q05}本", f"  ・下位20%: {q20}本", f"  ・60%分位: {q60}本",
-L242     ]
-L243     return lead_lines, mode
-L244
-L245
-L246 # ===== Input：外部I/Oと前処理（CSV/API・欠損補完） =====
-L247 class Input:
-L248     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
-L249         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
-L250         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
-L251
-L252     # ---- （Input専用）EPS補完・FCF算出系 ----
-L253     @staticmethod
-L254     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
-L255         out_col = out_col or ttm_col; df = df.copy(); df["eps_imputed"] = False
-L256        
+L183     used, D, i = set(top_G), list(top_D), 0
+L184     for j, t in enumerate(D):
+L185         if t in used:
+L186             while i<len(poolD) and (poolD[i] in used or poolD[i] in D): i+=1
+L187             if i < len(poolD): D[j] = poolD[i]; used.add(D[j]); i += 1
+L188     return top_G, D
+L189
+L190 _state_file = lambda: os.path.join(RESULTS_DIR, "breadth_state.json")
+L191 def load_mode(default: str="NORMAL") -> str:
+L192     try: m=json.loads(open(_state_file()).read()).get("mode", default); return m if m in ("EMERG","CAUTION","NORMAL") else default
+L193     except Exception: return default
+L194 def save_mode(mode: str):
+L195     try: open(_state_file(),"w").write(json.dumps({"mode": mode}))
+L196     except Exception: pass
+L197
+L198 # --- Breadth→自動しきい値→ヒステリシス→Slack先頭行を作成 ---
+L199 def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
+L200     win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
+L201     C_ts = Scorer.trend_template_breadth_series(inb.px[inb.tickers], inb.spx, win_days=win)
+L202     if C_ts.empty: raise RuntimeError("breadth series empty")
+L203     warmup=int(os.getenv("BREADTH_WARMUP_DAYS","252")); base=C_ts.iloc[warmup:] if len(C_ts)>warmup else C_ts; C_full=int(C_ts.iloc[-1])
+L204     q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
+L205     q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
+L206     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
+L207     th_in_rec, th_out_rec, th_norm_rec = max(N_G, q05), max(int(np.ceil(1.5*N_G)), q20), max(3*N_G, q60)
+L208     use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
+L209     th_in, th_out, th_norm, th_src = (th_in_rec, th_out_rec, th_norm_rec, "自動") if use_calib else (int(os.getenv("GTT_EMERG_IN",str(N_G))), int(os.getenv("GTT_EMERG_OUT",str(int(1.5*N_G)))), int(os.getenv("GTT_CAUTION_OUT",str(3*N_G))), "手動")
+L210     prev = load_mode("NORMAL")
+L211     if   prev == "EMERG":  mode = "EMERG" if (C_full < th_out) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+L212     elif prev == "CAUTION": mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
+L213     else:                   mode = "EMERG" if (C_full < th_in) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+L214     save_mode(mode)
+L215     _MODE_JA={"EMERG":"緊急","CAUTION":"警戒","NORMAL":"通常"}; _MODE_EMOJI={"EMERG":"🚨","CAUTION":"⚠️","NORMAL":"🟢"}
+L216     mode_ja,emoji,eff_days=_MODE_JA.get(mode,mode),_MODE_EMOJI.get(mode,"ℹ️"),len(base)
+L217     lead_lines = [
+L218         f"{emoji} *現在モード: {mode_ja}*", f"テンプレ合格本数: *{C_full}本*", "しきい値（{0}）".format(th_src),
+L219         f"  ・緊急入り: <{th_in}本", f"  ・緊急解除: ≥{th_out}本", f"  ・通常復帰: ≥{th_norm}本",
+L220         f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
+L221         f"  ・下位5%: {q05}本", f"  ・下位20%: {q20}本", f"  ・60%分位: {q60}本",
+L222     ]
+L223     return lead_lines, mode
+L224
+L225
+L226 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
+L227 class Input:
+L228     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
+L229         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
+L230         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
+L231
+L232     # ---- （Input専用）EPS補完・FCF算出系 ----
+L233     @staticmethod
+L234     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
+L235         out_col = out_col or ttm_col; df = df.copy(); df["eps_imputed"] = False
+L236         cand = df[q_col]*4; ok = df[ttm_col].isna() & cand.replace([np.inf,-np.inf], np.nan).notna()
+L237         df.loc[ok, out_col], df.loc[ok,"eps_imputed"] = cand[ok], True; return df
+L238
+L239     _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"], "capex":["Capital Expenditure","Capital Expenditures"]}
+L240
+L241     @staticmethod
+L242     def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series|None:
+L243         if df is None or df.empty: return None
+L244  
 ```
