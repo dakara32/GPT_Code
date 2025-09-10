@@ -278,32 +278,32 @@ L268     try:
 L269         sig = []
 L270         d = df.loc[idx]
 L271         close = _scalar(d, "Close")
-L272         open_ = _scalar(d, "Open")
-L273         ma20 = _scalar(d, "ma20")
-L274         ma50 = _scalar(d, "ma50")
-L275         vol = _scalar(d, "Volume")
-L276         vol50 = _scalar(df.iloc[-1], "vol50")
-L277         if any(pd.isna(x) for x in (close, open_, vol, vol50)):
-L278             return sig
-L279         if pd.notna(ma20) and close < ma20:
-L280             sig.append("20DMA↓")
-L281         if pd.notna(ma50) and close < ma50 and vol > 1.5 * vol50:
-L282             sig.append("50DMA↓(大商い)")
-L283
-L284         last4 = df.loc[:idx].tail(4)
-L285         lows_desc = _is_strict_down(last4["Low"].tolist())
-L286         last10 = df.loc[:idx].tail(10)
-L287         reds = int((last10["Close"] < last10["Open"]).sum())
+L272         ma20 = _scalar(d, "ma20")
+L273         ma50 = _scalar(d, "ma50")
+L274         vol = _scalar(d, "Volume")
+L275         vol50 = _scalar(d, "vol50")
+L276
+L277         if pd.notna(close) and pd.notna(ma20) and close < ma20:
+L278             sig.append("20DMA↓")
+L279
+L280         if all(pd.notna(x) for x in (close, ma50, vol, vol50)) and close < ma50 and vol > 1.5 * vol50:
+L281             sig.append("50DMA↓(大商い)")
+L282
+L283         last4 = df.loc[:idx].tail(4)
+L284         last10 = df.loc[:idx].tail(10)
+L285
+L286         lows_desc = _is_strict_down(last4["Low"].tolist()) if last4["Low"].notna().all() else False
+L287         reds = int((last10["Close"] < last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
 L288         if lows_desc or reds > 5:
 L289             sig.append("連続安値/陰線優勢")
 L290
-L291         ups = int((last10["Close"] > last10["Open"]).sum())
+L291         ups = int((last10["Close"] > last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
 L292         if ups >= 7:
 L293             sig.append("上げ偏重(>70%)")
 L294
 L295         last15 = df.loc[:idx].tail(15)
 L296         base0 = _scalar(last15.iloc[0], "Close") if len(last15) > 0 else float("nan")
-L297         if pd.notna(base0) and base0 != 0 and (close / base0 - 1) >= 0.25:
+L297         if pd.notna(base0) and pd.notna(close) and base0 != 0 and (close / base0 - 1) >= 0.25:
 L298             sig.append("+25%/15日内")
 L299
 L300         if len(df.loc[:idx]) >= 2:
@@ -499,61 +499,65 @@ L489     df_small = prepare_summary(df, total_drift_abs, alert)
 L490     if 'df_small' in locals() and isinstance(df_small, pd.DataFrame) and not df_small.empty:
 L491         col_sym = "sym" if "sym" in df_small.columns else ("symbol" if "symbol" in df_small.columns else None)
 L492         if col_sym:
-L493             df_small.insert(0, "⚠", df_small[col_sym].apply(lambda x: "🔴" if x in sell_alerts else ""))
-L494     formatters = formatters_for(alert)
-L495     header = build_header(
-L496         mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
-L497     )
-L498     if breadth_block:
-L499         header = breadth_block + "\n" + header
-L500     if sell_alerts:
-L501         def fmt_pair(date_tags):
-L502             date, tags = date_tags
-L503             return f"{date}:" + "・".join(tags)
-L504         listed = []
-L505         for t, arr in sell_alerts.items():
-L506             listed.append(f"*{t}*（" + ", ".join(fmt_pair(x) for x in arr) + "）")
-L507         hits = ", ".join(listed)
-L508         if "✅ アラートなし" in header:
-L509             header = header.replace(
-L510                 "✅ アラートなし",
-L511                 f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hits}",
-L512             )
-L513         else:
-L514             header += f"\n🟥 {hits}"
-L515     table_text = df_small.to_string(formatters=formatters, index=False)
-L516     send_slack(header + "\n```" + table_text + "```")
-L517
-L518     if debug_mode:
-L519         debug_cols = [
-L520             "symbol",
-L521             "shares",
-L522             "price",
-L523             "value",
-L524             "current_ratio",
-L525             "drift",
-L526             "drift_abs",
-L527             "adjusted_ratio",
-L528             "adjustable",
-L529             "trade_shares",
-L530             "new_shares",
-L531             "new_value",
-L532             "simulated_ratio",
-L533             "simulated_drift_abs",
-L534         ]
-L535         debug_text = (
-L536             "=== DEBUG: full dataframe ===\n"
-L537             + df[debug_cols].to_string()
-L538             + f"\n\ntotal_value={total_value}, new_total_value={new_total_value}\n"
-L539             + f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}"
-L540         )
-L541         print("\n" + debug_text)
-L542         send_debug(debug_text)
-L543
-L544
-L545 if __name__ == "__main__":
-L546     main()
+L493             alert_keys = {str(k) for k in sell_alerts.keys()}
+L494             df_small[col_sym] = df_small[col_sym].astype(str)
+L495             df_small.insert(0, "⚠", df_small[col_sym].map(lambda x: "🔴" if x in alert_keys else ""))
+L496             latest_tag = {s: " / ".join(sell_alerts[s][-1][1]) for s in sell_alerts}
+L497             df_small.insert(1, "sig", df_small[col_sym].map(latest_tag).fillna(""))
+L498     formatters = formatters_for(alert)
+L499     header = build_header(
+L500         mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
+L501     )
+L502     if breadth_block:
+L503         header = breadth_block + "\n" + header
+L504     if sell_alerts:
+L505         def fmt_pair(date_tags):
+L506             date, tags = date_tags
+L507             return f"{date}:" + "・".join(tags)
+L508         listed = []
+L509         for t, arr in sell_alerts.items():
+L510             listed.append(f"*{t}*（" + ", ".join(fmt_pair(x) for x in arr) + "）")
+L511         hits = ", ".join(listed)
+L512         if "✅ アラートなし" in header:
+L513             header = header.replace(
+L514                 "✅ アラートなし",
+L515                 f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hits}",
+L516             )
+L517         else:
+L518             header += f"\n🟥 {hits}"
+L519     table_text = df_small.to_string(formatters=formatters, index=False)
+L520     send_slack(header + "\n```" + table_text + "```")
+L521
+L522     if debug_mode:
+L523         debug_cols = [
+L524             "symbol",
+L525             "shares",
+L526             "price",
+L527             "value",
+L528             "current_ratio",
+L529             "drift",
+L530             "drift_abs",
+L531             "adjusted_ratio",
+L532             "adjustable",
+L533             "trade_shares",
+L534             "new_shares",
+L535             "new_value",
+L536             "simulated_ratio",
+L537             "simulated_drift_abs",
+L538         ]
+L539         debug_text = (
+L540             "=== DEBUG: full dataframe ===\n"
+L541             + df[debug_cols].to_string()
+L542             + f"\n\ntotal_value={total_value}, new_total_value={new_total_value}\n"
+L543             + f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}"
+L544         )
+L545         print("\n" + debug_text)
+L546         send_debug(debug_text)
 L547
+L548
+L549 if __name__ == "__main__":
+L550     main()
+L551
 ```
 
 ## <.github/workflows/daily-report.yml>
