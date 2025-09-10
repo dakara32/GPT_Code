@@ -1,4 +1,4 @@
-# scorer.py 
+# scorer.py
 # kawatest
 # =============================================================================
 # Scorer: ファクター/指標の生成と合成スコア算出を担う純粋層
@@ -39,8 +39,7 @@ if TYPE_CHECKING:
 
 # ---- Dividend Helpers -------------------------------------------------------
 def _last_close(t, price_map=None):
-    if price_map and (c := price_map.get(t)) is not None:
-        return float(c)
+    if price_map and (c := price_map.get(t)) is not None: return float(c)
     try:
         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
         return float(h.iloc[-1]) if len(h) else np.nan
@@ -50,8 +49,7 @@ def _last_close(t, price_map=None):
 def _ttm_div_sum(t, lookback_days=400):
     try:
         div = yf.Ticker(t).dividends
-        if div is None or len(div) == 0:
-            return 0.0
+        if div is None or len(div) == 0: return 0.0
         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
         return ttm if ttm > 0 else float(div.tail(4).sum())
@@ -68,7 +66,7 @@ def winsorize_s(s: pd.Series, p=0.02):
     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
 
 def robust_z(s: pd.Series, p=0.02):
-    s2=winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+    s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
 
 def _safe_div(a, b):
     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
@@ -211,11 +209,9 @@ class Scorer:
         bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
         """
         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
-        b50  = ((spx/ma50 - 1) + bands[0])/(2*bands[0])
-        b200 = ((spx/ma200 - 1) + bands[1])/(2*bands[1])
+        b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
-        b = float(hist.iloc[-1])
-        lo, mid = float(hist.quantile(q[0])), float(hist.quantile(q[1]))
+        b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
 
     @staticmethod
@@ -227,10 +223,7 @@ class Scorer:
         s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
         cnt, pen = {}, {}
         for t in order:
-            sec = sectors.get(t, "U")
-            k = cnt.get(sec, 0) + 1
-            pen[t] = alpha * max(0, k - cap)
-            cnt[sec] = k
+            sec = sectors.get(t, "U"); cnt[sec] = cnt.get(sec,0) + 1; pen[t] = alpha*max(0, cnt[sec]-cap)
         return (s - pd.Series(pen)).sort_values(ascending=False)
 
     @staticmethod
@@ -244,11 +237,9 @@ class Scorer:
         pick, used = [], {}
         for t in eff.index:
             s = sectors.get(t, "U")
-            if used.get(s, 0) < hard:
-                pick.append(t)
-                used[s] = used.get(s, 0) + 1
-            if len(pick) == N:
-                break
+            if used.get(s,0) < hard:
+                pick.append(t); used[s] = used.get(s,0) + 1
+            if len(pick) == N: break
         return pick
 
     @staticmethod
@@ -465,14 +456,10 @@ class Scorer:
             sma200 = s.rolling(200).mean()
             p = _safe_last(s)
 
-            df.loc[t,'MA50_OVER_150'] = (
-                _safe_last(sma50)/_safe_last(sma150) - 1
-                if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan
-            )
-            df.loc[t,'MA150_OVER_200'] = (
-                _safe_last(sma150)/_safe_last(sma200) - 1
-                if pd.notna(_safe_last(sma150)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
-            )
+            df.loc[t,'MA50_OVER_150'] = (_safe_last(sma50)/_safe_last(sma150) - 1
+                if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan)
+            df.loc[t,'MA150_OVER_200'] = (_safe_last(sma150)/_safe_last(sma200) - 1
+                if pd.notna(_safe_last(sma150)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan)
 
             lo52 = s[-252:].min() if len(s)>=252 else s.min()
             df.loc[t,'P_OVER_LOW52'] = (p/lo52 - 1) if (lo52 and lo52>0 and pd.notna(p)) else np.nan
@@ -557,8 +544,7 @@ class Scorer:
         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
-        df_z['GROWTH_F']  = robust_z(
-              0.25*df_z['REV']          # ↓0.30→0.25
+        df_z['GROWTH_F']  = robust_z(0.25*df_z['REV']          # ↓0.30→0.25
             + 0.20*df_z['EPS_Q_YOY']
             + 0.15*df_z['REV_Q_YOY']
             + 0.15*df_z['REV_YOY_ACC']
@@ -566,16 +552,13 @@ class Scorer:
             + 0.10*df_z['FCF_MGN']
             + 0.10*df_z['EPS']          # ★追加：黒字優遇／赤字減点
             + 0.05*df_z['REV_ANN_STREAK']
-            - 0.05*df_z['REV_YOY_VAR']
-        ).clip(-3.0,3.0)
-        df_z['MOM_F'] = robust_z(
-              0.40*df_z['RS']
+            - 0.05*df_z['REV_YOY_VAR']).clip(-3.0,3.0)
+        df_z['MOM_F'] = robust_z(0.40*df_z['RS']
             + 0.15*df_z['TR_str']
             + 0.15*df_z['RS_SLOPE_6W']
             + 0.15*df_z['RS_SLOPE_13W']
             + 0.10*df_z['MA200_SLOPE_5M']
-            + 0.10*df_z['MA200_UP_STREAK_D']
-        ).clip(-3.0,3.0)
+            + 0.10*df_z['MA200_UP_STREAK_D']).clip(-3.0,3.0)
         df_z['VOL'] = robust_z(df['BETA'])
         df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
 
@@ -629,16 +612,14 @@ class Scorer:
         # ② テンプレ判定（既存ロジックそのまま）
         mask = df['trend_template']
         if not bool(mask.any()):
-            mask = (
-                (df.get('P_OVER_LOW52', np.nan) >= 0.25) &
+            mask = ((df.get('P_OVER_LOW52', np.nan) >= 0.25) &
                 (df.get('NEAR_52W_HIGH', np.nan) >= -0.30) &
                 (df.get('RS', np.nan) >= 0.08) &
                 (df.get('MA200_SLOPE_1M', np.nan) > 0) &
                 (df.get('P_OVER_150', np.nan) > 0) & (df.get('P_OVER_200', np.nan) > 0) &
                 (df.get('MA150_OVER_200', np.nan) > 0) &
                 (df.get('MA50_OVER_150', np.nan) > 0) & (df.get('MA50_OVER_200', np.nan) > 0) &
-                (df.get('TR_str', np.nan) > 0)
-            ).fillna(False)
+                (df.get('TR_str', np.nan) > 0)).fillna(False)
             df['trend_template'] = mask
 
         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
@@ -648,12 +629,10 @@ class Scorer:
         df_z['DSC'] = d_score_all
 
         try:
-            current = (
-                pd.read_csv("current_tickers.csv")
+            current = (pd.read_csv("current_tickers.csv")
                   .iloc[:, 0]
                   .str.upper()
-                  .tolist()
-            )
+                  .tolist())
         except FileNotFoundError:
             warnings.warn("current_tickers.csv not found — bonus skipped")
             current = []
@@ -682,14 +661,11 @@ class Scorer:
             pass
 
         from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
-        return FeatureBundle(
-            df=df,
+        return FeatureBundle(df=df,
             df_z=df_z,
             g_score=g_score,
             d_score_all=d_score_all,
-            missing_logs=pd.DataFrame(missing_logs)
-        )
-
+            missing_logs=pd.DataFrame(missing_logs))
 
 def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_pullback=5):
     """
@@ -782,6 +758,4 @@ def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_
     except Exception:
         pass
     return feature_df
-
-
 
