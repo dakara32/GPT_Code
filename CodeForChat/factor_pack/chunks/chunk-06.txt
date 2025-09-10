@@ -1,60 +1,5 @@
 ```text
-n"
-L165         try:
-L166             a = t.actions
-L167             if (a is not None and not a.empty and "Stock Splits" in a.columns and a["Stock Splits"].abs().sum()>0): return "none_confident"
-L168         except Exception: pass
-L169         try:
-L170             fi = t.fast_info
-L171             if any(getattr(fi,k,None) for k in ("last_dividend_date","dividend_rate","dividend_yield")): return "maybe_missing"
-L172         except Exception: pass
-L173         return "unknown"
-L174
-L175     @staticmethod
-L176     def div_streak(t):
-L177         try:
-L178             divs = yf.Ticker(t).dividends.dropna(); ann = divs.groupby(divs.index.year).sum(); ann = ann[ann.index<pd.Timestamp.today().year]
-L179             years, streak = sorted(ann.index), 0
-L180             for i in range(len(years)-1,0,-1):
-L181                 if ann[years[i]] > ann[years[i-1]]: streak += 1
-L182                 else: break
-L183             return streak
-L184         except Exception: return 0
-L185
-L186     @staticmethod
-L187     def fetch_finnhub_metrics(symbol):
-L188         api_key = os.environ.get("FINNHUB_API_KEY")
-L189         if not api_key: return {}
-L190         url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":api_key}
-L191         try:
-L192             r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
-L193             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.get('enterpriseValue') else None}
-L194         except Exception: return {}
-L195
-L196     @staticmethod
-L197     def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
-L198         r, m = series.pct_change().dropna(), market.pct_change().dropna()
-L199         n = min(len(r), len(m), lookback)
-L200         if n<60: return np.nan
-L201         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
-L202         return np.nan if var==0 else cov/var
-L203
-L204     @staticmethod
-L205     def spx_to_alpha(spx: pd.Series, bands=(0.03,0.10), w=(0.6,0.4),
-L206                      span=5, q=(0.20,0.40), alphas=(0.05,0.08,0.10)) -> float:
-L207         """
-L208         S&P500指数のみから擬似breadthを作り、履歴分位でαを段階決定。
-L209         bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
-L210         """
-L211         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
-L212         b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
-L213         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
-L214         b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
-L215         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
-L216
-L217     @staticmethod
-L218     def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
-L219         """
+9         """
 L220         同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
 L221         戻り値は降順ソート済み。
 L222         """
@@ -228,5 +173,52 @@ L389                     if len(eps_q)>=4: EPS_VAR_8Q = float(eps_q.iloc[-min(8,
 L390             except Exception: pass
 L391             df.loc[t,'EPS_VAR_8Q'] = EPS_VAR_8Q
 L392
-L393             # --- サイズ/流動性
+L393             # --- サイズ/流動性 ---
+L394             df.loc[t,'MARKET_CAP'] = d.get('marketCap',np.nan); adv60 = np.nan
+L395             try:
+L396                 vol_series = ib.data['Volume'][t].dropna()
+L397                 if len(vol_series)>=5 and len(s)==len(vol_series):
+L398                     dv = (vol_series*s).rolling(60).mean(); adv60 = float(dv.iloc[-1])
+L399             except Exception: pass
+L400             df.loc[t,'ADV60_USD'] = adv60
+L401
+L402             # --- 売上/利益の加速度等 ---
+L403             REV_Q_YOY=EPS_Q_YOY=REV_YOY_ACC=REV_YOY_VAR=np.nan
+L404             REV_ANNUAL_STREAK = np.nan
+L405             try:
+L406                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
+L407                 if qe is not None and not qe.empty:
+L408                     if 'Revenue' in qe.columns:
+L409                         rev = qe['Revenue'].dropna().astype(float)
+L410                         if len(rev)>=5: REV_Q_YOY = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5])
+L411                         if len(rev)>=6:
+L412                             yoy_now = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5]); yoy_prev = _safe_div(rev.iloc[-2]-rev.iloc[-6], rev.iloc[-6])
+L413                             if pd.notna(yoy_now) and pd.notna(yoy_prev): REV_YOY_ACC = yoy_now - yoy_prev
+L414                         yoy_list=[]
+L415                         for k in range(1,5):
+L416                             if len(rev)>=4+k:
+L417                                 y = _safe_div(rev.iloc[-k]-rev.iloc[-(k+4)], rev.iloc[-(k+4)])
+L418                                 if pd.notna(y): yoy_list.append(y)
+L419                         if len(yoy_list)>=2: REV_YOY_VAR = float(np.std(yoy_list, ddof=1))
+L420                         # NEW: 年次の持続性（直近から遡って前年比プラスが何年連続か、四半期4本揃う完全年のみ）
+L421                         try:
+L422                             g = rev.groupby(rev.index.year)
+L423                             ann_sum, cnt = g.sum(), g.count()
+L424                             ann_sum = ann_sum[cnt >= 4]
+L425                             if len(ann_sum) >= 3:
+L426                                 yoy = ann_sum.pct_change().dropna()
+L427                                 streak = 0
+L428                                 for v in yoy.iloc[::-1]:
+L429                                     if pd.isna(v) or v <= 0:
+L430                                         break
+L431                                     streak += 1
+L432                                 REV_ANNUAL_STREAK = float(streak)
+L433                         except Exception:
+L434                             pass
+L435                     if 'Earnings' in qe.columns and so:
+L436                         eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
+L437                         if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0:
+L438                             EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
+L439             except Exception: pass
+L440             df.loc[t,'REV_Q_YOY'], df.l
 ```
