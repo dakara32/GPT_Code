@@ -68,12 +68,10 @@ def winsorize_s(s: pd.Series, p=0.02):
     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
 
 def robust_z(s: pd.Series, p=0.02):
-    s2 = winsorize_s(s, p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+    s2=winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
 
 def _safe_div(a, b):
-    try:
-        if b is None or float(b)==0 or pd.isna(b): return np.nan
-        return float(a)/float(b)
+    try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
     except Exception: return np.nan
 
 def _safe_last(series: pd.Series, default=np.nan):
