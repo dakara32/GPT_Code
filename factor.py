@@ -1,7 +1,7 @@
 '''ROLE: Orchestration ONLY（外部I/O・SSOT・Slack出力）, 計算は scorer.py'''
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
 BONUS_COEFF = 0.4   # 攻め=0.3 / 中庸=0.4 / 守り=0.5
-import os, json, time, requests
+import os, time, requests
 from time import perf_counter
 from dataclasses import dataclass
 from typing import Dict, List
@@ -177,43 +177,6 @@ def _disjoint_keepG(top_G, top_D, poolD):
                 D[j] = poolD[i]; used.add(D[j]); i += 1
     return top_G, D
 
-_state_file = lambda: os.path.join(RESULTS_DIR, "breadth_state.json")
-def load_mode(default: str="NORMAL") -> str:
-    try:
-        m = json.loads(open(_state_file()).read()).get("mode", default)
-        return m if m in ("EMERG","CAUTION","NORMAL") else default
-    except Exception:
-        return default
-def save_mode(mode: str):
-    try:
-        open(_state_file(),"w").write(json.dumps({"mode": mode}))
-    except Exception:
-        pass
-
-# --- Breadth→自動しきい値→ヒステリシス→Slack先頭行を作成 ---
-def _build_breadth_lead_lines(inb) -> tuple[list[str], str]:
-    win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
-    C_ts = Scorer.trend_template_breadth_series(inb.px[inb.tickers], inb.spx, win_days=win)
-    if C_ts.empty: raise RuntimeError("breadth series empty")
-    warmup=int(os.getenv("BREADTH_WARMUP_DAYS","252")); base=C_ts.iloc[warmup:] if len(C_ts)>warmup else C_ts; C_full=int(C_ts.iloc[-1])
-    q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
-    q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
-    q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
-    th_in_rec, th_out_rec, th_norm_rec = max(N_G, q05), max(int(np.ceil(1.5*N_G)), q20), max(3*N_G, q60)
-    use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
-    th_in, th_out, th_norm, th_src = (th_in_rec, th_out_rec, th_norm_rec, "自動") if use_calib else (int(os.getenv("GTT_EMERG_IN",str(N_G))), int(os.getenv("GTT_EMERG_OUT",str(int(1.5*N_G)))), int(os.getenv("GTT_CAUTION_OUT",str(3*N_G))), "手動")
-    prev = load_mode("NORMAL")
-    if   prev == "EMERG":  mode = "EMERG" if (C_full < th_out) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-    elif prev == "CAUTION": mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
-    else:                   mode = "EMERG" if (C_full < th_in) else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-    save_mode(mode)
-    _MODE_JA={"EMERG":"緊急","CAUTION":"警戒","NORMAL":"通常"}; _MODE_EMOJI={"EMERG":"🚨","CAUTION":"⚠️","NORMAL":"🟢"}
-    mode_ja,emoji,eff_days=_MODE_JA.get(mode,mode),_MODE_EMOJI.get(mode,"ℹ️"),len(base)
-    lead_lines = [f"{emoji} *現在モード: {mode_ja}*", f"テンプレ合格本数: *{C_full}本*", "しきい値（{0}）".format(th_src),
-        f"  ・緊急入り: <{th_in}本", f"  ・緊急解除: ≥{th_out}本", f"  ・通常復帰: ≥{th_norm}本",
-        f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
-        f"  ・下位5%: {q05}本", f"  ・下位20%: {q20}本", f"  ・60%分位: {q60}本",]
-    return lead_lines, mode
 
 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
 class Input:
@@ -825,13 +788,7 @@ def run_pipeline() -> SelectionBundle:
                           (str(df.at[t, "G_PULLBACK_recent_5d"]) == "True")]
     except Exception: fire_recent = []
 
-    # === 先頭ヘッダ（モード・しきい値・分位）をテキストブロック化して差し込み ===
-    try:
-        lead_lines, _mode = _build_breadth_lead_lines(inb)  # 既存の関数（以前の改修で追加済み）
-        head_block = "```" + "\n".join(lead_lines) + "```"
-    except Exception: head_block = ""  # フェイルセーフ（ヘッダなしでも後続は継続）
-
-    lines = [head_block,
+    lines = [
         "【G枠レポート｜週次モニタ（直近5営業日）】",
         "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
         f"選定12: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else "選定12: なし",
@@ -846,7 +803,6 @@ def run_pipeline() -> SelectionBundle:
     try:
         webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
         if webhook:
-            # 先頭の head_block を含む複数行をそのまま送信（Slack側で```がコードブロックとして描画）
             requests.post(webhook, json={"text": "\n".join([s for s in lines if s != ""])}, timeout=10)
     except Exception:
         pass
