@@ -350,8 +350,8 @@ def compute_threshold_by_mode(mode: str):
     """モードに応じて現金保有率とドリフト閾値を返す（README準拠）"""
     m = (mode or "NORMAL").upper()
     cash_map = {"NORMAL": 0.10, "CAUTION": 0.125, "EMERG": 0.20}
-    drift_map = {"NORMAL": 10, "CAUTION": 12, "EMERG": float("inf")}
-    return cash_map.get(m, 0.10), drift_map.get(m, 10)
+    drift_map = {"NORMAL": 12, "CAUTION": 14, "EMERG": float("inf")}
+    return cash_map.get(m, 0.10), drift_map.get(m, 12)
 
 
 def build_dataframe(portfolio):
@@ -444,6 +444,8 @@ def build_header(mode, cash_ratio, drift_threshold, total_drift_abs, alert, simu
         header += "🚨 *アラート: 発生！！ Δqtyのマイナス銘柄を売却、任意の銘柄を買い増してバランスを取りましょう！*\n"
     else:
         header += "✅ アラートなし\n"
+    # 固定表示: トレーリングストップ方針（G枠）
+    header += "*🛡 TS (G枠):* 基本 -15% / +30%→-12% / +60%→-9% / +100%→-7%\n"
     return header
 
 
