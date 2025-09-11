@@ -31,8 +31,8 @@ L349 def compute_threshold_by_mode(mode: str):
 L350     """モードに応じて現金保有率とドリフト閾値を返す（README準拠）"""
 L351     m = (mode or "NORMAL").upper()
 L352     cash_map = {"NORMAL": 0.10, "CAUTION": 0.125, "EMERG": 0.20}
-L353     drift_map = {"NORMAL": 10, "CAUTION": 12, "EMERG": float("inf")}
-L354     return cash_map.get(m, 0.10), drift_map.get(m, 10)
+L353     drift_map = {"NORMAL": 12, "CAUTION": 14, "EMERG": float("inf")}
+L354     return cash_map.get(m, 0.10), drift_map.get(m, 12)
 L355
 L356
 L357 def build_dataframe(portfolio):
@@ -125,111 +125,113 @@ L443         header += f"*🔁 半戻し後ドリフト合計(想定):* {simulat
 L444         header += "🚨 *アラート: 発生！！ Δqtyのマイナス銘柄を売却、任意の銘柄を買い増してバランスを取りましょう！*\n"
 L445     else:
 L446         header += "✅ アラートなし\n"
-L447     return header
-L448
-L449
-L450 def send_slack(text):
-L451     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-L452     if not SLACK_WEBHOOK_URL:
-L453         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-L454     payload = {"text": text}
-L455     try:
-L456         resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
-L457         resp.raise_for_status()
-L458         print("✅ Slack（Webhook）へ送信しました")
-L459     except Exception as e:
-L460         print(f"⚠️ Slack通知エラー: {e}")
-L461
-L462
-L463 def send_debug(debug_text):
-L464     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-L465     if not SLACK_WEBHOOK_URL:
-L466         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-L467     debug_payload = {"text": "```" + debug_text + "```"}
-L468     try:
-L469         resp = requests.post(SLACK_WEBHOOK_URL, json=debug_payload)
-L470         resp.raise_for_status()
-L471         print("✅ Debug情報をSlackに送信しました")
-L472     except Exception as e:
-L473         print(f"⚠️ Slack通知エラー: {e}")
-L474
-L475
-L476 def main():
-L477     portfolio = load_portfolio()
-L478     symbols = [r["symbol"] for r in portfolio]
-L479     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
-L480
-L481     breadth_block, mode, _C = build_breadth_header()
+L447     # 固定表示: トレーリングストップ方針（G枠）
+L448     header += "*🛡 TS (G枠):* 基本 -15% / +30%→-12% / +60%→-9% / +100%→-7%\n"
+L449     return header
+L450
+L451
+L452 def send_slack(text):
+L453     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+L454     if not SLACK_WEBHOOK_URL:
+L455         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+L456     payload = {"text": text}
+L457     try:
+L458         resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
+L459         resp.raise_for_status()
+L460         print("✅ Slack（Webhook）へ送信しました")
+L461     except Exception as e:
+L462         print(f"⚠️ Slack通知エラー: {e}")
+L463
+L464
+L465 def send_debug(debug_text):
+L466     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+L467     if not SLACK_WEBHOOK_URL:
+L468         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+L469     debug_payload = {"text": "```" + debug_text + "```"}
+L470     try:
+L471         resp = requests.post(SLACK_WEBHOOK_URL, json=debug_payload)
+L472         resp.raise_for_status()
+L473         print("✅ Debug情報をSlackに送信しました")
+L474     except Exception as e:
+L475         print(f"⚠️ Slack通知エラー: {e}")
+L476
+L477
+L478 def main():
+L479     portfolio = load_portfolio()
+L480     symbols = [r["symbol"] for r in portfolio]
+L481     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
 L482
-L483     cash_ratio, drift_threshold = compute_threshold_by_mode(mode)
+L483     breadth_block, mode, _C = build_breadth_header()
 L484
-L485     df, total_value, total_drift_abs = build_dataframe(portfolio)
-L486     df, alert, new_total_value, simulated_total_drift_abs = simulate(
-L487         df, total_value, total_drift_abs, drift_threshold
-L488     )
-L489     df_small = prepare_summary(df, total_drift_abs, alert)
-L490     if 'df_small' in locals() and isinstance(df_small, pd.DataFrame) and not df_small.empty:
-L491         col_sym = "sym" if "sym" in df_small.columns else ("symbol" if "symbol" in df_small.columns else None)
-L492         if col_sym:
-L493             alert_keys = {str(k) for k in sell_alerts.keys()}
-L494             df_small[col_sym] = df_small[col_sym].astype(str)
-L495             df_small.insert(0, "⚠", df_small[col_sym].map(lambda x: "🔴" if x in alert_keys else ""))
-L496             latest_tag = {s: " / ".join(sell_alerts[s][-1][1]) for s in sell_alerts}
-L497             df_small.insert(1, "sig", df_small[col_sym].map(latest_tag).fillna(""))
-L498     formatters = formatters_for(alert)
-L499     header = build_header(
-L500         mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
-L501     )
-L502     if breadth_block:
-L503         header = breadth_block + "\n" + header
-L504     if sell_alerts:
-L505         def fmt_pair(date_tags):
-L506             date, tags = date_tags
-L507             return f"{date}:" + "・".join(tags)
-L508         listed = []
-L509         for t, arr in sell_alerts.items():
-L510             listed.append(f"*{t}*（" + ", ".join(fmt_pair(x) for x in arr) + "）")
-L511         hits = ", ".join(listed)
-L512         if "✅ アラートなし" in header:
-L513             header = header.replace(
-L514                 "✅ アラートなし",
-L515                 f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hits}",
-L516             )
-L517         else:
-L518             header += f"\n🟥 {hits}"
-L519     table_text = df_small.to_string(formatters=formatters, index=False)
-L520     send_slack(header + "\n```" + table_text + "```")
-L521
-L522     if debug_mode:
-L523         debug_cols = [
-L524             "symbol",
-L525             "shares",
-L526             "price",
-L527             "value",
-L528             "current_ratio",
-L529             "drift",
-L530             "drift_abs",
-L531             "adjusted_ratio",
-L532             "adjustable",
-L533             "trade_shares",
-L534             "new_shares",
-L535             "new_value",
-L536             "simulated_ratio",
-L537             "simulated_drift_abs",
-L538         ]
-L539         debug_text = (
-L540             "=== DEBUG: full dataframe ===\n"
-L541             + df[debug_cols].to_string()
-L542             + f"\n\ntotal_value={total_value}, new_total_value={new_total_value}\n"
-L543             + f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}"
-L544         )
-L545         print("\n" + debug_text)
-L546         send_debug(debug_text)
-L547
-L548
-L549 if __name__ == "__main__":
-L550     main()
-L551
+L485     cash_ratio, drift_threshold = compute_threshold_by_mode(mode)
+L486
+L487     df, total_value, total_drift_abs = build_dataframe(portfolio)
+L488     df, alert, new_total_value, simulated_total_drift_abs = simulate(
+L489         df, total_value, total_drift_abs, drift_threshold
+L490     )
+L491     df_small = prepare_summary(df, total_drift_abs, alert)
+L492     if 'df_small' in locals() and isinstance(df_small, pd.DataFrame) and not df_small.empty:
+L493         col_sym = "sym" if "sym" in df_small.columns else ("symbol" if "symbol" in df_small.columns else None)
+L494         if col_sym:
+L495             alert_keys = {str(k) for k in sell_alerts.keys()}
+L496             df_small[col_sym] = df_small[col_sym].astype(str)
+L497             df_small.insert(0, "⚠", df_small[col_sym].map(lambda x: "🔴" if x in alert_keys else ""))
+L498             latest_tag = {s: " / ".join(sell_alerts[s][-1][1]) for s in sell_alerts}
+L499             df_small.insert(1, "sig", df_small[col_sym].map(latest_tag).fillna(""))
+L500     formatters = formatters_for(alert)
+L501     header = build_header(
+L502         mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
+L503     )
+L504     if breadth_block:
+L505         header = breadth_block + "\n" + header
+L506     if sell_alerts:
+L507         def fmt_pair(date_tags):
+L508             date, tags = date_tags
+L509             return f"{date}:" + "・".join(tags)
+L510         listed = []
+L511         for t, arr in sell_alerts.items():
+L512             listed.append(f"*{t}*（" + ", ".join(fmt_pair(x) for x in arr) + "）")
+L513         hits = ", ".join(listed)
+L514         if "✅ アラートなし" in header:
+L515             header = header.replace(
+L516                 "✅ アラートなし",
+L517                 f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hits}",
+L518             )
+L519         else:
+L520             header += f"\n🟥 {hits}"
+L521     table_text = df_small.to_string(formatters=formatters, index=False)
+L522     send_slack(header + "\n```" + table_text + "```")
+L523
+L524     if debug_mode:
+L525         debug_cols = [
+L526             "symbol",
+L527             "shares",
+L528             "price",
+L529             "value",
+L530             "current_ratio",
+L531             "drift",
+L532             "drift_abs",
+L533             "adjusted_ratio",
+L534             "adjustable",
+L535             "trade_shares",
+L536             "new_shares",
+L537             "new_value",
+L538             "simulated_ratio",
+L539             "simulated_drift_abs",
+L540         ]
+L541         debug_text = (
+L542             "=== DEBUG: full dataframe ===\n"
+L543             + df[debug_cols].to_string()
+L544             + f"\n\ntotal_value={total_value}, new_total_value={new_total_value}\n"
+L545             + f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}"
+L546         )
+L547         print("\n" + debug_text)
+L548         send_debug(debug_text)
+L549
+L550
+L551 if __name__ == "__main__":
+L552     main()
+L553
 ```
 
 ## <.github/workflows/daily-report.yml>
@@ -305,15 +307,11 @@ L17   - 通常復帰: `max(q60, 36本)`（= 3×N_G）
 L18 - ヒステリシス: 前回モードに依存（EMERG→解除は18本以上、CAUTION→通常は36本以上）
 L19
 L20 ## レジーム別の現金・ドリフト
-L21 - **通常(NORMAL)** : 現金 **10%** / ドリフト閾値 **10%**
-L22 - **警戒(CAUTION)** : 現金 **12.5%** / ドリフト閾値 **12%**
-L23 - **緊急(EMERG)** : 現金 **20%** / **ドリフト売買停止**（25×4%に全戻しのみ）
+L21  - **通常(NORMAL)** : 現金 **10%** / ドリフト閾値 **12%**
+L22  - **警戒(CAUTION)** : 現金 **12.5%** / ドリフト閾値 **14%**
+L23  - **緊急(EMERG)** : 現金 **20%** / **ドリフト売買停止**（25×4%に全戻しのみ）
 L24
-L25 ## トレーリングストップ（統一）
-L26 - G/D 共通の **基本TS=15%**
-L27 - 含み益が **+20% / +40% / +60%** 到達で TS を **12% / 9% / 7%** に段階引き上げ
-L28 - TS発動で減少した銘柄は翌日以降に補充（※緊急モード中は補充しない）
-L29
-L30 ## 入替銘柄選定
-L31 - Oxfordキャピタル／インカム、A
+L25 ## トレーリングストップ（G枠基準）
+L26 - **基本TS=15%**
+L27 - 含み益が **+30% / +60% / +100%** 到達で TS 
 ```
