@@ -350,8 +350,23 @@ def compute_threshold_by_mode(mode: str):
     """モードに応じて現金保有率とドリフト閾値を返す（README準拠）"""
     m = (mode or "NORMAL").upper()
     cash_map = {"NORMAL": 0.10, "CAUTION": 0.125, "EMERG": 0.20}
+    # ★ 閾値をREADMEに合わせて統一：NORMAL=12%, CAUTION=14%, EMERG=∞
     drift_map = {"NORMAL": 12, "CAUTION": 14, "EMERG": float("inf")}
     return cash_map.get(m, 0.10), drift_map.get(m, 12)
+
+
+def recommended_counts_by_mode(mode: str) -> tuple[int, int, int]:
+    """
+    モード別の推奨保有数 (G_count, D_count, cash_slots) を返す。
+    cash_slotsは「外すG枠の数」（各枠=4%）。
+    NORMAL: G15/D10/現金化0, CAUTION: G13/D10/現金化2, EMERG: G10/D10/現金化5
+    """
+    m = (mode or "NORMAL").upper()
+    if m == "CAUTION":
+        return 13, 10, 2
+    if m == "EMERG":
+        return 10, 10, 5
+    return 15, 10, 0
 
 
 def build_dataframe(portfolio):
@@ -444,8 +459,11 @@ def build_header(mode, cash_ratio, drift_threshold, total_drift_abs, alert, simu
         header += "🚨 *アラート: 発生！！ Δqtyのマイナス銘柄を売却、任意の銘柄を買い増してバランスを取りましょう！*\n"
     else:
         header += "✅ アラートなし\n"
-    # 固定表示: トレーリングストップ方針（汎用）
+    # ★ 追記: TSルール（G/D共通）と推奨保有数
     header += "*🛡 TS:* 基本 -15% / +30%→-12% / +60%→-9% / +100%→-7%\n"
+    g_cnt, d_cnt, cash_slots = recommended_counts_by_mode(mode)
+    cash_pct = cash_slots * 4
+    header += f"*📋 推奨保有数:* G {g_cnt} / D {d_cnt}（現金化枠 {cash_slots}枠 ≒ {cash_pct}%）\n"
     return header
 
 
