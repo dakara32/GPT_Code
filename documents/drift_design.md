@@ -2,7 +2,10 @@
 
 ## 概要
 - 25銘柄ポートフォリオのドリフトを日次監視し、閾値超過時に半戻し案をSlack通知するスクリプト。
-- Finnhubとyfinanceから価格を取得（レジームは trend_template 本数に基づく）。
+- Finnhubとyfinanceから価格を取得（レジームは trend_template 本数に基づく（基準 N_G=15））。
+  - 緊急入り: `max(q05, 15本)`
+  - 緊急解除: `max(q20, 23本)` （ceil(1.5*15)）
+  - 通常復帰: `max(q60, 45本)` （3*15）
 
 ## 定数・設定
 - `FINNHUB_API_KEY` / `SLACK_WEBHOOK_URL` を環境変数から取得。

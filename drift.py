@@ -120,7 +120,8 @@ def build_breadth_header():
     q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
 
-    N_G = 12
+    # G枠サイズ（Breadth基準）
+    N_G = 15
     th_in_rec   = max(N_G, q05)
     th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
     th_norm_rec = max(3*N_G, q60)
