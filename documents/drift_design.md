@@ -23,7 +23,7 @@
 - `current_tickers.csv` から銘柄と保有株数を読み込み、目標比率4%を付与したリストを生成。
 
 ### compute_threshold_by_mode
-- モード(NORMAL/CAUTION/EMERG) に応じて 10% / 12% / 停止(∞) を返す。
+- モード(NORMAL/CAUTION/EMERG) に応じて **12% / 14% / 停止(∞)** を返す。
 
 ### build_dataframe
 - 各銘柄の評価額や現在比率、ドリフト、半戻し後比率(`adjusted_ratio`)を計算しDataFrame化。
