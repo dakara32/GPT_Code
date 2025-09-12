@@ -6,6 +6,7 @@ import csv
 import json
 import time
 from pathlib import Path
+import config
 
 # --- breadth utilities (factor parity) ---
 BENCH = "^GSPC"
@@ -121,7 +122,7 @@ def build_breadth_header():
     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
 
     # G枠サイズ（Breadth基準）
-    N_G = 15
+    N_G = config.N_G
     th_in_rec   = max(N_G, q05)
     th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
     th_norm_rec = max(3*N_G, q60)
@@ -351,23 +352,21 @@ def compute_threshold_by_mode(mode: str):
     """モードに応じて現金保有率とドリフト閾値を返す（README準拠）"""
     m = (mode or "NORMAL").upper()
     cash_map = {"NORMAL": 0.10, "CAUTION": 0.125, "EMERG": 0.20}
-    # ★ 閾値をREADMEに合わせて統一：NORMAL=12%, CAUTION=14%, EMERG=∞
-    drift_map = {"NORMAL": 12, "CAUTION": 14, "EMERG": float("inf")}
+    drift_map = config.DRIFT_THRESHOLD_BY_MODE
     return cash_map.get(m, 0.10), drift_map.get(m, 12)
 
 
 def recommended_counts_by_mode(mode: str) -> tuple[int, int, int]:
     """
     モード別の推奨保有数 (G_count, D_count, cash_slots) を返す。
-    cash_slotsは「外すG枠の数」（各枠=4%）。
-    NORMAL: G15/D10/現金化0, CAUTION: G13/D10/現金化2, EMERG: G10/D10/現金化5
+    cash_slotsは「外すG枠の数」（各枠=5%）。
+    NORMAL: G12/D8/現金化0, CAUTION: G10/D8/現金化2, EMERG: G8/D8/現金化4
     """
     m = (mode or "NORMAL").upper()
-    if m == "CAUTION":
-        return 13, 10, 2
-    if m == "EMERG":
-        return 10, 10, 5
-    return 15, 10, 0
+    base = config.COUNTS_BY_MODE.get("NORMAL", config.COUNTS_BASE)
+    now  = config.COUNTS_BY_MODE.get(m, base)
+    cash_slots = max(0, base["G"] - now["G"])
+    return now["G"], now["D"], cash_slots
 
 
 def build_dataframe(portfolio):
@@ -461,10 +460,14 @@ def build_header(mode, cash_ratio, drift_threshold, total_drift_abs, alert, simu
     else:
         header += "✅ アラートなし\n"
     # ★ 追記: TSルール（G/D共通）と推奨保有数
-    header += "*🛡 TS:* 基本 -15% / +30%→-12% / +60%→-9% / +100%→-7%\n"
+    # TS(基本)をモードで動的表示。段階TSは「基本から -3/-6/-8 pt」固定。
+    base_ts = config.TS_BASE_BY_MODE.get(mode.upper(), config.TS_BASE_BY_MODE["NORMAL"])
+    d1, d2, d3 = config.TS_STEP_DELTAS_PT
+    ts_line = f"*🛡 TS:* 基本 -{base_ts*100:.0f}% / +30%→-{max(base_ts*100 - d1, 0):.0f}% / +60%→-{max(base_ts*100 - d2, 0):.0f}% / +100%→-{max(base_ts*100 - d3, 0):.0f}%\n"
+    header += ts_line
     g_cnt, d_cnt, cash_slots = recommended_counts_by_mode(mode)
-    cash_pct = cash_slots * 4
-    header += f"*📋 推奨保有数:* G {g_cnt} / D {d_cnt}（現金化枠 {cash_slots}枠 ≒ {cash_pct}%）\n"
+    cash_pct = cash_slots * (100 / (config.TOTAL_TARGETS))  # 1枠=総数分割の%（20銘柄なら5%）
+    header += f"*📋 推奨保有数:* G {g_cnt} / D {d_cnt}（現金化枠 {cash_slots}枠 ≒ {cash_pct:.0f}%）\n"
     return header
 
 
