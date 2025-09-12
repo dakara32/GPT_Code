@@ -23,242 +23,243 @@ L12 import pandas as pd
 L13 import yfinance as yf
 L14 from scipy.stats import zscore  # used via scorer
 L15 from scorer import Scorer, ttm_div_yield_portfolio
-L16
-L17 class T:
-L18     t = perf_counter()
-L19     log = staticmethod(lambda tag: (lambda now=perf_counter(): (print(f"[T] {tag}: {now - T.t:.2f}s"), setattr(T, "t", now))[-1])())
-L20
-L21 T.log("start")
-L22
-L23 # === ユニバースと定数（冒頭に固定） ===
-L24 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
-L25 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
-L26 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
-L27 N_G, N_D = 15, 10  # G/D枠サイズ（NORMAL基準: G15/D10）
-L28 g_weights = {'GRW':0.30,'MOM':0.55,'VOL':-0.15}
-L29 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
-L30 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
-L31 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
-L32 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
-L33
-L34 # DRRS 初期プール・各種パラメータ
-L35 corrM = 45
-L36 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
-L37 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
-L38
-L39 # クロス相関ペナルティ（未定義なら設定）
-L40 try: CROSS_MU_GD
-L41 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
-L42
-L43 # 出力関連
-L44 RESULTS_DIR = "results"
-L45 os.makedirs(RESULTS_DIR, exist_ok=True)
-L46
-L47 # その他
-L48 debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
-L49
-L50 # === 共有DTO（クラス間I/O契約）＋ Config ===
-L51 @dataclass(frozen=True)
-L52 class InputBundle:
-L53     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
-L54     cand: List[str]
-L55     tickers: List[str]
-L56     bench: str
-L57     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
-L58     px: pd.DataFrame                # data['Close']
-L59     spx: pd.Series                  # data['Close'][bench]
-L60     tickers_bulk: object            # yfinance.Tickers
-L61     info: Dict[str, dict]           # yfinance info per ticker
-L62     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
-L63     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
-L64     returns: pd.DataFrame           # px[tickers].pct_change()
-L65
-L66 @dataclass(frozen=True)
-L67 class FeatureBundle:
-L68     df: pd.DataFrame
-L69     df_z: pd.DataFrame
-L70     g_score: pd.Series
-L71     d_score_all: pd.Series
-L72     missing_logs: pd.DataFrame
-L73
-L74 @dataclass(frozen=True)
-L75 class SelectionBundle:
-L76     resG: dict
-L77     resD: dict
-L78     top_G: List[str]
-L79     top_D: List[str]
-L80     init_G: List[str]
-L81     init_D: List[str]
-L82
-L83 @dataclass(frozen=True)
-L84 class WeightsConfig:
-L85     g: Dict[str,float]
-L86     d: Dict[str,float]
-L87
-L88 @dataclass(frozen=True)
-L89 class DRRSParams:
-L90     corrM: int
-L91     shrink: float
-L92     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
-L93     D: Dict[str,float]
-L94     cross_mu_gd: float
-L95
-L96 @dataclass(frozen=True)
-L97 class PipelineConfig:
-L98     weights: WeightsConfig
-L99     drrs: DRRSParams
-L100     price_max: float
-L101
-L102 # === 共通ユーティリティ（複数クラスで使用） ===
-L103 # (unused local utils removed – use scorer.py versions if needed)
-L104
-L105 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
-L106
-L107 def _post_slack(payload: dict):
-L108     url = os.getenv("SLACK_WEBHOOK_URL")
-L109     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-L110     try:
-L111         requests.post(url, json=payload).raise_for_status()
-L112     except Exception as e:
-L113         print(f"⚠️ Slack通知エラー: {e}")
-L114
-L115 _slack = lambda message, code=False: _post_slack({"text": f"```{message}```" if code else message})
-L116
-L117 def _slack_debug(text: str, chunk=2800):
-L118     i = 0
-L119     while i < len(text):
-L120         j = min(len(text), i + chunk)
-L121         k = text.rfind("\n", i, j)
-L122         j = k if k > i + 100 else j
-L123         _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}]})
-L124         i = j
-L125
-L126 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-L127     want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
-L128     all_cols = _env_true("DEBUG_ALL_COLS", False)
-L129     cols = list(fb.df_z.columns if all_cols else [c for c in want if c in fb.df_z.columns])
-L130
-L131     Gp, Dp = set(prevG or []), set(prevD or [])
-L132     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
-L133     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
-L134
-L135     show_near = _env_true("DEBUG_NEAR5", True)
-L136     gs, ds = getattr(fb,"g_score",None), getattr(fb,"d_score_all",None)
-L137     gs = (gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None)
-L138     ds = (ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None)
-L139     g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
-L140     d_excl = set((sb.top_G or [])+(sb.top_D or []))
-L141     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
-L142
-L143     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-L144     focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))[:max_rows]
-L145
-L146     def _fmt_near(lbl, ser, lst):
-L147         if ser is None: return f"{lbl}: off"
-L148         g = ser.get
-L149         parts=[f"{t}:{g(t,float('nan')):.3f}" if pd.notna(g(t)) else f"{t}:nan" for t in lst]
-L150         return f"{lbl}: " + (", ".join(parts) if parts else "-")
-L151
-L152     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
-L153           _fmt_near("G near10", gs, g_miss),
-L154           _fmt_near("D near10", ds, d_miss),
-L155           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
-L156           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
-L157
-L158     tbl="(df_z or columns not available)"
-L159     if not fb.df_z.empty and cols:
-L160         idx=[t for t in focus if t in fb.df_z.index]
-L161         tbl=fb.df_z.loc[idx, cols].round(3).to_string(max_rows=None, max_cols=None)
-L162
-L163     miss_txt=""
-L164     if _env_true("DEBUG_MISSING_LOGS", False):
-L165         miss=getattr(fb,"missing_logs",None)
-L166         if miss is not None and not miss.empty:
-L167             miss_txt="\nMissing data (head)\n"+miss.head(10).to_string(index=False)
-L168
-L169     return "\n".join(head+["\nChanged/Selected (+ Near Miss)", tbl])+miss_txt
-L170
-L171 def _disjoint_keepG(top_G, top_D, poolD):
-L172     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
-L173     used, D, i = set(top_G), list(top_D), 0
-L174     for j, t in enumerate(D):
-L175         if t in used:
-L176             while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
-L177                 i += 1
-L178             if i < len(poolD):
-L179                 D[j] = poolD[i]; used.add(D[j]); i += 1
-L180     return top_G, D
-L181
+L16 import config
+L17
+L18 class T:
+L19     t = perf_counter()
+L20     log = staticmethod(lambda tag: (lambda now=perf_counter(): (print(f"[T] {tag}: {now - T.t:.2f}s"), setattr(T, "t", now))[-1])())
+L21
+L22 T.log("start")
+L23
+L24 # === ユニバースと定数（冒頭に固定） ===
+L25 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
+L26 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
+L27 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
+L28 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
+L29 g_weights = {'GRW':0.30,'MOM':0.55,'VOL':-0.15}
+L30 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
+L31 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
+L32 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
+L33 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
+L34
+L35 # DRRS 初期プール・各種パラメータ
+L36 corrM = 45
+L37 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
+L38 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
+L39
+L40 # クロス相関ペナルティ（未定義なら設定）
+L41 try: CROSS_MU_GD
+L42 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+L43
+L44 # 出力関連
+L45 RESULTS_DIR = "results"
+L46 os.makedirs(RESULTS_DIR, exist_ok=True)
+L47
+L48 # その他
+L49 debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
+L50
+L51 # === 共有DTO（クラス間I/O契約）＋ Config ===
+L52 @dataclass(frozen=True)
+L53 class InputBundle:
+L54     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
+L55     cand: List[str]
+L56     tickers: List[str]
+L57     bench: str
+L58     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
+L59     px: pd.DataFrame                # data['Close']
+L60     spx: pd.Series                  # data['Close'][bench]
+L61     tickers_bulk: object            # yfinance.Tickers
+L62     info: Dict[str, dict]           # yfinance info per ticker
+L63     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
+L64     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
+L65     returns: pd.DataFrame           # px[tickers].pct_change()
+L66
+L67 @dataclass(frozen=True)
+L68 class FeatureBundle:
+L69     df: pd.DataFrame
+L70     df_z: pd.DataFrame
+L71     g_score: pd.Series
+L72     d_score_all: pd.Series
+L73     missing_logs: pd.DataFrame
+L74
+L75 @dataclass(frozen=True)
+L76 class SelectionBundle:
+L77     resG: dict
+L78     resD: dict
+L79     top_G: List[str]
+L80     top_D: List[str]
+L81     init_G: List[str]
+L82     init_D: List[str]
+L83
+L84 @dataclass(frozen=True)
+L85 class WeightsConfig:
+L86     g: Dict[str,float]
+L87     d: Dict[str,float]
+L88
+L89 @dataclass(frozen=True)
+L90 class DRRSParams:
+L91     corrM: int
+L92     shrink: float
+L93     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
+L94     D: Dict[str,float]
+L95     cross_mu_gd: float
+L96
+L97 @dataclass(frozen=True)
+L98 class PipelineConfig:
+L99     weights: WeightsConfig
+L100     drrs: DRRSParams
+L101     price_max: float
+L102
+L103 # === 共通ユーティリティ（複数クラスで使用） ===
+L104 # (unused local utils removed – use scorer.py versions if needed)
+L105
+L106 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
+L107
+L108 def _post_slack(payload: dict):
+L109     url = os.getenv("SLACK_WEBHOOK_URL")
+L110     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+L111     try:
+L112         requests.post(url, json=payload).raise_for_status()
+L113     except Exception as e:
+L114         print(f"⚠️ Slack通知エラー: {e}")
+L115
+L116 _slack = lambda message, code=False: _post_slack({"text": f"```{message}```" if code else message})
+L117
+L118 def _slack_debug(text: str, chunk=2800):
+L119     i = 0
+L120     while i < len(text):
+L121         j = min(len(text), i + chunk)
+L122         k = text.rfind("\n", i, j)
+L123         j = k if k > i + 100 else j
+L124         _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}]})
+L125         i = j
+L126
+L127 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
+L128     want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
+L129     all_cols = _env_true("DEBUG_ALL_COLS", False)
+L130     cols = list(fb.df_z.columns if all_cols else [c for c in want if c in fb.df_z.columns])
+L131
+L132     Gp, Dp = set(prevG or []), set(prevD or [])
+L133     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
+L134     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
+L135
+L136     show_near = _env_true("DEBUG_NEAR5", True)
+L137     gs, ds = getattr(fb,"g_score",None), getattr(fb,"d_score_all",None)
+L138     gs = (gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None)
+L139     ds = (ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None)
+L140     g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
+L141     d_excl = set((sb.top_G or [])+(sb.top_D or []))
+L142     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
+L143
+L144     all_rows = _env_true("DEBUG_ALL_ROWS", False)
+L145     focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))[:max_rows]
+L146
+L147     def _fmt_near(lbl, ser, lst):
+L148         if ser is None: return f"{lbl}: off"
+L149         g = ser.get
+L150         parts=[f"{t}:{g(t,float('nan')):.3f}" if pd.notna(g(t)) else f"{t}:nan" for t in lst]
+L151         return f"{lbl}: " + (", ".join(parts) if parts else "-")
+L152
+L153     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
+L154           _fmt_near("G near10", gs, g_miss),
+L155           _fmt_near("D near10", ds, d_miss),
+L156           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
+L157           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
+L158
+L159     tbl="(df_z or columns not available)"
+L160     if not fb.df_z.empty and cols:
+L161         idx=[t for t in focus if t in fb.df_z.index]
+L162         tbl=fb.df_z.loc[idx, cols].round(3).to_string(max_rows=None, max_cols=None)
+L163
+L164     miss_txt=""
+L165     if _env_true("DEBUG_MISSING_LOGS", False):
+L166         miss=getattr(fb,"missing_logs",None)
+L167         if miss is not None and not miss.empty:
+L168             miss_txt="\nMissing data (head)\n"+miss.head(10).to_string(index=False)
+L169
+L170     return "\n".join(head+["\nChanged/Selected (+ Near Miss)", tbl])+miss_txt
+L171
+L172 def _disjoint_keepG(top_G, top_D, poolD):
+L173     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
+L174     used, D, i = set(top_G), list(top_D), 0
+L175     for j, t in enumerate(D):
+L176         if t in used:
+L177             while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
+L178                 i += 1
+L179             if i < len(poolD):
+L180                 D[j] = poolD[i]; used.add(D[j]); i += 1
+L181     return top_G, D
 L182
-L183 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
-L184                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
-L185     import pandas as pd, numpy as np
-L186     sel = list(pick)
-L187     if not sel: return sel
-L188     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
-L189     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
-L190     sigma = float(agg.std()) if pd.notna(agg.std()) else 0.0
-L191     thresh = kth - delta_z * sigma
-L192     ranked_all = agg.sort_values(ascending=False)
-L193     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
-L194     for t in cand:
-L195         within_score = (pd.notna(agg[t]) and agg[t] >= thresh)
-L196         within_rank  = (t in ranked_all.index) and (ranked_all.index.get_loc(t) < n_target + keep_buffer)
-L197         if within_score or within_rank:
-L198             non_inc = [x for x in sel if x not in incumbents]
-L199             if not non_inc: break
-L200             weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
-L201             if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
-L202                 sel.remove(weakest); sel.append(t)
-L203     if len(sel) > n_target:
-L204         sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
-L205     return sel
-L206
+L183
+L184 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
+L185                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
+L186     import pandas as pd, numpy as np
+L187     sel = list(pick)
+L188     if not sel: return sel
+L189     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
+L190     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
+L191     sigma = float(agg.std()) if pd.notna(agg.std()) else 0.0
+L192     thresh = kth - delta_z * sigma
+L193     ranked_all = agg.sort_values(ascending=False)
+L194     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
+L195     for t in cand:
+L196         within_score = (pd.notna(agg[t]) and agg[t] >= thresh)
+L197         within_rank  = (t in ranked_all.index) and (ranked_all.index.get_loc(t) < n_target + keep_buffer)
+L198         if within_score or within_rank:
+L199             non_inc = [x for x in sel if x not in incumbents]
+L200             if not non_inc: break
+L201             weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
+L202             if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
+L203                 sel.remove(weakest); sel.append(t)
+L204     if len(sel) > n_target:
+L205         sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
+L206     return sel
 L207
-L208 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
-L209 class Input:
-L210     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
-L211         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
-L212         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
-L213
-L214     # ---- （Input専用）EPS補完・FCF算出系 ----
-L215     @staticmethod
-L216     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
-L217         out_col = out_col or ttm_col; df = df.copy(); df["eps_imputed"] = False
-L218         cand = df[q_col]*4; ok = df[ttm_col].isna() & cand.replace([np.inf,-np.inf], np.nan).notna()
-L219         df.loc[ok, out_col], df.loc[ok,"eps_imputed"] = cand[ok], True; return df
-L220
-L221     _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"], "capex":["Capital Expenditure","Capital Expenditures"]}
-L222
-L223     @staticmethod
-L224     def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series|None:
-L225         if df is None or df.empty: return None
-L226         idx_lower={str(i).lower():i for i in df.index}
-L227         for n in names:
-L228             k=n.lower()
-L229             if k in idx_lower: return df.loc[idx_lower[k]]
-L230         return None
-L231
-L232     @staticmethod
-L233     def _sum_last_n(s: pd.Series|None, n: int) -> float|None:
-L234         if s is None or s.empty: return None
-L235         v=s.dropna().astype(float); return None if v.empty else v.iloc[:n].sum()
-L236
-L237     @staticmethod
-L238     def _latest(s: pd.Series|None) -> float|None:
-L239         if s is None or s.empty: return None
-L240         v=s.dropna().astype(float); return v.iloc[0] if not v.empty else None
-L241
-L242     def fetch_cfo_capex_ttm_yf(self, tickers: list[str]) -> pd.DataFrame:
-L243         from concurrent.futures import ThreadPoolExecutor, as_completed
-L244         pick, sumn, latest, aliases = self._pick_row, self._sum_last_n, self._latest, self._CF_ALIASES
-L245
-L246         def one(t: str):
-L247             try:
-L248                 tk = yf.Ticker(t)  # ★ セッションは渡さない（YFがcurl_cffiで管理）
-L249                 qcf = tk.quarterly_cashflow
-L250                 cfo_q, capex_q = pick(qcf, aliases["cfo"]), pick(qcf, aliases["capex"])
-L251                 fcf_q = pick(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
-L252                 cfo, capex, fcf = sumn(cfo_q,4), sumn(capex_q,4), sumn(fcf_q,4)
-L253                 if any(v is None for v in (cfo, capex, f
+L208
+L209 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
+L210 class Input:
+L211     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
+L212         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
+L213         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
+L214
+L215     # ---- （Input専用）EPS補完・FCF算出系 ----
+L216     @staticmethod
+L217     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
+L218         out_col = out_col or ttm_col; df = df.copy(); df["eps_imputed"] = False
+L219         cand = df[q_col]*4; ok = df[ttm_col].isna() & cand.replace([np.inf,-np.inf], np.nan).notna()
+L220         df.loc[ok, out_col], df.loc[ok,"eps_imputed"] = cand[ok], True; return df
+L221
+L222     _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"], "capex":["Capital Expenditure","Capital Expenditures"]}
+L223
+L224     @staticmethod
+L225     def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series|None:
+L226         if df is None or df.empty: return None
+L227         idx_lower={str(i).lower():i for i in df.index}
+L228         for n in names:
+L229             k=n.lower()
+L230             if k in idx_lower: return df.loc[idx_lower[k]]
+L231         return None
+L232
+L233     @staticmethod
+L234     def _sum_last_n(s: pd.Series|None, n: int) -> float|None:
+L235         if s is None or s.empty: return None
+L236         v=s.dropna().astype(float); return None if v.empty else v.iloc[:n].sum()
+L237
+L238     @staticmethod
+L239     def _latest(s: pd.Series|None) -> float|None:
+L240         if s is None or s.empty: return None
+L241         v=s.dropna().astype(float); return v.iloc[0] if not v.empty else None
+L242
+L243     def fetch_cfo_capex_ttm_yf(self, tickers: list[str]) -> pd.DataFrame:
+L244         from concurrent.futures import ThreadPoolExecutor, as_completed
+L245         pick, sumn, latest, aliases = self._pick_row, self._sum_last_n, self._latest, self._CF_ALIASES
+L246
+L247         def one(t: str):
+L248             try:
+L249                 tk = yf.Ticker(t)  # ★ セッションは渡さない（YFがcurl_cffiで管理）
+L250                 qcf = tk.quarterly_cashflow
+L251                 cfo_q, capex_q = pick(qcf, aliases["cfo"]), pick(qcf, aliases["capex"])
+L252                 fcf_q = pick(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
+L253                 cfo, capex, fcf = sumn(cfo_q,4), sumn(capex_q,4), sumn(fcf_q,4)
+L254                 if any
 ```

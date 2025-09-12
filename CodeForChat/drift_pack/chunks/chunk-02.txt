@@ -1,256 +1,259 @@
 ```text
-321         df = _yf_df(s)
-L322         if df is None or len(df) < 60:
-L323             continue
-L324         alerts = []
-L325         for idx in df.tail(lookback_days).index:
-L326             tags = _signals_for_day(df, idx)
-L327             if tags:
-L328                 alerts.append((idx.strftime("%Y-%m-%d"), tags))
-L329         if alerts:
-L330             out[s] = alerts
-L331     return out
-L332
+321     for s in symbols:
+L322         df = _yf_df(s)
+L323         if df is None or len(df) < 60:
+L324             continue
+L325         alerts = []
+L326         for idx in df.tail(lookback_days).index:
+L327             tags = _signals_for_day(df, idx)
+L328             if tags:
+L329                 alerts.append((idx.strftime("%Y-%m-%d"), tags))
+L330         if alerts:
+L331             out[s] = alerts
+L332     return out
 L333
-L334 def load_portfolio():
-L335     tickers_path = Path(__file__).with_name("current_tickers.csv")
-L336     with tickers_path.open() as f:
-L337         reader = list(csv.reader(f))
-L338     return [
-L339         {"symbol": sym.strip().upper(), "shares": int(qty), "target_ratio": 1 / len(reader)}
-L340         for sym, qty in reader
-L341     ]
-L342
+L334
+L335 def load_portfolio():
+L336     tickers_path = Path(__file__).with_name("current_tickers.csv")
+L337     with tickers_path.open() as f:
+L338         reader = list(csv.reader(f))
+L339     return [
+L340         {"symbol": sym.strip().upper(), "shares": int(qty), "target_ratio": 1 / len(reader)}
+L341         for sym, qty in reader
+L342     ]
 L343
-L344 def compute_threshold():
-L345     vix_ma5 = fetch_vix_ma5()
-L346     drift_threshold = 10 if vix_ma5 < 20 else 12 if vix_ma5 < 26 else float("inf")
-L347     return vix_ma5, drift_threshold
-L348
+L344
+L345 def compute_threshold():
+L346     vix_ma5 = fetch_vix_ma5()
+L347     drift_threshold = 10 if vix_ma5 < 20 else 12 if vix_ma5 < 26 else float("inf")
+L348     return vix_ma5, drift_threshold
 L349
-L350 def compute_threshold_by_mode(mode: str):
-L351     """モードに応じて現金保有率とドリフト閾値を返す（README準拠）"""
-L352     m = (mode or "NORMAL").upper()
-L353     cash_map = {"NORMAL": 0.10, "CAUTION": 0.125, "EMERG": 0.20}
-L354     # ★ 閾値をREADMEに合わせて統一：NORMAL=12%, CAUTION=14%, EMERG=∞
-L355     drift_map = {"NORMAL": 12, "CAUTION": 14, "EMERG": float("inf")}
+L350
+L351 def compute_threshold_by_mode(mode: str):
+L352     """モードに応じて現金保有率とドリフト閾値を返す（README準拠）"""
+L353     m = (mode or "NORMAL").upper()
+L354     cash_map = {"NORMAL": 0.10, "CAUTION": 0.125, "EMERG": 0.20}
+L355     drift_map = config.DRIFT_THRESHOLD_BY_MODE
 L356     return cash_map.get(m, 0.10), drift_map.get(m, 12)
 L357
 L358
 L359 def recommended_counts_by_mode(mode: str) -> tuple[int, int, int]:
 L360     """
 L361     モード別の推奨保有数 (G_count, D_count, cash_slots) を返す。
-L362     cash_slotsは「外すG枠の数」（各枠=4%）。
-L363     NORMAL: G15/D10/現金化0, CAUTION: G13/D10/現金化2, EMERG: G10/D10/現金化5
+L362     cash_slotsは「外すG枠の数」（各枠=5%）。
+L363     NORMAL: G12/D8/現金化0, CAUTION: G10/D8/現金化2, EMERG: G8/D8/現金化4
 L364     """
 L365     m = (mode or "NORMAL").upper()
-L366     if m == "CAUTION":
-L367         return 13, 10, 2
-L368     if m == "EMERG":
-L369         return 10, 10, 5
-L370     return 15, 10, 0
+L366     base = config.COUNTS_BY_MODE.get("NORMAL", config.COUNTS_BASE)
+L367     now  = config.COUNTS_BY_MODE.get(m, base)
+L368     cash_slots = max(0, base["G"] - now["G"])
+L369     return now["G"], now["D"], cash_slots
+L370
 L371
-L372
-L373 def build_dataframe(portfolio):
-L374     for stock in portfolio:
-L375         price = fetch_price(stock["symbol"])
-L376         stock["price"] = price
-L377         stock["value"] = price * stock["shares"]
-L378
-L379     df = pd.DataFrame(portfolio)
-L380     total_value = df["value"].sum()
-L381     df["current_ratio"] = df["value"] / total_value
-L382     df["drift"] = df["current_ratio"] - df["target_ratio"]
-L383     df["drift_abs"] = df["drift"].abs()
-L384     total_drift_abs = df["drift_abs"].sum()
-L385     df["adjusted_ratio"] = df["current_ratio"] - df["drift"] / 2
-L386     df["adjustable"] = (
-L387         (df["adjusted_ratio"] * total_value) >= df["price"]
-L388     ) & df["price"].notna() & df["price"].gt(0)
-L389     return df, total_value, total_drift_abs
+L372 def build_dataframe(portfolio):
+L373     for stock in portfolio:
+L374         price = fetch_price(stock["symbol"])
+L375         stock["price"] = price
+L376         stock["value"] = price * stock["shares"]
+L377
+L378     df = pd.DataFrame(portfolio)
+L379     total_value = df["value"].sum()
+L380     df["current_ratio"] = df["value"] / total_value
+L381     df["drift"] = df["current_ratio"] - df["target_ratio"]
+L382     df["drift_abs"] = df["drift"].abs()
+L383     total_drift_abs = df["drift_abs"].sum()
+L384     df["adjusted_ratio"] = df["current_ratio"] - df["drift"] / 2
+L385     df["adjustable"] = (
+L386         (df["adjusted_ratio"] * total_value) >= df["price"]
+L387     ) & df["price"].notna() & df["price"].gt(0)
+L388     return df, total_value, total_drift_abs
+L389
 L390
-L391
-L392 def simulate(df, total_value, total_drift_abs, drift_threshold):
-L393     alert = drift_threshold != float("inf") and total_drift_abs * 100 > drift_threshold
-L394     if alert:
-L395         df["trade_shares"] = df.apply(
-L396             lambda r: int(round(((r["adjusted_ratio"] * total_value) - r["value"]) / r["price"]))
-L397             if r["adjustable"] and r["price"] > 0 else 0,
-L398             axis=1,
-L399         )
-L400         df["new_shares"] = df["shares"] + df["trade_shares"]
-L401         df["new_value"] = df["new_shares"] * df["price"]
-L402         new_total_value = df["new_value"].sum()
-L403         df["simulated_ratio"] = df["new_value"] / new_total_value
-L404         df["simulated_drift_abs"] = (df["simulated_ratio"] - df["target_ratio"]).abs()
-L405         simulated_total_drift_abs = df["simulated_drift_abs"].sum()
-L406     else:
-L407         df["trade_shares"] = np.nan
-L408         df["new_shares"] = np.nan
-L409         df["new_value"] = np.nan
-L410         new_total_value = np.nan
-L411         df["simulated_ratio"] = np.nan
-L412         df["simulated_drift_abs"] = np.nan
-L413         simulated_total_drift_abs = np.nan
-L414     return df, alert, new_total_value, simulated_total_drift_abs
+L391 def simulate(df, total_value, total_drift_abs, drift_threshold):
+L392     alert = drift_threshold != float("inf") and total_drift_abs * 100 > drift_threshold
+L393     if alert:
+L394         df["trade_shares"] = df.apply(
+L395             lambda r: int(round(((r["adjusted_ratio"] * total_value) - r["value"]) / r["price"]))
+L396             if r["adjustable"] and r["price"] > 0 else 0,
+L397             axis=1,
+L398         )
+L399         df["new_shares"] = df["shares"] + df["trade_shares"]
+L400         df["new_value"] = df["new_shares"] * df["price"]
+L401         new_total_value = df["new_value"].sum()
+L402         df["simulated_ratio"] = df["new_value"] / new_total_value
+L403         df["simulated_drift_abs"] = (df["simulated_ratio"] - df["target_ratio"]).abs()
+L404         simulated_total_drift_abs = df["simulated_drift_abs"].sum()
+L405     else:
+L406         df["trade_shares"] = np.nan
+L407         df["new_shares"] = np.nan
+L408         df["new_value"] = np.nan
+L409         new_total_value = np.nan
+L410         df["simulated_ratio"] = np.nan
+L411         df["simulated_drift_abs"] = np.nan
+L412         simulated_total_drift_abs = np.nan
+L413     return df, alert, new_total_value, simulated_total_drift_abs
+L414
 L415
-L416
-L417 def prepare_summary(df, total_drift_abs, alert):
-L418     summary = {
-L419         "symbol": "合計",
-L420         "shares": df["shares"].sum(),
-L421         "value": df["value"].sum(),
-L422         "current_ratio": np.nan,
-L423         "drift_abs": total_drift_abs,
-L424     }
-L425     if alert:
-L426         summary["trade_shares"] = np.nan
-L427     # Sort details by evaluation value descending before appending summary
-L428     df = df.sort_values(by="value", ascending=False)
-L429     df = pd.concat([df, pd.DataFrame([summary])], ignore_index=True)
-L430     if alert:
-L431         cols = ["symbol", "shares", "value", "current_ratio", "drift_abs", "trade_shares"]
-L432         df_small = df[cols].copy()
-L433         df_small.columns = ["sym", "qty", "val", "now", "|d|", "Δqty"]
-L434     else:
-L435         cols = ["symbol", "shares", "value", "current_ratio", "drift_abs"]
-L436         df_small = df[cols].copy()
-L437         df_small.columns = ["sym", "qty", "val", "now", "|d|"]
-L438     return df_small
+L416 def prepare_summary(df, total_drift_abs, alert):
+L417     summary = {
+L418         "symbol": "合計",
+L419         "shares": df["shares"].sum(),
+L420         "value": df["value"].sum(),
+L421         "current_ratio": np.nan,
+L422         "drift_abs": total_drift_abs,
+L423     }
+L424     if alert:
+L425         summary["trade_shares"] = np.nan
+L426     # Sort details by evaluation value descending before appending summary
+L427     df = df.sort_values(by="value", ascending=False)
+L428     df = pd.concat([df, pd.DataFrame([summary])], ignore_index=True)
+L429     if alert:
+L430         cols = ["symbol", "shares", "value", "current_ratio", "drift_abs", "trade_shares"]
+L431         df_small = df[cols].copy()
+L432         df_small.columns = ["sym", "qty", "val", "now", "|d|", "Δqty"]
+L433     else:
+L434         cols = ["symbol", "shares", "value", "current_ratio", "drift_abs"]
+L435         df_small = df[cols].copy()
+L436         df_small.columns = ["sym", "qty", "val", "now", "|d|"]
+L437     return df_small
+L438
 L439
-L440
-L441 def currency(x):
-L442     return f"${x:,.0f}" if pd.notnull(x) else ""
+L440 def currency(x):
+L441     return f"${x:,.0f}" if pd.notnull(x) else ""
+L442
 L443
-L444
-L445 def formatters_for(alert):
-L446     formatters = {"val": currency, "now": "{:.2%}".format, "|d|": "{:.2%}".format}
-L447     if alert:
-L448         formatters["Δqty"] = "{:.0f}".format
-L449     return formatters
+L444 def formatters_for(alert):
+L445     formatters = {"val": currency, "now": "{:.2%}".format, "|d|": "{:.2%}".format}
+L446     if alert:
+L447         formatters["Δqty"] = "{:.0f}".format
+L448     return formatters
+L449
 L450
-L451
-L452 def build_header(mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs):
-L453     header = (
-L454         f"*💼 現金保有率:* {cash_ratio*100:.1f}%\n"
-L455         f"*📊 ドリフト閾値:* {'🔴(停止)' if drift_threshold == float('inf') else str(drift_threshold)+'%'}\n"
-L456         f"*📉 現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
-L457     )
-L458     if alert:
-L459         header += f"*🔁 半戻し後ドリフト合計(想定):* {simulated_total_drift_abs * 100:.2f}%\n"
-L460         header += "🚨 *アラート: 発生！！ Δqtyのマイナス銘柄を売却、任意の銘柄を買い増してバランスを取りましょう！*\n"
-L461     else:
-L462         header += "✅ アラートなし\n"
-L463     # ★ 追記: TSルール（G/D共通）と推奨保有数
-L464     header += "*🛡 TS:* 基本 -15% / +30%→-12% / +60%→-9% / +100%→-7%\n"
-L465     g_cnt, d_cnt, cash_slots = recommended_counts_by_mode(mode)
-L466     cash_pct = cash_slots * 4
-L467     header += f"*📋 推奨保有数:* G {g_cnt} / D {d_cnt}（現金化枠 {cash_slots}枠 ≒ {cash_pct}%）\n"
-L468     return header
-L469
-L470
-L471 def send_slack(text):
-L472     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-L473     if not SLACK_WEBHOOK_URL:
-L474         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-L475     payload = {"text": text}
-L476     try:
-L477         resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
-L478         resp.raise_for_status()
-L479         print("✅ Slack（Webhook）へ送信しました")
-L480     except Exception as e:
-L481         print(f"⚠️ Slack通知エラー: {e}")
-L482
-L483
-L484 def send_debug(debug_text):
-L485     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-L486     if not SLACK_WEBHOOK_URL:
-L487         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-L488     debug_payload = {"text": "```" + debug_text + "```"}
-L489     try:
-L490         resp = requests.post(SLACK_WEBHOOK_URL, json=debug_payload)
-L491         resp.raise_for_status()
-L492         print("✅ Debug情報をSlackに送信しました")
-L493     except Exception as e:
-L494         print(f"⚠️ Slack通知エラー: {e}")
-L495
-L496
-L497 def main():
-L498     portfolio = load_portfolio()
-L499     symbols = [r["symbol"] for r in portfolio]
-L500     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
-L501
-L502     breadth_block, mode, _C = build_breadth_header()
-L503
-L504     cash_ratio, drift_threshold = compute_threshold_by_mode(mode)
-L505
-L506     df, total_value, total_drift_abs = build_dataframe(portfolio)
-L507     df, alert, new_total_value, simulated_total_drift_abs = simulate(
-L508         df, total_value, total_drift_abs, drift_threshold
-L509     )
-L510     df_small = prepare_summary(df, total_drift_abs, alert)
-L511     if 'df_small' in locals() and isinstance(df_small, pd.DataFrame) and not df_small.empty:
-L512         col_sym = "sym" if "sym" in df_small.columns else ("symbol" if "symbol" in df_small.columns else None)
-L513         if col_sym:
-L514             alert_keys = {str(k) for k in sell_alerts.keys()}
-L515             df_small[col_sym] = df_small[col_sym].astype(str)
-L516             df_small.insert(0, "⚠", df_small[col_sym].map(lambda x: "🔴" if x in alert_keys else ""))
-L517             latest_tag = {s: " / ".join(sell_alerts[s][-1][1]) for s in sell_alerts}
-L518             df_small.insert(1, "sig", df_small[col_sym].map(latest_tag).fillna(""))
-L519     formatters = formatters_for(alert)
-L520     header = build_header(
-L521         mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
-L522     )
-L523     if breadth_block:
-L524         header = breadth_block + "\n" + header
-L525     if sell_alerts:
-L526         def fmt_pair(date_tags):
-L527             date, tags = date_tags
-L528             return f"{date}:" + "・".join(tags)
-L529         listed = []
-L530         for t, arr in sell_alerts.items():
-L531             listed.append(f"*{t}*（" + ", ".join(fmt_pair(x) for x in arr) + "）")
-L532         hits = ", ".join(listed)
-L533         if "✅ アラートなし" in header:
-L534             header = header.replace(
-L535                 "✅ アラートなし",
-L536                 f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hits}",
-L537             )
-L538         else:
-L539             header += f"\n🟥 {hits}"
-L540     table_text = df_small.to_string(formatters=formatters, index=False)
-L541     send_slack(header + "\n```" + table_text + "```")
-L542
-L543     if debug_mode:
-L544         debug_cols = [
-L545             "symbol",
-L546             "shares",
-L547             "price",
-L548             "value",
-L549             "current_ratio",
-L550             "drift",
-L551             "drift_abs",
-L552             "adjusted_ratio",
-L553             "adjustable",
-L554             "trade_shares",
-L555             "new_shares",
-L556             "new_value",
-L557             "simulated_ratio",
-L558             "simulated_drift_abs",
-L559         ]
-L560         debug_text = (
-L561             "=== DEBUG: full dataframe ===\n"
-L562             + df[debug_cols].to_string()
-L563             + f"\n\ntotal_value={total_value}, new_total_value={new_total_value}\n"
-L564             + f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}"
-L565         )
-L566         print("\n" + debug_text)
-L567         send_debug(debug_text)
-L568
-L569
-L570 if __name__ == "__main__":
-L571     main()
+L451 def build_header(mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs):
+L452     header = (
+L453         f"*💼 現金保有率:* {cash_ratio*100:.1f}%\n"
+L454         f"*📊 ドリフト閾値:* {'🔴(停止)' if drift_threshold == float('inf') else str(drift_threshold)+'%'}\n"
+L455         f"*📉 現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
+L456     )
+L457     if alert:
+L458         header += f"*🔁 半戻し後ドリフト合計(想定):* {simulated_total_drift_abs * 100:.2f}%\n"
+L459         header += "🚨 *アラート: 発生！！ Δqtyのマイナス銘柄を売却、任意の銘柄を買い増してバランスを取りましょう！*\n"
+L460     else:
+L461         header += "✅ アラートなし\n"
+L462     # ★ 追記: TSルール（G/D共通）と推奨保有数
+L463     # TS(基本)をモードで動的表示。段階TSは「基本から -3/-6/-8 pt」固定。
+L464     base_ts = config.TS_BASE_BY_MODE.get(mode.upper(), config.TS_BASE_BY_MODE["NORMAL"])
+L465     d1, d2, d3 = config.TS_STEP_DELTAS_PT
+L466     ts_line = f"*🛡 TS:* 基本 -{base_ts*100:.0f}% / +30%→-{max(base_ts*100 - d1, 0):.0f}% / +60%→-{max(base_ts*100 - d2, 0):.0f}% / +100%→-{max(base_ts*100 - d3, 0):.0f}%\n"
+L467     header += ts_line
+L468     g_cnt, d_cnt, cash_slots = recommended_counts_by_mode(mode)
+L469     cash_pct = cash_slots * (100 / (config.TOTAL_TARGETS))  # 1枠=総数分割の%（20銘柄なら5%）
+L470     header += f"*📋 推奨保有数:* G {g_cnt} / D {d_cnt}（現金化枠 {cash_slots}枠 ≒ {cash_pct:.0f}%）\n"
+L471     return header
+L472
+L473
+L474 def send_slack(text):
+L475     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+L476     if not SLACK_WEBHOOK_URL:
+L477         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+L478     payload = {"text": text}
+L479     try:
+L480         resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
+L481         resp.raise_for_status()
+L482         print("✅ Slack（Webhook）へ送信しました")
+L483     except Exception as e:
+L484         print(f"⚠️ Slack通知エラー: {e}")
+L485
+L486
+L487 def send_debug(debug_text):
+L488     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+L489     if not SLACK_WEBHOOK_URL:
+L490         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+L491     debug_payload = {"text": "```" + debug_text + "```"}
+L492     try:
+L493         resp = requests.post(SLACK_WEBHOOK_URL, json=debug_payload)
+L494         resp.raise_for_status()
+L495         print("✅ Debug情報をSlackに送信しました")
+L496     except Exception as e:
+L497         print(f"⚠️ Slack通知エラー: {e}")
+L498
+L499
+L500 def main():
+L501     portfolio = load_portfolio()
+L502     symbols = [r["symbol"] for r in portfolio]
+L503     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
+L504
+L505     breadth_block, mode, _C = build_breadth_header()
+L506
+L507     cash_ratio, drift_threshold = compute_threshold_by_mode(mode)
+L508
+L509     df, total_value, total_drift_abs = build_dataframe(portfolio)
+L510     df, alert, new_total_value, simulated_total_drift_abs = simulate(
+L511         df, total_value, total_drift_abs, drift_threshold
+L512     )
+L513     df_small = prepare_summary(df, total_drift_abs, alert)
+L514     if 'df_small' in locals() and isinstance(df_small, pd.DataFrame) and not df_small.empty:
+L515         col_sym = "sym" if "sym" in df_small.columns else ("symbol" if "symbol" in df_small.columns else None)
+L516         if col_sym:
+L517             alert_keys = {str(k) for k in sell_alerts.keys()}
+L518             df_small[col_sym] = df_small[col_sym].astype(str)
+L519             df_small.insert(0, "⚠", df_small[col_sym].map(lambda x: "🔴" if x in alert_keys else ""))
+L520             latest_tag = {s: " / ".join(sell_alerts[s][-1][1]) for s in sell_alerts}
+L521             df_small.insert(1, "sig", df_small[col_sym].map(latest_tag).fillna(""))
+L522     formatters = formatters_for(alert)
+L523     header = build_header(
+L524         mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
+L525     )
+L526     if breadth_block:
+L527         header = breadth_block + "\n" + header
+L528     if sell_alerts:
+L529         def fmt_pair(date_tags):
+L530             date, tags = date_tags
+L531             return f"{date}:" + "・".join(tags)
+L532         listed = []
+L533         for t, arr in sell_alerts.items():
+L534             listed.append(f"*{t}*（" + ", ".join(fmt_pair(x) for x in arr) + "）")
+L535         hits = ", ".join(listed)
+L536         if "✅ アラートなし" in header:
+L537             header = header.replace(
+L538                 "✅ アラートなし",
+L539                 f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hits}",
+L540             )
+L541         else:
+L542             header += f"\n🟥 {hits}"
+L543     table_text = df_small.to_string(formatters=formatters, index=False)
+L544     send_slack(header + "\n```" + table_text + "```")
+L545
+L546     if debug_mode:
+L547         debug_cols = [
+L548             "symbol",
+L549             "shares",
+L550             "price",
+L551             "value",
+L552             "current_ratio",
+L553             "drift",
+L554             "drift_abs",
+L555             "adjusted_ratio",
+L556             "adjustable",
+L557             "trade_shares",
+L558             "new_shares",
+L559             "new_value",
+L560             "simulated_ratio",
+L561             "simulated_drift_abs",
+L562         ]
+L563         debug_text = (
+L564             "=== DEBUG: full dataframe ===\n"
+L565             + df[debug_cols].to_string()
+L566             + f"\n\ntotal_value={total_value}, new_total_value={new_total_value}\n"
+L567             + f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}"
+L568         )
+L569         print("\n" + debug_text)
+L570         send_debug(debug_text)
+L571
 L572
+L573 if __name__ == "__main__":
+L574     main()
+L575
 ```
 
 ## <.github/workflows/daily-report.yml>
@@ -298,18 +301,5 @@ L40       - name: Persist breadth_state.json
 L41         if: always()
 L42         run: |
 L43           git config user.name  "github-actions[bot]"
-L44           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-L45           git add results/breadth_state.json || true
-L46           git commit -m "chore: update breadth_state [skip ci]" || echo "no changes"
-L47           git push || true
-```
-
-## <documents/README.md>
-```text
-L1 # 運用ルール
-L2
-L3 ## 基本構成
-L4 - 25銘柄を均等配分（現金を除き1銘柄あたり4%）
-L5 - moomoo証券で運用
-L6 - **Growth枠 15銘柄 / Defense枠 10銘柄*
+L44           gi
 ```
