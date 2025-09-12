@@ -18,6 +18,7 @@ CHUNK_SIZE = 12000  # iPhoneコピペ配慮で ~9k–14k の範囲で可
 
 FILES_GROUPS = {
     "factor_pack": [
+        "config.py",
         "factor.py",
         "scorer.py",
         ".github/workflows/weekly-report.yml",
@@ -25,6 +26,7 @@ FILES_GROUPS = {
         "documents/factor_design.md",
     ],
     "drift_pack": [
+        "config.py",
         "drift.py",
         ".github/workflows/daily-report.yml",
         "documents/README.md",
