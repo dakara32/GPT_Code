@@ -1,11 +1,11 @@
 # drift.py 詳細設計書
 
 ## 概要
-- 25銘柄ポートフォリオのドリフトを日次監視し、閾値超過時に半戻し案をSlack通知するスクリプト。
-- Finnhubとyfinanceから価格を取得（レジームは trend_template 本数に基づく（基準 N_G=15））。
-  - 緊急入り: `max(q05, 15本)`
-  - 緊急解除: `max(q20, 23本)` （ceil(1.5*15)）
-  - 通常復帰: `max(q60, 45本)` （3*15）
+- 20銘柄ポートフォリオのドリフトを日次監視し、閾値超過時に半戻し案をSlack通知するスクリプト。
+- Finnhubとyfinanceから価格を取得（レジームは trend_template 本数に基づく（基準 N_G=12））。
+  - 緊急入り: `max(q05, 12本)`
+  - 緊急解除: `max(q20, 18本)` （ceil(1.5*12)）
+  - 通常復帰: `max(q60, 36本)` （3*12）
 
 ## 定数・設定
 - `FINNHUB_API_KEY` / `SLACK_WEBHOOK_URL` を環境変数から取得。
@@ -26,7 +26,7 @@
 - `current_tickers.csv` から銘柄と保有株数を読み込み、目標比率4%を付与したリストを生成。
 
 ### compute_threshold_by_mode
-- モード(NORMAL/CAUTION/EMERG) に応じて **12% / 14% / 停止(∞)** を返す。
+- モード(NORMAL/CAUTION/EMERG) に応じて **12% / 14% / 停止(∞)** を返す（`config.py` を参照）。
 
 ### build_dataframe
 - 各銘柄の評価額や現在比率、ドリフト、半戻し後比率(`adjusted_ratio`)を計算しDataFrame化。
@@ -41,7 +41,7 @@
 - 通貨・比率・株数の表示フォーマットを定義。
 
 ### build_header
-- 現金保有率・閾値・ドリフト値およびアラート有無をSlackメッセージ用ヘッダに整形。
+- 現金保有率・閾値・ドリフト値およびアラート有無をSlackメッセージ用ヘッダに整形。TS(基本)はモード別に `config.py` から動的表示し、段階TSは base から -3/-6/-8 pt。
 
 ### send_slack / send_debug
 - 通常通知およびデバッグ詳細をSlack Webhookへ送信。
