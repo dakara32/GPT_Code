@@ -534,6 +534,10 @@ class Scorer:
         # === Z化と合成 ===
         for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
 
+        for _c in ('DIV_TTM_PS', 'DIV_FCF_COVER'):
+            if _c in df.columns:
+                df[_c] = df[_c].fillna(0.0)
+
         df_z = pd.DataFrame(index=df.index)
         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
