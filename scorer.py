@@ -306,16 +306,32 @@ class Scorer:
             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
 
-            # --- 配当（欠損補完含む） ---
-            div = d.get('dividendYield') if d.get('dividendYield') is not None else d.get('trailingAnnualDividendYield')
-            if div is None or pd.isna(div):
+            # --- 配当（直近1年無配は DIV=0 扱い） ---
+            div = 0.0
+            try:
+                divs = yf.Ticker(t).dividends
+                if divs is not None and not divs.empty:
+                    last_close = s.iloc[-1]
+                    cutoff = divs.index.max() - pd.Timedelta(days=365)
+                    ttm_sum = float(divs[divs.index >= cutoff].sum())
+                    # 直近1年の現金配当合計が正ならのみ採用（特別配の過去分は無視）
+                    if last_close and last_close > 0 and ttm_sum > 0:
+                        div = ttm_sum / float(last_close)
+            except Exception:
+                pass
+
+            # dividends 時系列が取れなかったときだけ、info側にフォールバック
+            if div == 0.0:
+                yi = d.get('dividendYield', None)
+                if yi is None:
+                    yi = d.get('trailingAnnualDividendYield', None)
                 try:
-                    divs = yf.Ticker(t).dividends
-                    if divs is not None and not divs.empty:
-                        last_close = s.iloc[-1]; div_1y = divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum()
-                        if last_close and last_close>0: div = float(div_1y/last_close)
-                except Exception: pass
-            df.loc[t,'DIV'] = 0.0 if (div is None or pd.isna(div)) else float(div)
+                    if yi is not None and not pd.isna(yi):
+                        div = float(yi)
+                except Exception:
+                    pass
+
+            df.loc[t, 'DIV'] = float(div)  # 最終確定。直近1年ゼロなら必ず 0.0
 
             # --- FCF/EV ---
             fcf_val = fcf_df.loc[t,'FCF_TTM'] if t in fcf_df.index else np.nan
