@@ -316,6 +316,35 @@ class Input:
             rows.append({"ticker":sym,"cfo_ttm_fh":np.nan if cfo_ttm is None else cfo_ttm,"capex_ttm_fh":np.nan if capex_ttm is None else capex_ttm})
         return pd.DataFrame(rows).set_index("ticker")
 
+    def fetch_eps_ttm_finnhub_once(self, tickers: list[str], api_key: str|None=None) -> pd.Series:
+        import requests, numpy as np, pandas as pd, os
+        api_key = api_key or os.getenv("FINNHUB_API_KEY")
+        if not api_key or not tickers:
+            return pd.Series(dtype=float)
+        base = "https://finnhub.io/api/v1"
+        out = {}
+        s = requests.Session()
+
+        def one(sym: str) -> float:
+            try:
+                r = s.get(f"{base}/stock/earnings", params={"symbol": sym, "limit": 4, "token": api_key}, timeout=12)
+                arr = r.json() if r.ok else []
+                vals = []
+                for it in (arr or [])[:4]:
+                    v = it.get("eps")
+                    try:
+                        vals.append(float(v))
+                    except Exception:
+                        vals.append(np.nan)
+                v = float(np.nansum(vals)) if any([x == x for x in vals]) else np.nan
+                return v
+            except Exception:
+                return np.nan
+
+        for t in tickers:
+            out[t] = one(t)
+        return pd.Series(out, dtype=float)
+
     def compute_fcf_with_fallback(self, tickers: list[str], finnhub_api_key: str|None=None) -> pd.DataFrame:
         yf_df = self.fetch_cfo_capex_ttm_yf(tickers)
         T.log("financials (yf) done")
@@ -793,6 +822,43 @@ def run_pipeline() -> SelectionBundle:
     Slack文言・丸め・順序は既存の Output を用いて変更しない。
     """
     inb = io_build_input_bundle()
+    try:
+        eps_df = inb.eps_df
+        red_mask = (eps_df["eps_ttm"] <= 0) | (
+            eps_df.get("eps_imputed", pd.Series(False, index=eps_df.index)).astype(bool)
+        )
+        red = eps_df.index[red_mask].tolist()
+        if red:
+            corrM = 45
+            exist_set = set(exist)
+            top_cand = set(inb.cand[:corrM])
+            try:
+                mom = (1 + inb.returns).iloc[-63:].prod() - 1
+                mom_top = set(
+                    mom.dropna().sort_values(ascending=False).head(corrM).index.tolist()
+                )
+            except Exception:
+                mom_top = set()
+            hopeful_pool = exist_set | top_cand | mom_top
+            target = sorted(set(red) & hopeful_pool)
+            if target:
+                eps_fix = Input(
+                    cand=[], exist=[], bench="", price_max=0,
+                    finnhub_api_key=os.environ.get("FINNHUB_API_KEY")
+                ).fetch_eps_ttm_finnhub_once(target)
+                pos = eps_fix[eps_fix > 0].index.tolist()
+                if pos:
+                    eps_df.loc[pos, "eps_ttm"] = eps_fix.loc[pos].astype(float)
+                    if "eps_imputed" in eps_df.columns:
+                        eps_df.loc[pos, "eps_imputed"] = False
+                    inb = InputBundle(
+                        cand=inb.cand, tickers=inb.tickers, bench=inb.bench,
+                        data=inb.data, px=inb.px, spx=inb.spx,
+                        tickers_bulk=inb.tickers_bulk, info=inb.info,
+                        eps_df=eps_df, fcf_df=inb.fcf_df, returns=inb.returns
+                    )
+    except Exception as _e:
+        print(f"[warn] EPS red-flag finnhub check skipped: {str(_e)}")
     cfg = PipelineConfig(weights=WeightsConfig(g=g_weights, d=D_weights),
         drrs=DRRSParams(corrM=corrM, shrink=DRRS_SHRINK,
                          G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD),
