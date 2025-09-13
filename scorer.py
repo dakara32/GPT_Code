@@ -615,13 +615,13 @@ class Scorer:
         df_z['VOL'] = robust_z(df['BETA'])
         df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
 
-        # --- Profitability penalty: punish negative EPS or FCF ---
+        # --- EPS-only penalty: punish negative EPS (GAAP or nEPS) ---
         eps_any = (df.get('EPS', 0) > 0) | (df.get('nEPS_ttm', 0) > 0)
-        profitable = eps_any & (df.get('FCF_TTM', 0) > 0)
-        PEN_GROWTH = 0.8  # strength of deduction (adjust 0.5-1.0 as needed)
+        PEN_EPS = float(os.getenv("PEN_EPS_FOR_GRW", "0.8"))
         if 'GRW' in df_z.columns:
-            red = (~profitable.reindex(df_z.index)).astype(float)
-            df_z['GRW'] = (df_z['GRW'] - PEN_GROWTH * red).clip(-3.0, 3.0)
+            red_eps = (~eps_any).astype(float)
+            # Adjust displayed GRW directly based on EPS penalty only (no FCF)
+            df_z['GRW'] = (df_z['GRW'] - PEN_EPS * red_eps).clip(-3.0, 3.0)
 
         # === begin: BIO LOSS PENALTY =====================================
         try:
