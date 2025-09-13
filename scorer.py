@@ -308,6 +308,10 @@ class Scorer:
             # --- 基本特徴 ---
             df.loc[t,'TR']   = self.trend(s)
             df.loc[t,'EPS']  = eps_df.loc[t,'EPS_TTM'] if t in eps_df.index else np.nan
+            if 'nEPS_ttm' in eps_df.columns:
+                df.loc[t,'nEPS_ttm'] = eps_df.loc[t,'nEPS_ttm'] if t in eps_df.index else np.nan
+            else:
+                df.loc[t,'nEPS_ttm'] = np.nan
             df.loc[t,'REV']  = d.get('revenueGrowth',np.nan)
             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
@@ -341,6 +345,7 @@ class Scorer:
 
             # --- FCF/EV ---
             fcf_val = fcf_df.loc[t,'FCF_TTM'] if t in fcf_df.index else np.nan
+            df.loc[t,'FCF_TTM'] = fcf_val
             df.loc[t,'FCF'] = (fcf_val/ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev>0) else np.nan
 
             # --- モメンタム・ボラ関連 ---
@@ -609,6 +614,14 @@ class Scorer:
             + 0.10*df_z['MA200_UP_STREAK_D']).clip(-3.0,3.0)
         df_z['VOL'] = robust_z(df['BETA'])
         df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
+
+        # --- Profitability penalty: punish negative EPS or FCF ---
+        eps_any = (df.get('EPS', 0) > 0) | (df.get('nEPS_ttm', 0) > 0)
+        profitable = eps_any & (df.get('FCF_TTM', 0) > 0)
+        PEN_GROWTH = 0.8  # strength of deduction (adjust 0.5-1.0 as needed)
+        if 'GRW' in df_z.columns:
+            red = (~profitable.reindex(df_z.index)).astype(float)
+            df_z['GRW'] = (df_z['GRW'] - PEN_GROWTH * red).clip(-3.0, 3.0)
 
         # === begin: BIO LOSS PENALTY =====================================
         try:
