@@ -597,7 +597,7 @@ class Scorer:
         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
-        grw_z = robust_z(0.25*df_z['REV']          # ↓0.30→0.25
+        GRW_z = robust_z(0.25*df_z['REV']          # ↓0.30→0.25
             + 0.20*df_z['EPS_Q_YOY']
             + 0.15*df_z['REV_Q_YOY']
             + 0.15*df_z['REV_YOY_ACC']
@@ -606,7 +606,8 @@ class Scorer:
             + 0.10*df_z['EPS']          # ★追加：黒字優遇／赤字減点
             + 0.05*df_z['REV_ANN_STREAK']
             - 0.05*df_z['REV_YOY_VAR'])
-        df_z['GROWTH_F'] = grw_z.clip(-3.0,3.0)
+        df_z['GRW_raw'] = GRW_z.clip(-3.0,3.0)
+        df_z['GRW']     = df_z['GRW_raw']
         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
             + 0.15*df_z['TR_str']
             + 0.15*df_z['RS_SLOPE_6W']
@@ -614,16 +615,13 @@ class Scorer:
             + 0.10*df_z['MA200_SLOPE_5M']
             + 0.10*df_z['MA200_UP_STREAK_D']).clip(-3.0,3.0)
         df_z['VOL'] = robust_z(df['BETA'])
-        df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
-        df_z['GRW_raw'] = df_z['GRW']  # 純粋な成長z（ログ用）
-        df_z['GRW'] = df_z['GRW_raw']  # 表示＆選定に使われるGRW
+        df_z.rename(columns={'MOM_F':'MOM','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
 
         # --- EPS-only penalty: punish negative EPS (GAAP or nEPS) ---
-        eps_any = (df.get('EPS', 0) > 0) | (df.get('nEPS_ttm', 0) > 0)
+        eps_any = (df['EPS'] > 0) | (df.get('nEPS_ttm', 0) > 0)
         PEN_EPS = float(os.getenv("PEN_EPS_FOR_GRW", "0.8"))
-        if 'GRW' in df_z.columns:
-            red_eps = (~eps_any).astype(float)
-            df_z['GRW'] = (df_z['GRW'] - PEN_EPS * red_eps).clip(-3.0, 3.0)
+        red_eps = (~eps_any).astype(float)
+        df_z['GRW'] = (df_z['GRW'] - PEN_EPS * red_eps).clip(-3.0, 3.0)
 
         # === begin: BIO LOSS PENALTY =====================================
         try:
@@ -661,7 +659,11 @@ class Scorer:
         # --- 重みは cfg を優先（外部があればそれを使用） ---
         # ① 全銘柄で G/D スコアを算出（unmasked）
         g_cols = list(pd.Series(cfg.weights.g, dtype=float).index)
-        g_score_all = df_z[g_cols].mul(pd.Series(cfg.weights.g)).sum(axis=1)
+        X = df_z[g_cols].copy()
+        X["GRW"] = df_z["GRW"]
+        g_score_all = X.mul(pd.Series(cfg.weights.g)).sum(axis=1)
+        # print("[GRW apply] PLTR raw/adj:", df_z.loc["PLTR", ["GRW_raw","GRW"]].to_dict())
+        # print("[X GRW] PLTR:", float(X.loc["PLTR","GRW"]))
 
         d_comp = pd.concat({
             'QAL': df_z['D_QAL'],
