@@ -5,7 +5,7 @@ SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / �
 SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
 import os, time, requests
 from time import perf_counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
@@ -807,11 +807,46 @@ def run_pipeline() -> SelectionBundle:
         drrs=DRRSParams(corrM=corrM, shrink=DRRS_SHRINK,
                          G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD),
         price_max=CAND_PRICE_MAX)
+
+    # --- Pass-1: 暫定選定（GAAPのみ） ---
+    sc_p1 = Scorer()
+    top_G1, _, _, _ = run_group(sc_p1, "G", inb, cfg, N_G)
+    poolG1 = list(getattr(sc_p1, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False).index)
+    alpha1 = Scorer.spx_to_alpha(inb.spx)
+    sectors1 = {t:(inb.info.get(t,{}).get("sector") or "U") for t in poolG1}; scores1 = {t:Scorer.g_score.get(t,0.0) for t in poolG1}
+    top_G1 = Scorer.pick_top_softcap(scores1, sectors1, N=N_G, cap=2, alpha=alpha1, hard=5)
+    sc_p1._top_G = top_G1
+    try:
+        aggG1 = getattr(sc_p1, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False)
+        sc_p1._near_G = [t for t in aggG1.index if t not in set(top_G1)][:10]
+    except Exception:
+        pass
+    top_D1, _, _, _ = run_group(sc_p1, "D", inb, cfg, N_D)
+    hopeful = sorted(set(top_G1 + top_D1 + getattr(sc_p1, "_near_G", []) + getattr(sc_p1, "_near_D", [])))
+
+    # --- hopeful only: Non-GAAP EPS 取得 ---
+    eps_df2 = inb.eps_df.copy()
+    _api = os.getenv("FINNHUB_API_KEY", "").strip()
+    if _api and hopeful:
+        n_map = {t: _fetch_eps_non_gaap_ttm(t, _api) for t in hopeful}
+        if "nEPS_ttm" not in eps_df2.columns:
+            eps_df2["nEPS_ttm"] = np.nan
+        for t, v in n_map.items():
+            if t in eps_df2.index:
+                eps_df2.at[t, "nEPS_ttm"] = v
+    else:
+        if "nEPS_ttm" not in eps_df2.columns:
+            eps_df2["nEPS_ttm"] = np.nan
+
+    # Frozen 回避: InputBundle を replace で再生成
+    inb2 = replace(inb, eps_df=eps_df2)
+
+    # --- Pass-2: 最終選定（nEPS 反映後） ---
     sc = Scorer()
-    top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G)
+    top_G, avgG, sumG, objG = run_group(sc, "G", inb2, cfg, N_G)
     poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False).index)
-    alpha = Scorer.spx_to_alpha(inb.spx)
-    sectors = {t:(inb.info.get(t,{}).get("sector") or "U") for t in poolG}; scores = {t:Scorer.g_score.get(t,0.0) for t in poolG}
+    alpha = Scorer.spx_to_alpha(inb2.spx)
+    sectors = {t:(inb2.info.get(t,{}).get("sector") or "U") for t in poolG}; scores = {t:Scorer.g_score.get(t,0.0) for t in poolG}
     top_G = Scorer.pick_top_softcap(scores, sectors, N=N_G, cap=2, alpha=alpha, hard=5)
     sc._top_G = top_G
     try:
@@ -822,21 +857,11 @@ def run_pipeline() -> SelectionBundle:
     base = sum(Scorer.g_score.get(t,0.0) for t in poolG[:N_G])
     effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
-    top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D)
+    top_D, avgD, sumD, objD = run_group(sc, "D", inb2, cfg, N_D)
     fb = getattr(sc, "_feat", None)
-    if FINNHUB_API_KEY:
-        hopeful = set(top_G + top_D + getattr(sc, "_near_G", []) + getattr(sc, "_near_D", []))
-        n_map = {t: _fetch_eps_non_gaap_ttm(t, FINNHUB_API_KEY) for t in hopeful}
-        eps_df = inb.eps_df.copy()
-        eps_df["nEPS_ttm"] = pd.Series(n_map, index=eps_df.index, dtype=float)
-        inb.eps_df = eps_df
-    else:
-        eps_df = inb.eps_df.copy()
-        eps_df["nEPS_ttm"] = np.nan
-        inb.eps_df = eps_df
     if fb is not None:
         try:
-            fb.df_z["nEPS_ttm"] = inb.eps_df["nEPS_ttm"]
+            fb.df_z["nEPS_ttm"] = inb2.eps_df["nEPS_ttm"]
         except Exception:
             pass
     near_G = getattr(sc, "_near_G", [])
