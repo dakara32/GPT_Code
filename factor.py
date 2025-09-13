@@ -47,14 +47,33 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # その他
 debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
+_API = (FINNHUB_API_KEY or "").strip()
 
-def _fetch_eps_non_gaap_ttm(sym: str, token: str) -> float:
+def _fetch_eps_non_gaap_ttm_metric(sym: str, token: str) -> float:
+    """
+    Finnhub /stock/metric から Non-GAAPに相当するTTMを取得。
+    第一候補: epsExclExtraItemsTTM（調整後EPSに相当）
+    代替候補: epsNormalizedAnnual（年次だがNon-GAAPに近い）
+    最終候補: epsTTM（GAAP、フォールバック）
+    いずれも欠損なら NaN を返す（0.0は返さない）。
+    """
     try:
-        r = requests.get("https://finnhub.io/api/v1/stock/earnings",
-                         params={"symbol": sym, "limit": 4, "token": token}, timeout=12)
-        arr = r.json() if r.ok else []
-        vals = [float(x.get("epsNonGAAP", np.nan)) for x in arr[:4]]
-        return float(np.nansum([v for v in vals if pd.notna(v)]))
+        r = requests.get(
+            "https://finnhub.io/api/v1/stock/metric",
+            params={"symbol": sym, "metric": "all", "token": token},
+            timeout=12,
+        )
+        j = r.json() if r.ok else {}
+        m = (j or {}).get("metric", {}) or {}
+        for k in ("epsExclExtraItemsTTM", "epsNormalizedAnnual", "epsTTM"):
+            v = m.get(k, None)
+            if v is not None:
+                try:
+                    fv = float(v)
+                    return fv
+                except Exception:
+                    pass
+        return np.nan
     except Exception:
         return np.nan
 
@@ -826,17 +845,17 @@ def run_pipeline() -> SelectionBundle:
 
     # --- hopeful only: Non-GAAP EPS 取得 ---
     eps_df2 = inb.eps_df.copy()
-    _api = os.getenv("FINNHUB_API_KEY", "").strip()
-    if _api and hopeful:
-        n_map = {t: _fetch_eps_non_gaap_ttm(t, _api) for t in hopeful}
-        if "nEPS_ttm" not in eps_df2.columns:
-            eps_df2["nEPS_ttm"] = np.nan
+    if "nEPS_ttm" not in eps_df2.columns:
+        eps_df2["nEPS_ttm"] = np.nan
+    if _API and hopeful:
+        n_map = {t: _fetch_eps_non_gaap_ttm_metric(t, _API) for t in hopeful}
         for t, v in n_map.items():
             if t in eps_df2.index:
                 eps_df2.at[t, "nEPS_ttm"] = v
+        print(f"[nEPS] fetched={sum(np.isfinite(list(n_map.values())))}  sample: "
+              f"{[(k, round(v,3)) for k,v in list(n_map.items())[:5]]}")
     else:
-        if "nEPS_ttm" not in eps_df2.columns:
-            eps_df2["nEPS_ttm"] = np.nan
+        pass  # APIキー無しの場合でも列は必ず保持（後段のKeyError防止）
 
     # Frozen 回避: InputBundle を replace で再生成
     inb2 = replace(inb, eps_df=eps_df2)
