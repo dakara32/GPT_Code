@@ -1,5 +1,27 @@
 ```text
-yield")): return "maybe_missing"
+ None and not bs.empty:
+L150                 c = bs.columns[0]
+L151                 for k in ("Total Debt","Long Term Debt","Short Long Term Debt"):
+L152                     if k in bs.index: debt = float(bs.loc[k,c]); break
+L153                 for k in ("Cash And Cash Equivalents","Cash And Cash Equivalents And Short Term Investments","Cash"):
+L154                     if k in bs.index: cash = float(bs.loc[k,c]); break
+L155         except Exception: pass
+L156         if pd.notna(mc): return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
+L157         return np.nan
+L158
+L159     @staticmethod
+L160     def dividend_status(ticker: str) -> str:
+L161         t = yf.Ticker(ticker)
+L162         try:
+L163             if not t.dividends.empty: return "has"
+L164         except Exception: return "unknown"
+L165         try:
+L166             a = t.actions
+L167             if (a is not None and not a.empty and "Stock Splits" in a.columns and a["Stock Splits"].abs().sum()>0): return "none_confident"
+L168         except Exception: pass
+L169         try:
+L170             fi = t.fast_info
+L171             if any(getattr(fi,k,None) for k in ("last_dividend_date","dividend_rate","dividend_yield")): return "maybe_missing"
 L172         except Exception: pass
 L173         return "unknown"
 L174
@@ -118,121 +140,105 @@ L286         tt &= (rs >= 0.10)
 L287
 L288         return tt.fillna(False).sum(axis=1).astype(int)
 L289
-L290     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
-L291     def aggregate_scores(self, ib: Any, cfg):
-L292         if cfg is None:
-L293             raise ValueError("cfg is required; pass factor.PipelineConfig")
-L294         self._validate_ib_for_scorer(ib)
+L290     def filter_candidates(self, ib, agg, group, cfg):
+L291         df = ib.eps_df.join(ib.fcf_df, how="outer")
+L292         eps_any = (df.get("EPS_TTM", 0) > 0) | (df.get("nEPS_ttm", 0) > 0)
+L293         profitable = eps_any & (df.get("FCF_TTM", 0) > 0)
+L294         return profitable.reindex(agg.index).fillna(False)
 L295
-L296         px, spx, tickers = ib.px, ib.spx, ib.tickers
-L297         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
-L298
-L299         df, missing_logs = pd.DataFrame(index=tickers), []
-L300         for t in tickers:
-L301             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
-L302             # --- 基本特徴 ---
-L303             df.loc[t,'TR']   = self.trend(s)
-L304             df.loc[t,'EPS']  = eps_df.loc[t,'EPS_TTM'] if t in eps_df.index else np.nan
-L305             df.loc[t,'REV']  = d.get('revenueGrowth',np.nan)
-L306             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
-L307             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
-L308
-L309             # --- 配当（直近1年無配は DIV=0 扱い） ---
-L310             div = 0.0
-L311             try:
-L312                 divs = yf.Ticker(t).dividends
-L313                 if divs is not None and not divs.empty:
-L314                     last_close = s.iloc[-1]
-L315                     cutoff = divs.index.max() - pd.Timedelta(days=365)
-L316                     ttm_sum = float(divs[divs.index >= cutoff].sum())
-L317                     # 直近1年の現金配当合計が正ならのみ採用（特別配の過去分は無視）
-L318                     if last_close and last_close > 0 and ttm_sum > 0:
-L319                         div = ttm_sum / float(last_close)
-L320             except Exception:
-L321                 pass
-L322
-L323             # dividends 時系列が取れなかったときだけ、info側にフォールバック
-L324             if div == 0.0:
-L325                 yi = d.get('dividendYield', None)
-L326                 if yi is None:
-L327                     yi = d.get('trailingAnnualDividendYield', None)
-L328                 try:
-L329                     if yi is not None and not pd.isna(yi):
-L330                         div = float(yi)
-L331                 except Exception:
-L332                     pass
-L333
-L334             df.loc[t, 'DIV'] = float(div)  # 最終確定。直近1年ゼロなら必ず 0.0
-L335
-L336             # --- FCF/EV ---
-L337             fcf_val = fcf_df.loc[t,'FCF_TTM'] if t in fcf_df.index else np.nan
-L338             df.loc[t,'FCF'] = (fcf_val/ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev>0) else np.nan
+L296     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
+L297     def aggregate_scores(self, ib: Any, cfg):
+L298         if cfg is None:
+L299             raise ValueError("cfg is required; pass factor.PipelineConfig")
+L300         self._validate_ib_for_scorer(ib)
+L301
+L302         px, spx, tickers = ib.px, ib.spx, ib.tickers
+L303         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
+L304
+L305         df, missing_logs = pd.DataFrame(index=tickers), []
+L306         for t in tickers:
+L307             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
+L308             # --- 基本特徴 ---
+L309             df.loc[t,'TR']   = self.trend(s)
+L310             df.loc[t,'EPS']  = eps_df.loc[t,'EPS_TTM'] if t in eps_df.index else np.nan
+L311             df.loc[t,'REV']  = d.get('revenueGrowth',np.nan)
+L312             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
+L313             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
+L314
+L315             # --- 配当（直近1年無配は DIV=0 扱い） ---
+L316             div = 0.0
+L317             try:
+L318                 divs = yf.Ticker(t).dividends
+L319                 if divs is not None and not divs.empty:
+L320                     last_close = s.iloc[-1]
+L321                     cutoff = divs.index.max() - pd.Timedelta(days=365)
+L322                     ttm_sum = float(divs[divs.index >= cutoff].sum())
+L323                     # 直近1年の現金配当合計が正ならのみ採用（特別配の過去分は無視）
+L324                     if last_close and last_close > 0 and ttm_sum > 0:
+L325                         div = ttm_sum / float(last_close)
+L326             except Exception:
+L327                 pass
+L328
+L329             # dividends 時系列が取れなかったときだけ、info側にフォールバック
+L330             if div == 0.0:
+L331                 yi = d.get('dividendYield', None)
+L332                 if yi is None:
+L333                     yi = d.get('trailingAnnualDividendYield', None)
+L334                 try:
+L335                     if yi is not None and not pd.isna(yi):
+L336                         div = float(yi)
+L337                 except Exception:
+L338                     pass
 L339
-L340             # --- モメンタム・ボラ関連 ---
-L341             df.loc[t,'RS'], df.loc[t,'TR_str'] = self.rs(s, spx), self.tr_str(s)
-L342             r, rm = s.pct_change().dropna(), spx.pct_change().dropna()
-L343             n = int(min(len(r), len(rm)))
-L344
-L345             DOWNSIDE_DEV = np.nan
-L346             if n>=60:
-L347                 r6 = r.iloc[-min(len(r),126):]; neg = r6[r6<0]
-L348                 if len(neg)>=10: DOWNSIDE_DEV = float(neg.std(ddof=0)*np.sqrt(252))
-L349             df.loc[t,'DOWNSIDE_DEV'] = DOWNSIDE_DEV
+L340             df.loc[t, 'DIV'] = float(div)  # 最終確定。直近1年ゼロなら必ず 0.0
+L341
+L342             # --- FCF/EV ---
+L343             fcf_val = fcf_df.loc[t,'FCF_TTM'] if t in fcf_df.index else np.nan
+L344             df.loc[t,'FCF'] = (fcf_val/ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev>0) else np.nan
+L345
+L346             # --- モメンタム・ボラ関連 ---
+L347             df.loc[t,'RS'], df.loc[t,'TR_str'] = self.rs(s, spx), self.tr_str(s)
+L348             r, rm = s.pct_change().dropna(), spx.pct_change().dropna()
+L349             n = int(min(len(r), len(rm)))
 L350
-L351             MDD_1Y = np.nan
-L352             try:
-L353                 w = s.iloc[-min(len(s),252):].dropna()
-L354                 if len(w)>=30:
-L355                     roll_max = w.cummax(); MDD_1Y = float((w/roll_max - 1.0).min())
-L356             except Exception: pass
-L357             df.loc[t,'MDD_1Y'] = MDD_1Y
-L358
-L359             RESID_VOL = np.nan
-L360             if n>=120:
-L361                 rr, rrm = r.iloc[-n:].align(rm.iloc[-n:], join='inner')
-L362                 if len(rr)==len(rrm) and len(rr)>=120 and rrm.var()>0:
-L363                     beta = float(np.cov(rr, rrm)[0,1]/np.var(rrm)); resid = rr - beta*rrm
-L364                     RESID_VOL = float(resid.std(ddof=0)*np.sqrt(252))
-L365             df.loc[t,'RESID_VOL'] = RESID_VOL
-L366
-L367             DOWN_OUTPERF = np.nan
-L368             if n>=60:
-L369                 m, x = rm.iloc[-n:], r.iloc[-n:]; mask = m<0
-L370                 if mask.sum()>=10:
-L371                     mr, sr = float(m[mask].mean()), float(x[mask].mean())
-L372                     DOWN_OUTPERF = (sr - mr)/abs(mr) if mr!=0 else np.nan
-L373             df.loc[t,'DOWN_OUTPERF'] = DOWN_OUTPERF
-L374
-L375             # --- 長期移動平均/位置 ---
-L376             sma200 = s.rolling(200).mean(); df.loc[t,'EXT_200'] = np.nan
-L377             if pd.notna(sma200.iloc[-1]) and sma200.iloc[-1]!=0: df.loc[t,'EXT_200'] = abs(float(s.iloc[-1]/sma200.iloc[-1]-1.0))
-L378
-L379             # --- 配当の詳細系 ---
-L380             DIV_TTM_PS=DIV_VAR5=DIV_YOY=DIV_FCF_COVER=np.nan
-L381             try:
-L382                 divs = yf.Ticker(t).dividends.dropna()
-L383                 if not divs.empty:
-L384                     last_close = s.iloc[-1]; div_1y = float(divs[divs.index >= (divs.index.max()-pd.Timedelta(days=365))].sum())
-L385                     DIV_TTM_PS = div_1y if div_1y>0 else np.nan
-L386                     ann = divs.groupby(divs.index.year).sum()
-L387                     if len(ann)>=2 and ann.iloc[-2]!=0: DIV_YOY = float(ann.iloc[-1]/ann.iloc[-2]-1.0)
-L388                     tail = ann.iloc[-5:] if len(ann)>=5 else ann
-L389                     if len(tail)>=3 and tail.mean()!=0: DIV_VAR5 = float(tail.std(ddof=1)/abs(tail.mean()))
-L390                 so = d.get('sharesOutstanding',None)
-L391                 if so and pd.notna(DIV_TTM_PS) and pd.notna(fcf_val) and fcf_val!=0:
-L392                     DIV_FCF_COVER = float((fcf_val)/(DIV_TTM_PS*float(so)))
-L393             except Exception: pass
-L394             df.loc[t,'DIV_TTM_PS'], df.loc[t,'DIV_VAR5'], df.loc[t,'DIV_YOY'], df.loc[t,'DIV_FCF_COVER'] = DIV_TTM_PS, DIV_VAR5, DIV_YOY, DIV_FCF_COVER
-L395
-L396             # --- 財務安定性 ---
-L397             df.loc[t,'DEBT2EQ'], df.loc[t,'CURR_RATIO'] = d.get('debtToEquity',np.nan), d.get('currentRatio',np.nan)
-L398
-L399             # --- EPS 変動 ---
-L400             EPS_VAR_8Q = np.nan
-L401             try:
-L402                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
-L403                 if qe is not None and not qe.empty and so:
-L404                     eps_q = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
-L405                     if len(eps_q)>=4: EPS_VAR_8Q = float(eps_q.iloc[-min(8,len(eps_q)):].std(ddof=1))
-L406             except 
+L351             DOWNSIDE_DEV = np.nan
+L352             if n>=60:
+L353                 r6 = r.iloc[-min(len(r),126):]; neg = r6[r6<0]
+L354                 if len(neg)>=10: DOWNSIDE_DEV = float(neg.std(ddof=0)*np.sqrt(252))
+L355             df.loc[t,'DOWNSIDE_DEV'] = DOWNSIDE_DEV
+L356
+L357             MDD_1Y = np.nan
+L358             try:
+L359                 w = s.iloc[-min(len(s),252):].dropna()
+L360                 if len(w)>=30:
+L361                     roll_max = w.cummax(); MDD_1Y = float((w/roll_max - 1.0).min())
+L362             except Exception: pass
+L363             df.loc[t,'MDD_1Y'] = MDD_1Y
+L364
+L365             RESID_VOL = np.nan
+L366             if n>=120:
+L367                 rr, rrm = r.iloc[-n:].align(rm.iloc[-n:], join='inner')
+L368                 if len(rr)==len(rrm) and len(rr)>=120 and rrm.var()>0:
+L369                     beta = float(np.cov(rr, rrm)[0,1]/np.var(rrm)); resid = rr - beta*rrm
+L370                     RESID_VOL = float(resid.std(ddof=0)*np.sqrt(252))
+L371             df.loc[t,'RESID_VOL'] = RESID_VOL
+L372
+L373             DOWN_OUTPERF = np.nan
+L374             if n>=60:
+L375                 m, x = rm.iloc[-n:], r.iloc[-n:]; mask = m<0
+L376                 if mask.sum()>=10:
+L377                     mr, sr = float(m[mask].mean()), float(x[mask].mean())
+L378                     DOWN_OUTPERF = (sr - mr)/abs(mr) if mr!=0 else np.nan
+L379             df.loc[t,'DOWN_OUTPERF'] = DOWN_OUTPERF
+L380
+L381             # --- 長期移動平均/位置 ---
+L382             sma200 = s.rolling(200).mean(); df.loc[t,'EXT_200'] = np.nan
+L383             if pd.notna(sma200.iloc[-1]) and sma200.iloc[-1]!=0: df.loc[t,'EXT_200'] = abs(float(s.iloc[-1]/sma200.iloc[-1]-1.0))
+L384
+L385             # --- 配当の詳細系 ---
+L386             DIV_TTM_PS=DIV_VAR5=DIV_YOY=DIV_FCF_COVER=np.nan
+L387             try:
+L388                 divs = yf.Ticker(t).dividends.dropna()
+L389                 if not divs.empty:
+L390                     last_close = s.iloc[-1]; div_1y = float(divs[divs.index >= (divs.index.max()-pd.Timedelta(da
 ```
