@@ -555,11 +555,28 @@ class Scorer:
                 df[_c] = df[_c].fillna(0.0)
 
         df_z = pd.DataFrame(index=df.index)
-        for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
+        for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']:
+            df_z[col] = robust_z(df[col])
         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
         for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
         for col in ['REV_Q_YOY','EPS_Q_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']: df_z[col] = robust_z(df[col])
         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
+
+        # --- Dividend handling: penalize non-payers ---
+        df['HAS_DIV'] = (df['DIV_TTM_PS'] > 0).astype(int)
+        y = df['DIV_TTM_PS'].where(df['HAS_DIV'] == 1, np.nan)
+        y_non = y.dropna()
+        z_yld = pd.Series(robust_z(y_non), index=y_non.index).reindex(df.index)
+        penalty = (np.nanmin(z_yld) - 1.0) if len(z_yld.dropna()) else -1.0
+        z_yld = z_yld.fillna(penalty)
+        z_streak = pd.Series(robust_z(df['DIV_STREAK'].where(df['HAS_DIV'] == 1, 0)), index=df.index)
+        z_cover = pd.Series(robust_z(df['DIV_FCF_COVER'].where(df['HAS_DIV'] == 1, 0)), index=df.index)
+        z_var = pd.Series(robust_z(df['DIV_VAR5'].where(df['HAS_DIV'] == 1, df['DIV_VAR5'].max())), index=df.index)
+        df['YLD'] = 0.45*z_yld + 0.25*z_streak + 0.20*z_cover - 0.10*z_var
+        df_z['DIV'] = z_yld
+        df_z['DIV_STREAK'] = z_streak
+        df_z['DIV_FCF_COVER'] = z_cover
+        df_z['DIV_VAR5'] = z_var
 
         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
@@ -612,7 +629,7 @@ class Scorer:
 
         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
         df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
-        df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
+        df_z['D_YLD']     = df['YLD']
         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
 
         # --- 重みは cfg を優先（外部があればそれを使用） ---
