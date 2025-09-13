@@ -608,6 +608,21 @@ class Scorer:
             - 0.05*df_z['REV_YOY_VAR'])
         df_z['GRW_raw'] = GRW_z.clip(-3.0,3.0)
         df_z['GRW']     = df_z['GRW_raw']
+        # GAAP EPS と Non-GAAP EPS を比較し、有利な方を eps_any_raw とする
+        eps_gaap = df.get("EPS")            # GAAP EPS
+        eps_non  = df.get("nEPS_ttm")       # Non-GAAP EPS (TTM)
+        eps_any_raw = pd.concat([eps_gaap, eps_non], axis=1).max(axis=1, skipna=True)
+
+        # robust_z は既存の関数（GRW 計算で使用しているもの）を利用
+        eps_any_z = robust_z(eps_any_raw)
+
+        # GRW 本体に入っている GAAP EPS z を差し替える
+        # 既存の 0.10*EPS_z を打ち消し、0.10*eps_any_z を加算
+        if "EPS" in df_z.columns:
+            df_z["GRW"] = (df_z["GRW"] - 0.10 * df_z["EPS"] + 0.10 * eps_any_z).clip(-3.0, 3.0)
+        else:
+            # EPS カラムが存在しない場合（古い仕様用フォールバック）
+            df_z["GRW"] = (df_z["GRW"] + 0.10 * eps_any_z).clip(-3.0, 3.0)
         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
             + 0.15*df_z['TR_str']
             + 0.15*df_z['RS_SLOPE_6W']
