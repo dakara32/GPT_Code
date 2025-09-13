@@ -48,6 +48,16 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 # その他
 debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
 
+def _fetch_eps_non_gaap_ttm(sym: str, token: str) -> float:
+    try:
+        r = requests.get("https://finnhub.io/api/v1/stock/earnings",
+                         params={"symbol": sym, "limit": 4, "token": token}, timeout=12)
+        arr = r.json() if r.ok else []
+        vals = [float(x.get("epsNonGAAP", np.nan)) for x in arr[:4]]
+        return float(np.nansum([v for v in vals if pd.notna(v)]))
+    except Exception:
+        return np.nan
+
 # === 共有DTO（クラス間I/O契約）＋ Config ===
 @dataclass(frozen=True)
 class InputBundle:
@@ -125,7 +135,7 @@ def _slack_debug(text: str, chunk=2800):
         i = j
 
 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-    want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
+    want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC","eps_ttm","nEPS_ttm","eps_imputed","fcf_ttm","fcf_imputed"]
     all_cols = _env_true("DEBUG_ALL_COLS", False)
     cols = list(fb.df_z.columns if all_cols else [c for c in want if c in fb.df_z.columns])
 
@@ -814,6 +824,21 @@ def run_pipeline() -> SelectionBundle:
     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
     top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D)
     fb = getattr(sc, "_feat", None)
+    if FINNHUB_API_KEY:
+        hopeful = set(top_G + top_D + getattr(sc, "_near_G", []) + getattr(sc, "_near_D", []))
+        n_map = {t: _fetch_eps_non_gaap_ttm(t, FINNHUB_API_KEY) for t in hopeful}
+        eps_df = inb.eps_df.copy()
+        eps_df["nEPS_ttm"] = pd.Series(n_map, index=eps_df.index, dtype=float)
+        inb.eps_df = eps_df
+    else:
+        eps_df = inb.eps_df.copy()
+        eps_df["nEPS_ttm"] = np.nan
+        inb.eps_df = eps_df
+    if fb is not None:
+        try:
+            fb.df_z["nEPS_ttm"] = inb.eps_df["nEPS_ttm"]
+        except Exception:
+            pass
     near_G = getattr(sc, "_near_G", [])
     selected12 = list(top_G)
     df = fb.df if fb is not None else pd.DataFrame()

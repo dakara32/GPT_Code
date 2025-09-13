@@ -287,6 +287,12 @@ class Scorer:
 
         return tt.fillna(False).sum(axis=1).astype(int)
 
+    def filter_candidates(self, ib, agg, group, cfg):
+        df = ib.eps_df.join(ib.fcf_df, how="outer")
+        eps_any = (df.get("EPS_TTM", 0) > 0) | (df.get("nEPS_ttm", 0) > 0)
+        profitable = eps_any & (df.get("FCF_TTM", 0) > 0)
+        return profitable.reindex(agg.index).fillna(False)
+
     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
     def aggregate_scores(self, ib: Any, cfg):
         if cfg is None:
