@@ -572,7 +572,12 @@ class Scorer:
         z_streak = pd.Series(robust_z(df['DIV_STREAK'].where(df['HAS_DIV'] == 1, 0)), index=df.index)
         z_cover = pd.Series(robust_z(df['DIV_FCF_COVER'].where(df['HAS_DIV'] == 1, 0)), index=df.index)
         z_var = pd.Series(robust_z(df['DIV_VAR5'].where(df['HAS_DIV'] == 1, df['DIV_VAR5'].max())), index=df.index)
-        df['YLD'] = 0.45*z_yld + 0.25*z_streak + 0.20*z_cover - 0.10*z_var
+        df['YLD'] = (
+            0.30*z_yld +
+            0.30*z_streak +
+            0.25*z_cover -
+            0.15*z_var
+        )
         df_z['DIV'] = z_yld
         df_z['DIV_STREAK'] = z_streak
         df_z['DIV_FCF_COVER'] = z_cover
