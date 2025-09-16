@@ -46,7 +46,7 @@ RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # その他
-debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
+debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
 
 # === 共有DTO（クラス間I/O契約）＋ Config ===
 @dataclass(frozen=True)
@@ -142,7 +142,8 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
 
     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-    focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))[:max_rows]
+    curr = [t for t in (exist or []) if t in getattr(fb, 'df_z', pd.DataFrame()).index]
+    focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss+curr))[:max_rows]
 
     def _fmt_near(lbl, ser, lst):
         if ser is None: return f"{lbl}: off"
@@ -159,7 +160,15 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     tbl="(df_z or columns not available)"
     if not fb.df_z.empty and cols:
         idx=[t for t in focus if t in fb.df_z.index]
-        tbl=fb.df_z.loc[idx, cols].round(3).to_string(max_rows=None, max_cols=None)
+        base=fb.df_z.loc[idx, cols].round(3).copy()
+        try:
+            if gs is not None:
+                base["GSC"] = [gs.get(t, np.nan) for t in base.index]
+            if ds is not None:
+                base["DSC"] = [ds.get(t, np.nan) for t in base.index]
+        except Exception:
+            pass
+        tbl=base.to_string(max_rows=None, max_cols=None)
 
     miss_txt=""
     if _env_true("DEBUG_MISSING_LOGS", False):
@@ -167,7 +176,7 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
         if miss is not None and not miss.empty:
             miss_txt="\nMissing data (head)\n"+miss.head(10).to_string(index=False)
 
-    return "\n".join(head+["\nChanged/Selected (+ Near Miss)", tbl])+miss_txt
+    return "\n".join(head+["\nChanged/Selected (+ Near Miss + Current)", tbl])+miss_txt
 
 def _disjoint_keepG(top_G, top_D, poolD):
     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
