@@ -8,7 +8,11 @@ PERIOD  = os.getenv("YF_PROBE_PERIOD", "180d")
 MIN_LEN = int(os.getenv("YF_PROBE_MIN_LEN", "120"))
 MAX_NAN_RATIO = float(os.getenv("YF_PROBE_MAX_NAN", "0.15"))
 RETRY_ON_EMPTY = int(os.getenv("YF_PROBE_RETRY", "1"))
-SLACK_WEBHOOK = os.getenv("YF_PROBE_SLACK_WEBHOOK", "")
+SLACK_WEBHOOK = (
+    os.getenv("SLACK_WEBHOOK_URL")
+    or os.getenv("SLACK_WEBHOOK")
+    or os.getenv("YF_PROBE_SLACK_WEBHOOK")
+)
 TIMEOUT_MS_WARN = int(os.getenv("YF_PROBE_TIMEOUT_MS_WARN", "5000"))
 
 def per_ticker_retry(px, bad):
@@ -40,10 +44,10 @@ def assess(px):
     elif ok_ratio>=0.5: return 10,"DEGRADED","⚠️",details
     else: return 20,"DOWN","🛑",details
 
-def post_slack(text):
+def send_slack(text):
     if not SLACK_WEBHOOK:
-        print("[SLACK] No webhook URL set, skip")
-        return
+        print("[SLACK] Missing webhook. Set 'SLACK_WEBHOOK_URL' (preferred) or 'SLACK_WEBHOOK'.")
+        sys.exit(78)
     try:
         r = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=5)
         print(f"[SLACK] status={r.status_code}")
@@ -60,6 +64,6 @@ def main():
     code,level,emoji,details=assess(close)
     latency=int((time.time()-t0)*1000); speed="🚀" if latency<TIMEOUT_MS_WARN else "🐢"
     summary=f"{emoji} YF_HEALTH {level} ok={len([d for d in details if 'OK' in d])}/{len(TICKERS)} latency={latency}ms {speed}\n" + " | ".join(details)
-    print(summary); post_slack(summary); sys.exit(code)
+    print(summary); send_slack(summary); sys.exit(code)
 
 if __name__=="__main__": main()
