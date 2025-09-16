@@ -46,7 +46,7 @@ RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # その他
-debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
+debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
 
 # === 共有DTO（クラス間I/O契約）＋ Config ===
 @dataclass(frozen=True)
