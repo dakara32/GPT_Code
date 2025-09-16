@@ -2,11 +2,11 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from typing import List
 
 import pandas as pd
 import requests
 import yfinance as yf
-
 
 DEFAULT_FALLBACK = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA"]
 PERIOD = os.getenv("YF_PROBE_PERIOD", "180d")
@@ -23,12 +23,14 @@ SLACK_WEBHOOK = (
 )
 
 
-def _parse_tickers(text: str) -> list[str]:
+def _parse_tickers(text: str) -> List[str]:
     raw = [x.strip().upper() for x in text.replace(",", "\n").splitlines()]
-    return [t for t in raw if t and not t.startswith("#")]
+    return [ticker for ticker in raw if ticker and not ticker.startswith("#")]
 
 
-def load_candidates() -> list[str]:
+def load_candidates() -> List[str]:
+    """Load candidate tickers from env, file, or fallback list."""
+
     env_list = os.getenv("CAND_TICKERS", "").strip()
     if env_list:
         tickers = _parse_tickers(env_list)
@@ -38,8 +40,8 @@ def load_candidates() -> list[str]:
     path = os.getenv("CAND_FILE", "data/candidates.txt")
     if os.path.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                tickers = _parse_tickers(fh.read())
+            with open(path, "r", encoding="utf-8") as file:
+                tickers = _parse_tickers(file.read())
                 if tickers:
                     return tickers
         except Exception:
@@ -48,7 +50,7 @@ def load_candidates() -> list[str]:
     return DEFAULT_FALLBACK
 
 
-def per_ticker_retry(px: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+def per_ticker_retry(px: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
     for ticker in tickers:
         try:
             history = (
@@ -63,8 +65,8 @@ def per_ticker_retry(px: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
     return px
 
 
-def assess(px: pd.DataFrame, tickers: list[str]):
-    details: list[str] = []
+def assess(px: pd.DataFrame, tickers: List[str]):
+    details: List[str] = []
     good = 0
     for ticker in tickers:
         if ticker not in px.columns:
@@ -75,9 +77,9 @@ def assess(px: pd.DataFrame, tickers: list[str]):
         total = series.shape[0]
         non_nan = series.notna().sum()
         nan_ratio = 1.0 - (non_nan / total if total else 0.0)
-        head_nan = next((i for i, v in enumerate(series) if pd.notna(v)), len(series))
+        head_nan = next((i for i, value in enumerate(series) if pd.notna(value)), len(series))
         tail_nan = next(
-            (i for i, v in enumerate(reversed(series.tolist())) if pd.notna(v)),
+            (i for i, value in enumerate(reversed(series.tolist())) if pd.notna(value)),
             len(series),
         )
 
@@ -107,7 +109,7 @@ def assess(px: pd.DataFrame, tickers: list[str]):
 
 def send_slack(text: str) -> None:
     if not SLACK_WEBHOOK:
-        print("[SLACK] Missing webhook. Set 'SLACK_WEBHOOK_URL' (preferred).")
+        print("[SLACK] Missing webhook. Set 'SLACK_WEBHOOK_URL'.")
         sys.exit(78)
 
     response = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=5)
@@ -121,19 +123,19 @@ def main() -> None:
         print("[ERR] no tickers")
         sys.exit(78)
 
-    start = time.time()
+    def preview(items: List[str], show: int = 12) -> str:
+        head = ",".join(items[:show])
+        return head + (" …" if len(items) > show else "")
 
+    print(f"[UNIVERSE] {len(tickers)} tickers: {preview(tickers)}")
+
+    start = time.time()
     kwargs = dict(period=PERIOD, auto_adjust=True, progress=False, threads=True)
     if END_OFFSET_DAYS > 0:
-        kwargs["end"] = (
-            datetime.now(timezone.utc) - timedelta(days=END_OFFSET_DAYS)
-        ).date()
+        kwargs["end"] = (datetime.now(timezone.utc) - timedelta(days=END_OFFSET_DAYS)).date()
 
     data = yf.download(tickers, **kwargs)
-    if isinstance(data, pd.DataFrame) and "Close" in data:
-        close = data["Close"]
-    else:
-        close = pd.DataFrame()
+    close = data["Close"] if isinstance(data, pd.DataFrame) and "Close" in data else pd.DataFrame()
 
     bad = [
         ticker
@@ -148,9 +150,10 @@ def main() -> None:
     latency = int((time.time() - start) * 1000)
     ok_count = sum(1 for detail in details if ":OK(" in detail)
     speed = "🚀" if latency < TIMEOUT_MS_WARN else "🐢"
+    universe_note = f"universe={len(tickers)} [{preview(tickers)}]"
     summary = (
         f"{emoji} YF_HEALTH {level} ok={ok_count}/{len(tickers)} latency={latency}ms {speed}\n"
-        + " | ".join(details)
+        f"{universe_note}\n" + " | ".join(details)
     )
 
     print(summary)
