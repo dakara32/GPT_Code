@@ -140,9 +140,13 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
     d_excl = set((sb.top_G or [])+(sb.top_D or []))
     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
+    # --- add: 現行（current）をデバッグ対象に含める
+    cur = [t for t in (globals().get("exist", []) or []) if t in getattr(fb, "df_z", pd.DataFrame()).index]
 
     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-    focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))[:max_rows]
+    focus = list(fb.df_z.index) if all_rows else sorted(set(
+        g_new + g_out + d_new + d_out + (sb.top_G or []) + (sb.top_D or []) + g_miss + d_miss + cur
+    ))[:max_rows]
 
     def _fmt_near(lbl, ser, lst):
         if ser is None: return f"{lbl}: off"
@@ -151,6 +155,7 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
         return f"{lbl}: " + (", ".join(parts) if parts else "-")
 
     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
+          ("Current: " + ", ".join(cur[:20])) if cur else "Current: -",
           _fmt_near("G near10", gs, g_miss),
           _fmt_near("D near10", ds, d_miss),
           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
