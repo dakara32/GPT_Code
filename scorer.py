@@ -401,7 +401,8 @@ class Scorer:
 
             # --- 売上/利益の加速度等 ---
             REV_Q_YOY=EPS_Q_YOY=REV_YOY_ACC=REV_YOY_VAR=np.nan
-            REV_ANNUAL_STREAK = np.nan
+            REV_ANNUAL_STREAK = REV_YOY = np.nan
+            EPS_YOY = np.nan
             try:
                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
                 if qe is not None and not qe.empty:
@@ -422,8 +423,10 @@ class Scorer:
                             g = rev.groupby(rev.index.year)
                             ann_sum, cnt = g.sum(), g.count()
                             ann_sum = ann_sum[cnt >= 4]
-                            if len(ann_sum) >= 3:
+                            if len(ann_sum) >= 2:
                                 yoy = ann_sum.pct_change().dropna()
+                                if not yoy.empty:
+                                    REV_YOY = float(yoy.iloc[-1])
                                 streak = 0
                                 for v in yoy.iloc[::-1]:
                                     if pd.isna(v) or v <= 0:
@@ -436,9 +439,22 @@ class Scorer:
                         eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
                         if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0:
                             EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
+                        try:
+                            g_eps = eps_series.groupby(eps_series.index.year)
+                            ann_eps, cnt_eps = g_eps.sum(), g_eps.count()
+                            ann_eps = ann_eps[cnt_eps >= 4]
+                            if len(ann_eps) >= 2:
+                                eps_yoy = ann_eps.pct_change().dropna()
+                                if not eps_yoy.empty:
+                                    EPS_YOY = float(eps_yoy.iloc[-1])
+                        except Exception:
+                            pass
             except Exception: pass
-            df.loc[t,'REV_Q_YOY'], df.loc[t,'EPS_Q_YOY'], df.loc[t,'REV_YOY_ACC'], df.loc[t,'REV_YOY_VAR'] = REV_Q_YOY, EPS_Q_YOY, REV_YOY_ACC, REV_YOY_VAR
+            df.loc[t,'REV_Q_YOY'], df.loc[t,'EPS_Q_YOY'] = REV_Q_YOY, EPS_Q_YOY
+            df.loc[t,'REV_YOY_ACC'], df.loc[t,'REV_YOY_VAR'] = REV_YOY_ACC, REV_YOY_VAR
+            df.loc[t,'REV_YOY'] = REV_YOY
             df.loc[t,'REV_ANN_STREAK'] = REV_ANNUAL_STREAK
+            df.loc[t,'EPS_YOY'] = EPS_YOY
 
             # --- Rule of 40 や周辺 ---
             total_rev_ttm = d.get('totalRevenue',np.nan)
@@ -538,21 +554,61 @@ class Scorer:
         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
         for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
-        for col in ['REV_Q_YOY','EPS_Q_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']: df_z[col] = robust_z(df[col])
+        for col in ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']:
+            df_z[col] = robust_z(df[col])
         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
 
         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
-        df_z['GROWTH_F']  = robust_z(0.25*df_z['REV']          # ↓0.30→0.25
-            + 0.20*df_z['EPS_Q_YOY']
-            + 0.15*df_z['REV_Q_YOY']
-            + 0.15*df_z['REV_YOY_ACC']
-            + 0.10*df_z['RULE40']
+
+        # EPSが赤字でもFCFが黒字なら実質黒字とみなす
+        eps_pos_mask = (df['EPS'] > 0) | (df['FCF_MGN'] > 0)
+        df_z['EPS_POS'] = df_z['EPS'].where(eps_pos_mask, 0.0)
+
+        # ===== トレンドスロープ算出 =====
+        def zpos(x):
+            arr = robust_z(x)
+            idx = getattr(x, 'index', df_z.index)
+            return pd.Series(arr, index=idx).fillna(0.0)
+
+        def relu(x):
+            ser = x if isinstance(x, pd.Series) else pd.Series(x, index=df_z.index)
+            return ser.clip(lower=0).fillna(0.0)
+
+        # 売上トレンドスロープ（四半期）
+        slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
+        noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
+        df_z['TREND_SLOPE_REV'] = (slope_rev - 0.25*noise_rev).clip(-3.0, 3.0)
+
+        # EPSトレンドスロープ（四半期）
+        slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
+        df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
+
+        # 年次トレンド（サブ）
+        slope_rev_yr = zpos(df_z['REV_YOY'])
+        slope_eps_yr = zpos(df_z.get('EPS_YOY', pd.Series(0.0, index=df.index)))
+        streak_base = df['REV_ANN_STREAK'].clip(lower=0).fillna(0)
+        streak_yr = streak_base / (streak_base.abs() + 1.0)
+        df_z['TREND_SLOPE_REV_YR'] = (0.7*slope_rev_yr + 0.3*streak_yr).clip(-3.0, 3.0)
+        df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
+
+        # ===== 新GRW合成式（SEPA寄りシフト） =====
+        df_z['GROWTH_F'] = robust_z(
+              0.20*df_z['REV_Q_YOY']
+            + 0.10*df_z['REV_YOY_ACC']
+            + 0.10*df_z['REV_ANN_STREAK']
+            - 0.05*df_z['REV_YOY_VAR']
+            + 0.10*df_z['TREND_SLOPE_REV']
+            + 0.15*df_z['EPS_Q_YOY']
+            + 0.05*df_z['EPS_POS']
+            + 0.20*df_z['TREND_SLOPE_EPS']
+            + 0.05*df_z['TREND_SLOPE_REV_YR']
+            + 0.03*df_z['TREND_SLOPE_EPS_YR']
             + 0.10*df_z['FCF_MGN']
-            + 0.10*df_z['EPS']          # ★追加：黒字優遇／赤字減点
-            + 0.05*df_z['REV_ANN_STREAK']
-            - 0.05*df_z['REV_YOY_VAR']).clip(-3.0,3.0)
+            + 0.05*df_z['RULE40']
+        ).clip(-3.0, 3.0)
+
         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
             + 0.15*df_z['TR_str']
             + 0.15*df_z['RS_SLOPE_6W']
@@ -560,7 +616,8 @@ class Scorer:
             + 0.10*df_z['MA200_SLOPE_5M']
             + 0.10*df_z['MA200_UP_STREAK_D']).clip(-3.0,3.0)
         df_z['VOL'] = robust_z(df['BETA'])
-        df_z.rename(columns={'GROWTH_F':'GRW','MOM_F':'MOM','QUALITY_F':'QAL','YIELD_F':'YLD'}, inplace=True)
+        df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
+        df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
 
         # === begin: BIO LOSS PENALTY =====================================
         try:
@@ -578,13 +635,28 @@ class Scorer:
             return any(k in ind for k in keys)
 
         tickers_s = pd.Index(df_z.index)
+        debug = bool(getattr(sys.modules.get("factor"), "debug_mode", False))
+        if debug:
+            print("[DEBUG: GRW]")
+            for t in tickers_s:
+                print(f"Ticker: {t}")
+                print(f"  REV_Q_YOY        : {df_z.loc[t,'REV_Q_YOY']:+.2f}")
+                print(f"  REV_YOY_ACC      : {df_z.loc[t,'REV_YOY_ACC']:+.2f}")
+                print(f"  TREND_SLOPE_REV  : {df_z.loc[t,'TREND_SLOPE_REV']:+.2f}")
+                print(f"  EPS_Q_YOY        : {df_z.loc[t,'EPS_Q_YOY']:+.2f}")
+                print(f"  TREND_SLOPE_EPS  : {df_z.loc[t,'TREND_SLOPE_EPS']:+.2f}")
+                print(f"  FCF_MGN          : {df_z.loc[t,'FCF_MGN']:+.2f}")
+                print(f"  RULE40           : {df_z.loc[t,'RULE40']:+.2f}")
+                print(f"  GRW total        : {df_z.loc[t,'GROWTH_F']:+.2f}")
+                print("")
+
         is_bio = pd.Series({t: _is_bio_like(t) for t in tickers_s})
         is_loss = pd.Series({t: (pd.notna(df.loc[t,"EPS"]) and df.loc[t,"EPS"] <= 0) for t in tickers_s})
         mask_bio_loss = (is_bio & is_loss).reindex(df_z.index).fillna(False)
 
         if bool(mask_bio_loss.any()) and penalty_z > 0:
-            df_z.loc[mask_bio_loss, "GRW"] = df_z.loc[mask_bio_loss, "GRW"] - penalty_z
-            df_z["GRW"] = df_z["GRW"].clip(-3.0, 3.0)
+            df_z.loc[mask_bio_loss, "GROWTH_F"] = df_z.loc[mask_bio_loss, "GROWTH_F"] - penalty_z
+            df_z["GROWTH_F"] = df_z["GROWTH_F"].clip(-3.0, 3.0)
         # === end: BIO LOSS PENALTY =======================================
 
         df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
