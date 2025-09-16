@@ -3,7 +3,13 @@ import pandas as pd
 import yfinance as yf
 import requests
 
-TICKERS = os.getenv("YF_PROBE_TICKERS", "AAPL,MSFT,NVDA,GOOGL,AMZN,META,TSLA").split(",")
+TICKERS = os.getenv(
+    "YF_PROBE_TICKERS",
+    (
+        "AAPL,MSFT,NVDA,GOOGL,AMZN,META,TSLA,BRK-B,JPM,JNJ,V,UNH,XOM,PG,MA,HD,AVGO,"
+        "KO,PEP,MRK,ABBV,COST,CRM,DIS,NFLX,AMD,ORCL,INTC,TSM,NKE"
+    ),
+).split(",")
 PERIOD  = os.getenv("YF_PROBE_PERIOD", "180d")
 MIN_LEN = int(os.getenv("YF_PROBE_MIN_LEN", "120"))
 MAX_NAN_RATIO = float(os.getenv("YF_PROBE_MAX_NAN", "0.15"))
