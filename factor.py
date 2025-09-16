@@ -124,27 +124,34 @@ def _slack_debug(text: str, chunk=2800):
         j = min(len(text), i + chunk)
         k = text.rfind("\n", i, j)
         j = k if k > i + 100 else j
-        _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}]})
+        # blocks で送る場合は code fence を二重にしない
+        if j > i:
+            _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":text[i:j]}}]})
         i = j
 
 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     df_z = getattr(fb, "df_z", None)
     if not isinstance(df_z, pd.DataFrame):
         df_z = pd.DataFrame()
-    alias = {}
-    if "GROWTH_F" in df_z.columns:
-        alias["GROWTH_F"] = "GRW"
-    alias.update({col: f"TR_{col.split('TREND_SLOPE_', 1)[1]}" for col in df_z.columns if col.startswith("TREND_SLOPE_")})
-    df_show = df_z.rename(columns=alias) if alias else df_z
-
+    # 表示は“人が読む列名”に統一（Changed/Selected/Current すべて同じ）
     want = [
-        "GRW", "TR_EPS", "TR_REV", "TR",
-        "EPS", "EPS_Q_YOY", "EPS_YOY",
-        "REV", "REV_Q_YOY", "REV_YOY", "REV_YOY_ACC", "REV_YOY_VAR", "REV_ANN_STREAK",
-        "RULE40", "FCF", "FCF_MGN",
-        "RS", "TR_str", "ROE", "BETA_RAW", "DIV_STREAK", "DSC",
+        "GRW",
+        "TR_EPS", "TR_REV",
+        "EPS_Q_YOY", "REV_Q_YOY", "REV_YOY_ACC", "REV_YOY_VAR",
+        "RULE40", "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK", "DSC"
     ]
     all_cols = _env_true("DEBUG_ALL_COLS", False)
+    # df_z → 表示名の別名テーブルを作る（常に alias 済みを使う）
+    df_show = df_z.copy()
+    alias = {
+        "GROWTH_F": "GRW",
+        "TREND_SLOPE_EPS": "TR_EPS", "TREND_SLOPE_REV": "TR_REV",
+        "EPS_Q_YOY": "EPS_Q_YOY", "REV_Q_YOY": "REV_Q_YOY",
+        "REV_YOY_ACC": "REV_YOY_ACC", "REV_YOY_VAR": "REV_YOY_VAR",
+        "RULE40": "RULE40", "FCF_Z": "FCF", "ROE": "ROE", "RS": "RS",
+        "TR_END": "TR_str", "BETA": "BETA_RAW", "DIV_STREAK": "DIV_STREAK"
+    }
+    df_show.rename(columns={k: v for k, v in alias.items() if k in df_show.columns}, inplace=True)
     cols = list(df_show.columns if all_cols else [c for c in want if c in df_show.columns])
 
     Gp, Dp = set(prevG or []), set(prevD or [])
