@@ -1,5 +1,125 @@
 ```text
-用。行数に応じて自動で均等比率が再計算される。
+hes: [ main ]
+L6     paths-ignore:
+L7       - 'CodeForChat/**'
+L8   schedule:
+L9     - cron: '0 0 * * 6'  # UTC 00:00 → JST 09:00（土）
+L10   workflow_dispatch:
+L11
+L12 jobs:
+L13   build-and-report:
+L14     runs-on: ubuntu-latest
+L15     permissions:
+L16       contents: write
+L17
+L18     steps:
+L19       - name: Debug start
+L20         run: echo '🚀 DEBUGstarted'
+L21               
+L22       - name: Checkout repository
+L23         uses: actions/checkout@v3
+L24
+L25       - name: Setup Python
+L26         uses: actions/setup-python@v5
+L27         with:
+L28           python-version: '3.x'
+L29           cache: 'pip'
+L30           cache-dependency-path: requirements.txt
+L31
+L32       - name: Install dependencies
+L33         run: pip install -r requirements.txt
+L34
+L35       - name: Prepare results directory
+L36         run: mkdir -p results
+L37
+L38       - name: Run factor & scoring
+L39         env:
+L40           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+L41           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+L42           FIN_THREADS: "8"
+L43         run: python factor.py
+```
+
+## <documents/README.md>
+```text
+L1 # 運用ルール
+L2
+L3 ## 基本構成
+L4 - 20銘柄を均等配分（現金を除き1銘柄あたり5%）
+L5 - moomoo証券で運用
+L6 - **Growth枠 12銘柄 / Defense枠 8銘柄**（NORMAL 基準）
+L7
+L8 ## Barbell Growth-Defense方針
+L9 - Growth枠 **12銘柄**：高成長で乖離源となる攻めの銘柄
+L10 - Defense枠 **8銘柄**：低ボラで安定成長し配当を増やす守りの銘柄
+L11 - 「猛烈に伸びる攻め × 着実に稼ぐ盾」の組合せで乖離→半戻しプレミアムを狙う
+L12
+L13 ## レジーム判定（trend_template 合格“本数”で判定）
+L14 - 合格本数 = current+candidate 全体のうち、trend_template 条件を満たした銘柄の**本数(C)**（基準 N_G=12）
+L15 - しきい値は過去~600営業日の分布から**毎回自動採用**（分位点と運用“床”のmax）
+L16   - 緊急入り: `max(q05, 12本)`（= N_G）
+L17   - 緊急解除: `max(q20, 18本)`（= ceil(1.5×12)）
+L18   - 通常復帰: `max(q60, 36本)`（= 3×N_G）
+L19 - ヒステリシス: 前回モードに依存（EMERG→解除は23本以上、CAUTION→通常は45本以上）
+L20
+L21 ## レジーム別の現金・ドリフト
+L22  - **通常(NORMAL)** : 現金 **10%** / ドリフト閾値 **12%**
+L23  - **警戒(CAUTION)** : 現金 **12.5%** / ドリフト閾値 **14%**
+L24  - **緊急(EMERG)** : 現金 **20%** / **ドリフト売買停止**（20×5%に全戻しのみ）
+L25
+L26 ## モード別の推奨“保有銘柄数”（MMF≒現金）
+L27 *各枠=5%（20銘柄均等）。モード移行時は**Gの枠数のみ**調整し、外した枠は現金として保持。*
+L28
+L29 - **NORMAL:** G **12** / D **8** / 現金化枠 **0**  
+L30 - **CAUTION:** G **10** / D **8** / 現金化枠 **2**（= 10%）  
+L31 - **EMERG:** G **8**  / D **8** / 現金化枠 **4**（= 20%）  
+L32
+L33 > 実運用：⭐️低スコアのGから順に外す。解除時はfactor上位から補充。
+L34
+L35 ## トレーリングストップ
+L36 - **基本TS (モード別):** NORMAL **15%** / CAUTION **13%** / EMERG **10%**
+L37 - 含み益が **+30% / +60% / +100%** 到達で、基本から **-3pt / -6pt / -8pt** 引き上げ
+L38 - TS発動で減少した銘柄は翌日以降に補充（※緊急モード中は補充しない）
+L39
+L40 ## 半戻し（リバランス）手順
+L41 ドリフトチェックで**アラート**が出た場合（合計|drift| がモード閾値を超過、EMERG除く）、翌営業日の米国寄付きで下記を実施する。
+L42
+L43 1. **売却（必須）**  
+L44    Slackテーブルの **Δqty がマイナスの銘柄を売却** する（寄付き成行推奨）。  
+L45    これは「半戻し」計算に基づく過重量の削減を意味する。
+L46
+L47 2. **購入（任意・半戻し目安）**  
+L48    半戻し後の合計|drift|を**シミュレーション値（Slackヘッダに表示）**に近づけることを目安に、  
+L49    **任意の銘柄を買い増し**してバランスを取る（Δqtyがプラスの銘柄を優先してもよい）。
+L50
+L51 3. **トレーリングストップの再設定（必須）**  
+L52    すべての保有銘柄について、最新の評価額に合わせてTSを**再発注／更新**する。  
+L53    ルールは下記（利益到達で段階的にタイト化）：  
+L54    - **基本TS:** -15%  
+L55    - **+30% 到達 → TS -12%**  
+L56    - **+60% 到達 → TS -9%**  
+L57    - **+100% 到達 → TS -7%**  
+L58    ※ストップ価格の引き上げは許可、**引き下げは不可**（利益保全の原則）。
+L59
+L60 4. **例外（EMERGモード）**  
+L61    緊急(EMERG)では**ドリフト由来の売買は停止（∞）**。20銘柄×各5%への**全戻し**のみ許容。
+L62
+L63 5. **実行タイミング**
+L64    - 判定：米国市場終値直後
+L65    - 執行：翌営業日の米国寄付き成行
+L66
+L67 ## モード移行の実務手順（超シンプル）
+L68 モードが変わったら、**MMF≒現金**として扱い、**Gの枠数だけ**を調整する：
+L69 1. **Gを削る**（CAUTION/EMERG）  
+L70    - ⭐️低スコアのGから順に外す。  
+L71    - **`current_tickers.csv` から外すG銘柄の行を削除**（＝その枠は現金化）。
+L72 2. **現金として保持**  
+L73    - 外した枠は現金（またはMMF相当）でプール。  
+L74 3. **復帰時の補充**（NORMALへ）  
+L75    - **`current_tickers.csv` に銘柄を追加**（factor上位から）。  
+L76    - 以降は日次ドリフト/TSルールに従う。
+L77
+L78 > driftは `target_ratio = 1/銘柄数` を自動適用。行数に応じて自動で均等比率が再計算される。
 L79
 L80 ## 入替銘柄選定
 L81 - Oxfordキャピタル／インカム、Alpha Investor、Motley Fool Stock Advisor、moomooスクリーニング等を参考にchatGPTで検討
@@ -190,80 +310,5 @@ L172       | TR_str | `tr_str` | 価格と50日移動平均の乖離 |
 L173       | RS_SLOPE_6W | `rs_line_slope` | 相対強さ線の6週回帰傾き |
 L174       | RS_SLOPE_13W | `rs_line_slope` | 相対強さ線の13週回帰傾き |
 L175       | MA200_SLOPE_5M | - | 200日移動平均の5か月騰落率 |
-L176       | MA200_UP_STREAK_D | - | 200日線が連続で上向いた日数 |
-L177       | BETA | `calc_beta` | ベンチマークに対するβ |
-L178       | DOWNSIDE_DEV | - | 下方リターンのみの年率化標準偏差 |
-L179       | RESID_VOL | - | βで調整した残差リターンの年率化標準偏差 |
-L180       | MDD_1Y | - | 過去1年の最大ドローダウン |
-L181       | DOWN_OUTPERF | - | 市場下落日に対する平均超過リターン |
-L182       | EXT_200 | - | 200日移動平均からの絶対乖離率 |
-L183       | NEAR_52W_HIGH | - | 52週高値までの下方距離（0=高値） |
-L184       | FCF_W | - | ウィンザー処理後のFCF/EV |
-L185       | ROE_W | - | ウィンザー処理後のROE |
-L186       | FCF | - | FCF/EV |
-L187       | QAL | - | FCF_WとROE_Wを組み合わせた品質スコア |
-L188       | CURR_RATIO | - | 流動比率 |
-L189       | DEBT2EQ | - | 負債資本倍率 |
-L190       | EPS_VAR_8Q | - | EPSの8四半期標準偏差 |
-L191       | DIV | - | 年率換算配当利回り |
-L192       | DIV_STREAK | `div_streak` | 連続増配年数 |
-L193       | DIV_FCF_COVER | - | 配当のFCFカバレッジ |
-L194       | DIV_VAR5 | - | 5年配当変動率 |
-L195       | DIV_TTM_PS | - | 1株当たりTTM配当 |
-L196       | DIV_YOY | - | 前年比配当成長率 |
-L197       | REV | - | 売上成長率TTM |
-L198       | EPS_Q_YOY | - | 四半期EPSの前年同期比 |
-L199       | REV_Q_YOY | - | 四半期売上の前年同期比 |
-L200       | REV_YOY_ACC | - | 売上成長率の加速分 |
-L201       | RULE40 | - | 売上成長率とFCFマージンの合計 |
-L202       | FCF_MGN | - | FCFマージン |
-L203       | REV_ANN_STREAK | - | 年次売上成長の連続年数 |
-L204       | REV_YOY_VAR | - | 年次売上成長率の変動性 |
-L205       | SIZE | - | 時価総額の対数値 |
-L206       | LIQ | - | 60日平均出来高ドルの対数値 |
-L207    - Gバケット: `GRW`、`MOM`、`VOL`を`cfg.weights.g`（0.40/0.45/-0.15）で加重し`g_score`を得る。
-L208    - Dバケット: `D_QAL`、`D_YLD`、`D_VOL_RAW`、`D_TRD`を`cfg.weights.d`（0.15/0.15/-0.45/0.25）で加重し`d_score_all`を算出。
-L209    - セクターcapによる`soft_cap_effective_scores`を適用し、G採用銘柄にはトレンドテンプレートフィルタを適用。
-L210 5. `_apply_growth_entry_flags`でブレイクアウト/押し目発火状況を付加し、`FeatureBundle`を返す。
-L211
-L212 ### Step3: Correlation Reduction & Selection (Selector)
-L213 DRRSアルゴリズムで相関を抑えた銘柄選定を行い、`SelectionBundle`を返す。`results/`に保存された前回選定（`G_selection.json` / `D_selection.json`）を`_load_prev`で読み込み、目的値が大きく悪化しない限り維持する。新しい採用集合は`_save_sel`でJSONに書き出し次回以降の入力に備える。
-L214 主なメソッド:
-L215 - `residual_corr` : 収益率行列をZスコア化し、上位主成分を除去した残差から相関行列を求め、平均相関に応じてシュリンク。
-L216 - `rrqr_like_det` : スコアを重み付けしたQR分解風の手順で初期候補をk件抽出し、スコアの高い非相関な集合を得る。
-L217 - `swap_local_det` / `swap_local_det_cross` : `sum(score) - λ*within_corr - μ*cross_corr`を目的関数として、入れ替え探索で局所的に最適化。
-L218 - `select_bucket_drrs` : プール銘柄とスコアから残差相関を計算し、上記2段階(初期選択→入れ替え)でk銘柄を決定。過去採用銘柄との比較で目的値が劣化しなければ維持する。
-L219 - `select_buckets` : Gバケットを選定後、その結果を除いた候補からDバケットを選ぶ。D選定時はGとの相関ペナルティμを付与し、両バケットの分散を制御する。
-L220
-L221 #### 相関低減ロジック詳細
-L222 1. **残差相関行列の構築 (`residual_corr`)**
-L223    - リターン行列`R`をZスコア化。
-L224    - SVDで上位`n_pc`主成分`F`を求め、最小二乗で係数`B`を算出し残差`E = Z - F@B`を得る。
-L225    - `E`の相関行列`C`を計算し、平均絶対相関に応じてシュリンク量`shrink_eff`を補正して対角を強調。
-L226 2. **初期候補の抽出 (`rrqr_like_det`)**
-L227    - スコアを0-1正規化した重み`w`とし、`Z*(1+γw)`で列ノルムを強調。
-L228    - 残差ノルム最大の列を逐次選び、QRライクなデフレーションを行って非相関かつ高スコアな`k`銘柄集合`S0`を得る。
-L229 3. **局所探索 (`swap_local_det` / `swap_local_det_cross`)**
-L230    - 目的関数`Σz_score − λ·within_corr − μ·cross_corr`を最大化。
-L231    - 選択集合の各銘柄を他候補と入れ替え、改善がなくなるまでまたは`max_pass`回まで探索。
-L232    - `swap_local_det_cross`はGバケットとのクロス相関行列`C_cross`を使用し、ペナルティ`μ`を付与。
-L233 4. **過去採用の維持とクロスペナルティ (`select_bucket_drrs` / `select_buckets`)**
-L234    - 局所探索結果`S`と過去集合`P`の目的値を比較し、`S`が`P`より`η`未満の改善なら`P`を維持。
-L235    - `select_buckets`ではGを先に決定し、D選定時にGとの相関ペナルティ`μ`を加えてクロス分散を抑制。
-L236
-L237 ### Step4: Output
-L238 選定結果を可視化し共有する工程。以下の内容をテーブル化して標準出力とSlackへ送る。
-L239 - 採用銘柄と惜しくも選外となった銘柄のスコア一覧
-L240 - IN/OUTリストとOUT銘柄のスコア（低得点銘柄を確認しやすく）
-L241 - 新旧ポートフォリオの比較表（組入れ・除外、スコア変化）
-L242 - 検討中銘柄の低スコアランキング
-L243
-L244 主なメソッド:
-L245 - `display_results` : 上記テーブルに加えパフォーマンス指標や分散化指標を表示。
-L246 - `notify_slack` : Slack Webhookへ同内容を送信。
-L247 - 補助:`_avg_offdiag`、`_resid_avg_rho`、`_raw_avg_rho`、`_cross_block_raw_rho`。
-L248
-L249 ## エントリポイント
-L250 1. `PipelineConfig`を構築。
-L251
+L176       | MA200_UP_STREAK_D | 
 ```
