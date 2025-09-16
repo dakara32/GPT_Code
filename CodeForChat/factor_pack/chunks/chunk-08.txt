@@ -1,10 +1,40 @@
 ```text
-==== 新GRW合成式（SEPA寄りシフト） =====
+] > 0)
+L567         df_z['EPS_POS'] = df_z['EPS'].where(eps_pos_mask, 0.0)
+L568
+L569         # ===== トレンドスロープ算出 =====
+L570         def zpos(x):
+L571             arr = robust_z(x)
+L572             idx = getattr(x, 'index', df_z.index)
+L573             return pd.Series(arr, index=idx).fillna(0.0)
+L574
+L575         def relu(x):
+L576             ser = x if isinstance(x, pd.Series) else pd.Series(x, index=df_z.index)
+L577             return ser.clip(lower=0).fillna(0.0)
+L578
+L579         # 売上トレンドスロープ（四半期）: 直近傾きを重視しつつノイズ罰を緩和
+L580         slope_rev = 0.80*zpos(df_z['REV_Q_YOY']) + 0.20*zpos(df_z['REV_YOY_ACC'])
+L581         noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 1.0)
+L582         df_z['TREND_SLOPE_REV'] = (slope_rev - 0.12*noise_rev).clip(-3.0, 3.0)
+L583
+L584         # EPSトレンドスロープ（四半期）
+L585         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
+L586         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
+L587
+L588         # 年次トレンド（サブ）
+L589         slope_rev_yr = zpos(df_z['REV_YOY'])
+L590         slope_eps_yr = zpos(df_z.get('EPS_YOY', pd.Series(0.0, index=df.index)))
+L591         streak_base = df['REV_ANN_STREAK'].clip(lower=0).fillna(0)
+L592         streak_yr = streak_base / (streak_base.abs() + 1.0)
+L593         df_z['TREND_SLOPE_REV_YR'] = (0.7*slope_rev_yr + 0.3*streak_yr).clip(-3.0, 3.0)
+L594         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
+L595
+L596         # ===== 新GRW合成式（SEPA寄りシフト） =====
 L597         df_z['GROWTH_F'] = robust_z(
 L598               0.20*df_z['REV_Q_YOY']
 L599             + 0.10*df_z['REV_YOY_ACC']
 L600             + 0.10*df_z['REV_ANN_STREAK']
-L601             - 0.05*df_z['REV_YOY_VAR']
+L601             - 0.02*df_z['REV_YOY_VAR']
 L602             + 0.10*df_z['TREND_SLOPE_REV']
 L603             + 0.15*df_z['EPS_Q_YOY']
 L604             + 0.05*df_z['EPS_POS']
@@ -15,235 +45,197 @@ L608             + 0.10*df_z['FCF_MGN']
 L609             + 0.05*df_z['RULE40']
 L610         ).clip(-3.0, 3.0)
 L611
-L612         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
-L613             + 0.15*df_z['TR_str']
-L614             + 0.15*df_z['RS_SLOPE_6W']
-L615             + 0.15*df_z['RS_SLOPE_13W']
-L616             + 0.10*df_z['MA200_SLOPE_5M']
-L617             + 0.10*df_z['MA200_UP_STREAK_D']).clip(-3.0,3.0)
-L618         df_z['VOL'] = robust_z(df['BETA'])
-L619         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
-L620         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
-L621
-L622         # === begin: BIO LOSS PENALTY =====================================
-L623         try:
-L624             penalty_z = float(os.getenv("BIO_LOSS_PENALTY_Z", "0.8"))
-L625         except Exception:
-L626             penalty_z = 0.8
-L627
-L628         def _is_bio_like(t: str) -> bool:
-L629             inf = info.get(t, {}) if isinstance(info, dict) else {}
-L630             sec = str(inf.get("sector", "")).lower()
-L631             ind = str(inf.get("industry", "")).lower()
-L632             if "health" not in sec:
-L633                 return False
-L634             keys = ("biotech", "biopharma", "pharma")
-L635             return any(k in ind for k in keys)
-L636
-L637         tickers_s = pd.Index(df_z.index)
-L638         debug = bool(getattr(sys.modules.get("factor"), "debug_mode", False))
-L639         if debug:
-L640             print("[DEBUG: GRW]")
-L641             for t in tickers_s:
-L642                 print(f"Ticker: {t}")
-L643                 print(f"  REV_Q_YOY        : {df_z.loc[t,'REV_Q_YOY']:+.2f}")
-L644                 print(f"  REV_YOY_ACC      : {df_z.loc[t,'REV_YOY_ACC']:+.2f}")
-L645                 print(f"  TREND_SLOPE_REV  : {df_z.loc[t,'TREND_SLOPE_REV']:+.2f}")
-L646                 print(f"  EPS_Q_YOY        : {df_z.loc[t,'EPS_Q_YOY']:+.2f}")
+L612         df_z['GRW_BONUS_EPS'] = (((df_z['EPS_POS'] > 0) & (df_z['EPS_Q_YOY'] > 0))
+L613             .astype(float) * 0.15)
+L614         df_z['GROWTH_F'] = (df_z['GROWTH_F'] + df_z['GRW_BONUS_EPS']).clip(-3.0, 3.0)
+L615
+L616         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
+L617             + 0.15*df_z['TR_str']
+L618             + 0.15*df_z['RS_SLOPE_6W']
+L619             + 0.15*df_z['RS_SLOPE_13W']
+L620             + 0.10*df_z['MA200_SLOPE_5M']
+L621             + 0.10*df_z['MA200_UP_STREAK_D']).clip(-3.0,3.0)
+L622         df_z['VOL'] = robust_z(df['BETA'])
+L623         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
+L624         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
+L625
+L626         # === begin: BIO LOSS PENALTY =====================================
+L627         try:
+L628             penalty_z = float(os.getenv("BIO_LOSS_PENALTY_Z", "0.8"))
+L629         except Exception:
+L630             penalty_z = 0.8
+L631
+L632         def _is_bio_like(t: str) -> bool:
+L633             inf = info.get(t, {}) if isinstance(info, dict) else {}
+L634             sec = str(inf.get("sector", "")).lower()
+L635             ind = str(inf.get("industry", "")).lower()
+L636             if "health" not in sec:
+L637                 return False
+L638             keys = ("biotech", "biopharma", "pharma")
+L639             return any(k in ind for k in keys)
+L640
+L641         tickers_s = pd.Index(df_z.index)
+L642         debug = bool(getattr(sys.modules.get("factor"), "debug_mode", False))
+L643         if debug:
+L644             print("[DEBUG: GRW]")
+L645             for t in tickers_s:
+L646                 print(f"Ticker: {t}")
 L647                 print(f"  TREND_SLOPE_EPS  : {df_z.loc[t,'TREND_SLOPE_EPS']:+.2f}")
-L648                 print(f"  FCF_MGN          : {df_z.loc[t,'FCF_MGN']:+.2f}")
-L649                 print(f"  RULE40           : {df_z.loc[t,'RULE40']:+.2f}")
-L650                 print(f"  GRW total        : {df_z.loc[t,'GROWTH_F']:+.2f}")
-L651                 print("")
-L652
-L653         is_bio = pd.Series({t: _is_bio_like(t) for t in tickers_s})
-L654         is_loss = pd.Series({t: (pd.notna(df.loc[t,"EPS"]) and df.loc[t,"EPS"] <= 0) for t in tickers_s})
-L655         mask_bio_loss = (is_bio & is_loss).reindex(df_z.index).fillna(False)
-L656
-L657         if bool(mask_bio_loss.any()) and penalty_z > 0:
-L658             df_z.loc[mask_bio_loss, "GROWTH_F"] = df_z.loc[mask_bio_loss, "GROWTH_F"] - penalty_z
-L659             df_z["GROWTH_F"] = df_z["GROWTH_F"].clip(-3.0, 3.0)
-L660         # === end: BIO LOSS PENALTY =======================================
-L661
-L662         df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
-L663         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
+L648                 print(f"  TREND_SLOPE_REV  : {df_z.loc[t,'TREND_SLOPE_REV']:+.2f}")
+L649                 print(f"  EPS_Q_YOY        : {df_z.loc[t,'EPS_Q_YOY']:+.2f}")
+L650                 print(f"  REV_Q_YOY        : {df_z.loc[t,'REV_Q_YOY']:+.2f}")
+L651                 print(f"  FCF_MGN          : {df_z.loc[t,'FCF_MGN']:+.2f}")
+L652                 print(f"  RULE40           : {df_z.loc[t,'RULE40']:+.2f}")
+L653                 print(f"  GRW total        : {df_z.loc[t,'GROWTH_F']:+.2f}")
+L654                 print("")
+L655
+L656         is_bio = pd.Series({t: _is_bio_like(t) for t in tickers_s})
+L657         is_loss = pd.Series({t: (pd.notna(df.loc[t,"EPS"]) and df.loc[t,"EPS"] <= 0) for t in tickers_s})
+L658         mask_bio_loss = (is_bio & is_loss).reindex(df_z.index).fillna(False)
+L659
+L660         if bool(mask_bio_loss.any()) and penalty_z > 0:
+L661             df_z.loc[mask_bio_loss, "GROWTH_F"] = df_z.loc[mask_bio_loss, "GROWTH_F"] - penalty_z
+L662             df_z["GROWTH_F"] = df_z["GROWTH_F"].clip(-3.0, 3.0)
+L663         # === end: BIO LOSS PENALTY =======================================
 L664
-L665         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
-L666         df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
-L667         df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
-L668         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
-L669
-L670         # --- 重みは cfg を優先（外部があればそれを使用） ---
-L671         # ① 全銘柄で G/D スコアを算出（unmasked）
-L672         g_score_all = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
-L673
-L674         d_comp = pd.concat({
-L675             'QAL': df_z['D_QAL'],
-L676             'YLD': df_z['D_YLD'],
-L677             'VOL': df_z['D_VOL_RAW'],
-L678             'TRD': df_z['D_TRD']
-L679         }, axis=1)
-L680         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
-L681         globals()['D_WEIGHTS_EFF'] = dw.copy()
-L682         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
-L683
-L684         # ② テンプレ判定（既存ロジックそのまま）
-L685         mask = df['trend_template']
-L686         if not bool(mask.any()):
-L687             mask = ((df.get('P_OVER_LOW52', np.nan) >= 0.25) &
-L688                 (df.get('NEAR_52W_HIGH', np.nan) >= -0.30) &
-L689                 (df.get('RS', np.nan) >= 0.08) &
-L690                 (df.get('MA200_SLOPE_1M', np.nan) > 0) &
-L691                 (df.get('P_OVER_150', np.nan) > 0) & (df.get('P_OVER_200', np.nan) > 0) &
-L692                 (df.get('MA150_OVER_200', np.nan) > 0) &
-L693                 (df.get('MA50_OVER_150', np.nan) > 0) & (df.get('MA50_OVER_200', np.nan) > 0) &
-L694                 (df.get('TR_str', np.nan) > 0)).fillna(False)
-L695             df['trend_template'] = mask
-L696
-L697         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
-L698         g_score = g_score_all.loc[mask]
-L699         Scorer.g_score = g_score
-L700         df_z['GSC'] = g_score_all
-L701         df_z['DSC'] = d_score_all
-L702
-L703         try:
-L704             current = (pd.read_csv("current_tickers.csv")
-L705                   .iloc[:, 0]
-L706                   .str.upper()
-L707                   .tolist())
-L708         except FileNotFoundError:
-L709             warnings.warn("current_tickers.csv not found — bonus skipped")
-L710             current = []
-L711
-L712         mask_bonus = g_score.index.isin(current)
-L713         if mask_bonus.any():
-L714             # 1) factor.BONUS_COEFF から k を決め、無ければ 0.4
-L715             k = float(getattr(sys.modules.get("factor"), "BONUS_COEFF", 0.4))
-L716             # 2) g 側の σ を取り、NaN なら 0 に丸める
-L717             sigma_g = g_score.std()
-L718             if pd.isna(sigma_g):
-L719                 sigma_g = 0.0
-L720             bonus_g = round(k * sigma_g, 3)
-L721             g_score.loc[mask_bonus] += bonus_g
-L722             Scorer.g_score = g_score
-L723             # 3) D 側も同様に σ の NaN をケア
-L724             sigma_d = d_score_all.std()
-L725             if pd.isna(sigma_d):
-L726                 sigma_d = 0.0
-L727             bonus_d = round(k * sigma_d, 3)
-L728             d_score_all.loc[d_score_all.index.isin(current)] += bonus_d
-L729
-L730         try:
-L731             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
-L732         except Exception:
-L733             pass
-L734
-L735         from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
-L736         return FeatureBundle(df=df,
-L737             df_z=df_z,
-L738             g_score=g_score,
-L739             d_score_all=d_score_all,
-L740             missing_logs=pd.DataFrame(missing_logs))
-L741
-L742 def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_pullback=5):
-L743     """
-L744     G枠ユニバースに対し、ブレイクアウト確定/押し目反発の「直近N営業日内の発火」を判定し、
-L745     次の列を feature_df に追加する（index=ticker）。
-L746       - G_BREAKOUT_recent_5d : bool
-L747       - G_BREAKOUT_last_date : str "YYYY-MM-DD"
-L748       - G_PULLBACK_recent_5d : bool
-L749       - G_PULLBACK_last_date : str "YYYY-MM-DD"
-L750       - G_PIVOT_price        : float
-L751     失敗しても例外は握り潰し、既存処理を阻害しない。
-L752     """
-L753     try:
-L754         px   = bundle.px                      # 終値 DataFrame
-L755         hi   = bundle.data['High']
-L756         lo   = bundle.data['Low']
-L757         vol  = bundle.data['Volume']
-L758         bench= bundle.spx                     # ベンチマーク Series
-L759
-L760         # Gユニバース推定：self.g_universe 優先 → feature_df['group']=='G' → 全銘柄
-L761         g_universe = getattr(self_obj, "g_universe", None)
-L762         if g_universe is None:
-L763             try:
-L764                 g_universe = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
-L765             except Exception:
-L766                 g_universe = list(feature_df.index)
-L767         if not g_universe:
-L768             return feature_df
-L769
-L770         # 指標
-L771         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
-L772         ma50  = px[g_universe].rolling(50).mean()
-L773         ma150 = px[g_universe].rolling(150).mean()
-L774         ma200 = px[g_universe].rolling(200).mean()
-L775         atr20 = (hi[g_universe] - lo[g_universe]).rolling(20).mean()
-L776         vol20 = vol[g_universe].rolling(20).mean()
-L777         vol50 = vol[g_universe].rolling(50).mean()
-L778
-L779         # トレンドテンプレート合格
-L780         trend_template_ok = (px[g_universe] > ma50) & (px[g_universe] > ma150) & (px[g_universe] > ma200) \
-L781                             & (ma150 > ma200) & (ma200.diff() > 0)
-L782
-L783         # 汎用ピボット：直近65営業日の高値（当日除外）
-L784         pivot_price = hi[g_universe].rolling(65).max().shift(1)
+L665         df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
+L666         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
+L667
+L668         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
+L669         df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
+L670         df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
+L671         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
+L672
+L673         # --- 重みは cfg を優先（外部があればそれを使用） ---
+L674         # ① 全銘柄で G/D スコアを算出（unmasked）
+L675         g_score_all = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
+L676
+L677         d_comp = pd.concat({
+L678             'QAL': df_z['D_QAL'],
+L679             'YLD': df_z['D_YLD'],
+L680             'VOL': df_z['D_VOL_RAW'],
+L681             'TRD': df_z['D_TRD']
+L682         }, axis=1)
+L683         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
+L684         globals()['D_WEIGHTS_EFF'] = dw.copy()
+L685         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
+L686
+L687         # ② テンプレ判定（既存ロジックそのまま）
+L688         mask = df['trend_template']
+L689         if not bool(mask.any()):
+L690             mask = ((df.get('P_OVER_LOW52', np.nan) >= 0.25) &
+L691                 (df.get('NEAR_52W_HIGH', np.nan) >= -0.30) &
+L692                 (df.get('RS', np.nan) >= 0.08) &
+L693                 (df.get('MA200_SLOPE_1M', np.nan) > 0) &
+L694                 (df.get('P_OVER_150', np.nan) > 0) & (df.get('P_OVER_200', np.nan) > 0) &
+L695                 (df.get('MA150_OVER_200', np.nan) > 0) &
+L696                 (df.get('MA50_OVER_150', np.nan) > 0) & (df.get('MA50_OVER_200', np.nan) > 0) &
+L697                 (df.get('TR_str', np.nan) > 0)).fillna(False)
+L698             df['trend_template'] = mask
+L699
+L700         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
+L701         g_score = g_score_all.loc[mask]
+L702         Scorer.g_score = g_score
+L703         df_z['GSC'] = g_score_all
+L704         df_z['DSC'] = d_score_all
+L705
+L706         try:
+L707             current = (pd.read_csv("current_tickers.csv")
+L708                   .iloc[:, 0]
+L709                   .str.upper()
+L710                   .tolist())
+L711         except FileNotFoundError:
+L712             warnings.warn("current_tickers.csv not found — bonus skipped")
+L713             current = []
+L714
+L715         mask_bonus = g_score.index.isin(current)
+L716         if mask_bonus.any():
+L717             # 1) factor.BONUS_COEFF から k を決め、無ければ 0.4
+L718             k = float(getattr(sys.modules.get("factor"), "BONUS_COEFF", 0.4))
+L719             # 2) g 側の σ を取り、NaN なら 0 に丸める
+L720             sigma_g = g_score.std()
+L721             if pd.isna(sigma_g):
+L722                 sigma_g = 0.0
+L723             bonus_g = round(k * sigma_g, 3)
+L724             g_score.loc[mask_bonus] += bonus_g
+L725             Scorer.g_score = g_score
+L726             # 3) D 側も同様に σ の NaN をケア
+L727             sigma_d = d_score_all.std()
+L728             if pd.isna(sigma_d):
+L729                 sigma_d = 0.0
+L730             bonus_d = round(k * sigma_d, 3)
+L731             d_score_all.loc[d_score_all.index.isin(current)] += bonus_d
+L732
+L733         try:
+L734             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
+L735         except Exception:
+L736             pass
+L737
+L738         from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
+L739         return FeatureBundle(df=df,
+L740             df_z=df_z,
+L741             g_score=g_score,
+L742             d_score_all=d_score_all,
+L743             missing_logs=pd.DataFrame(missing_logs))
+L744
+L745 def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_pullback=5):
+L746     """
+L747     G枠ユニバースに対し、ブレイクアウト確定/押し目反発の「直近N営業日内の発火」を判定し、
+L748     次の列を feature_df に追加する（index=ticker）。
+L749       - G_BREAKOUT_recent_5d : bool
+L750       - G_BREAKOUT_last_date : str "YYYY-MM-DD"
+L751       - G_PULLBACK_recent_5d : bool
+L752       - G_PULLBACK_last_date : str "YYYY-MM-DD"
+L753       - G_PIVOT_price        : float
+L754     失敗しても例外は握り潰し、既存処理を阻害しない。
+L755     """
+L756     try:
+L757         px   = bundle.px                      # 終値 DataFrame
+L758         hi   = bundle.data['High']
+L759         lo   = bundle.data['Low']
+L760         vol  = bundle.data['Volume']
+L761         bench= bundle.spx                     # ベンチマーク Series
+L762
+L763         # Gユニバース推定：self.g_universe 優先 → feature_df['group']=='G' → 全銘柄
+L764         g_universe = getattr(self_obj, "g_universe", None)
+L765         if g_universe is None:
+L766             try:
+L767                 g_universe = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
+L768             except Exception:
+L769                 g_universe = list(feature_df.index)
+L770         if not g_universe:
+L771             return feature_df
+L772
+L773         # 指標
+L774         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
+L775         ma50  = px[g_universe].rolling(50).mean()
+L776         ma150 = px[g_universe].rolling(150).mean()
+L777         ma200 = px[g_universe].rolling(200).mean()
+L778         atr20 = (hi[g_universe] - lo[g_universe]).rolling(20).mean()
+L779         vol20 = vol[g_universe].rolling(20).mean()
+L780         vol50 = vol[g_universe].rolling(50).mean()
+L781
+L782         # トレンドテンプレート合格
+L783         trend_template_ok = (px[g_universe] > ma50) & (px[g_universe] > ma150) & (px[g_universe] > ma200) \
+L784                             & (ma150 > ma200) & (ma200.diff() > 0)
 L785
-L786         # 相対力：年内高値更新
-L787         bench_aligned = bench.reindex(px.index).ffill()
-L788         rs = px[g_universe].div(bench_aligned, axis=0)
-L789         rs_high = rs.rolling(252).max().shift(1)
-L790
-L791         # ブレイクアウト「発生日」：条件立ち上がり
-L792         breakout_today = trend_template_ok & (px[g_universe] > pivot_price) \
-L793                          & (vol[g_universe] >= 1.5 * vol50) & (rs > rs_high)
-L794         breakout_event = breakout_today & ~breakout_today.shift(1).fillna(False)
-L795
-L796         # 押し目反発「発生日」：EMA21帯×出来高ドライアップ×前日高値越え×終値EMA21上
-L797         near_ema21_band = px[g_universe].between(ema21 - atr20, ema21 + atr20)
-L798         volume_dryup = (vol20 / vol50) <= 1.0
-L799         pullback_bounce_confirmed = (px[g_universe] > hi[g_universe].shift(1)) & (px[g_universe] > ema21)
-L800         pullback_today = trend_template_ok & near_ema21_band & volume_dryup & pullback_bounce_confirmed
-L801         pullback_event = pullback_today & ~pullback_today.shift(1).fillna(False)
-L802
-L803         # 直近N営業日内の発火 / 最終発生日
-L804         rows = []
-L805         for t in g_universe:
-L806             def _recent_and_date(s, win):
-L807                 sw = s[t].iloc[-win:]
-L808                 if sw.any():
-L809                     d = sw[sw].index[-1]
-L810                     return True, d.strftime("%Y-%m-%d")
-L811                 return False, ""
-L812             br_recent, br_date = _recent_and_date(breakout_event, win_breakout)
-L813             pb_recent, pb_date = _recent_and_date(pullback_event, win_pullback)
-L814             rows.append((t, {
-L815                 "G_BREAKOUT_recent_5d": br_recent,
-L816                 "G_BREAKOUT_last_date": br_date,
-L817                 "G_PULLBACK_recent_5d": pb_recent,
-L818                 "G_PULLBACK_last_date": pb_date,
-L819                 "G_PIVOT_price": float(pivot_price[t].iloc[-1]) if t in pivot_price.columns else float('nan'),
-L820             }))
-L821         flags = pd.DataFrame({k: v for k, v in rows}).T
-L822
-L823         # 列を作成・上書き
-L824         cols = ["G_BREAKOUT_recent_5d","G_BREAKOUT_last_date","G_PULLBACK_recent_5d","G_PULLBACK_last_date","G_PIVOT_price"]
-L825         for c in cols:
-L826             if c not in feature_df.columns:
-L827                 feature_df[c] = np.nan
-L828         feature_df.loc[flags.index, flags.columns] = flags
-L829
-L830     except Exception:
-L831         pass
-L832     return feature_df
-L833
-```
-
-## <.github/workflows/weekly-report.yml>
-```text
-L1 name: Weekly Stock Report
-L2
-L3 on:
-L4   push:
-L5     branch
+L786         # 汎用ピボット：直近65営業日の高値（当日除外）
+L787         pivot_price = hi[g_universe].rolling(65).max().shift(1)
+L788
+L789         # 相対力：年内高値更新
+L790         bench_aligned = bench.reindex(px.index).ffill()
+L791         rs = px[g_universe].div(bench_aligned, axis=0)
+L792         rs_high = rs.rolling(252).max().shift(1)
+L793
+L794         # ブレイクアウト「発生日」：条件立ち上がり
+L795         breakout_today = trend_template_ok & (px[g_universe] > pivot_price) \
+L796                          & (vol[g_universe] >= 1.5 * vol50) & (rs > rs_high)
+L797         breakout_event = breakout_today & ~breakout_today.shift(1).fillna(False)
+L798
+L799         # 押し目反発「発生日」：EMA21帯×出来高ドライアップ×前日高値越え×終値EMA21上
+L800         near_ema21_band = px[g_universe].between(ema21 - atr20, ema21 + atr20)
+L801         volume_dryup = (vol20 / vol50) <= 1.0
+L802         pullback_bounce_confirmed = (px[g_universe] > hi[g_universe].shift(1)) & (px[g_universe] > ema21)
+L803         pullback_today = trend_template_ok & near_ema21_band & volume_dryup & pullback_bounce_confirmed
+L804         pullback_event = pullback_to
 ```
