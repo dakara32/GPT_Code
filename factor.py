@@ -116,6 +116,9 @@ def _post_slack(payload: dict):
 _slack = lambda message, code=False: _post_slack({"text": f"```{message}```" if code else message})
 
 def _slack_debug(text: str, chunk=2800):
+    text = text.rstrip()
+    if not text:
+        return
     i = 0
     while i < len(text):
         j = min(len(text), i + chunk)
@@ -125,9 +128,24 @@ def _slack_debug(text: str, chunk=2800):
         i = j
 
 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-    want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
+    df_z = getattr(fb, "df_z", None)
+    if not isinstance(df_z, pd.DataFrame):
+        df_z = pd.DataFrame()
+    alias = {}
+    if "GROWTH_F" in df_z.columns:
+        alias["GROWTH_F"] = "GRW"
+    alias.update({col: f"TR_{col.split('TREND_SLOPE_', 1)[1]}" for col in df_z.columns if col.startswith("TREND_SLOPE_")})
+    df_show = df_z.rename(columns=alias) if alias else df_z
+
+    want = [
+        "GRW", "TR_EPS", "TR_REV", "TR",
+        "EPS", "EPS_Q_YOY", "EPS_YOY",
+        "REV", "REV_Q_YOY", "REV_YOY", "REV_YOY_ACC", "REV_YOY_VAR", "REV_ANN_STREAK",
+        "RULE40", "FCF", "FCF_MGN",
+        "RS", "TR_str", "ROE", "BETA_RAW", "DIV_STREAK", "DSC",
+    ]
     all_cols = _env_true("DEBUG_ALL_COLS", False)
-    cols = list(fb.df_z.columns if all_cols else [c for c in want if c in fb.df_z.columns])
+    cols = list(df_show.columns if all_cols else [c for c in want if c in df_show.columns])
 
     Gp, Dp = set(prevG or []), set(prevD or [])
     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
@@ -142,8 +160,8 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
 
     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-    curr = [t for t in (exist or []) if t in getattr(fb, 'df_z', pd.DataFrame()).index]
-    focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss+curr))[:max_rows]
+    curr = [t for t in (exist or []) if t in df_z.index]
+    focus = list(df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss+curr))[:max_rows]
 
     def _fmt_near(lbl, ser, lst):
         if ser is None: return f"{lbl}: off"
@@ -158,9 +176,9 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
 
     tbl="(df_z or columns not available)"
-    if not fb.df_z.empty and cols:
-        idx=[t for t in focus if t in fb.df_z.index]
-        base=fb.df_z.loc[idx, cols].round(3).copy()
+    if not df_show.empty and cols:
+        idx=[t for t in focus if t in df_show.index]
+        base=df_show.loc[idx, cols].round(3).copy()
         try:
             if gs is not None:
                 base["GSC"] = [gs.get(t, np.nan) for t in base.index]
