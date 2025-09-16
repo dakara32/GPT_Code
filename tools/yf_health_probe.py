@@ -1,12 +1,13 @@
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
-from typing import List, Tuple
+from typing import Iterable
 
 import pandas as pd
 import requests
 import yfinance as yf
+
+DEFAULT_FALLBACK = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA"]
 PERIOD = os.getenv("YF_PROBE_PERIOD", "180d")
 MIN_LEN = int(os.getenv("YF_PROBE_MIN_LEN", "120"))
 MAX_NAN_RATIO = float(os.getenv("YF_PROBE_MAX_NAN", "0.15"))
@@ -22,34 +23,62 @@ SLACK_WEBHOOK = (
 )
 
 
-def _parse_tickers(text: str) -> List[str]:
-    raw = [x.strip().upper() for x in text.replace(",", "\n").splitlines()]
+def _parse_tickers(text: str) -> list[str]:
+    raw = [item.strip().upper() for item in text.replace(",", "\n").splitlines()]
     return [ticker for ticker in raw if ticker and not ticker.startswith("#")]
 
 
-def load_candidates() -> Tuple[List[str], str]:
-    """Load candidate tickers from environment or file."""
+def _resolve_cand_file() -> str | None:
+    path = os.getenv("CAND_FILE", "").strip()
+    if path:
+        return path
+    if os.path.exists("candidate_tickers.csv"):
+        return "candidate_tickers.csv"
+    if os.path.exists("data/candidates.txt"):
+        return "data/candidates.txt"
+    return None
 
+
+def load_candidates() -> tuple[list[str], str]:
     env_list = os.getenv("CAND_TICKERS", "").strip()
     if env_list:
         tickers = _parse_tickers(env_list)
         if tickers:
             return tickers, "ENV"
 
-    path = os.getenv("CAND_FILE", "data/candidates.txt")
-    if os.path.exists(path):
+    path = _resolve_cand_file()
+    if path and os.path.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as file:
-                tickers = _parse_tickers(file.read())
-                if tickers:
-                    return tickers, "FILE"
+            tickers: list[str] = []
+            if path.lower().endswith(".csv"):
+                df = pd.read_csv(path)
+                pick = None
+                candidates: Iterable[str | None] = [
+                    "ticker",
+                    "symbol",
+                    "code",
+                    df.columns[0] if len(df.columns) else None,
+                ]
+                for candidate in candidates:
+                    if candidate and candidate in df.columns:
+                        pick = candidate
+                        break
+                if pick:
+                    tickers = [str(value).strip().upper() for value in df[pick].tolist()]
+            else:
+                with open(path, "r", encoding="utf-8") as handle:
+                    tickers = _parse_tickers(handle.read())
+
+            tickers = [ticker for ticker in tickers if ticker and not ticker.startswith("#")]
+            if tickers:
+                return tickers, "FILE"
         except Exception:
             pass
 
-    return [], "NONE"
+    return DEFAULT_FALLBACK, "FALLBACK"
 
 
-def per_ticker_retry(px: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
+def per_ticker_retry(px: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
     for ticker in tickers:
         try:
             history = (
@@ -64,8 +93,8 @@ def per_ticker_retry(px: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
     return px
 
 
-def assess(px: pd.DataFrame, tickers: List[str]):
-    details: List[str] = []
+def assess(px: pd.DataFrame, tickers: list[str]):
+    details: list[str] = []
     good = 0
     for ticker in tickers:
         if ticker not in px.columns:
@@ -118,16 +147,11 @@ def send_slack(text: str) -> None:
 
 def main() -> None:
     tickers, source = load_candidates()
-    if not tickers:
-        message = "[ERR] no candidate supplied. Provide CAND_TICKERS or data/candidates.txt."
-        if REQUIRE_CAND == "1":
-            print(message)
-            sys.exit(78)
+    if source == "FALLBACK" and REQUIRE_CAND == "1":
+        print("[ERR] no candidate supplied.")
+        sys.exit(78)
 
-        print(f"[WARN] {message} Skipping probe.")
-        return
-
-    def preview(items: List[str], show: int = 12) -> str:
+    def preview(items: list[str], show: int = 12) -> str:
         head = ",".join(items[:show])
         return head + (" …" if len(items) > show else "")
 
@@ -136,6 +160,8 @@ def main() -> None:
     start = time.time()
     kwargs = dict(period=PERIOD, auto_adjust=True, progress=False, threads=True)
     if END_OFFSET_DAYS > 0:
+        from datetime import datetime, timedelta, timezone
+
         kwargs["end"] = (datetime.now(timezone.utc) - timedelta(days=END_OFFSET_DAYS)).date()
 
     data = yf.download(tickers, **kwargs)
@@ -154,7 +180,7 @@ def main() -> None:
     latency = int((time.time() - start) * 1000)
     ok_count = sum(1 for detail in details if ":OK(" in detail)
     speed = "🚀" if latency < TIMEOUT_MS_WARN else "🐢"
-    universe_note = f"universe={len(tickers)} src={source} [{preview(tickers)}]"
+    universe_note = f"[CAND] universe={len(tickers)} src={source} [{preview(tickers)}]"
     summary = (
         f"{emoji} YF_HEALTH {level} ok={ok_count}/{len(tickers)} latency={latency}ms {speed}\n"
         f"{universe_note}\n" + " | ".join(details)
@@ -167,3 +193,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
