@@ -576,10 +576,10 @@ class Scorer:
             ser = x if isinstance(x, pd.Series) else pd.Series(x, index=df_z.index)
             return ser.clip(lower=0).fillna(0.0)
 
-        # 売上トレンドスロープ（四半期）
-        slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
-        noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
-        df_z['TREND_SLOPE_REV'] = (slope_rev - 0.25*noise_rev).clip(-3.0, 3.0)
+        # 売上トレンドスロープ（四半期）: 直近傾きを重視しつつノイズ罰を緩和
+        slope_rev = 0.80*zpos(df_z['REV_Q_YOY']) + 0.20*zpos(df_z['REV_YOY_ACC'])
+        noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 1.0)
+        df_z['TREND_SLOPE_REV'] = (slope_rev - 0.12*noise_rev).clip(-3.0, 3.0)
 
         # EPSトレンドスロープ（四半期）
         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
@@ -598,7 +598,7 @@ class Scorer:
               0.20*df_z['REV_Q_YOY']
             + 0.10*df_z['REV_YOY_ACC']
             + 0.10*df_z['REV_ANN_STREAK']
-            - 0.05*df_z['REV_YOY_VAR']
+            - 0.02*df_z['REV_YOY_VAR']
             + 0.10*df_z['TREND_SLOPE_REV']
             + 0.15*df_z['EPS_Q_YOY']
             + 0.05*df_z['EPS_POS']
@@ -608,6 +608,10 @@ class Scorer:
             + 0.10*df_z['FCF_MGN']
             + 0.05*df_z['RULE40']
         ).clip(-3.0, 3.0)
+
+        df_z['GRW_BONUS_EPS'] = (((df_z['EPS_POS'] > 0) & (df_z['EPS_Q_YOY'] > 0))
+            .astype(float) * 0.15)
+        df_z['GROWTH_F'] = (df_z['GROWTH_F'] + df_z['GRW_BONUS_EPS']).clip(-3.0, 3.0)
 
         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
             + 0.15*df_z['TR_str']
@@ -640,11 +644,10 @@ class Scorer:
             print("[DEBUG: GRW]")
             for t in tickers_s:
                 print(f"Ticker: {t}")
-                print(f"  REV_Q_YOY        : {df_z.loc[t,'REV_Q_YOY']:+.2f}")
-                print(f"  REV_YOY_ACC      : {df_z.loc[t,'REV_YOY_ACC']:+.2f}")
+                print(f"  TREND_SLOPE_EPS  : {df_z.loc[t,'TREND_SLOPE_EPS']:+.2f}")
                 print(f"  TREND_SLOPE_REV  : {df_z.loc[t,'TREND_SLOPE_REV']:+.2f}")
                 print(f"  EPS_Q_YOY        : {df_z.loc[t,'EPS_Q_YOY']:+.2f}")
-                print(f"  TREND_SLOPE_EPS  : {df_z.loc[t,'TREND_SLOPE_EPS']:+.2f}")
+                print(f"  REV_Q_YOY        : {df_z.loc[t,'REV_Q_YOY']:+.2f}")
                 print(f"  FCF_MGN          : {df_z.loc[t,'FCF_MGN']:+.2f}")
                 print(f"  RULE40           : {df_z.loc[t,'RULE40']:+.2f}")
                 print(f"  GRW total        : {df_z.loc[t,'GROWTH_F']:+.2f}")
