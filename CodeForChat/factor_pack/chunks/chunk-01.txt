@@ -165,124 +165,125 @@ L123     while i < len(text):
 L124         j = min(len(text), i + chunk)
 L125         k = text.rfind("\n", i, j)
 L126         j = k if k > i + 100 else j
-L127         _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}]})
-L128         i = j
-L129
-L130 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-L131     df_z = getattr(fb, "df_z", None)
-L132     if not isinstance(df_z, pd.DataFrame):
-L133         df_z = pd.DataFrame()
-L134     alias = {}
-L135     if "GROWTH_F" in df_z.columns:
-L136         alias["GROWTH_F"] = "GRW"
-L137     alias.update({col: f"TR_{col.split('TREND_SLOPE_', 1)[1]}" for col in df_z.columns if col.startswith("TREND_SLOPE_")})
-L138     df_show = df_z.rename(columns=alias) if alias else df_z
-L139
-L140     want = [
-L141         "GRW", "TR_EPS", "TR_REV", "TR",
-L142         "EPS", "EPS_Q_YOY", "EPS_YOY",
-L143         "REV", "REV_Q_YOY", "REV_YOY", "REV_YOY_ACC", "REV_YOY_VAR", "REV_ANN_STREAK",
-L144         "RULE40", "FCF", "FCF_MGN",
-L145         "RS", "TR_str", "ROE", "BETA_RAW", "DIV_STREAK", "DSC",
-L146     ]
-L147     all_cols = _env_true("DEBUG_ALL_COLS", False)
-L148     cols = list(df_show.columns if all_cols else [c for c in want if c in df_show.columns])
-L149
-L150     Gp, Dp = set(prevG or []), set(prevD or [])
-L151     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
-L152     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
-L153
-L154     show_near = _env_true("DEBUG_NEAR5", True)
-L155     gs, ds = getattr(fb,"g_score",None), getattr(fb,"d_score_all",None)
-L156     gs = (gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None)
-L157     ds = (ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None)
-L158     g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
-L159     d_excl = set((sb.top_G or [])+(sb.top_D or []))
-L160     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
-L161
-L162     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-L163     curr = [t for t in (exist or []) if t in df_z.index]
-L164     focus = list(df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss+curr))[:max_rows]
-L165
-L166     def _fmt_near(lbl, ser, lst):
-L167         if ser is None: return f"{lbl}: off"
-L168         g = ser.get
-L169         parts=[f"{t}:{g(t,float('nan')):.3f}" if pd.notna(g(t)) else f"{t}:nan" for t in lst]
-L170         return f"{lbl}: " + (", ".join(parts) if parts else "-")
-L171
-L172     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
-L173           _fmt_near("G near10", gs, g_miss),
-L174           _fmt_near("D near10", ds, d_miss),
-L175           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
-L176           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
-L177
-L178     tbl="(df_z or columns not available)"
-L179     if not df_show.empty and cols:
-L180         idx=[t for t in focus if t in df_show.index]
-L181         base=df_show.loc[idx, cols].round(3).copy()
-L182         try:
-L183             if gs is not None:
-L184                 base["GSC"] = [gs.get(t, np.nan) for t in base.index]
-L185             if ds is not None:
-L186                 base["DSC"] = [ds.get(t, np.nan) for t in base.index]
-L187         except Exception:
-L188             pass
-L189         tbl=base.to_string(max_rows=None, max_cols=None)
-L190
-L191     miss_txt=""
-L192     if _env_true("DEBUG_MISSING_LOGS", False):
-L193         miss=getattr(fb,"missing_logs",None)
-L194         if miss is not None and not miss.empty:
-L195             miss_txt="\nMissing data (head)\n"+miss.head(10).to_string(index=False)
-L196
-L197     return "\n".join(head+["\nChanged/Selected (+ Near Miss + Current)", tbl])+miss_txt
-L198
-L199 def _disjoint_keepG(top_G, top_D, poolD):
-L200     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
-L201     used, D, i = set(top_G), list(top_D), 0
-L202     for j, t in enumerate(D):
-L203         if t in used:
-L204             while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
-L205                 i += 1
-L206             if i < len(poolD):
-L207                 D[j] = poolD[i]; used.add(D[j]); i += 1
-L208     return top_G, D
-L209
-L210
-L211 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
-L212                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
-L213     import pandas as pd, numpy as np
-L214     sel = list(pick)
-L215     if not sel: return sel
-L216     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
-L217     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
-L218     sigma = float(agg.std()) if pd.notna(agg.std()) else 0.0
-L219     thresh = kth - delta_z * sigma
-L220     ranked_all = agg.sort_values(ascending=False)
-L221     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
-L222     for t in cand:
-L223         within_score = (pd.notna(agg[t]) and agg[t] >= thresh)
-L224         within_rank  = (t in ranked_all.index) and (ranked_all.index.get_loc(t) < n_target + keep_buffer)
-L225         if within_score or within_rank:
-L226             non_inc = [x for x in sel if x not in incumbents]
-L227             if not non_inc: break
-L228             weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
-L229             if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
-L230                 sel.remove(weakest); sel.append(t)
-L231     if len(sel) > n_target:
-L232         sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
-L233     return sel
-L234
-L235
-L236 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
-L237 class Input:
-L238     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
-L239         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
-L240         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
+L127         # blocks で送る場合は code fence を二重にしない
+L128         if j > i:
+L129             _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":text[i:j]}}]})
+L130         i = j
+L131
+L132 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
+L133     df_z = getattr(fb, "df_z", None)
+L134     if not isinstance(df_z, pd.DataFrame):
+L135         df_z = pd.DataFrame()
+L136     # 表示は“人が読む列名”に統一（Changed/Selected/Current すべて同じ）
+L137     want = [
+L138         "GRW",
+L139         "TR_EPS", "TR_REV",
+L140         "EPS_Q_YOY", "REV_Q_YOY", "REV_YOY_ACC", "REV_YOY_VAR",
+L141         "RULE40", "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK", "DSC"
+L142     ]
+L143     all_cols = _env_true("DEBUG_ALL_COLS", False)
+L144     # df_z → 表示名の別名テーブルを作る（常に alias 済みを使う）
+L145     df_show = df_z.copy()
+L146     alias = {
+L147         "GROWTH_F": "GRW",
+L148         "TREND_SLOPE_EPS": "TR_EPS", "TREND_SLOPE_REV": "TR_REV",
+L149         "EPS_Q_YOY": "EPS_Q_YOY", "REV_Q_YOY": "REV_Q_YOY",
+L150         "REV_YOY_ACC": "REV_YOY_ACC", "REV_YOY_VAR": "REV_YOY_VAR",
+L151         "RULE40": "RULE40", "FCF_Z": "FCF", "ROE": "ROE", "RS": "RS",
+L152         "TR_END": "TR_str", "BETA": "BETA_RAW", "DIV_STREAK": "DIV_STREAK"
+L153     }
+L154     df_show.rename(columns={k: v for k, v in alias.items() if k in df_show.columns}, inplace=True)
+L155     cols = list(df_show.columns if all_cols else [c for c in want if c in df_show.columns])
+L156
+L157     Gp, Dp = set(prevG or []), set(prevD or [])
+L158     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
+L159     d_new=[t for t in (sb.top_D or []) if t not in Dp]; d_out=[t for t in Dp if t not in (sb.top_D or [])]
+L160
+L161     show_near = _env_true("DEBUG_NEAR5", True)
+L162     gs, ds = getattr(fb,"g_score",None), getattr(fb,"d_score_all",None)
+L163     gs = (gs.sort_values(ascending=False) if show_near and hasattr(gs,"sort_values") else None)
+L164     ds = (ds.sort_values(ascending=False) if show_near and hasattr(ds,"sort_values") else None)
+L165     g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
+L166     d_excl = set((sb.top_G or [])+(sb.top_D or []))
+L167     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
+L168
+L169     all_rows = _env_true("DEBUG_ALL_ROWS", False)
+L170     curr = [t for t in (exist or []) if t in df_z.index]
+L171     focus = list(df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss+curr))[:max_rows]
+L172
+L173     def _fmt_near(lbl, ser, lst):
+L174         if ser is None: return f"{lbl}: off"
+L175         g = ser.get
+L176         parts=[f"{t}:{g(t,float('nan')):.3f}" if pd.notna(g(t)) else f"{t}:nan" for t in lst]
+L177         return f"{lbl}: " + (", ".join(parts) if parts else "-")
+L178
+L179     head=[f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
+L180           _fmt_near("G near10", gs, g_miss),
+L181           _fmt_near("D near10", ds, d_miss),
+L182           f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
+L183           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
+L184
+L185     tbl="(df_z or columns not available)"
+L186     if not df_show.empty and cols:
+L187         idx=[t for t in focus if t in df_show.index]
+L188         base=df_show.loc[idx, cols].round(3).copy()
+L189         try:
+L190             if gs is not None:
+L191                 base["GSC"] = [gs.get(t, np.nan) for t in base.index]
+L192             if ds is not None:
+L193                 base["DSC"] = [ds.get(t, np.nan) for t in base.index]
+L194         except Exception:
+L195             pass
+L196         tbl=base.to_string(max_rows=None, max_cols=None)
+L197
+L198     miss_txt=""
+L199     if _env_true("DEBUG_MISSING_LOGS", False):
+L200         miss=getattr(fb,"missing_logs",None)
+L201         if miss is not None and not miss.empty:
+L202             miss_txt="\nMissing data (head)\n"+miss.head(10).to_string(index=False)
+L203
+L204     return "\n".join(head+["\nChanged/Selected (+ Near Miss + Current)", tbl])+miss_txt
+L205
+L206 def _disjoint_keepG(top_G, top_D, poolD):
+L207     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
+L208     used, D, i = set(top_G), list(top_D), 0
+L209     for j, t in enumerate(D):
+L210         if t in used:
+L211             while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
+L212                 i += 1
+L213             if i < len(poolD):
+L214                 D[j] = poolD[i]; used.add(D[j]); i += 1
+L215     return top_G, D
+L216
+L217
+L218 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
+L219                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
+L220     import pandas as pd, numpy as np
+L221     sel = list(pick)
+L222     if not sel: return sel
+L223     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
+L224     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
+L225     sigma = float(agg.std()) if pd.notna(agg.std()) else 0.0
+L226     thresh = kth - delta_z * sigma
+L227     ranked_all = agg.sort_values(ascending=False)
+L228     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
+L229     for t in cand:
+L230         within_score = (pd.notna(agg[t]) and agg[t] >= thresh)
+L231         within_rank  = (t in ranked_all.index) and (ranked_all.index.get_loc(t) < n_target + keep_buffer)
+L232         if within_score or within_rank:
+L233             non_inc = [x for x in sel if x not in incumbents]
+L234             if not non_inc: break
+L235             weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
+L236             if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
+L237                 sel.remove(weakest); sel.append(t)
+L238     if len(sel) > n_target:
+L239         sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
+L240     return sel
 L241
-L242     # ---- （Input専用）EPS補完・FCF算出系 ----
-L243     @staticmethod
-L244     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
-L245         out_col = out_col or ttm_col; df = df.copy(); df["eps_imputed"] = False
-L246         cand =
+L242
+L243 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
+L244 class Input:
+L245     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
+L246         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
+L247         self.api_key = finnhub_api_key o
 ```

@@ -1,187 +1,190 @@
 ```text
- df[q_col]*4; ok = df[ttm_col].isna() & cand.replace([np.inf,-np.inf], np.nan).notna()
-L247         df.loc[ok, out_col], df.loc[ok,"eps_imputed"] = cand[ok], True; return df
+r os.environ.get("FINNHUB_API_KEY")
 L248
-L249     _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"], "capex":["Capital Expenditure","Capital Expenditures"]}
-L250
-L251     @staticmethod
-L252     def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series|None:
-L253         if df is None or df.empty: return None
-L254         idx_lower={str(i).lower():i for i in df.index}
-L255         for n in names:
-L256             k=n.lower()
-L257             if k in idx_lower: return df.loc[idx_lower[k]]
-L258         return None
-L259
-L260     @staticmethod
-L261     def _sum_last_n(s: pd.Series|None, n: int) -> float|None:
-L262         if s is None or s.empty: return None
-L263         v=s.dropna().astype(float); return None if v.empty else v.iloc[:n].sum()
-L264
-L265     @staticmethod
-L266     def _latest(s: pd.Series|None) -> float|None:
-L267         if s is None or s.empty: return None
-L268         v=s.dropna().astype(float); return v.iloc[0] if not v.empty else None
-L269
-L270     def fetch_cfo_capex_ttm_yf(self, tickers: list[str]) -> pd.DataFrame:
-L271         from concurrent.futures import ThreadPoolExecutor, as_completed
-L272         pick, sumn, latest, aliases = self._pick_row, self._sum_last_n, self._latest, self._CF_ALIASES
-L273
-L274         def one(t: str):
-L275             try:
-L276                 tk = yf.Ticker(t)  # ★ セッションは渡さない（YFがcurl_cffiで管理）
-L277                 qcf = tk.quarterly_cashflow
-L278                 cfo_q, capex_q = pick(qcf, aliases["cfo"]), pick(qcf, aliases["capex"])
-L279                 fcf_q = pick(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
-L280                 cfo, capex, fcf = sumn(cfo_q,4), sumn(capex_q,4), sumn(fcf_q,4)
-L281                 if any(v is None for v in (cfo, capex, fcf)):
-L282                     acf = tk.cashflow
-L283                     if cfo   is None: cfo   = latest(pick(acf, aliases["cfo"]))
-L284                     if capex is None: capex = latest(pick(acf, aliases["capex"]))
-L285                     if fcf   is None: fcf   = latest(pick(acf, ["Free Cash Flow","FreeCashFlow","Free cash flow"]))
-L286             except Exception as e:
-L287                 print(f"[warn] yf financials error: {t}: {e}"); cfo=capex=fcf=None
-L288             n=np.nan
-L289             return {"ticker":t,
-L290                     "cfo_ttm_yf":   n if cfo   is None else cfo,
-L291                     "capex_ttm_yf": n if capex is None else capex,
-L292                     "fcf_ttm_yf_direct": n if fcf is None else fcf}
-L293
-L294         rows, mw = [], int(os.getenv("FIN_THREADS","8"))
-L295         with ThreadPoolExecutor(max_workers=mw) as ex:
-L296             rows=[f.result() for f in as_completed(ex.submit(one,t) for t in tickers)]
-L297         return pd.DataFrame(rows).set_index("ticker")
-L298
-L299     _FINN_CFO_KEYS = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
-L300     _FINN_CAPEX_KEYS = ["capitalExpenditure","capitalExpenditures","purchaseOfPPE","investmentsInPropertyPlantAndEquipment"]
-L301
-L302     @staticmethod
-L303     def _first_key(d: dict, keys: list[str]):
-L304         for k in keys:
-L305             if k in d and d[k] is not None: return d[k]
-L306         return None
-L307
-L308     @staticmethod
-L309     def _finn_get(session: requests.Session, url: str, params: dict, retries: int=3, sleep_s: float=0.5):
-L310         for i in range(retries):
-L311             r = session.get(url, params=params, timeout=15)
-L312             if r.status_code==429: time.sleep(min(2**i*sleep_s,4.0)); continue
-L313             r.raise_for_status(); return r.json()
-L314         r.raise_for_status()
-L315
-L316     def fetch_cfo_capex_ttm_finnhub(self, tickers: list[str], api_key: str|None=None) -> pd.DataFrame:
-L317         api_key = api_key or os.getenv("FINNHUB_API_KEY")
-L318         if not api_key: raise ValueError("Finnhub API key not provided. Set FINNHUB_API_KEY or pass api_key=")
-L319         base, s, rows = "https://finnhub.io/api/v1", requests.Session(), []
-L320         for sym in tickers:
-L321             cfo_ttm = capex_ttm = None
-L322             try:
-L323                 j = self._finn_get(s, f"{base}/stock/cash-flow", {"symbol":sym,"frequency":"quarterly","limit":8,"token":api_key})
-L324                 arr = j.get("cashFlow") or []; cfo_vals, capex_vals = [], []
-L325                 for item in arr[:4]:
-L326                     cfo_vals.append(self._first_key(item,self._FINN_CFO_KEYS)); capex_vals.append(self._first_key(item,self._FINN_CAPEX_KEYS))
-L327                 if any(v is not None for v in cfo_vals): cfo_ttm = float(np.nansum([np.nan if v is None else float(v) for v in cfo_vals]))
-L328                 if any(v is not None for v in capex_vals): capex_ttm = float(np.nansum([np.nan if v is None else float(v) for v in capex_vals]))
-L329             except Exception: pass
-L330             if cfo_ttm is None or capex_ttm is None:
-L331                 try:
-L332                     j = self._finn_get(s, f"{base}/stock/cash-flow", {"symbol":sym,"frequency":"annual","limit":1,"token":api_key})
-L333                     arr = j.get("cashFlow") or []
-L334                     if arr:
-L335                         item0 = arr[0]
-L336                         if cfo_ttm is None:
-L337                             v = self._first_key(item0,self._FINN_CFO_KEYS)
-L338                             if v is not None: cfo_ttm = float(v)
-L339                         if capex_ttm is None:
-L340                             v = self._first_key(item0,self._FINN_CAPEX_KEYS)
-L341                             if v is not None: capex_ttm = float(v)
-L342                 except Exception: pass
-L343             rows.append({"ticker":sym,"cfo_ttm_fh":np.nan if cfo_ttm is None else cfo_ttm,"capex_ttm_fh":np.nan if capex_ttm is None else capex_ttm})
-L344         return pd.DataFrame(rows).set_index("ticker")
-L345
-L346     def compute_fcf_with_fallback(self, tickers: list[str], finnhub_api_key: str|None=None) -> pd.DataFrame:
-L347         yf_df = self.fetch_cfo_capex_ttm_yf(tickers)
-L348         T.log("financials (yf) done")
-L349         miss_mask = yf_df[["cfo_ttm_yf","capex_ttm_yf","fcf_ttm_yf_direct"]].isna().any(axis=1)
-L350         need = yf_df.index[miss_mask].tolist(); print(f"[T] yf financials missing: {len(need)} {need[:10]}{'...' if len(need)>10 else ''}")
-L351         if need:
-L352             fh_df = self.fetch_cfo_capex_ttm_finnhub(need, api_key=finnhub_api_key)
-L353             df = yf_df.join(fh_df, how="left")
-L354             for col_yf, col_fh in [("cfo_ttm_yf","cfo_ttm_fh"),("capex_ttm_yf","capex_ttm_fh")]:
-L355                 df[col_yf] = df[col_yf].fillna(df[col_fh])
-L356             print("[T] financials (finnhub) done (fallback only)")
-L357         else:
-L358             df = yf_df.assign(cfo_ttm_fh=np.nan, capex_ttm_fh=np.nan)
-L359             print("[T] financials (finnhub) skipped (no missing)")
-L360         df["cfo_ttm"]  = df["cfo_ttm_yf"].where(df["cfo_ttm_yf"].notna(), df["cfo_ttm_fh"])
-L361         df["capex_ttm"] = df["capex_ttm_yf"].where(df["capex_ttm_yf"].notna(), df["capex_ttm_fh"])
-L362         cfo, capex = pd.to_numeric(df["cfo_ttm"], errors="coerce"), pd.to_numeric(df["capex_ttm"], errors="coerce").abs()
-L363         fcf_calc = cfo - capex
-L364         fcf_direct = pd.to_numeric(df.get("fcf_ttm_yf_direct"), errors="coerce")
-L365         df["fcf_ttm"] = fcf_calc.where(fcf_calc.notna(), fcf_direct)
-L366         df["cfo_source"]  = np.where(df["cfo_ttm_yf"].notna(),"yfinance",np.where(df["cfo_ttm_fh"].notna(),"finnhub",""))
-L367         df["capex_source"] = np.where(df["capex_ttm_yf"].notna(),"yfinance",np.where(df["capex_ttm_fh"].notna(),"finnhub",""))
-L368         df["fcf_imputed"] = df[["cfo_ttm","capex_ttm"]].isna().any(axis=1) & df["fcf_ttm"].notna()
-L369         cols = ["cfo_ttm_yf","capex_ttm_yf","cfo_ttm_fh","capex_ttm_fh","cfo_ttm","capex_ttm","fcf_ttm","fcf_ttm_yf_direct","cfo_source","capex_source","fcf_imputed"]
-L370         return df[cols].sort_index()
-L371
-L372     def _build_eps_df(self, tickers, tickers_bulk, info):
-L373         eps_rows=[]
-L374         for t in tickers:
-L375             info_t, eps_ttm, eps_q = info[t], info[t].get("trailingEps", np.nan), np.nan
-L376             try:
-L377                 qearn, so = tickers_bulk.tickers[t].quarterly_earnings, info_t.get("sharesOutstanding")
-L378                 if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
-L379                     eps_ttm_q = qearn["Earnings"].head(4).sum()/so
-L380                     if pd.notna(eps_ttm_q) and (pd.isna(eps_ttm) or (abs(eps_ttm)>0 and abs(eps_ttm/eps_ttm_q)>3)): eps_ttm = eps_ttm_q
-L381                     eps_q = qearn["Earnings"].iloc[-1]/so
-L382             except Exception: pass
-L383             eps_rows.append({"ticker":t,"eps_ttm":eps_ttm,"eps_q_recent":eps_q})
-L384         return self.impute_eps_ttm(pd.DataFrame(eps_rows).set_index("ticker"))
-L385
-L386     def prepare_data(self):
-L387         """Fetch price and fundamental data for all tickers."""
-L388         cand_info = yf.Tickers(" ".join(self.cand)); cand_prices = {}
-L389         for t in self.cand:
-L390             try: cand_prices[t] = cand_info.tickers[t].fast_info.get("lastPrice", np.inf)
-L391             except Exception as e: print(f"{t}: price fetch failed ({e})"); cand_prices[t] = np.inf
-L392         cand_f = [t for t,p in cand_prices.items() if p<=self.price_max]
-L393         T.log("price cap filter done (CAND_PRICE_MAX)")
-L394         tickers = sorted(set(self.exist + cand_f))
-L395         T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
-L396         data = yf.download(tickers + [self.bench], period="600d", auto_adjust=True, progress=False)
-L397         T.log("yf.download done")
-L398         px, spx = data["Close"], data["Close"][self.bench]
-L399         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
-L400         if clip_days > 0:
-L401             px  = px.tail(clip_days + 1)
-L402             spx = spx.tail(clip_days + 1)
-L403             print(f"[T] price window clipped by env: {len(px)} rows (PRICE_CLIP_DAYS={clip_days})")
-L404         else:
-L405             print(f"[T] price window clip skipped; rows={len(px)}")
-L406         tickers_bulk, info = yf.Tickers(" ".join(tickers)), {}
-L407         for t in tickers:
-L408             try: info[t] = tickers_bulk.tickers[t].info
-L409             except Exception as e: print(f"{t}: info fetch failed ({e})"); info[t] = {}
-L410         eps_df = self._build_eps_df(tickers, tickers_bulk, info)
-L411         fcf_df = self.compute_fcf_with_fallback(tickers, finnhub_api_key=self.api_key)
-L412         T.log("eps/fcf prep done")
-L413         returns = px[tickers].pct_change()
-L414         T.log("price prep/returns done")
-L415         return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
-L416
-L417 # === Selector：相関低減・選定（スコア＆リターンだけ読む） ===
-L418 class Selector:
-L419     # ---- DRRS helpers（Selector専用） ----
-L420     @staticmethod
-L421     def _z_np(X: np.ndarray) -> np.ndarray:
-L422         X = np.asarray(X, dtype=np.float32); m = np.nanmean(X, axis=0, keepdims=True); s = np.nanstd(X, axis=0, keepdims=True)+1e-9
-L423         return (np.nan_to_num(X)-m)/s
-L424
-L425     @classmethod
-L426     def residual_corr(cls, R: np.ndarray, n_pc: int=3, shrink: float=0.1) -> np.ndarray:
-L427         Z = cls._z_np(R); U,S,_ = np.linalg.svd(Z, full_matrices=False); F = U[:,:n_pc]*S[:n_pc]; B = np.linalg.lstsq(F, Z, rcond=None)[0]
-L428         E = Z - F@B; C = np.corrcoef(E, rowvar=False)
-L429         off = C - np.diag(np.diag(C)); iu = np.triu_indices_from(off,1); avg_abs = np.nanmean(np.abs(off[iu])) if iu[0].size else 0.0
-L430      
+L249     # ---- （Input専用）EPS補完・FCF算出系 ----
+L250     @staticmethod
+L251     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
+L252         out_col = out_col or ttm_col; df = df.copy(); df["eps_imputed"] = False
+L253         cand = df[q_col]*4; ok = df[ttm_col].isna() & cand.replace([np.inf,-np.inf], np.nan).notna()
+L254         df.loc[ok, out_col], df.loc[ok,"eps_imputed"] = cand[ok], True; return df
+L255
+L256     _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"], "capex":["Capital Expenditure","Capital Expenditures"]}
+L257
+L258     @staticmethod
+L259     def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series|None:
+L260         if df is None or df.empty: return None
+L261         idx_lower={str(i).lower():i for i in df.index}
+L262         for n in names:
+L263             k=n.lower()
+L264             if k in idx_lower: return df.loc[idx_lower[k]]
+L265         return None
+L266
+L267     @staticmethod
+L268     def _sum_last_n(s: pd.Series|None, n: int) -> float|None:
+L269         if s is None or s.empty: return None
+L270         v=s.dropna().astype(float); return None if v.empty else v.iloc[:n].sum()
+L271
+L272     @staticmethod
+L273     def _latest(s: pd.Series|None) -> float|None:
+L274         if s is None or s.empty: return None
+L275         v=s.dropna().astype(float); return v.iloc[0] if not v.empty else None
+L276
+L277     def fetch_cfo_capex_ttm_yf(self, tickers: list[str]) -> pd.DataFrame:
+L278         from concurrent.futures import ThreadPoolExecutor, as_completed
+L279         pick, sumn, latest, aliases = self._pick_row, self._sum_last_n, self._latest, self._CF_ALIASES
+L280
+L281         def one(t: str):
+L282             try:
+L283                 tk = yf.Ticker(t)  # ★ セッションは渡さない（YFがcurl_cffiで管理）
+L284                 qcf = tk.quarterly_cashflow
+L285                 cfo_q, capex_q = pick(qcf, aliases["cfo"]), pick(qcf, aliases["capex"])
+L286                 fcf_q = pick(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
+L287                 cfo, capex, fcf = sumn(cfo_q,4), sumn(capex_q,4), sumn(fcf_q,4)
+L288                 if any(v is None for v in (cfo, capex, fcf)):
+L289                     acf = tk.cashflow
+L290                     if cfo   is None: cfo   = latest(pick(acf, aliases["cfo"]))
+L291                     if capex is None: capex = latest(pick(acf, aliases["capex"]))
+L292                     if fcf   is None: fcf   = latest(pick(acf, ["Free Cash Flow","FreeCashFlow","Free cash flow"]))
+L293             except Exception as e:
+L294                 print(f"[warn] yf financials error: {t}: {e}"); cfo=capex=fcf=None
+L295             n=np.nan
+L296             return {"ticker":t,
+L297                     "cfo_ttm_yf":   n if cfo   is None else cfo,
+L298                     "capex_ttm_yf": n if capex is None else capex,
+L299                     "fcf_ttm_yf_direct": n if fcf is None else fcf}
+L300
+L301         rows, mw = [], int(os.getenv("FIN_THREADS","8"))
+L302         with ThreadPoolExecutor(max_workers=mw) as ex:
+L303             rows=[f.result() for f in as_completed(ex.submit(one,t) for t in tickers)]
+L304         return pd.DataFrame(rows).set_index("ticker")
+L305
+L306     _FINN_CFO_KEYS = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
+L307     _FINN_CAPEX_KEYS = ["capitalExpenditure","capitalExpenditures","purchaseOfPPE","investmentsInPropertyPlantAndEquipment"]
+L308
+L309     @staticmethod
+L310     def _first_key(d: dict, keys: list[str]):
+L311         for k in keys:
+L312             if k in d and d[k] is not None: return d[k]
+L313         return None
+L314
+L315     @staticmethod
+L316     def _finn_get(session: requests.Session, url: str, params: dict, retries: int=3, sleep_s: float=0.5):
+L317         for i in range(retries):
+L318             r = session.get(url, params=params, timeout=15)
+L319             if r.status_code==429: time.sleep(min(2**i*sleep_s,4.0)); continue
+L320             r.raise_for_status(); return r.json()
+L321         r.raise_for_status()
+L322
+L323     def fetch_cfo_capex_ttm_finnhub(self, tickers: list[str], api_key: str|None=None) -> pd.DataFrame:
+L324         api_key = api_key or os.getenv("FINNHUB_API_KEY")
+L325         if not api_key: raise ValueError("Finnhub API key not provided. Set FINNHUB_API_KEY or pass api_key=")
+L326         base, s, rows = "https://finnhub.io/api/v1", requests.Session(), []
+L327         for sym in tickers:
+L328             cfo_ttm = capex_ttm = None
+L329             try:
+L330                 j = self._finn_get(s, f"{base}/stock/cash-flow", {"symbol":sym,"frequency":"quarterly","limit":8,"token":api_key})
+L331                 arr = j.get("cashFlow") or []; cfo_vals, capex_vals = [], []
+L332                 for item in arr[:4]:
+L333                     cfo_vals.append(self._first_key(item,self._FINN_CFO_KEYS)); capex_vals.append(self._first_key(item,self._FINN_CAPEX_KEYS))
+L334                 if any(v is not None for v in cfo_vals): cfo_ttm = float(np.nansum([np.nan if v is None else float(v) for v in cfo_vals]))
+L335                 if any(v is not None for v in capex_vals): capex_ttm = float(np.nansum([np.nan if v is None else float(v) for v in capex_vals]))
+L336             except Exception: pass
+L337             if cfo_ttm is None or capex_ttm is None:
+L338                 try:
+L339                     j = self._finn_get(s, f"{base}/stock/cash-flow", {"symbol":sym,"frequency":"annual","limit":1,"token":api_key})
+L340                     arr = j.get("cashFlow") or []
+L341                     if arr:
+L342                         item0 = arr[0]
+L343                         if cfo_ttm is None:
+L344                             v = self._first_key(item0,self._FINN_CFO_KEYS)
+L345                             if v is not None: cfo_ttm = float(v)
+L346                         if capex_ttm is None:
+L347                             v = self._first_key(item0,self._FINN_CAPEX_KEYS)
+L348                             if v is not None: capex_ttm = float(v)
+L349                 except Exception: pass
+L350             rows.append({"ticker":sym,"cfo_ttm_fh":np.nan if cfo_ttm is None else cfo_ttm,"capex_ttm_fh":np.nan if capex_ttm is None else capex_ttm})
+L351         return pd.DataFrame(rows).set_index("ticker")
+L352
+L353     def compute_fcf_with_fallback(self, tickers: list[str], finnhub_api_key: str|None=None) -> pd.DataFrame:
+L354         yf_df = self.fetch_cfo_capex_ttm_yf(tickers)
+L355         T.log("financials (yf) done")
+L356         miss_mask = yf_df[["cfo_ttm_yf","capex_ttm_yf","fcf_ttm_yf_direct"]].isna().any(axis=1)
+L357         need = yf_df.index[miss_mask].tolist(); print(f"[T] yf financials missing: {len(need)} {need[:10]}{'...' if len(need)>10 else ''}")
+L358         if need:
+L359             fh_df = self.fetch_cfo_capex_ttm_finnhub(need, api_key=finnhub_api_key)
+L360             df = yf_df.join(fh_df, how="left")
+L361             for col_yf, col_fh in [("cfo_ttm_yf","cfo_ttm_fh"),("capex_ttm_yf","capex_ttm_fh")]:
+L362                 df[col_yf] = df[col_yf].fillna(df[col_fh])
+L363             print("[T] financials (finnhub) done (fallback only)")
+L364         else:
+L365             df = yf_df.assign(cfo_ttm_fh=np.nan, capex_ttm_fh=np.nan)
+L366             print("[T] financials (finnhub) skipped (no missing)")
+L367         df["cfo_ttm"]  = df["cfo_ttm_yf"].where(df["cfo_ttm_yf"].notna(), df["cfo_ttm_fh"])
+L368         df["capex_ttm"] = df["capex_ttm_yf"].where(df["capex_ttm_yf"].notna(), df["capex_ttm_fh"])
+L369         cfo, capex = pd.to_numeric(df["cfo_ttm"], errors="coerce"), pd.to_numeric(df["capex_ttm"], errors="coerce").abs()
+L370         fcf_calc = cfo - capex
+L371         fcf_direct = pd.to_numeric(df.get("fcf_ttm_yf_direct"), errors="coerce")
+L372         df["fcf_ttm"] = fcf_calc.where(fcf_calc.notna(), fcf_direct)
+L373         df["cfo_source"]  = np.where(df["cfo_ttm_yf"].notna(),"yfinance",np.where(df["cfo_ttm_fh"].notna(),"finnhub",""))
+L374         df["capex_source"] = np.where(df["capex_ttm_yf"].notna(),"yfinance",np.where(df["capex_ttm_fh"].notna(),"finnhub",""))
+L375         df["fcf_imputed"] = df[["cfo_ttm","capex_ttm"]].isna().any(axis=1) & df["fcf_ttm"].notna()
+L376         cols = ["cfo_ttm_yf","capex_ttm_yf","cfo_ttm_fh","capex_ttm_fh","cfo_ttm","capex_ttm","fcf_ttm","fcf_ttm_yf_direct","cfo_source","capex_source","fcf_imputed"]
+L377         return df[cols].sort_index()
+L378
+L379     def _build_eps_df(self, tickers, tickers_bulk, info):
+L380         eps_rows=[]
+L381         for t in tickers:
+L382             info_t, eps_ttm, eps_q = info[t], info[t].get("trailingEps", np.nan), np.nan
+L383             try:
+L384                 qearn, so = tickers_bulk.tickers[t].quarterly_earnings, info_t.get("sharesOutstanding")
+L385                 if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
+L386                     eps_ttm_q = qearn["Earnings"].head(4).sum()/so
+L387                     if pd.notna(eps_ttm_q) and (pd.isna(eps_ttm) or (abs(eps_ttm)>0 and abs(eps_ttm/eps_ttm_q)>3)): eps_ttm = eps_ttm_q
+L388                     eps_q = qearn["Earnings"].iloc[-1]/so
+L389             except Exception: pass
+L390             eps_rows.append({"ticker":t,"eps_ttm":eps_ttm,"eps_q_recent":eps_q})
+L391         return self.impute_eps_ttm(pd.DataFrame(eps_rows).set_index("ticker"))
+L392
+L393     def prepare_data(self):
+L394         """Fetch price and fundamental data for all tickers."""
+L395         cand_info = yf.Tickers(" ".join(self.cand)); cand_prices = {}
+L396         for t in self.cand:
+L397             try: cand_prices[t] = cand_info.tickers[t].fast_info.get("lastPrice", np.inf)
+L398             except Exception as e: print(f"{t}: price fetch failed ({e})"); cand_prices[t] = np.inf
+L399         cand_f = [t for t,p in cand_prices.items() if p<=self.price_max]
+L400         T.log("price cap filter done (CAND_PRICE_MAX)")
+L401         tickers = sorted(set(self.exist + cand_f))
+L402         T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
+L403         data = yf.download(tickers + [self.bench], period="600d", auto_adjust=True, progress=False)
+L404         T.log("yf.download done")
+L405         px, spx = data["Close"], data["Close"][self.bench]
+L406         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
+L407         if clip_days > 0:
+L408             px  = px.tail(clip_days + 1)
+L409             spx = spx.tail(clip_days + 1)
+L410             print(f"[T] price window clipped by env: {len(px)} rows (PRICE_CLIP_DAYS={clip_days})")
+L411         else:
+L412             print(f"[T] price window clip skipped; rows={len(px)}")
+L413         tickers_bulk, info = yf.Tickers(" ".join(tickers)), {}
+L414         for t in tickers:
+L415             try: info[t] = tickers_bulk.tickers[t].info
+L416             except Exception as e: print(f"{t}: info fetch failed ({e})"); info[t] = {}
+L417         eps_df = self._build_eps_df(tickers, tickers_bulk, info)
+L418         fcf_df = self.compute_fcf_with_fallback(tickers, finnhub_api_key=self.api_key)
+L419         T.log("eps/fcf prep done")
+L420         returns = px[tickers].pct_change()
+L421         T.log("price prep/returns done")
+L422         return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
+L423
+L424 # === Selector：相関低減・選定（スコア＆リターンだけ読む） ===
+L425 class Selector:
+L426     # ---- DRRS helpers（Selector専用） ----
+L427     @staticmethod
+L428     def _z_np(X: np.ndarray) -> np.ndarray:
+L429         X = np.asarray(X, dtype=np.float32); m = np.nanmean(X, axis=0, keepdims=True); s = np.nanstd(X, axis=0, keepdims=True)+1e-9
+L430         return (np.nan_to_num(X)-m)/s
+L431
+L432     @classmethod
+L433     def residual_corr(cls, R: np.ndarray, n_pc: int=3, shrink: float=0.1) -> np.ndarray:
+L43
 ```
