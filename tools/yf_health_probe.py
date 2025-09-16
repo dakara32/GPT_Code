@@ -2,19 +2,18 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import List, Tuple
 
 import pandas as pd
 import requests
 import yfinance as yf
-
-DEFAULT_FALLBACK = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA"]
 PERIOD = os.getenv("YF_PROBE_PERIOD", "180d")
 MIN_LEN = int(os.getenv("YF_PROBE_MIN_LEN", "120"))
 MAX_NAN_RATIO = float(os.getenv("YF_PROBE_MAX_NAN", "0.15"))
 RETRY_ON_EMPTY = int(os.getenv("YF_PROBE_RETRY", "1"))
 TIMEOUT_MS_WARN = int(os.getenv("YF_PROBE_TIMEOUT_MS_WARN", "5000"))
 END_OFFSET_DAYS = int(os.getenv("END_OFFSET_DAYS", "1"))
+REQUIRE_CAND = os.getenv("REQUIRE_CAND", "1")
 
 SLACK_WEBHOOK = (
     os.getenv("SLACK_WEBHOOK_URL")
@@ -28,14 +27,14 @@ def _parse_tickers(text: str) -> List[str]:
     return [ticker for ticker in raw if ticker and not ticker.startswith("#")]
 
 
-def load_candidates() -> List[str]:
-    """Load candidate tickers from env, file, or fallback list."""
+def load_candidates() -> Tuple[List[str], str]:
+    """Load candidate tickers from environment or file."""
 
     env_list = os.getenv("CAND_TICKERS", "").strip()
     if env_list:
         tickers = _parse_tickers(env_list)
         if tickers:
-            return tickers
+            return tickers, "ENV"
 
     path = os.getenv("CAND_FILE", "data/candidates.txt")
     if os.path.exists(path):
@@ -43,11 +42,11 @@ def load_candidates() -> List[str]:
             with open(path, "r", encoding="utf-8") as file:
                 tickers = _parse_tickers(file.read())
                 if tickers:
-                    return tickers
+                    return tickers, "FILE"
         except Exception:
             pass
 
-    return DEFAULT_FALLBACK
+    return [], "NONE"
 
 
 def per_ticker_retry(px: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
@@ -118,16 +117,21 @@ def send_slack(text: str) -> None:
 
 
 def main() -> None:
-    tickers = load_candidates()
+    tickers, source = load_candidates()
     if not tickers:
-        print("[ERR] no tickers")
-        sys.exit(78)
+        message = "[ERR] no candidate supplied. Provide CAND_TICKERS or data/candidates.txt."
+        if REQUIRE_CAND == "1":
+            print(message)
+            sys.exit(78)
+
+        print(f"[WARN] {message} Skipping probe.")
+        return
 
     def preview(items: List[str], show: int = 12) -> str:
         head = ",".join(items[:show])
         return head + (" …" if len(items) > show else "")
 
-    print(f"[UNIVERSE] {len(tickers)} tickers: {preview(tickers)}")
+    print(f"[UNIVERSE] src={source} count={len(tickers)}: {preview(tickers)}")
 
     start = time.time()
     kwargs = dict(period=PERIOD, auto_adjust=True, progress=False, threads=True)
@@ -150,7 +154,7 @@ def main() -> None:
     latency = int((time.time() - start) * 1000)
     ok_count = sum(1 for detail in details if ":OK(" in detail)
     speed = "🚀" if latency < TIMEOUT_MS_WARN else "🐢"
-    universe_note = f"universe={len(tickers)} [{preview(tickers)}]"
+    universe_note = f"universe={len(tickers)} src={source} [{preview(tickers)}]"
     summary = (
         f"{emoji} YF_HEALTH {level} ok={ok_count}/{len(tickers)} latency={latency}ms {speed}\n"
         f"{universe_note}\n" + " | ".join(details)
