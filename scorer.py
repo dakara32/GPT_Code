@@ -583,7 +583,9 @@ class Scorer:
 
         # EPSトレンドスロープ（四半期）
         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
-        df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
+        # 直近改善を少しだけブースト（赤字→黒字の初動を拾う）
+        recent_eps = zpos(df['EPS'].rolling(2).mean())
+        df_z['TREND_SLOPE_EPS'] = (slope_eps + 0.20*recent_eps).clip(-3.0, 3.0)
 
         # 年次トレンド（サブ）
         slope_rev_yr = zpos(df_z['REV_YOY'])
@@ -592,6 +594,11 @@ class Scorer:
         streak_yr = streak_base / (streak_base.abs() + 1.0)
         df_z['TREND_SLOPE_REV_YR'] = (0.7*slope_rev_yr + 0.3*streak_yr).clip(-3.0, 3.0)
         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
+
+        # FCFを非対称に再マッピング：正は満額、負は0.3倍（CFOプラスでもCapEx重い業種の過剰減点を緩和）
+        fcf_pos = df['FCF_MGN'].clip(lower=0)
+        fcf_neg = (-df['FCF_MGN']).clip(lower=0)
+        df_z['FCF_ASYM'] = (zpos(fcf_pos) - 0.30*zpos(fcf_neg)).fillna(0.0)
 
         # ===== 新GRW合成式（SEPA寄りシフト） =====
         df_z['GROWTH_F'] = robust_z(
@@ -605,9 +612,17 @@ class Scorer:
             + 0.20*df_z['TREND_SLOPE_EPS']
             + 0.05*df_z['TREND_SLOPE_REV_YR']
             + 0.03*df_z['TREND_SLOPE_EPS_YR']
-            + 0.10*df_z['FCF_MGN']
+            + 0.10*df_z['FCF_ASYM']
             + 0.05*df_z['RULE40']
         ).clip(-3.0, 3.0)
+
+        # ★ 最終テーブルへ主要列を保存（後段のデバッグ/出力で0になるのを防ぐ）
+        for col in [
+            'TREND_SLOPE_EPS','TREND_SLOPE_REV','EPS_Q_YOY','REV_Q_YOY',
+            'FCF_ASYM','FCF_MGN','RULE40','GROWTH_F'
+        ]:
+            if col in df_z.columns:
+                df[col] = df_z[col]
 
         df_z['GRW_BONUS_EPS'] = (((df_z['EPS_POS'] > 0) & (df_z['EPS_Q_YOY'] > 0))
             .astype(float) * 0.15)
@@ -641,16 +656,16 @@ class Scorer:
         tickers_s = pd.Index(df_z.index)
         debug = bool(getattr(sys.modules.get("factor"), "debug_mode", False))
         if debug:
-            print("[DEBUG: GRW]")
+            print("[DEBUG: GRW]")  # 必要最小限の数値のみ（従来形式）
             for t in tickers_s:
                 print(f"Ticker: {t}")
-                print(f"  TREND_SLOPE_EPS  : {df_z.loc[t,'TREND_SLOPE_EPS']:+.2f}")
-                print(f"  TREND_SLOPE_REV  : {df_z.loc[t,'TREND_SLOPE_REV']:+.2f}")
-                print(f"  EPS_Q_YOY        : {df_z.loc[t,'EPS_Q_YOY']:+.2f}")
-                print(f"  REV_Q_YOY        : {df_z.loc[t,'REV_Q_YOY']:+.2f}")
-                print(f"  FCF_MGN          : {df_z.loc[t,'FCF_MGN']:+.2f}")
-                print(f"  RULE40           : {df_z.loc[t,'RULE40']:+.2f}")
-                print(f"  GRW total        : {df_z.loc[t,'GROWTH_F']:+.2f}")
+                print(f"  TREND_SLOPE_EPS  : {df.loc[t,'TREND_SLOPE_EPS']:+.2f}")
+                print(f"  TREND_SLOPE_REV  : {df.loc[t,'TREND_SLOPE_REV']:+.2f}")
+                print(f"  EPS_Q_YOY        : {df.loc[t,'EPS_Q_YOY']:+.2f}")
+                print(f"  REV_Q_YOY        : {df.loc[t,'REV_Q_YOY']:+.2f}")
+                print(f"  FCF(ASYM)        : {df.loc[t,'FCF_ASYM']:+.2f}")
+                print(f"  RULE40           : {df.loc[t,'RULE40']:+.2f}")
+                print(f"  GRW total        : {df.loc[t,'GROWTH_F']:+.2f}")
                 print("")
 
         is_bio = pd.Series({t: _is_bio_like(t) for t in tickers_s})
@@ -702,6 +717,8 @@ class Scorer:
         Scorer.g_score = g_score
         df_z['GSC'] = g_score_all
         df_z['DSC'] = d_score_all
+        df['GSC'] = g_score_all
+        df['DSC'] = d_score_all
 
         try:
             current = (pd.read_csv("current_tickers.csv")

@@ -126,6 +126,7 @@ def _slack_debug(text: str, chunk=2800):
 
 def _compact_debug(fb, sb, prevG, prevD, *, held_tickers=None, max_rows=140):
     df_z = fb.df_z
+    gdf = getattr(fb, "df", pd.DataFrame())
     want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
     all_cols = _env_true("DEBUG_ALL_COLS", False)
     cols = list(df_z.columns if all_cols else [c for c in want if c in df_z.columns])
@@ -170,29 +171,31 @@ def _compact_debug(fb, sb, prevG, prevD, *, held_tickers=None, max_rows=140):
 
     parts = head + ["", "Changed/Selected (+ Near Miss)", tbl]
 
+    # （拡張）選定＋ニアミス＋現行保有 の3ブロックを同形式で出力
     held_lines = []
     if held_tickers:
-        ht = [t for t in held_tickers if t in df_z.index]
+        # ※ gdf は直前の選定テーブルと同じソースDF（scorerからの df を想定）
+        ht = [t for t in held_tickers if t in gdf.index]
         if ht:
             cols_spec = [
-                ("TR_EPS",  "TREND_SLOPE_EPS"),
-                ("TR_REV",  "TREND_SLOPE_REV"),
-                ("EPS",     "EPS_Q_YOY"),
-                ("REV",     "REV_Q_YOY"),
-                ("FCF",     "FCF_MGN"),
-                ("RULE40",  "RULE40"),
-                ("GRW",     "GROWTH_F"),
-                ("GSC",     "GSC"),
+                ("TR_EPS", "TREND_SLOPE_EPS"),
+                ("TR_REV", "TREND_SLOPE_REV"),
+                ("EPS", "EPS_Q_YOY"),
+                ("REV", "REV_Q_YOY"),
+                ("FCF", "FCF_ASYM"),
+                ("RULE40", "RULE40"),
+                ("GRW", "GROWTH_F"),
+                ("GSC", "GSC"),
             ]
             header = "  " + "  ".join(f"{lab:>6}" for lab, _ in cols_spec)
             rows = []
             for t in ht:
                 values = []
                 for _, col_name in cols_spec:
-                    if col_name in df_z.columns and pd.notna(df_z.at[t, col_name]):
-                        values.append(f"{df_z.at[t, col_name]:+.3f}")
+                    if col_name in gdf.columns and pd.notna(gdf.at[t, col_name]):
+                        values.append(f"{gdf.at[t, col_name]:+.3f}")
                     else:
-                        values.append("  NaN ")
+                        values.append("   NaN")
                 rows.append(f"{t:<6}" + "  " + "  ".join(values))
             if rows:
                 held_lines = [header] + rows
@@ -203,6 +206,7 @@ def _compact_debug(fb, sb, prevG, prevD, *, held_tickers=None, max_rows=140):
     out = "\n".join(parts)
     if miss_txt:
         out += miss_txt
+    # 末尾のバッククォートは出力しない（Slack側でコードブロック化する）
     return out
 
 def _disjoint_keepG(top_G, top_D, poolD):
