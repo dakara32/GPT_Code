@@ -1,119 +1,65 @@
-import os
-import sys
-import time
-
+import os, time, sys
 import pandas as pd
 import yfinance as yf
+import requests
 
 TICKERS = os.getenv("YF_PROBE_TICKERS", "AAPL,MSFT,NVDA,GOOGL,AMZN,META,TSLA").split(",")
-PERIOD = os.getenv("YF_PROBE_PERIOD", "180d")
+PERIOD  = os.getenv("YF_PROBE_PERIOD", "180d")
 MIN_LEN = int(os.getenv("YF_PROBE_MIN_LEN", "120"))
 MAX_NAN_RATIO = float(os.getenv("YF_PROBE_MAX_NAN", "0.15"))
 RETRY_ON_EMPTY = int(os.getenv("YF_PROBE_RETRY", "1"))
 SLACK_WEBHOOK = os.getenv("YF_PROBE_SLACK_WEBHOOK", "")
 TIMEOUT_MS_WARN = int(os.getenv("YF_PROBE_TIMEOUT_MS_WARN", "5000"))
 
-
-def per_ticker_retry(px: pd.DataFrame, bad: list[str]) -> pd.DataFrame:
-    """Retry fetching history for tickers with missing data."""
-    for ticker in bad:
+def per_ticker_retry(px, bad):
+    for t in bad:
         try:
-            history = (
-                yf.Ticker(ticker)
-                .history(period=PERIOD, auto_adjust=True)["Close"]
-                .rename(ticker)
-            )
-            if not history.dropna().empty:
-                px[ticker] = history.reindex(px.index) if len(px.index) else history
-        except Exception:  # pragma: no cover - best effort retry
+            h = yf.Ticker(t).history(period=PERIOD, auto_adjust=True)["Close"].rename(t)
+            if not h.dropna().empty:
+                px[t] = h.reindex(px.index) if len(px.index) else h
+        except Exception: 
             pass
     return px
 
-
-def assess(px: pd.DataFrame) -> tuple[int, str, str, list[str]]:
-    """Assess data quality for each ticker."""
-    details: list[str] = []
-    good = 0
-    for ticker in TICKERS:
-        if ticker not in px.columns:
-            details.append(f"{ticker}:NF")
-            continue
-
-        series = px[ticker]
-        total = series.shape[0]
-        non_null = series.notna().sum()
-        nan_ratio = 1.0 - (non_null / total if total else 0.0)
-        head_nan = next((i for i, value in enumerate(series) if pd.notna(value)), len(series))
-        tail_nan = next(
-            (i for i, value in enumerate(reversed(series.tolist())) if pd.notna(value)),
-            len(series),
-        )
-
+def assess(px):
+    details, good = [], 0
+    for t in TICKERS:
+        if t not in px.columns:
+            details.append(f"{t}:NF"); continue
+        s = px[t]; n = s.shape[0]; nn = s.notna().sum()
+        nan_ratio = 1.0 - (nn/n if n else 0.0)
+        head_nan = next((i for i,v in enumerate(s) if pd.notna(v)), len(s))
+        tail_nan = next((i for i,v in enumerate(reversed(s.tolist())) if pd.notna(v)), len(s))
         status = "OK"
-        if non_null == 0:
-            status = "EMPTY"
-        elif (
-            non_null < MIN_LEN
-            or nan_ratio > MAX_NAN_RATIO
-            or head_nan > 5
-            or tail_nan > 5
-        ):
-            status = "BAD"
+        if nn==0: status="EMPTY"
+        elif nn<MIN_LEN or nan_ratio>MAX_NAN_RATIO or head_nan>5 or tail_nan>5: status="BAD"
+        if status=="OK": good+=1
+        details.append(f"{t}:{status}(len={nn},nan={nan_ratio:.2f})")
+    ok_ratio = good/len(TICKERS)
+    if good==len(TICKERS): return 0,"HEALTHY","✅",details
+    elif ok_ratio>=0.5: return 10,"DEGRADED","⚠️",details
+    else: return 20,"DOWN","🛑",details
 
-        if status == "OK":
-            good += 1
-        details.append(f"{ticker}:{status}(len={non_null},nan={nan_ratio:.2f})")
-
-    ok_ratio = good / len(TICKERS)
-    if good == len(TICKERS):
-        return 0, "HEALTHY", "✅", details
-    if ok_ratio >= 0.5:
-        return 10, "DEGRADED", "⚠️", details
-    return 20, "DOWN", "🛑", details
-
-
-def post_slack(text: str) -> None:
-    """Send message to Slack webhook if configured."""
+def post_slack(text):
     if not SLACK_WEBHOOK:
+        print("[SLACK] No webhook URL set, skip")
         return
     try:
-        import requests
+        r = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=5)
+        print(f"[SLACK] status={r.status_code}")
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[SLACK] send error: {e}")
 
-        requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=5)
-    except Exception:  # pragma: no cover - avoid crashing on notification failure
-        pass
+def main():
+    t0=time.time()
+    data=yf.download(TICKERS,period=PERIOD,auto_adjust=True,progress=False,threads=True)
+    close=data["Close"] if isinstance(data,pd.DataFrame) and "Close" in data else pd.DataFrame()
+    bad=[t for t in TICKERS if (t not in close.columns) or close.get(t,pd.Series(dtype=float)).dropna().empty]
+    if bad and RETRY_ON_EMPTY: close=per_ticker_retry(close,bad)
+    code,level,emoji,details=assess(close)
+    latency=int((time.time()-t0)*1000); speed="🚀" if latency<TIMEOUT_MS_WARN else "🐢"
+    summary=f"{emoji} YF_HEALTH {level} ok={len([d for d in details if 'OK' in d])}/{len(TICKERS)} latency={latency}ms {speed}\n" + " | ".join(details)
+    print(summary); post_slack(summary); sys.exit(code)
 
-
-def main() -> None:
-    t0 = time.time()
-    data = yf.download(
-        TICKERS,
-        period=PERIOD,
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
-    close = data["Close"] if isinstance(data, pd.DataFrame) and "Close" in data else pd.DataFrame()
-    bad = [
-        ticker
-        for ticker in TICKERS
-        if (ticker not in close.columns)
-        or close.get(ticker, pd.Series(dtype=float)).dropna().empty
-    ]
-    if bad and RETRY_ON_EMPTY:
-        close = per_ticker_retry(close, bad)
-    code, level, emoji, details = assess(close)
-    latency = int((time.time() - t0) * 1000)
-    speed = "🚀" if latency < TIMEOUT_MS_WARN else "🐢"
-    summary = (
-        f"{emoji} YF_HEALTH {level} "
-        f"ok={len([detail for detail in details if 'OK' in detail])}/{len(TICKERS)} "
-        f"latency={latency}ms {speed}\n" + " | ".join(details)
-    )
-    print(summary)
-    post_slack(summary)
-    sys.exit(code)
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
