@@ -46,7 +46,7 @@ RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # その他
-debug_mode, FINNHUB_API_KEY = False, os.environ.get("FINNHUB_API_KEY")
+debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
 
 # === 共有DTO（クラス間I/O契約）＋ Config ===
 @dataclass(frozen=True)
@@ -142,7 +142,9 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
 
     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-    focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))[:max_rows]
+    inc_all = list((Gp or set()) | (Dp or set()))
+    focus = (list(fb.df_z.index) if all_rows
+             else sorted(set(inc_all + g_new + g_out + d_new + d_out + (sb.top_G or []) + (sb.top_D or []) + g_miss + d_miss))[:max_rows])
 
     def _fmt_near(lbl, ser, lst):
         if ser is None: return f"{lbl}: off"
@@ -552,6 +554,17 @@ class Output:
             if add:
                 near_tbl = pd.concat([df_z.loc[add,['GROWTH_F','MOM','TRD','VOL']], pd.Series({t: g_score.get(t) for t in add}, name='GSC')], axis=1)
                 self.g_table = pd.concat([self.g_table, near_tbl], axis=0)
+        existing_idx_no_mark = [i.replace("⭐️", "") for i in self.g_table.index] if self.g_table is not None else []
+        cur_G = [t for t in exist if (t in df_z.index)]
+        cur_G_add = [t for t in cur_G if t not in existing_idx_no_mark]
+        if cur_G_add:
+            cur_g_tbl = pd.concat(
+                [df_z.loc[cur_G_add, ['GROWTH_F','MOM','TRD','VOL']],
+                 pd.Series({t: g_score.get(t) for t in cur_G_add}, name='GSC')],
+                axis=1
+            )
+            cur_g_tbl.index = [t + " (CUR)" for t in cur_g_tbl.index]
+            self.g_table = pd.concat([self.g_table, cur_g_tbl], axis=0)
         print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
 
         extra_D = [t for t in init_D if t not in top_D][:5]; D_UNI = top_D + extra_D
@@ -571,6 +584,21 @@ class Output:
                 d_disp2['QAL'], d_disp2['YLD'], d_disp2['VOL'], d_disp2['TRD'] = df_z.loc[add,'D_QAL'], df_z.loc[add,'D_YLD'], df_z.loc[add,'D_VOL_RAW'], df_z.loc[add,'D_TRD']
                 near_tbl = pd.concat([d_disp2, pd.Series({t: d_score_all.get(t) for t in add}, name='DSC')], axis=1)
                 self.d_table = pd.concat([self.d_table, near_tbl], axis=0)
+        existing_d_idx_no_mark = [i.replace("⭐️", "") for i in self.d_table.index] if self.d_table is not None else []
+        cur_D = [t for t in exist if (t in df_z.index)]
+        cur_D_add = [t for t in cur_D if t not in existing_d_idx_no_mark]
+        if cur_D_add:
+            d_disp2 = pd.DataFrame(index=cur_D_add)
+            d_disp2['QAL'] = df_z.loc[cur_D_add, 'D_QAL']
+            d_disp2['YLD'] = df_z.loc[cur_D_add, 'D_YLD']
+            d_disp2['VOL'] = df_z.loc[cur_D_add, 'D_VOL_RAW']
+            d_disp2['TRD'] = df_z.loc[cur_D_add, 'D_TRD']
+            cur_d_tbl = pd.concat(
+                [d_disp2, pd.Series({t: d_score_all.get(t) for t in cur_D_add}, name='DSC')],
+                axis=1
+            )
+            cur_d_tbl.index = [t + " (CUR)" for t in cur_d_tbl.index]
+            self.d_table = pd.concat([self.d_table, cur_d_tbl], axis=0)
         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
 
         # === Changes（IN の GSC/DSC を表示。OUT は銘柄名のみ） ===
