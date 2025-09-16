@@ -124,10 +124,11 @@ def _slack_debug(text: str, chunk=2800):
         _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":f"```{text[i:j]}```"}}]})
         i = j
 
-def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
+def _compact_debug(fb, sb, prevG, prevD, *, held_tickers=None, max_rows=140):
+    df_z = fb.df_z
     want=["TR","EPS","REV","ROE","BETA_RAW","FCF","RS","TR_str","DIV_STREAK","DSC"]
     all_cols = _env_true("DEBUG_ALL_COLS", False)
-    cols = list(fb.df_z.columns if all_cols else [c for c in want if c in fb.df_z.columns])
+    cols = list(df_z.columns if all_cols else [c for c in want if c in df_z.columns])
 
     Gp, Dp = set(prevG or []), set(prevD or [])
     g_new=[t for t in (sb.top_G or []) if t not in Gp]; g_out=[t for t in Gp if t not in (sb.top_G or [])]
@@ -142,7 +143,7 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
 
     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-    focus = list(fb.df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))[:max_rows]
+    focus = list(df_z.index) if all_rows else sorted(set(g_new+g_out+d_new+d_out+(sb.top_G or [])+(sb.top_D or [])+g_miss+d_miss))[:max_rows]
 
     def _fmt_near(lbl, ser, lst):
         if ser is None: return f"{lbl}: off"
@@ -157,9 +158,9 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
           f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}"]
 
     tbl="(df_z or columns not available)"
-    if not fb.df_z.empty and cols:
-        idx=[t for t in focus if t in fb.df_z.index]
-        tbl=fb.df_z.loc[idx, cols].round(3).to_string(max_rows=None, max_cols=None)
+    if not df_z.empty and cols:
+        idx=[t for t in focus if t in df_z.index]
+        tbl=df_z.loc[idx, cols].round(3).to_string(max_rows=None, max_cols=None)
 
     miss_txt=""
     if _env_true("DEBUG_MISSING_LOGS", False):
@@ -167,7 +168,42 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
         if miss is not None and not miss.empty:
             miss_txt="\nMissing data (head)\n"+miss.head(10).to_string(index=False)
 
-    return "\n".join(head+["\nChanged/Selected (+ Near Miss)", tbl])+miss_txt
+    parts = head + ["", "Changed/Selected (+ Near Miss)", tbl]
+
+    held_lines = []
+    if held_tickers:
+        ht = [t for t in held_tickers if t in df_z.index]
+        if ht:
+            cols_spec = [
+                ("TR_EPS",  "TREND_SLOPE_EPS"),
+                ("TR_REV",  "TREND_SLOPE_REV"),
+                ("EPS",     "EPS_Q_YOY"),
+                ("REV",     "REV_Q_YOY"),
+                ("FCF",     "FCF_MGN"),
+                ("RULE40",  "RULE40"),
+                ("GRW",     "GROWTH_F"),
+                ("GSC",     "GSC"),
+            ]
+            header = "  " + "  ".join(f"{lab:>6}" for lab, _ in cols_spec)
+            rows = []
+            for t in ht:
+                values = []
+                for _, col_name in cols_spec:
+                    if col_name in df_z.columns and pd.notna(df_z.at[t, col_name]):
+                        values.append(f"{df_z.at[t, col_name]:+.3f}")
+                    else:
+                        values.append("  NaN ")
+                rows.append(f"{t:<6}" + "  " + "  ".join(values))
+            if rows:
+                held_lines = [header] + rows
+
+    if held_lines:
+        parts.extend(["", "Current(Held):", *held_lines, ""])
+
+    out = "\n".join(parts)
+    if miss_txt:
+        out += miss_txt
+    return out
 
 def _disjoint_keepG(top_G, top_D, poolD):
     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
@@ -878,7 +914,7 @@ def run_pipeline() -> SelectionBundle:
 
     if debug_mode:
         try:
-            _slack_debug(_compact_debug(fb, sb, [], []))
+            _slack_debug(_compact_debug(fb, sb, [], [], held_tickers=exist))
         except Exception as e:
             print(f"[debug skipped] {e}")
 
