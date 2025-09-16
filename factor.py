@@ -26,7 +26,7 @@ exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_ticker
 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
-g_weights = {'GRW':0.30,'MOM':0.55,'VOL':-0.15}
+g_weights = {'GROWTH_F':0.30,'MOM':0.55,'VOL':-0.15}
 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
@@ -527,9 +527,9 @@ class Output:
 
         extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
         gsc_series = pd.Series({t: g_score.get(t) for t in G_UNI}, name='GSC')
-        self.g_table = pd.concat([df_z.loc[G_UNI,['GRW','MOM','TRD','VOL']], gsc_series], axis=1)
+        self.g_table = pd.concat([df_z.loc[G_UNI,['GROWTH_F','MOM','TRD','VOL']], gsc_series], axis=1)
         self.g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
-        self.g_formatters = {col:"{:.2f}".format for col in ['GRW','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
+        self.g_formatters = {col:"{:.2f}".format for col in ['GROWTH_F','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
         self.g_title = (f"[G枠 / {N_G} / {_fmt_w(g_weights)} / corrM={corrM} / "
                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
         if near_G:
@@ -550,7 +550,7 @@ class Output:
                 except Exception:
                     pass
             if add:
-                near_tbl = pd.concat([df_z.loc[add,['GRW','MOM','TRD','VOL']], pd.Series({t: g_score.get(t) for t in add}, name='GSC')], axis=1)
+                near_tbl = pd.concat([df_z.loc[add,['GROWTH_F','MOM','TRD','VOL']], pd.Series({t: g_score.get(t) for t in add}, name='GSC')], axis=1)
                 self.g_table = pd.concat([self.g_table, near_tbl], axis=0)
         print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
 
