@@ -169,8 +169,12 @@ def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
         except Exception as e:
             print(f"[ERR] debug_post_failed: {e}")
 
-    body = str(text or "")
-    lines = body.splitlines() or [""]
+    body = str(text or "").strip()
+    if not body:
+        print("[DBG] skip debug send: empty body")
+        return
+
+    lines = body.splitlines()
     block: list[str] = []
     block_len = 0
 
@@ -850,12 +854,14 @@ class Output:
         except Exception as e:
             print(f"[ERR] main_post_failed: {e}")
 
-        if debug_mode:
+        if debug_mode and (self.debug_text or "").strip():
             try:
                 requests.post(SLACK_WEBHOOK_URL, json={"text": "```DEBUG (after Low Score)```"})
             except Exception as e:
                 print(f"[ERR] debug_header_failed: {e}")
             _slack_send_text_chunks(SLACK_WEBHOOK_URL, self.debug_text, chunk=2800)
+        else:
+            print(f"[DBG] skip debug send: debug_mode={debug_mode} debug_text_empty={not bool((self.debug_text or '').strip())}")
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
     try:
