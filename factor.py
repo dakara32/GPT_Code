@@ -188,11 +188,13 @@ def _slack_debug(text: str, chunk: int = 2800, fenced: bool = True) -> None:
     _send(block)
 
 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-    src = getattr(fb, "df_full_z", None)
+    src = getattr(fb, "df_full", None)
+    if not isinstance(src, pd.DataFrame) or src.empty:
+        src = getattr(fb, "df_full_z", None)
     if not isinstance(src, pd.DataFrame) or src.empty:
         src = getattr(fb, "df_z", None)
     if not isinstance(src, pd.DataFrame) or src.empty:
-        return "df_z not available"
+        return "df not available"
 
     df_show = src.apply(pd.to_numeric, errors="coerce").rename(
         columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in src.columns}
@@ -734,9 +736,13 @@ class Output:
         # --- ここから: デバッグ出力は _compact_debug で一本化（表示経路もSlack経路もこれだけ）---
         if self.debug:
             from types import SimpleNamespace
+            df_full_src    = getattr(getattr(self, "_sc", None), "_feat", None)
+            df_full        = getattr(df_full_src, "df_full", None) or kwargs.get("df_full")
+            df_full_z_pass = getattr(df_full_src, "df_full_z", None) or kwargs.get("df_full_z")
             fb_like = SimpleNamespace(
+                df_full=df_full,
                 df_z=df_z,
-                df_full_z=kwargs.get("df_full_z"),
+                df_full_z=df_full_z_pass,
                 g_score=g_score,
                 d_score_all=d_score_all,
                 missing_logs=self.miss_df,
@@ -749,7 +755,7 @@ class Output:
                 prevD=kwargs.get("prev_D", exist),
                 max_rows=int(os.getenv("DEBUG_MAX_ROWS", "140")),
             )
-            print(self.debug_text)
+            # print(self.debug_text)
         else:
             self.debug_text = ""
         # === 追加: GSC+DSC が低い順 TOP10 ===
