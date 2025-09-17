@@ -99,244 +99,250 @@ L57     return exist, cand_keep, tickers
 L58
 L59
 L60 def _fetch_prices_600d(tickers):
-L61     data = yf.download(tickers + [BENCH], period="600d", auto_adjust=True, progress=False)
-L62     px   = data["Close"].dropna(how="all", axis=1)
-L63     spx  = data["Close"][BENCH].dropna()
-L64     return px, spx
-L65
-L66
-L67 def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
-L68     # scorer.py の実装をそのまま移植（ベクトル化版）
-L69     import numpy as np, pandas as pd
-L70     if px is None or px.empty:
-L71         return pd.Series(dtype=int)
-L72     px = px.dropna(how="all", axis=1)
-L73     if win_days and win_days > 0:
-L74         px = px.tail(win_days)
-L75     if px.empty:
-L76         return pd.Series(dtype=int)
-L77     spx = spx.reindex(px.index).ffill()
-L78
-L79     ma50  = px.rolling(50).mean()
-L80     ma150 = px.rolling(150).mean()
-L81     ma200 = px.rolling(200).mean()
-L82
-L83     tt = (px > ma150)
-L84     tt &= (px > ma200)
-L85     tt &= (ma150 > ma200)
-L86     tt &= (ma200 - ma200.shift(21) > 0)
-L87     tt &= (ma50  > ma150)
-L88     tt &= (ma50  > ma200)
-L89     tt &= (px    > ma50)
-L90
-L91     lo252 = px.rolling(252).min()
-L92     hi252 = px.rolling(252).max()
-L93     tt &= (px.divide(lo252).sub(1.0) >= 0.30)
-L94     tt &= (px >= (0.75 * hi252))
-L95
-L96     r12  = px.divide(px.shift(252)).sub(1.0)
-L97     br12 = spx.divide(spx.shift(252)).sub(1.0)
-L98     r1   = px.divide(px.shift(22)).sub(1.0)
-L99     br1  = spx.divide(spx.shift(22)).sub(1.0)
-L100     rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
-L101     tt &= (rs >= 0.10)
-L102
-L103     return tt.fillna(False).sum(axis=1).astype(int)
+L61     data = yf.download(
+L62         tickers + [BENCH],
+L63         period="600d",
+L64         auto_adjust=True,
+L65         progress=False,
+L66         threads=False,
+L67     )
+L68     close = data["Close"]
+L69     px = close.dropna(how="all", axis=1).ffill(limit=2)
+L70     spx = close[BENCH].reindex(px.index).ffill()
+L71     return px, spx
+L72
+L73
+L74 def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
+L75     # scorer.py の実装をそのまま移植（ベクトル化版）
+L76     import numpy as np, pandas as pd
+L77     if px is None or px.empty:
+L78         return pd.Series(dtype=int)
+L79     px = px.dropna(how="all", axis=1)
+L80     if win_days and win_days > 0:
+L81         px = px.tail(win_days)
+L82     if px.empty:
+L83         return pd.Series(dtype=int)
+L84     # 欠損吸収
+L85     px = px.ffill(limit=2)
+L86     spx = spx.reindex(px.index).ffill()
+L87
+L88     ma50  = px.rolling(50,  min_periods=50).mean()
+L89     ma150 = px.rolling(150, min_periods=150).mean()
+L90     ma200 = px.rolling(200, min_periods=200).mean()
+L91
+L92     tt = (px > ma150)
+L93     tt &= (px > ma200)
+L94     tt &= (ma150 > ma200)
+L95     tt &= (ma200 - ma200.shift(21) > 0)
+L96     tt &= (ma50  > ma150)
+L97     tt &= (ma50  > ma200)
+L98     tt &= (px    > ma50)
+L99
+L100     lo252 = px.rolling(252, min_periods=252).min()
+L101     hi252 = px.rolling(252, min_periods=252).max()
+L102     tt &= (px.divide(lo252).sub(1.0) >= 0.30)
+L103     tt &= (px >= (0.75 * hi252))
 L104
-L105
-L106 def build_breadth_header():
-L107     # factor._build_breadth_lead_lines と同一挙動
-L108     exist, cand, tickers = _load_universe()
-L109     if not tickers:
-L110         return "", "NORMAL", 0
-L111     px, spx = _fetch_prices_600d(tickers)
-L112     win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
-L113     C_ts = trend_template_breadth_series(px, spx, win_days=win)
-L114     if C_ts.empty:
-L115         return "", "NORMAL", 0
-L116     warmup = int(os.getenv("BREADTH_WARMUP_DAYS","252"))
-L117     base = C_ts.iloc[warmup:] if len(C_ts)>warmup else C_ts
-L118     C_full = int(C_ts.iloc[-1])
-L119
-L120     q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
-L121     q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
-L122     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
-L123
-L124     # G枠サイズ（Breadth基準）
-L125     N_G = config.N_G
-L126     th_in_rec   = max(N_G, q05)
-L127     th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
-L128     th_norm_rec = max(3*N_G, q60)
-L129
-L130     use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
-L131     if use_calib:
-L132         th_in, th_out, th_norm, th_src = th_in_rec, th_out_rec, th_norm_rec, "自動"
-L133     else:
-L134         th_in   = int(os.getenv("GTT_EMERG_IN", str(N_G)))
-L135         th_out  = int(os.getenv("GTT_EMERG_OUT", str(int(1.5*N_G))))
-L136         th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3*N_G)))
-L137         th_src = "手動"
+L105     r12  = px.divide(px.shift(252)).sub(1.0)
+L106     br12 = spx.divide(spx.shift(252)).sub(1.0)
+L107     r1   = px.divide(px.shift(22)).sub(1.0)
+L108     br1  = spx.divide(spx.shift(22)).sub(1.0)
+L109     rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
+L110     tt &= (rs >= 0.10)
+L111
+L112     return tt.fillna(False).sum(axis=1).astype(int)
+L113
+L114
+L115 def build_breadth_header():
+L116     # factor._build_breadth_lead_lines と同一挙動
+L117     exist, cand, tickers = _load_universe()
+L118     if not tickers:
+L119         return "", "NORMAL", 0
+L120     px, spx = _fetch_prices_600d(tickers)
+L121     win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
+L122     C_ts = trend_template_breadth_series(px, spx, win_days=win)
+L123     if C_ts.empty:
+L124         return "", "NORMAL", 0
+L125     warmup = int(os.getenv("BREADTH_WARMUP_DAYS","252"))
+L126     base = C_ts.iloc[warmup:] if len(C_ts)>warmup else C_ts
+L127     C_full = int(C_ts.iloc[-1])
+L128
+L129     q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
+L130     q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
+L131     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
+L132
+L133     # G枠サイズ（Breadth基準）
+L134     N_G = config.N_G
+L135     th_in_rec   = max(N_G, q05)
+L136     th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
+L137     th_norm_rec = max(3*N_G, q60)
 L138
-L139     prev = load_mode("NORMAL")
-L140     if   prev == "EMERG":
-L141         mode = "EMERG"   if (C_full < th_out)  else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-L142     elif prev == "CAUTION":
-L143         mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
-L144     else:
-L145         mode = "EMERG"   if (C_full < th_in)   else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-L146     save_mode(mode)
+L139     use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
+L140     if use_calib:
+L141         th_in, th_out, th_norm, th_src = th_in_rec, th_out_rec, th_norm_rec, "自動"
+L142     else:
+L143         th_in   = int(os.getenv("GTT_EMERG_IN", str(N_G)))
+L144         th_out  = int(os.getenv("GTT_EMERG_OUT", str(int(1.5*N_G))))
+L145         th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3*N_G)))
+L146         th_src = "手動"
 L147
-L148     _MODE_JA   = {"EMERG":"緊急","CAUTION":"警戒","NORMAL":"通常"}
-L149     _MODE_EMOJI= {"EMERG":"🚨","CAUTION":"⚠️","NORMAL":"🟢"}
-L150     mode_ja, emoji = _MODE_JA.get(mode,mode), _MODE_EMOJI.get(mode,"ℹ️")
-L151     eff_days = len(base)
-L152
-L153     lead_lines = [
-L154         f"{emoji} *現在モード: {mode_ja}*",
-L155         f"テンプレ合格本数: *{C_full}本*",
-L156         "しきい値（{0}）".format(th_src),
-L157         f"  ・緊急入り: <{th_in}本",
-L158         f"  ・緊急解除: ≥{th_out}本",
-L159         f"  ・通常復帰: ≥{th_norm}本",
-L160         f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
-L161         f"  ・下位5%: {q05}本",
-L162         f"  ・下位20%: {q20}本",
-L163         f"  ・60%分位: {q60}本",
-L164     ]
-L165     return "```" + "\n".join(lead_lines) + "```", mode, C_full
-L166 # Debug flag
-L167 debug_mode = False  # set to True for detailed output
-L168
-L169 # --- Finnhub settings & helper ---
-L170 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
-L171 if not FINNHUB_API_KEY:
-L172     raise ValueError("FINNHUB_API_KEY not set (環境変数が未設定です)")
-L173
-L174 RATE_LIMIT = 55  # requests per minute (free tier is 60)
-L175 call_times = []
-L176
+L148     prev = load_mode("NORMAL")
+L149     if   prev == "EMERG":
+L150         mode = "EMERG"   if (C_full < th_out)  else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+L151     elif prev == "CAUTION":
+L152         mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
+L153     else:
+L154         mode = "EMERG"   if (C_full < th_in)   else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+L155     save_mode(mode)
+L156
+L157     _MODE_JA   = {"EMERG":"緊急","CAUTION":"警戒","NORMAL":"通常"}
+L158     _MODE_EMOJI= {"EMERG":"🚨","CAUTION":"⚠️","NORMAL":"🟢"}
+L159     mode_ja, emoji = _MODE_JA.get(mode,mode), _MODE_EMOJI.get(mode,"ℹ️")
+L160     eff_days = len(base)
+L161
+L162     lead_lines = [
+L163         f"{emoji} *現在モード: {mode_ja}*",
+L164         f"テンプレ合格本数: *{C_full}本*",
+L165         "しきい値（{0}）".format(th_src),
+L166         f"  ・緊急入り: <{th_in}本",
+L167         f"  ・緊急解除: ≥{th_out}本",
+L168         f"  ・通常復帰: ≥{th_norm}本",
+L169         f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
+L170         f"  ・下位5%: {q05}本",
+L171         f"  ・下位20%: {q20}本",
+L172         f"  ・60%分位: {q60}本",
+L173     ]
+L174     return "```" + "\n".join(lead_lines) + "```", mode, C_full
+L175 # Debug flag
+L176 debug_mode = False  # set to True for detailed output
 L177
-L178 def finnhub_get(endpoint, params):
-L179     """Call Finnhub API with basic rate limiting."""
-L180     now = time.time()
-L181     cutoff = now - 60
-L182     while call_times and call_times[0] < cutoff:
-L183         call_times.pop(0)
-L184     if len(call_times) >= RATE_LIMIT:
-L185         sleep_time = 60 - (now - call_times[0])
-L186         time.sleep(sleep_time)
-L187     params = {**params, "token": FINNHUB_API_KEY}
-L188     try:
-L189         resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params)
-L190         resp.raise_for_status()
-L191         data = resp.json()
-L192     except requests.exceptions.JSONDecodeError as e:
-L193         print(f"⚠️ Finnhub API JSON decode error: {e}")
-L194         return {}
-L195     except Exception as e:
-L196         print(f"⚠️ Finnhub API error: {e}")
-L197         return {}
-L198     call_times.append(time.time())
-L199     return data
-L200
-L201
-L202 def fetch_price(symbol):
-L203     try:
-L204         data = finnhub_get("quote", {"symbol": symbol})
-L205         price = data.get("c")
-L206         return float(price) if price not in (None, 0) else float("nan")
-L207     except Exception:
-L208         return float("nan")
+L178 # --- Finnhub settings & helper ---
+L179 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+L180 if not FINNHUB_API_KEY:
+L181     raise ValueError("FINNHUB_API_KEY not set (環境変数が未設定です)")
+L182
+L183 RATE_LIMIT = 55  # requests per minute (free tier is 60)
+L184 call_times = []
+L185
+L186
+L187 def finnhub_get(endpoint, params):
+L188     """Call Finnhub API with basic rate limiting."""
+L189     now = time.time()
+L190     cutoff = now - 60
+L191     while call_times and call_times[0] < cutoff:
+L192         call_times.pop(0)
+L193     if len(call_times) >= RATE_LIMIT:
+L194         sleep_time = 60 - (now - call_times[0])
+L195         time.sleep(sleep_time)
+L196     params = {**params, "token": FINNHUB_API_KEY}
+L197     try:
+L198         resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params)
+L199         resp.raise_for_status()
+L200         data = resp.json()
+L201     except requests.exceptions.JSONDecodeError as e:
+L202         print(f"⚠️ Finnhub API JSON decode error: {e}")
+L203         return {}
+L204     except Exception as e:
+L205         print(f"⚠️ Finnhub API error: {e}")
+L206         return {}
+L207     call_times.append(time.time())
+L208     return data
 L209
 L210
-L211 def fetch_vix_ma5():
-L212     """Retrieve VIX 5-day moving average via yfinance."""
-L213     try:
-L214         vix = (
-L215             yf.download("^VIX", period="7d", interval="1d", progress=False, auto_adjust=False)["Close"]
-L216             .dropna()
-L217             .tail(5)
-L218         )
-L219         if len(vix) < 5:
-L220             return float("nan")
-L221         return vix.mean().item()
-L222     except Exception:
-L223         return float("nan")
-L224
-L225
-L226
-L227 # === Minervini-like sell signals ===
-L228 def _yf_df(sym, period="6mo"):
-L229     """日足/MA/出来高平均を取得。欠損時は None。"""
-L230     try:
-L231         df = yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False)
-L232         if df is None or df.empty:
-L233             return None
-L234         return df.dropna().assign(
-L235             ma20=lambda d: d["Close"].rolling(20).mean(),
-L236             ma50=lambda d: d["Close"].rolling(50).mean(),
-L237             vol50=lambda d: d["Volume"].rolling(50).mean(),
-L238         )
-L239     except Exception:
-L240         return None
-L241
-L242
-L243 def _scalar(row, col):
-L244     """Series/npスカラ→Pythonスカラ化（NaNはNaNのまま）"""
-L245     try:
-L246         v = row[col]
-L247         if hasattr(v, "item"):
-L248             try:
-L249                 v = v.item()
-L250             except Exception:
-L251                 pass
-L252         return v
-L253     except Exception:
-L254         return float("nan")
-L255
-L256
-L257 def _is_strict_down(seq):
-L258     """数列が厳密に連続で切り下がっているか（len>=4を想定）。NaN含みはFalse。"""
-L259     try:
-L260         xs = [float(x) for x in seq]
-L261         if any(pd.isna(x) for x in xs) or len(xs) < 4:
-L262             return False
-L263         return all(b < a for a, b in zip(xs[:-1], xs[1:]))
-L264     except Exception:
-L265         return False
-L266
-L267
-L268 def _signals_for_day(df, idx):
-L269     """df.loc[idx] 1日分に対しシグナル配列を返す（値動き/出来高ベースのみ）。"""
-L270     try:
-L271         sig = []
-L272         d = df.loc[idx]
-L273         close = _scalar(d, "Close")
-L274         ma20 = _scalar(d, "ma20")
-L275         ma50 = _scalar(d, "ma50")
-L276         vol = _scalar(d, "Volume")
-L277         vol50 = _scalar(d, "vol50")
-L278
-L279         if pd.notna(close) and pd.notna(ma20) and close < ma20:
-L280             sig.append("20DMA↓")
-L281
-L282         if all(pd.notna(x) for x in (close, ma50, vol, vol50)) and close < ma50 and vol > 1.5 * vol50:
-L283             sig.append("50DMA↓(大商い)")
-L284
-L285         last4 = df.loc[:idx].tail(4)
-L286         last10 = df.loc[:idx].tail(10)
+L211 def fetch_price(symbol):
+L212     try:
+L213         data = finnhub_get("quote", {"symbol": symbol})
+L214         price = data.get("c")
+L215         return float(price) if price not in (None, 0) else float("nan")
+L216     except Exception:
+L217         return float("nan")
+L218
+L219
+L220 def fetch_vix_ma5():
+L221     """Retrieve VIX 5-day moving average via yfinance."""
+L222     try:
+L223         vix = (
+L224             yf.download("^VIX", period="7d", interval="1d", progress=False, auto_adjust=False)["Close"]
+L225             .dropna()
+L226             .tail(5)
+L227         )
+L228         if len(vix) < 5:
+L229             return float("nan")
+L230         return vix.mean().item()
+L231     except Exception:
+L232         return float("nan")
+L233
+L234
+L235
+L236 # === Minervini-like sell signals ===
+L237 def _yf_df(sym, period="6mo"):
+L238     """日足/MA/出来高平均を取得。欠損時は None。"""
+L239     try:
+L240         df = yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False)
+L241         if df is None or df.empty:
+L242             return None
+L243         return df.dropna().assign(
+L244             ma20=lambda d: d["Close"].rolling(20).mean(),
+L245             ma50=lambda d: d["Close"].rolling(50).mean(),
+L246             vol50=lambda d: d["Volume"].rolling(50).mean(),
+L247         )
+L248     except Exception:
+L249         return None
+L250
+L251
+L252 def _scalar(row, col):
+L253     """Series/npスカラ→Pythonスカラ化（NaNはNaNのまま）"""
+L254     try:
+L255         v = row[col]
+L256         if hasattr(v, "item"):
+L257             try:
+L258                 v = v.item()
+L259             except Exception:
+L260                 pass
+L261         return v
+L262     except Exception:
+L263         return float("nan")
+L264
+L265
+L266 def _is_strict_down(seq):
+L267     """数列が厳密に連続で切り下がっているか（len>=4を想定）。NaN含みはFalse。"""
+L268     try:
+L269         xs = [float(x) for x in seq]
+L270         if any(pd.isna(x) for x in xs) or len(xs) < 4:
+L271             return False
+L272         return all(b < a for a, b in zip(xs[:-1], xs[1:]))
+L273     except Exception:
+L274         return False
+L275
+L276
+L277 def _signals_for_day(df, idx):
+L278     """df.loc[idx] 1日分に対しシグナル配列を返す（値動き/出来高ベースのみ）。"""
+L279     try:
+L280         sig = []
+L281         d = df.loc[idx]
+L282         close = _scalar(d, "Close")
+L283         ma20 = _scalar(d, "ma20")
+L284         ma50 = _scalar(d, "ma50")
+L285         vol = _scalar(d, "Volume")
+L286         vol50 = _scalar(d, "vol50")
 L287
-L288         lows_desc = _is_strict_down(last4["Low"].tolist()) if last4["Low"].notna().all() else False
-L289         reds = int((last10["Close"] < last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
-L290         if lows_desc or reds > 5:
-L291             sig.append("連続安値/陰線優勢")
-L292
-L293         ups = int((last10["Close"] > last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
-L294         if ups >= 7:
-L295             sig.append("上げ偏重(>70%)")
+L288         if pd.notna(close) and pd.notna(ma20) and close < ma20:
+L289             sig.append("20DMA↓")
+L290
+L291         if all(pd.notna(x) for x in (close, ma50, vol, vol50)) and close < ma50 and vol > 1.5 * vol50:
+L292             sig.append("50DMA↓(大商い)")
+L293
+L294         last4 = df.loc[:idx].tail(4)
+L295         last10 = df.loc[:idx].tail(10)
 L296
-L297         last15 = df.loc[:idx].tail(15)
-L298         base0 = _scalar(last15.iloc[0], "Close") if len(last15) > 0 else float("nan")
-L299         if pd.notna(base0) and pd.notna(close) and base0 != 0 and (close / base0 - 1) >= 0.25:
-L300             sig.append("+25%/15日内
+L297         lows_desc = _is_strict_down(last4["Low"].tolist()) if last4["Low"].notna().all() else False
+L298         reds = int((last10["Close"] < last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
+L299         if lows_desc or reds > 5:
+L300             sig.append("連続安値/陰線優勢")
+L301
+L302         ups = int((last10["Close"] > last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
+L303         if ups >= 7:
+L304             sig.append("上げ偏重(>70%)")
+L305
+L306
 ```
