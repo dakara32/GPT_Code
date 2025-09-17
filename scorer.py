@@ -772,12 +772,18 @@ class Scorer:
         except Exception:
             pass
 
+        df_full = df.copy()
+        df_full_z = df_z.copy()
+
         from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
         return FeatureBundle(df=df,
             df_z=df_z,
             g_score=g_score,
             d_score_all=d_score_all,
-            missing_logs=pd.DataFrame(missing_logs))
+            missing_logs=pd.DataFrame(missing_logs),
+            df_full=df_full,
+            df_full_z=df_full_z,
+            scaler=None)
 
 def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_pullback=5):
     """

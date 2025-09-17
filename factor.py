@@ -3,10 +3,10 @@
 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
 SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
 SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
-import os, time, requests
+import os, time, requests, logging
 from time import perf_counter
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
@@ -14,6 +14,8 @@ import yfinance as yf
 from scipy.stats import zscore  # used via scorer
 from scorer import Scorer, ttm_div_yield_portfolio
 import config
+
+logger = logging.getLogger(__name__)
 
 class T:
     t = perf_counter()
@@ -71,6 +73,9 @@ class FeatureBundle:
     g_score: pd.Series
     d_score_all: pd.Series
     missing_logs: pd.DataFrame
+    df_full: pd.DataFrame | None = None
+    df_full_z: pd.DataFrame | None = None
+    scaler: Any | None = None
 
 @dataclass(frozen=True)
 class SelectionBundle:
@@ -129,6 +134,20 @@ _DEBUG_COL_ORDER = [
     "RULE40", "RULE40_RAW", "FCF_MGN", "FCF_MGN_RAW",
     "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK",
 ]
+
+DEBUG_COLS = [
+    "GRW", "GRW_RAW",
+    "TR_EPS", "TR_EPS_RAW", "TR_REV", "TR_REV_RAW",
+    "TR_EPS_YR", "TR_EPS_YR_RAW", "TR_REV_YR", "TR_REV_YR_RAW",
+    "EPS_Q_YOY", "EPS_Q_YOY_RAW", "EPS_YOY", "EPS_YOY_RAW",
+    "REV_Q_YOY", "REV_Q_YOY_RAW", "REV_YOY", "REV_YOY_RAW",
+    "REV_YOY_ACC", "REV_YOY_ACC_RAW", "REV_YOY_VAR", "REV_YOY_VAR_RAW",
+    "REV_ANN_STREAK", "RULE40", "RULE40_RAW",
+    "FCF_MGN", "FCF_MGN_RAW", "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK",
+    "GSC", "DSC"
+]
+
+MUST_DEBUG_COLS = {"TR_EPS", "TR_REV", "REV_Q_YOY", "REV_YOY_ACC", "RULE40", "FCF_MGN"}
 
 def _post_slack(payload: dict):
     url = os.getenv("SLACK_WEBHOOK_URL")
@@ -198,6 +217,61 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     g_miss = [t for t in (g_sorted.index if g_sorted is not None else []) if t not in g_pick][:10]
     used_d = set(g_pick + d_pick)
     d_miss = [t for t in (d_sorted.index if d_sorted is not None else []) if t not in used_d][:10]
+
+
+def _build_debug_table(bundle: FeatureBundle | None, selected: List[str], near: List[str], current: List[str]) -> pd.DataFrame:
+    if bundle is None:
+        return pd.DataFrame()
+    source = getattr(bundle, "df_full_z", None)
+    if not isinstance(source, pd.DataFrame) or source.empty:
+        source = getattr(bundle, "df_z", pd.DataFrame())
+    if not isinstance(source, pd.DataFrame) or source.empty:
+        return pd.DataFrame()
+    source = source.apply(pd.to_numeric, errors="coerce")
+    source = source.rename(columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in source.columns})
+
+    missing = sorted(c for c in MUST_DEBUG_COLS if c not in source.columns)
+    if missing:
+        logger.warning("[debug] missing cols: %s", missing)
+
+    cols = [c for c in DEBUG_COLS if c in source.columns]
+    if not cols:
+        cols = [c for c in source.columns if c not in ("GSC", "DSC")]
+
+    if cols:
+        ratio_nan = source[cols].isna().mean().round(3)
+        if not ratio_nan.empty:
+            logger.info("[debug] NaN ratio: %s", ratio_nan.to_dict())
+
+    seen, tickers_all = set(), []
+
+    def _extend(items: List[str]):
+        for t in items or []:
+            if t not in seen:
+                tickers_all.append(t)
+                seen.add(t)
+
+    _extend(list(dict.fromkeys(selected or [])))
+    _extend(list(dict.fromkeys(near or [])))
+    _extend(list(dict.fromkeys(current or [])))
+    for t in source.index:
+        if t not in seen:
+            tickers_all.append(t)
+
+    dbg = source.reindex(tickers_all)
+    if cols:
+        dbg = dbg.reindex(columns=cols)
+
+    def _fmt_col(series: pd.Series) -> pd.Series:
+        return series.apply(lambda v: f"{float(v):.3f}" if pd.notna(v) else "nan")
+
+    dbg_fmt = dbg.apply(_fmt_col)
+
+    order = [c for c in DEBUG_COLS if c in dbg_fmt.columns]
+    extra = [c for c in dbg_fmt.columns if c not in order]
+    if extra:
+        order.extend(extra)
+    return dbg_fmt.reindex(columns=order)
 
     all_rows = _env_true("DEBUG_ALL_ROWS", False)
 
@@ -691,20 +765,6 @@ class Output:
         def _fmt_row(s):
             return pd.Series({'RET':f"{s['RET']:.1f}%",'VOL':f"{s['VOL']:.1f}%",'SHP':f"{s['SHP']:.1f}",'MDD':f"{s['MDD']:.1f}%",'RAWρ':(f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"),'RESIDρ':(f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN"),'DIVY':f"{s['DIVY']:.1f}%"})
         self.df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1); print("Performance Comparison:"); print(self.df_metrics_fmt.to_string())
-        if self.debug:
-            dbg_df = df_z.rename(columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in df_z.columns})
-            dbg_cols = [c for c in _DEBUG_COL_ORDER if c in dbg_df.columns]
-            if not dbg_cols:
-                dbg_cols = [c for c in dbg_df.columns if c not in ("GSC", "DSC")]
-            debug_tbl = dbg_df.reindex(columns=dbg_cols).copy()
-            if hasattr(g_score, "get"):
-                debug_tbl["GSC"] = [g_score.get(t, np.nan) for t in debug_tbl.index]
-            if hasattr(d_score_all, "get"):
-                debug_tbl["DSC"] = [d_score_all.get(t, np.nan) for t in debug_tbl.index]
-            order = dbg_cols + [c for c in ("GSC", "DSC") if c not in dbg_cols]
-            self.debug_table = debug_tbl.reindex(columns=order).round(3)
-            print("Debug Data:"); print(self.debug_table.to_string())
-
         # === 追加: GSC+DSC が低い順 TOP10 ===
         try:
             all_scores = pd.DataFrame({'GSC': df_z['GSC'], 'DSC': df_z['DSC']}).copy()
@@ -942,10 +1002,20 @@ def run_pipeline() -> SelectionBundle:
     except Exception: pass
     if hasattr(sc, "_feat"):
         try:
-            out.miss_df = sc._feat.missing_logs
-            out.display_results(exist=exist, bench=bench, df_z=sc._feat.df_z,
-                g_score=sc._feat.g_score, d_score_all=sc._feat.d_score_all,
+            fb = sc._feat
+            out.miss_df = fb.missing_logs
+            out.display_results(exist=exist, bench=bench, df_z=fb.df_z,
+                g_score=fb.g_score, d_score_all=fb.d_score_all,
                 init_G=top_G, init_D=top_D, top_G=top_G, top_D=top_D)
+            near_D = getattr(sc, "_near_D", [])
+            selected_all = list(dict.fromkeys(list(top_G) + list(top_D)))
+            near_all = list(dict.fromkeys(list(near_G or []) + list(near_D or [])))
+            debug_tbl = _build_debug_table(fb, selected_all, near_all, exist)
+            if not debug_tbl.empty:
+                out.debug_table = debug_tbl
+                if debug_mode:
+                    print("Debug Data:")
+                    print(debug_tbl.to_string())
         except Exception:
             pass
     out.notify_slack()
