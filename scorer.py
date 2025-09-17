@@ -68,6 +68,19 @@ def winsorize_s(s: pd.Series, p=0.02):
 def robust_z(s: pd.Series, p=0.02):
     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
 
+def robust_z_keepnan(s: pd.Series) -> pd.Series:
+    """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
+    if s is None:
+        return pd.Series(dtype=float)
+    v = pd.to_numeric(s, errors="coerce")
+    m = np.nanmedian(v)
+    mad = np.nanmedian(np.abs(v - m))
+    z = (v - m) / (1.4826 * mad + 1e-9)
+    if np.nanstd(z) < 1e-9:
+        r = v.rank(method="average", na_option="keep")
+        z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
+    return pd.Series(z, index=v.index, dtype=float)
+
 def _safe_div(a, b):
     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
     except Exception: return np.nan
@@ -554,13 +567,19 @@ class Scorer:
         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
         for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
-        # 主要YoY/加速度など…（既存）
-        for col in ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']:
-            df_z[col] = robust_z(df[col])
-        # ★ TREND_SLOPE 系を df_z に必ず入れる（デバッグ・スコア双方で利用）
+
+        # === Growth深掘り系（欠損保持z + RAW併載） ===
+        grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']
+        for col in grw_cols:
+            if col in df.columns:
+                raw = pd.to_numeric(df[col], errors="coerce")
+                df_z[col] = robust_z_keepnan(raw)
+                df_z[f'{col}_RAW'] = raw
         for k in ("TREND_SLOPE_EPS", "TREND_SLOPE_REV"):
-            if k in df.columns:
-                df_z[k] = robust_z(df[k])
+            if k in df.columns and k not in df_z.columns:
+                raw = pd.to_numeric(df[k], errors="coerce")
+                df_z[k] = robust_z_keepnan(raw)
+                df_z[f'{k}_RAW'] = raw
         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
 
         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
@@ -584,10 +603,13 @@ class Scorer:
         # 売上トレンドスロープ（四半期）
         slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
         noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
-        df_z['TREND_SLOPE_REV'] = (slope_rev - 0.25*noise_rev).clip(-3.0, 3.0)
+        slope_rev_combo = slope_rev - 0.25*noise_rev
+        df_z['TREND_SLOPE_REV_RAW'] = slope_rev_combo
+        df_z['TREND_SLOPE_REV'] = slope_rev_combo.clip(-3.0, 3.0)
 
         # EPSトレンドスロープ（四半期）
         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
+        df_z['TREND_SLOPE_EPS_RAW'] = slope_eps
         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
 
         # 年次トレンド（サブ）
@@ -595,24 +617,30 @@ class Scorer:
         slope_eps_yr = zpos(df_z.get('EPS_YOY', pd.Series(0.0, index=df.index)))
         streak_base = df['REV_ANN_STREAK'].clip(lower=0).fillna(0)
         streak_yr = streak_base / (streak_base.abs() + 1.0)
-        df_z['TREND_SLOPE_REV_YR'] = (0.7*slope_rev_yr + 0.3*streak_yr).clip(-3.0, 3.0)
+        slope_rev_yr_combo = 0.7*slope_rev_yr + 0.3*streak_yr
+        df_z['TREND_SLOPE_REV_YR_RAW'] = slope_rev_yr_combo
+        df_z['TREND_SLOPE_REV_YR'] = slope_rev_yr_combo.clip(-3.0, 3.0)
+        df_z['TREND_SLOPE_EPS_YR_RAW'] = slope_eps_yr
         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
 
         # ===== 新GRW合成式（SEPA寄りシフト） =====
-        df_z['GROWTH_F'] = robust_z(
-              0.20*df_z['REV_Q_YOY']
-            + 0.10*df_z['REV_YOY_ACC']
-            + 0.10*df_z['REV_ANN_STREAK']
-            - 0.05*df_z['REV_YOY_VAR']
-            + 0.10*df_z['TREND_SLOPE_REV']
-            + 0.15*df_z['EPS_Q_YOY']
-            + 0.05*df_z['EPS_POS']
-            + 0.20*df_z['TREND_SLOPE_EPS']
-            + 0.05*df_z['TREND_SLOPE_REV_YR']
-            + 0.03*df_z['TREND_SLOPE_EPS_YR']
-            + 0.10*df_z['FCF_MGN']
-            + 0.05*df_z['RULE40']
-        ).clip(-3.0, 3.0)
+        _nz = lambda name: df_z.get(name, pd.Series(0.0, index=df_z.index)).fillna(0.0)
+        grw_combo = (
+              0.20*_nz('REV_Q_YOY')
+            + 0.10*_nz('REV_YOY_ACC')
+            + 0.10*_nz('REV_ANN_STREAK')
+            - 0.05*_nz('REV_YOY_VAR')
+            + 0.10*_nz('TREND_SLOPE_REV')
+            + 0.15*_nz('EPS_Q_YOY')
+            + 0.05*_nz('EPS_POS')
+            + 0.20*_nz('TREND_SLOPE_EPS')
+            + 0.05*_nz('TREND_SLOPE_REV_YR')
+            + 0.03*_nz('TREND_SLOPE_EPS_YR')
+            + 0.10*_nz('FCF_MGN')
+            + 0.05*_nz('RULE40')
+        )
+        df_z['GROWTH_F_RAW'] = grw_combo
+        df_z['GROWTH_F'] = robust_z(grw_combo).clip(-3.0, 3.0)
 
         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
             + 0.15*df_z['TR_str']
