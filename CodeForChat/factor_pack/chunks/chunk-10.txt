@@ -1,5 +1,86 @@
 ```text
-a`の基準指数 |
+- 執行：翌営業日の米国寄付き成行
+L66
+L67 ## モード移行の実務手順（超シンプル）
+L68 モードが変わったら、**MMF≒現金**として扱い、**Gの枠数だけ**を調整する：
+L69 1. **Gを削る**（CAUTION/EMERG）  
+L70    - ⭐️低スコアのGから順に外す。  
+L71    - **`current_tickers.csv` から外すG銘柄の行を削除**（＝その枠は現金化）。
+L72 2. **現金として保持**  
+L73    - 外した枠は現金（またはMMF相当）でプール。  
+L74 3. **復帰時の補充**（NORMALへ）  
+L75    - **`current_tickers.csv` に銘柄を追加**（factor上位から）。  
+L76    - 以降は日次ドリフト/TSルールに従う。
+L77
+L78 > driftは `target_ratio = 1/銘柄数` を自動適用。行数に応じて自動で均等比率が再計算される。
+L79
+L80 ## 入替銘柄選定
+L81 - Oxfordキャピタル／インカム、Alpha Investor、Motley Fool Stock Advisor、moomooスクリーニング等を参考にchatGPTで検討
+L82 - 年間NISA枠はGrowth群の中から低ボラ銘柄を選定し利用。長期保持にはこだわらない。
+L83
+L84 ## 再エントリー（クールダウン）
+L85 - TSヒット後の同銘柄再INは **8営業日** のクールダウンを設ける（期間中は再IN禁止）
+L86
+L87 ## 実行タイミング
+L88 - 判定：米国市場終値直後
+L89 - 執行：翌営業日の米国寄付き成行
+```
+
+## <documents/factor_design.md>
+```text
+L1 # factor.py 詳細設計書
+L2
+L3 ## 概要
+L4 - 既存ポートフォリオの銘柄と検討中の銘柄群を同時に扱う銘柄選定パイプライン。
+L5 - 価格・財務データを取り込みスコアリングとDRRS選定を行うことで、以下のアウトプットを得る。
+L6   - 採用銘柄と惜しくも漏れた銘柄のスコア一覧
+L7   - IN/OUTのティッカーリストとOUT側の低スコア銘柄
+L8   - 新旧ポートフォリオの比較表
+L9   - 検討中銘柄の低スコアランキング（整理用）
+L10
+L11 ## 全体フロー
+L12 1. **Input** – `current_tickers.csv`と`candidate_tickers.csv`を読み込み、yfinanceやFinnhubのAPIから価格・財務データを収集して`InputBundle`を整備。
+L13 2. **Score Calculation** – Scorerが特徴量を計算し因子スコアを合成して`FeatureBundle`を生成。
+L14 3. **Correlation Reduction & Selection** – SelectorがDRRSロジックで相関を抑えつつG/D銘柄を選定し`SelectionBundle`を得る。
+L15 4. **Output** – 採用結果と周辺情報を表・Slack通知として出力。
+L16
+L17 ```mermaid
+L18 flowchart LR
+L19   A[Input\nAPI & 前処理] --> B[Score Calculation\n特徴量・因子合成]
+L20   B --> C[Correlation Reduction\nDRRS選定]
+L21   C --> D[Output\nSlack通知]
+L22 ```
+L23
+L24 ## 定数・設定
+L25 | 変数 | 内容 | 主な用途 |
+L26 | --- | --- | --- |
+L27 | `exist` / `cand` | 現行ポートフォリオと検討中銘柄のティッカーリスト | スコア対象ユニバースの構成、候補整理 |
+L28 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
+L29 | `CAND_PRICE_MAX` | 候補銘柄の許容価格上限 | 高額銘柄の事前除外 |
+L30 | `N_G` / `N_D` | G/D採用枠の件数（**既定: 12 / 8**） | 最終的に選ぶ銘柄数の制約 |
+L31 | `g_weights` / `D_weights` | 各因子の重みdict | G/Dスコア合成 |
+L32 | `D_BETA_MAX` | Dバケットの許容β上限 | 高β銘柄の除外フィルタ |
+L33 | `FILTER_SPEC` | G/Dごとの前処理フィルタ | トレンドマスクやβ上限設定 |
+L34 | `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
+L35 | `DRRS_G` / `DRRS_D` | DRRSパラメータdict | バケット別の相関低減設定 |
+L36 | `DRRS_SHRINK` | 残差相関の対角シュリンク率 | `residual_corr`の安定化 |
+L37 | `CROSS_MU_GD` | G-D間クロス相関ペナルティμ | 2バケット同時最適化で相関抑制 |
+L38 | `RESULTS_DIR` | 選定結果保存ディレクトリ | `_save_sel`/`_load_prev`の入出力 |
+L39
+L40 選定結果は`results/`配下にJSONとして保存し、次回実行時に`_load_prev`で読み込んで選定条件に反映。
+L41
+L42 ## DTO/Config
+L43 各ステップ間で受け渡すデータ構造と設定値。変数の意味合いと利用箇所を以下に示す。
+L44
+L45 ### InputBundle（Input → Scorer）
+L46 | 変数 | 内容 | 主な用途 |
+L47 | --- | --- | --- |
+L48 | `cand` | 候補銘柄ティッカーのリスト | OUTテーブルや低スコアランキング対象の母集団 |
+L49 | `tickers` | 現行+候補を合わせたティッカー一覧 | 価格・出来高ダウンロード、リターン計算 |
+L50 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
+L51 | `data` | yfinanceのダウンロード結果（階層列） | `px`/`spx`/リターン等の基礎データ |
+L52 | `px` | `data['Close']`だけを抜き出した価格系列 | 指標計算・リターン生成 |
+L53 | `spx` | `data['Close'][bench]` のSeries | `rs`や`calc_beta`の基準指数 |
 L54 | `tickers_bulk` | `yf.Tickers`オブジェクト | `info`等の一括取得 |
 L55 | `info` | ティッカー別のyfinance情報dict | セクター判定やEPS補完 |
 L56 | `eps_df` | EPS TTM/直近EPS等をまとめた表 | 成長指標の算出 |
@@ -184,23 +265,5 @@ L234    - 局所探索結果`S`と過去集合`P`の目的値を比較し、`S`�
 L235    - `select_buckets`ではGを先に決定し、D選定時にGとの相関ペナルティ`μ`を加えてクロス分散を抑制。
 L236
 L237 ### Step4: Output
-L238 選定結果を可視化し共有する工程。以下の内容をテーブル化して標準出力とSlackへ送る。
-L239 - 採用銘柄と惜しくも選外となった銘柄のスコア一覧
-L240 - IN/OUTリストとOUT銘柄のスコア（低得点銘柄を確認しやすく）
-L241 - 新旧ポートフォリオの比較表（組入れ・除外、スコア変化）
-L242 - 検討中銘柄の低スコアランキング
-L243
-L244 主なメソッド:
-L245 - `display_results` : 上記テーブルに加えパフォーマンス指標や分散化指標を表示。
-L246 - `notify_slack` : Slack Webhookへ同内容を送信。
-L247 - 補助:`_avg_offdiag`、`_resid_avg_rho`、`_raw_avg_rho`、`_cross_block_raw_rho`。
-L248
-L249 ## エントリポイント
-L250 1. `PipelineConfig`を構築。
-L251 2. **Step1** `Input.prepare_data`で`InputBundle`を生成。
-L252 3. **Step2** `Scorer.aggregate_scores`で`FeatureBundle`を取得。
-L253 4. **Step3** `Selector.select_buckets`で`SelectionBundle`を算出。
-L254 5. **Step4** `Output.display_results`と`notify_slack`で結果を出力。
-```
-
+L238 選定結
 ```

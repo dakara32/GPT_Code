@@ -1,5 +1,69 @@
 ```text
-bulk","info","eps_df","fcf_df","returns"] if not hasattr(ib,a) or getattr(ib,a) is None]
+return float(h.iloc[-1]) if len(h) else np.nan
+L46     except Exception:
+L47         return np.nan
+L48
+L49 def _ttm_div_sum(t, lookback_days=400):
+L50     try:
+L51         div = yf.Ticker(t).dividends
+L52         if div is None or len(div) == 0: return 0.0
+L53         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
+L54         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
+L55         return ttm if ttm > 0 else float(div.tail(4).sum())
+L56     except Exception:
+L57         return 0.0
+L58
+L59 def ttm_div_yield_portfolio(tickers, price_map=None):
+L60     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
+L61     return float(np.mean(ys)) if ys else 0.0
+L62
+L63 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
+L64 def winsorize_s(s: pd.Series, p=0.02):
+L65     if s is None or s.dropna().empty: return s
+L66     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L67
+L68 def robust_z(s: pd.Series, p=0.02):
+L69     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L70
+L71 def robust_z_keepnan(s: pd.Series) -> pd.Series:
+L72     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
+L73     if s is None:
+L74         return pd.Series(dtype=float)
+L75     v = pd.to_numeric(s, errors="coerce")
+L76     m = np.nanmedian(v)
+L77     mad = np.nanmedian(np.abs(v - m))
+L78     z = (v - m) / (1.4826 * mad + 1e-9)
+L79     if np.nanstd(z) < 1e-9:
+L80         r = v.rank(method="average", na_option="keep")
+L81         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
+L82     return pd.Series(z, index=v.index, dtype=float)
+L83
+L84 def _safe_div(a, b):
+L85     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
+L86     except Exception: return np.nan
+L87
+L88 def _safe_last(series: pd.Series, default=np.nan):
+L89     try: return float(series.iloc[-1])
+L90     except Exception: return default
+L91
+L92 D_WEIGHTS_EFF = None  # 出力表示互換のため
+L93
+L94 # ---- Scorer 本体 -------------------------------------------------------------
+L95 class Scorer:
+L96     """
+L97     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
+L98     - cfg は必須（factor.PipelineConfig を渡す）。
+L99     - 旧カラム名を自動リネームして新スキーマに吸収します。
+L100     """
+L101
+L102     # === 先頭で旧→新カラム名マップ（移行用） ===
+L103     EPS_RENAME = {"eps_ttm":"EPS_TTM", "eps_q_recent":"EPS_Q_LastQ"}
+L104     FCF_RENAME = {"fcf_ttm":"FCF_TTM"}
+L105
+L106     # === スキーマ簡易チェック（最低限） ===
+L107     @staticmethod
+L108     def _validate_ib_for_scorer(ib: Any):
+L109         miss = [a for a in ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"] if not hasattr(ib,a) or getattr(ib,a) is None]
 L110         if miss: raise ValueError(f"InputBundle is missing required attributes for Scorer: {miss}")
 L111         if any(c in ib.eps_df.columns for c in Scorer.EPS_RENAME): ib.eps_df.rename(columns=Scorer.EPS_RENAME, inplace=True)
 L112         if any(c in ib.fcf_df.columns for c in Scorer.FCF_RENAME): ib.fcf_df.rename(columns=Scorer.FCF_RENAME, inplace=True)
@@ -167,63 +231,5 @@ L273         """
 L274         import numpy as np, pandas as pd
 L275         if px is None or px.empty:
 L276             return pd.Series(dtype=int)
-L277         px = px.dropna(how="all", axis=1)
-L278         if win_days and win_days > 0:
-L279             px = px.tail(win_days)
-L280         if px.empty:
-L281             return pd.Series(dtype=int)
-L282         spx = spx.reindex(px.index).ffill()
-L283
-L284         ma50  = px.rolling(50).mean()
-L285         ma150 = px.rolling(150).mean()
-L286         ma200 = px.rolling(200).mean()
-L287
-L288         tt = (px > ma150)
-L289         tt &= (px > ma200)
-L290         tt &= (ma150 > ma200)
-L291         tt &= (ma200 - ma200.shift(21) > 0)
-L292         tt &= (ma50  > ma150)
-L293         tt &= (ma50  > ma200)
-L294         tt &= (px    > ma50)
-L295
-L296         lo252 = px.rolling(252).min()
-L297         hi252 = px.rolling(252).max()
-L298         tt &= (px.divide(lo252).sub(1.0) >= 0.30)   # P_OVER_LOW52 >= 0.30
-L299         tt &= (px >= (0.75 * hi252))                # NEAR_52W_HIGH >= -0.25
-L300
-L301         r12  = px.divide(px.shift(252)).sub(1.0)
-L302         br12 = spx.divide(spx.shift(252)).sub(1.0)
-L303         r1   = px.divide(px.shift(22)).sub(1.0)
-L304         br1  = spx.divide(spx.shift(22)).sub(1.0)
-L305         rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
-L306         tt &= (rs >= 0.10)
-L307
-L308         return tt.fillna(False).sum(axis=1).astype(int)
-L309
-L310     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
-L311     def aggregate_scores(self, ib: Any, cfg):
-L312         if cfg is None:
-L313             raise ValueError("cfg is required; pass factor.PipelineConfig")
-L314         self._validate_ib_for_scorer(ib)
-L315
-L316         px, spx, tickers = ib.px, ib.spx, ib.tickers
-L317         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
-L318
-L319         df, missing_logs = pd.DataFrame(index=tickers), []
-L320         for t in tickers:
-L321             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
-L322             # --- 基本特徴 ---
-L323             df.loc[t,'TR']   = self.trend(s)
-L324             df.loc[t,'EPS']  = eps_df.loc[t,'EPS_TTM'] if t in eps_df.index else np.nan
-L325             df.loc[t,'REV']  = d.get('revenueGrowth',np.nan)
-L326             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
-L327             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
-L328
-L329             # --- 配当（欠損補完含む） ---
-L330             div = d.get('dividendYield') if d.get('dividendYield') is not None else d.get('trailingAnnualDividendYield')
-L331             if div is None or pd.isna(div):
-L332                 try:
-L333                     divs = yf.Ticker(t).dividends
-L334                     if divs is not None and not divs.empty:
-L335                         last_close = s.iloc[-1]; div_1y = divs[divs.index >= (divs.index.max() - pd.
+L277         px = px.dropna(how="all", 
 ```
