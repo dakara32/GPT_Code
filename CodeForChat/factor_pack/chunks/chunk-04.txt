@@ -1,5 +1,5 @@
 ```text
-mat for col in ['GROWTH_F','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
+ol:"{:.2f}".format for col in ['GROWTH_F','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
 L658         self.g_title = (f"[G枠 / {N_G} / {_fmt_w(g_weights)} / corrM={corrM} / "
 L659                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
 L660         if near_G:
@@ -79,7 +79,7 @@ L733         def _fmt_row(s):
 L734             return pd.Series({'RET':f"{s['RET']:.1f}%",'VOL':f"{s['VOL']:.1f}%",'SHP':f"{s['SHP']:.1f}",'MDD':f"{s['MDD']:.1f}%",'RAWρ':(f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"),'RESIDρ':(f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN"),'DIVY':f"{s['DIVY']:.1f}%"})
 L735         self.df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1); print("Performance Comparison:"); print(self.df_metrics_fmt.to_string())
 L736         # --- ここから: デバッグ出力は _compact_debug で一本化（表示経路もSlack経路もこれだけ）---
-L737         if self.debug:
+L737         if debug_mode:
 L738             from types import SimpleNamespace
 L739             df_full_src    = getattr(getattr(self, "_sc", None), "_feat", None)
 L740             df_full        = getattr(df_full_src, "df_full", None) or kwargs.get("df_full")
@@ -100,85 +100,87 @@ L754                 prevG=kwargs.get("prev_G", exist),
 L755                 prevD=kwargs.get("prev_D", exist),
 L756                 max_rows=int(os.getenv("DEBUG_MAX_ROWS", "140")),
 L757             )
-L758             # print(self.debug_text)
-L759         else:
-L760             self.debug_text = ""
-L761         # === 追加: GSC+DSC が低い順 TOP10 ===
-L762         try:
-L763             all_scores = pd.DataFrame({'GSC': df_z['GSC'], 'DSC': df_z['DSC']}).copy()
-L764             all_scores['G_plus_D'] = all_scores['GSC'] + all_scores['DSC']
-L765             all_scores = all_scores.dropna(subset=['G_plus_D'])
-L766             self.low10_table = all_scores.sort_values('G_plus_D', ascending=True).head(10).round(3)
-L767             print("Low Score Candidates (GSC+DSC bottom 10):")
-L768             print(self.low10_table.to_string())
-L769         except Exception as e:
-L770             print(f"[warn] low-score ranking failed: {e}")
-L771             self.low10_table = None
-L772
-L773     # --- Slack送信（元 notify_slack のロジックそのまま） ---
-L774     def notify_slack(self):
-L775         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-L776         if not SLACK_WEBHOOK_URL: raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-L777         def _filter_suffix_from(spec: dict, group: str) -> str:
-L778             g = spec.get(group, {})
-L779             parts = [str(m) for m in g.get("pre_mask", [])]
-L780             for k, v in (g.get("pre_filter", {}) or {}).items():
-L781                 base, op = (k[:-4], "<") if k.endswith("_max") else ((k[:-4], ">") if k.endswith("_min") else (k, "="))
-L782                 name = {"beta": "β"}.get(base, base)
-L783                 try: val = f"{float(v):g}"
-L784                 except: val = str(v)
-L785                 parts.append(f"{name}{op}{val}")
-L786             return "" if not parts else " / filter:" + " & ".join(parts)
-L787         def _inject_filter_suffix(title: str, group: str) -> str:
-L788             suf = _filter_suffix_from(FILTER_SPEC, group)
-L789             return f"{title[:-1]}{suf}]" if suf and title.endswith("]") else (title + suf)
-L790         def _blk(title, tbl, fmt=None, drop=()):
-L791             if tbl is None or getattr(tbl,'empty',False): return f"{title}\n(選定なし)\n"
-L792             if drop and hasattr(tbl,'columns'):
-L793                 keep = [c for c in tbl.columns if c not in drop]
-L794                 tbl, fmt = tbl[keep], {k:v for k,v in (fmt or {}).items() if k in keep}
-L795             return f"{title}\n```{tbl.to_string(formatters=fmt)}```\n"
-L796
-L797         g_title = _inject_filter_suffix(self.g_title, "G")
-L798         d_title = _inject_filter_suffix(self.d_title, "D")
-L799         message  = "📈 ファクター分散最適化の結果\n"
-L800         if self.miss_df is not None and not self.miss_df.empty:
-L801             message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
-L802         message += _blk(g_title, self.g_table, self.g_formatters, drop=("TRD",))
-L803         message += _blk(d_title, self.d_table, self.d_formatters)
-L804         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table,'empty',False) else f"```{self.io_table.to_string(index=False)}```\n")
-L805         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
-L806         if self.debug and getattr(self, "debug_text", ""):
-L807             message += "\n```" + self.debug_text + "```"
-L808         payload = {"text": message}
-L809         try:
-L810             resp = requests.post(SLACK_WEBHOOK_URL, json=payload); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
-L811         except Exception as e: print(f"⚠️ Slack通知エラー: {e}")
-L812
-L813 def _infer_g_universe(feature_df, selected12=None, near5=None):
-L814     try:
-L815         out = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
-L816         if out: return out
-L817     except Exception:
-L818         pass
-L819     base = set()
-L820     for lst in (selected12 or []), (near5 or []):
-L821         for x in (lst or []): base.add(x)
-L822     return list(base) if base else list(feature_df.index)
-L823
-L824 def _fmt_with_fire_mark(tickers, feature_df):
-L825     out = []
-L826     for t in tickers or []:
-L827         try:
-L828             br = bool(feature_df.at[t, "G_BREAKOUT_recent_5d"])
-L829             pb = bool(feature_df.at[t, "G_PULLBACK_recent_5d"])
-L830             out.append(f"{t}{' 🔥' if (br or pb) else ''}")
-L831         except Exception:
-L832             out.append(t)
-L833     return out
-L834
-L835 def _label_recent_event(t, feature_df):
-L836     try:
-L837         br = bool(feature_df.at[t, "G_BREAKOUT_recent_5d"]); dbr = str(feature_df.at[t, "G_BREAKOUT_last_date"]) if br else ""
-L838         pb = bool(feature_df.at[t, "G_PULLBACK_recent_5d"]); dpb = str(feature_df.at[t
+L758         else:
+L759             self.debug_text = ""
+L760         # === 追加: GSC+DSC が低い順 TOP10 ===
+L761         try:
+L762             all_scores = pd.DataFrame({'GSC': df_z['GSC'], 'DSC': df_z['DSC']}).copy()
+L763             all_scores['G_plus_D'] = all_scores['GSC'] + all_scores['DSC']
+L764             all_scores = all_scores.dropna(subset=['G_plus_D'])
+L765             self.low10_table = all_scores.sort_values('G_plus_D', ascending=True).head(10).round(3)
+L766             print("Low Score Candidates (GSC+DSC bottom 10):")
+L767             print(self.low10_table.to_string())
+L768         except Exception as e:
+L769             print(f"[warn] low-score ranking failed: {e}")
+L770             self.low10_table = None
+L771
+L772         if debug_mode and self.debug_text:
+L773             print(self.debug_text)
+L774
+L775     # --- Slack送信（元 notify_slack のロジックそのまま） ---
+L776     def notify_slack(self):
+L777         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+L778         if not SLACK_WEBHOOK_URL: raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+L779         def _filter_suffix_from(spec: dict, group: str) -> str:
+L780             g = spec.get(group, {})
+L781             parts = [str(m) for m in g.get("pre_mask", [])]
+L782             for k, v in (g.get("pre_filter", {}) or {}).items():
+L783                 base, op = (k[:-4], "<") if k.endswith("_max") else ((k[:-4], ">") if k.endswith("_min") else (k, "="))
+L784                 name = {"beta": "β"}.get(base, base)
+L785                 try: val = f"{float(v):g}"
+L786                 except: val = str(v)
+L787                 parts.append(f"{name}{op}{val}")
+L788             return "" if not parts else " / filter:" + " & ".join(parts)
+L789         def _inject_filter_suffix(title: str, group: str) -> str:
+L790             suf = _filter_suffix_from(FILTER_SPEC, group)
+L791             return f"{title[:-1]}{suf}]" if suf and title.endswith("]") else (title + suf)
+L792         def _blk(title, tbl, fmt=None, drop=()):
+L793             if tbl is None or getattr(tbl,'empty',False): return f"{title}\n(選定なし)\n"
+L794             if drop and hasattr(tbl,'columns'):
+L795                 keep = [c for c in tbl.columns if c not in drop]
+L796                 tbl, fmt = tbl[keep], {k:v for k,v in (fmt or {}).items() if k in keep}
+L797             return f"{title}\n```{tbl.to_string(formatters=fmt)}```\n"
+L798
+L799         g_title = _inject_filter_suffix(self.g_title, "G")
+L800         d_title = _inject_filter_suffix(self.d_title, "D")
+L801         message  = "📈 ファクター分散最適化の結果\n"
+L802         if self.miss_df is not None and not self.miss_df.empty:
+L803             message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
+L804         message += _blk(g_title, self.g_table, self.g_formatters, drop=("TRD",))
+L805         message += _blk(d_title, self.d_table, self.d_formatters)
+L806         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table,'empty',False) else f"```{self.io_table.to_string(index=False)}```\n")
+L807         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
+L808         if debug_mode and getattr(self, "debug_text", ""):
+L809             message += "\n```" + self.debug_text + "```"
+L810         payload = {"text": message}
+L811         try:
+L812             resp = requests.post(SLACK_WEBHOOK_URL, json=payload); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
+L813         except Exception as e: print(f"⚠️ Slack通知エラー: {e}")
+L814
+L815 def _infer_g_universe(feature_df, selected12=None, near5=None):
+L816     try:
+L817         out = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
+L818         if out: return out
+L819     except Exception:
+L820         pass
+L821     base = set()
+L822     for lst in (selected12 or []), (near5 or []):
+L823         for x in (lst or []): base.add(x)
+L824     return list(base) if base else list(feature_df.index)
+L825
+L826 def _fmt_with_fire_mark(tickers, feature_df):
+L827     out = []
+L828     for t in tickers or []:
+L829         try:
+L830             br = bool(feature_df.at[t, "G_BREAKOUT_recent_5d"])
+L831             pb = bool(feature_df.at[t, "G_PULLBACK_recent_5d"])
+L832             out.append(f"{t}{' 🔥' if (br or pb) else ''}")
+L833         except Exception:
+L834             out.append(t)
+L835     return out
+L836
+L837 def _label_recent_event(t, feature_df):
+L838     try:
+L839         br = bool(feature_df.at[t, "G_BREAKOUT_recent_5d"]); dbr = str(feature_df.at[t, "G_BREAKOUT_last_date"]) if br else ""
+L840         pb = bool(fe
 ```
