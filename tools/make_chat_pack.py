@@ -32,6 +32,14 @@ FILES_GROUPS = {
         "documents/README.md",
         "documents/drift_design.md",
     ],
+    "yf-health-probe_pack": [
+        "tools/yf_health_probe.py",
+        ".github/workflows/yf-health-probe.yml",
+    ],  
+    "make_chat_pack_pack": [
+        "tools/make_chat_pack.py",
+        ".github/workflows/prepare-chat-pack.yml",
+    ],      
 }
 
 def add_line_numbers(body: str) -> str:
