@@ -157,35 +157,44 @@ def _post_slack(payload: dict):
     except Exception as e:
         print(f"⚠️ Slack通知エラー: {e}")
 
-def _slack_debug(text: str, chunk: int = 2800, fenced: bool = True) -> None:
-    """Slackへデバッグテキストをコードブロックで送信（行ベース分割）。"""
-    body = str(text or "").rstrip("\n")
-    if not body:
-        return
+def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
+    """Slackへテキストを分割送信（コードブロック形式）。"""
 
-    def _send(lines: List[str]) -> None:
-        if not lines:
+    def _post_text(payload: str) -> None:
+        try:
+            resp = requests.post(url, json={"text": payload})
+            print(f"[DBG] debug_post status={getattr(resp, 'status_code', None)} size={len(payload)}")
+            if resp is not None:
+                resp.raise_for_status()
+        except Exception as e:
+            print(f"[ERR] debug_post_failed: {e}")
+
+    body = str(text or "")
+    lines = body.splitlines() or [""]
+    block: list[str] = []
+    block_len = 0
+
+    def _flush() -> None:
+        nonlocal block, block_len
+        if not block:
             return
-        payload = "```\n" + "\n".join(lines) + "\n```" if fenced else "\n".join(lines)
-        _post_slack({"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": payload}}]})
+        payload = "```" + "\n".join(block) + "```"
+        _post_text(payload)
+        block, block_len = [], 0
 
-    block, block_len = [], 0
-    for raw in body.splitlines():
+    for raw in lines:
         line = raw or ""
         while len(line) > chunk:
             head, line = line[:chunk], line[chunk:]
-            if block:
-                _send(block)
-                block, block_len = [], 0
-            _send([head])
+            _flush()
+            _post_text("```" + head + "```")
         add_len = len(line) if not block else len(line) + 1
         if block and block_len + add_len > chunk:
-            _send(block)
-            block, block_len = [], 0
+            _flush()
             add_len = len(line)
         block.append(line)
         block_len += add_len
-    _send(block)
+    _flush()
 
 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     src = getattr(fb, "df_full", None)
@@ -613,8 +622,7 @@ class Output:
         self.g_formatters = self.d_formatters = {}
         # 低スコア（GSC+DSC）Top10 表示/送信用
         self.low10_table = None
-        self.debug_text = ""
-        self._has_debug = False  # 送信可否の明示フラグ
+        self.debug_text = ""   # デバッグ用本文はここに一本化
 
     # --- 表示（元 display_results のロジックそのまま） ---
     def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
@@ -767,11 +775,11 @@ class Output:
                 prevD=kwargs.get("prev_D", exist),
                 max_rows=int(os.getenv("DEBUG_MAX_ROWS", "140")),
             )
-            self._has_debug = bool((self.debug_text or "").strip())
+            if not (self.debug_text or "").strip():
+                self.debug_text = "(no debug info generated)"
             print(f"[DBG] debug_mode={debug_mode}  debug_len={len(self.debug_text or '')}  low10={self.low10_table is not None}")
         else:
             self.debug_text = ""
-            self._has_debug = False
         # Slack側で分割送信するためコンソールには出力しない
         # if debug_mode and self.debug_text:
         #     print(self.debug_text)
@@ -816,19 +824,20 @@ class Output:
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
 
         try:
-            resp = requests.post(SLACK_WEBHOOK_URL, json={"text": message})
-            print(f"[DBG] main_post_status={getattr(resp, 'status_code', None)}  size={len(message)}")
-            if resp is not None:
-                resp.raise_for_status()
-            print("✅ Slack: main message sent")
+            r = requests.post(SLACK_WEBHOOK_URL, json={"text": message})
+            print(f"[DBG] main_post status={getattr(r, 'status_code', None)} size={len(message)}")
+            if r is not None:
+                r.raise_for_status()
         except Exception as e:
-            print(f"⚠️ Slack main message error: {e}")
+            print(f"[ERR] main_post_failed: {e}")
 
-        if debug_mode and self._has_debug:
-            print(f"[DBG] sending debug chunks... len={len(self.debug_text)}")
-            _slack_debug(self.debug_text, chunk=2800, fenced=True)
-        else:
-            print(f"[DBG] skip debug send: debug_mode={debug_mode} _has_debug={self._has_debug}")
+        if debug_mode:
+            header = "```DEBUG (after Low Score)```"
+            try:
+                requests.post(SLACK_WEBHOOK_URL, json={"text": header})
+            except Exception as e:
+                print(f"[ERR] debug_header_failed: {e}")
+            _slack_send_text_chunks(SLACK_WEBHOOK_URL, self.debug_text or "(empty)", chunk=2800)
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
     try:
