@@ -141,8 +141,15 @@ class Scorer:
 
     @staticmethod
     def tr_str(s):
-        if len(s)<50: return np.nan
-        return s.iloc[-1]/s.rolling(50).mean().iloc[-1] - 1
+        if s is None:
+            return np.nan
+        s = s.ffill(limit=2).dropna()
+        if len(s) < 50:
+            return np.nan
+        ma50 = s.rolling(50, min_periods=50).mean()
+        last_ma = ma50.iloc[-1]
+        last_px = s.iloc[-1]
+        return float(last_px/last_ma - 1.0) if pd.notna(last_ma) and pd.notna(last_px) else np.nan
 
     @staticmethod
     def rs_line_slope(s: pd.Series, b: pd.Series, win: int) -> float:
