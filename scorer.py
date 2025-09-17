@@ -814,6 +814,7 @@ def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_
             return feature_df
 
         # 指標
+        px = px.ffill(limit=2)
         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
         ma50  = px[g_universe].rolling(50).mean()
         ma150 = px[g_universe].rolling(150).mean()
