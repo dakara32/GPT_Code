@@ -198,110 +198,113 @@ L156         requests.post(url, json=payload).raise_for_status()
 L157     except Exception as e:
 L158         print(f"⚠️ Slack通知エラー: {e}")
 L159
-L160 def _slack_debug(text: str, chunk: int = 2800, fenced: bool = True) -> None:
-L161     """Slackへデバッグテキストをコードブロックで送信（行ベース分割）。"""
-L162     body = str(text or "").rstrip("\n")
-L163     if not body:
-L164         return
-L165
-L166     def _send(lines: List[str]) -> None:
-L167         if not lines:
-L168             return
-L169         payload = "```\n" + "\n".join(lines) + "\n```" if fenced else "\n".join(lines)
-L170         _post_slack({"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": payload}}]})
+L160 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
+L161     """Slackへテキストを分割送信（コードブロック形式）。"""
+L162
+L163     def _post_text(payload: str) -> None:
+L164         try:
+L165             resp = requests.post(url, json={"text": payload})
+L166             print(f"[DBG] debug_post status={getattr(resp, 'status_code', None)} size={len(payload)}")
+L167             if resp is not None:
+L168                 resp.raise_for_status()
+L169         except Exception as e:
+L170             print(f"[ERR] debug_post_failed: {e}")
 L171
-L172     block, block_len = [], 0
-L173     for raw in body.splitlines():
-L174         line = raw or ""
-L175         while len(line) > chunk:
-L176             head, line = line[:chunk], line[chunk:]
-L177             if block:
-L178                 _send(block)
-L179                 block, block_len = [], 0
-L180             _send([head])
-L181         add_len = len(line) if not block else len(line) + 1
-L182         if block and block_len + add_len > chunk:
-L183             _send(block)
-L184             block, block_len = [], 0
-L185             add_len = len(line)
-L186         block.append(line)
-L187         block_len += add_len
-L188     _send(block)
-L189
-L190 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-L191     src = getattr(fb, "df_full", None)
-L192     if not isinstance(src, pd.DataFrame) or src.empty:
-L193         src = getattr(fb, "df_full_z", None)
-L194     if not isinstance(src, pd.DataFrame) or src.empty:
-L195         src = getattr(fb, "df_z", None)
-L196     if not isinstance(src, pd.DataFrame) or src.empty:
-L197         return "df not available"
+L172     body = str(text or "")
+L173     lines = body.splitlines() or [""]
+L174     block: list[str] = []
+L175     block_len = 0
+L176
+L177     def _flush() -> None:
+L178         nonlocal block, block_len
+L179         if not block:
+L180             return
+L181         payload = "```" + "\n".join(block) + "```"
+L182         _post_text(payload)
+L183         block, block_len = [], 0
+L184
+L185     for raw in lines:
+L186         line = raw or ""
+L187         while len(line) > chunk:
+L188             head, line = line[:chunk], line[chunk:]
+L189             _flush()
+L190             _post_text("```" + head + "```")
+L191         add_len = len(line) if not block else len(line) + 1
+L192         if block and block_len + add_len > chunk:
+L193             _flush()
+L194             add_len = len(line)
+L195         block.append(line)
+L196         block_len += add_len
+L197     _flush()
 L198
-L199     df_show = src.apply(pd.to_numeric, errors="coerce").rename(
-L200         columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in src.columns}
-L201     )
-L202
-L203     missing = sorted(c for c in MUST_DEBUG_COLS if c not in df_show.columns)
-L204     if missing:
-L205         logger.warning("[debug] missing cols: %s", missing)
-L206
-L207     all_cols = _env_true("DEBUG_ALL_COLS", False)
-L208     ordered = [c for c in _DEBUG_COL_ORDER if c in df_show.columns]
-L209     cols = list(df_show.columns) if all_cols else ordered
-L210     if not cols:
-L211         cols = [c for c in df_show.columns if c not in ("GSC", "DSC")]
-L212
-L213     g_series = getattr(fb, "g_score", None)
-L214     d_series = getattr(fb, "d_score_all", None)
-L215     show_near = _env_true("DEBUG_NEAR5", True)
-L216     g_sorted = g_series.sort_values(ascending=False) if show_near and hasattr(g_series, "sort_values") else None
-L217     d_sorted = d_series.sort_values(ascending=False) if show_near and hasattr(d_series, "sort_values") else None
-L218
-L219     g_pick = list(getattr(sb, "top_G", []) or [])
-L220     d_pick = list(getattr(sb, "top_D", []) or [])
-L221     prevG = list(prevG or [])
-L222     prevD = list(prevD or [])
-L223     Gp, Dp = set(prevG), set(prevD)
-L224     g_new = [t for t in g_pick if t not in Gp]
-L225     g_out = [t for t in prevG if t not in g_pick]
-L226     d_new = [t for t in d_pick if t not in Dp]
-L227     d_out = [t for t in prevD if t not in d_pick]
-L228
-L229     g_miss = [t for t in (g_sorted.index if g_sorted is not None else []) if t not in g_pick][:10]
-L230     used_d = set(g_pick + d_pick)
-L231     d_miss = [t for t in (d_sorted.index if d_sorted is not None else []) if t not in used_d][:10]
-L232
-L233     def _merge_rows(*seqs):
-L234         seen, out = set(), []
-L235         for seq in seqs:
-L236             for t in seq or []:
-L237                 if t in df_show.index and t not in seen:
-L238                     seen.add(t)
-L239                     out.append(t)
-L240         return out
+L199 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
+L200     src = getattr(fb, "df_full", None)
+L201     if not isinstance(src, pd.DataFrame) or src.empty:
+L202         src = getattr(fb, "df_full_z", None)
+L203     if not isinstance(src, pd.DataFrame) or src.empty:
+L204         src = getattr(fb, "df_z", None)
+L205     if not isinstance(src, pd.DataFrame) or src.empty:
+L206         return "df not available"
+L207
+L208     df_show = src.apply(pd.to_numeric, errors="coerce").rename(
+L209         columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in src.columns}
+L210     )
+L211
+L212     missing = sorted(c for c in MUST_DEBUG_COLS if c not in df_show.columns)
+L213     if missing:
+L214         logger.warning("[debug] missing cols: %s", missing)
+L215
+L216     all_cols = _env_true("DEBUG_ALL_COLS", False)
+L217     ordered = [c for c in _DEBUG_COL_ORDER if c in df_show.columns]
+L218     cols = list(df_show.columns) if all_cols else ordered
+L219     if not cols:
+L220         cols = [c for c in df_show.columns if c not in ("GSC", "DSC")]
+L221
+L222     g_series = getattr(fb, "g_score", None)
+L223     d_series = getattr(fb, "d_score_all", None)
+L224     show_near = _env_true("DEBUG_NEAR5", True)
+L225     g_sorted = g_series.sort_values(ascending=False) if show_near and hasattr(g_series, "sort_values") else None
+L226     d_sorted = d_series.sort_values(ascending=False) if show_near and hasattr(d_series, "sort_values") else None
+L227
+L228     g_pick = list(getattr(sb, "top_G", []) or [])
+L229     d_pick = list(getattr(sb, "top_D", []) or [])
+L230     prevG = list(prevG or [])
+L231     prevD = list(prevD or [])
+L232     Gp, Dp = set(prevG), set(prevD)
+L233     g_new = [t for t in g_pick if t not in Gp]
+L234     g_out = [t for t in prevG if t not in g_pick]
+L235     d_new = [t for t in d_pick if t not in Dp]
+L236     d_out = [t for t in prevD if t not in d_pick]
+L237
+L238     g_miss = [t for t in (g_sorted.index if g_sorted is not None else []) if t not in g_pick][:10]
+L239     used_d = set(g_pick + d_pick)
+L240     d_miss = [t for t in (d_sorted.index if d_sorted is not None else []) if t not in used_d][:10]
 L241
-L242     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-L243     focus = df_show.index.tolist() if all_rows else _merge_rows(g_pick + d_pick, prevG + prevD, g_miss, d_miss)
-L244     if not focus:
-L245         focus = df_show.index.tolist()
-L246     focus = focus[:max_rows]
-L247
-L248     if cols:
-L249         df_focus = df_show.loc[focus, cols].copy()
-L250     else:
-L251         df_focus = df_show.loc[focus].copy()
-L252     if "GSC" not in df_focus.columns and g_series is not None:
-L253         df_focus["GSC"] = [g_series.get(t, np.nan) if hasattr(g_series, "get") else np.nan for t in df_focus.index]
-L254     if "DSC" not in df_focus.columns and d_series is not None:
-L255         df_focus["DSC"] = [d_series.get(t, np.nan) if hasattr(d_series, "get") else np.nan for t in df_focus.index]
+L242     def _merge_rows(*seqs):
+L243         seen, out = set(), []
+L244         for seq in seqs:
+L245             for t in seq or []:
+L246                 if t in df_show.index and t not in seen:
+L247                     seen.add(t)
+L248                     out.append(t)
+L249         return out
+L250
+L251     all_rows = _env_true("DEBUG_ALL_ROWS", False)
+L252     focus = df_show.index.tolist() if all_rows else _merge_rows(g_pick + d_pick, prevG + prevD, g_miss, d_miss)
+L253     if not focus:
+L254         focus = df_show.index.tolist()
+L255     focus = focus[:max_rows]
 L256
-L257     if not all_cols:
-L258         extra = [c for c in df_focus.columns if c not in cols]
-L259         cols = cols + [c for c in ("GSC", "DSC") if c not in cols]
-L260         cols += [c for c in extra if c not in cols]
-L261     else:
-L262         cols = [c for c in df_focus.columns if c not in ("GSC", "DSC")]
-L263         cols += [c for c in ("GSC", "DSC") if c not in cols]
-L264
-L265     
+L257     if cols:
+L258         df_focus = df_show.loc[focus, cols].copy()
+L259     else:
+L260         df_focus = df_show.loc[focus].copy()
+L261     if "GSC" not in df_focus.columns and g_series is not None:
+L262         df_focus["GSC"] = [g_series.get(t, np.nan) if hasattr(g_series, "get") else np.nan for t in df_focus.index]
+L263     if "DSC" not in df_focus.columns and d_series is not None:
+L264         df_focus["DSC"] = [d_series.get(t, np.nan) if hasattr(d_series, "get") else np.nan for t in df_focus.index]
+L265
+L266     if not all_cols:
+L267         extra = [c for c in df_focus.columns if c not in cols]
+L268         cols = cols + [c for c in ("GSC"
 ```
