@@ -21,10 +21,11 @@ SLACK_WEBHOOK = (
     or os.getenv("YF_PROBE_SLACK_WEBHOOK")
 )
 TIMEOUT_MS_WARN = int(os.getenv("YF_PROBE_TIMEOUT_MS_WARN", "5000"))
+SOFT_FAIL = os.getenv("YF_PROBE_SOFT_FAIL", "0") == "1"
 
 # 追加: 欠損検知の詳細閾値（任意）
 MAX_HEAD_TAIL_NAN = int(os.getenv("YF_PROBE_MAX_HEADTAIL_N", "0"))  # 先頭/末尾の連続NaN許容（既定0=1つでもNG）
-MAX_INTERNAL_NAN  = int(os.getenv("YF_PROBE_MAX_INTERNAL_N", "0"))  # 途中の連続NaN許容（既定0）
+MAX_INTERNAL_N    = int(os.getenv("YF_PROBE_MAX_INTERNAL_N", "0"))  # 途中の連続NaN許容（既定0）
 
 def per_ticker_retry(px, bad):
     for t in bad:
@@ -39,9 +40,18 @@ def per_ticker_retry(px, bad):
 # 追加: 連続NaNの本数/最大長と最初/最後のNaN日を計算
 def _nan_profile(s: pd.Series):
     if s.empty:
-        return dict(n_gaps=0, max_gap=0, first_nan=None, last_nan=None,
-                    head_run=0, tail_run=0, total_nan=0)
+        return dict(
+            n_gaps=0,
+            max_gap=0,
+            first_nan=None,
+            last_nan=None,
+            head_run=0,
+            tail_run=0,
+            total_nan=0,
+            dates=set(),
+        )
     isna = s.isna().values
+    idx = s.index
     total_nan = int(isna.sum())
     # 先頭/末尾の連続NaN
     head_run = 0
@@ -56,30 +66,43 @@ def _nan_profile(s: pd.Series):
     n_gaps = 0
     max_gap = 0
     cur = 0
+    dates = set(str(d.date()) for d, v in zip(idx, isna) if v)
     for v in isna:
         if v:
             cur += 1
         else:
             if cur > 0:
                 n_gaps += 1
-                if cur > max_gap: max_gap = cur
+                if cur > max_gap:
+                    max_gap = cur
                 cur = 0
     if cur > 0:
         n_gaps += 1
-        if cur > max_gap: max_gap = cur
+        if cur > max_gap:
+            max_gap = cur
     # 最初/最後のNaN日
-    first_nan = s.index[isna.argmax()] if total_nan > 0 else None
-    last_nan  = s.index[::-1][isna[::-1].argmax()] if total_nan > 0 else None
-    return dict(n_gaps=n_gaps, max_gap=int(max_gap), first_nan=first_nan, last_nan=last_nan,
-                head_run=int(head_run), tail_run=int(tail_run), total_nan=int(total_nan))
+    first_nan = idx[isna.argmax()] if total_nan > 0 else None
+    last_nan = idx[::-1][isna[::-1].argmax()] if total_nan > 0 else None
+    return dict(
+        n_gaps=n_gaps,
+        max_gap=int(max_gap),
+        first_nan=first_nan,
+        last_nan=last_nan,
+        head_run=int(head_run),
+        tail_run=int(tail_run),
+        total_nan=int(total_nan),
+        dates=dates,
+    )
 
 def assess(px):
     details, good = [], 0
     missing_brief = []  # Slack用の簡易まとめ
+    per_ticker_missing_dates = {}
     for t in TICKERS:
         if t not in px.columns:
             details.append(f"{t}:NF")
             missing_brief.append(f"{t}:NF")
+            per_ticker_missing_dates[t] = {"dates": set(), "max_gap": 0}
             continue
         s = px[t]
         n = s.shape[0]
@@ -95,7 +118,7 @@ def assess(px):
             # 追加の安全弾（既存基準も併用）:
             if nn < MIN_LEN or nan_ratio > MAX_NAN_RATIO or \
                prof["head_run"] > MAX_HEAD_TAIL_NAN or prof["tail_run"] > MAX_HEAD_TAIL_NAN or \
-               prof["max_gap"]  > MAX_INTERNAL_NAN:
+               prof["max_gap"]  > MAX_INTERNAL_N:
                 status = "MISSING"
         else:
             # NaNゼロでも長さが短い等はBAD
@@ -124,6 +147,8 @@ def assess(px):
         det += ")"
         details.append(det)
 
+        per_ticker_missing_dates[t] = {"dates": prof["dates"], "max_gap": prof["max_gap"]}
+
     ok_ratio = good / len(TICKERS) if TICKERS else 0.0
     if good == len(TICKERS):
         code, level, emoji = 0, "HEALTHY", "✅"
@@ -132,7 +157,7 @@ def assess(px):
     else:
         code, level, emoji = 20, "DOWN", "🛑"
 
-    return code, level, emoji, details, missing_brief
+    return code, level, emoji, details, missing_brief, per_ticker_missing_dates
 
 def send_slack(text):
     if not SLACK_WEBHOOK:
@@ -154,7 +179,30 @@ def main():
     if bad and RETRY_ON_EMPTY:
         close = per_ticker_retry(close, bad)
 
-    code, level, emoji, details, missing_brief = assess(close)
+    code, level, emoji, details, missing_brief, missing_dates = assess(close)
+
+    # OUTAGE判定: 過半数のティッカーが同一日を1日だけ欠損している場合
+    from collections import Counter
+
+    date_counter = Counter()
+    one_day_missing = 0
+    for t in TICKERS:
+        info = missing_dates.get(t, {"dates": set(), "max_gap": 0})
+        dates = info.get("dates", set())
+        max_gap = info.get("max_gap", 0)
+        if len(dates) == 1 and max_gap == 1:
+            one_day_missing += 1
+            date_counter.update(dates)
+    threshold = max(1, len(TICKERS) // 2)
+    if one_day_missing >= threshold:
+        common = date_counter.most_common(1)
+        if common:
+            missing_day, hits = common[0]
+            if hits >= threshold:
+                level, emoji = "OUTAGE", "🟠"
+                if not missing_brief or not missing_brief[0].startswith("common_missing_day="):
+                    missing_brief.insert(0, f"common_missing_day={missing_day} hits={hits}")
+                code = 10  # OUTAGEは外部障害とみなしDEGRADE扱い
     latency = int((time.time() - t0) * 1000)
     speed = "🚀" if latency < TIMEOUT_MS_WARN else "🐢"
 
@@ -165,7 +213,8 @@ def main():
         head = " | ".join(missing_brief[:10])
         if len(missing_brief) > 10:
             head += f" …(+{len(missing_brief)-10})"
-        missing_line = f"\n❗Missing Close: {head}"
+        prefix = "❗Missing Close" if level != "OUTAGE" else "🟠OUTAGE"
+        missing_line = f"\n{prefix}: {head}"
 
     summary = (
         f"{emoji} YF_HEALTH {level} ok={len([d for d in details if ':OK(' in d])}/{len(TICKERS)} "
@@ -175,6 +224,8 @@ def main():
 
     print(summary)
     send_slack(summary)
+    if SOFT_FAIL:
+        sys.exit(0)
     sys.exit(code)
 
 if __name__ == "__main__":
