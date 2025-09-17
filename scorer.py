@@ -649,6 +649,23 @@ class Scorer:
         df_z['GROWTH_F_RAW'] = grw_combo
         df_z['GROWTH_F'] = robust_z(grw_combo).clip(-3.0, 3.0)
 
+        # Debug dump for GRW composition (console OFF by default; enable only with env)
+        if bool(os.getenv("GRW_CONSOLE_DEBUG")):
+            try:
+                i = df_z[['GROWTH_F', 'GROWTH_F_RAW']].copy()
+                i.sort_values('GROWTH_F', ascending=False, inplace=True)
+                limit = max(0, min(40, len(i)))
+                print("[DEBUG: GRW]")
+                for t in i.index[:limit]:
+                    row = i.loc[t]
+                    parts = [f"GROWTH_F={row['GROWTH_F']:.3f}"]
+                    if pd.notna(row.get('GROWTH_F_RAW')):
+                        parts.append(f"GROWTH_F_RAW={row['GROWTH_F_RAW']:.3f}")
+                    print(f"Ticker: {t} | " + " ".join(parts))
+                print()
+            except Exception as exc:
+                print(f"[ERR] GRW debug dump failed: {exc}")
+
         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
             + 0.15*df_z['TR_str']
             + 0.15*df_z['RS_SLOPE_6W']
