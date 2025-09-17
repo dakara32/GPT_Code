@@ -486,9 +486,11 @@ class Input:
         T.log("price cap filter done (CAND_PRICE_MAX)")
         tickers = sorted(set(self.exist + cand_f))
         T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
-        data = yf.download(tickers + [self.bench], period="600d", auto_adjust=True, progress=False)
+        data = yf.download(tickers + [self.bench], period="600d",
+                           auto_adjust=True, progress=False, threads=False)
         T.log("yf.download done")
-        px, spx = data["Close"], data["Close"][self.bench]
+        px = data["Close"].dropna(how="all", axis=1).ffill(limit=2)
+        spx = data["Close"][self.bench].reindex(px.index).ffill()
         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
         if clip_days > 0:
             px  = px.tail(clip_days + 1)
@@ -710,7 +712,7 @@ class Output:
         print("Changes:")
         print(self.io_table.to_string(index=False))
 
-        all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False)['Close']
+        all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False, threads=False)['Close'].ffill(limit=2)
         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
         for name,ticks in portfolios.items():
             pr = ret[ticks].mean(axis=1, skipna=True).dropna(); cum = (1+pr).cumprod()-1; n = len(pr)
