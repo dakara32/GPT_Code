@@ -1,0 +1,290 @@
+```text
+# === Chat Paste Pack ===
+# Repo: dakara32/GPT_Code @ main
+# Files: tools/yf_health_probe.py, .github/workflows/yf-health-probe.yml
+# 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
+# 注記: 各ファイルは個別に L1.. で行番号付与。
+---
+
+## <tools/yf_health_probe.py>
+```text
+L1 # file: tools/yf_health_probe.py など
+L2 import os, time, sys
+L3 import pandas as pd
+L4 import yfinance as yf
+L5 import requests
+L6
+L7 TICKERS = os.getenv(
+L8     "YF_PROBE_TICKERS",
+L9     (
+L10         "AAPL,MSFT,NVDA,GOOGL,AMZN,META,TSLA,BRK-B,JPM,JNJ,V,UNH,XOM,PG,MA,HD,AVGO,"
+L11         "KO,PEP,MRK,ABBV,COST,CRM,DIS,NFLX,AMD,ORCL,INTC,TSM,NKE"
+L12     ),
+L13 ).split(",")
+L14 PERIOD  = os.getenv("YF_PROBE_PERIOD", "180d")
+L15 MIN_LEN = int(os.getenv("YF_PROBE_MIN_LEN", "120"))
+L16 MAX_NAN_RATIO = float(os.getenv("YF_PROBE_MAX_NAN", "0.15"))  # 参考値として残す
+L17 RETRY_ON_EMPTY = int(os.getenv("YF_PROBE_RETRY", "1"))
+L18 SLACK_WEBHOOK = (
+L19     os.getenv("SLACK_WEBHOOK_URL")
+L20     or os.getenv("SLACK_WEBHOOK")
+L21     or os.getenv("YF_PROBE_SLACK_WEBHOOK")
+L22 )
+L23 TIMEOUT_MS_WARN = int(os.getenv("YF_PROBE_TIMEOUT_MS_WARN", "5000"))
+L24 SOFT_FAIL = os.getenv("YF_PROBE_SOFT_FAIL", "0") == "1"
+L25
+L26 # 追加: 欠損検知の詳細閾値（任意）
+L27 MAX_HEAD_TAIL_NAN = int(os.getenv("YF_PROBE_MAX_HEADTAIL_N", "0"))  # 先頭/末尾の連続NaN許容（既定0=1つでもNG）
+L28 MAX_INTERNAL_N    = int(os.getenv("YF_PROBE_MAX_INTERNAL_N", "0"))  # 途中の連続NaN許容（既定0）
+L29
+L30 def per_ticker_retry(px, bad):
+L31     for t in bad:
+L32         try:
+L33             h = yf.Ticker(t).history(period=PERIOD, auto_adjust=True)["Close"].rename(t)
+L34             if not h.dropna().empty:
+L35                 px[t] = h.reindex(px.index) if len(px.index) else h
+L36         except Exception:
+L37             pass
+L38     return px
+L39
+L40 # 追加: 連続NaNの本数/最大長と最初/最後のNaN日を計算
+L41 def _nan_profile(s: pd.Series):
+L42     if s.empty:
+L43         return dict(
+L44             n_gaps=0,
+L45             max_gap=0,
+L46             first_nan=None,
+L47             last_nan=None,
+L48             head_run=0,
+L49             tail_run=0,
+L50             total_nan=0,
+L51             dates=set(),
+L52         )
+L53     isna = s.isna().values
+L54     idx = s.index
+L55     total_nan = int(isna.sum())
+L56     # 先頭/末尾の連続NaN
+L57     head_run = 0
+L58     for v in isna:
+L59         if v: head_run += 1
+L60         else: break
+L61     tail_run = 0
+L62     for v in isna[::-1]:
+L63         if v: tail_run += 1
+L64         else: break
+L65     # 途中の連続NaN（区間数と最長）
+L66     n_gaps = 0
+L67     max_gap = 0
+L68     cur = 0
+L69     dates = set(str(d.date()) for d, v in zip(idx, isna) if v)
+L70     for v in isna:
+L71         if v:
+L72             cur += 1
+L73         else:
+L74             if cur > 0:
+L75                 n_gaps += 1
+L76                 if cur > max_gap:
+L77                     max_gap = cur
+L78                 cur = 0
+L79     if cur > 0:
+L80         n_gaps += 1
+L81         if cur > max_gap:
+L82             max_gap = cur
+L83     # 最初/最後のNaN日
+L84     first_nan = idx[isna.argmax()] if total_nan > 0 else None
+L85     last_nan = idx[::-1][isna[::-1].argmax()] if total_nan > 0 else None
+L86     return dict(
+L87         n_gaps=n_gaps,
+L88         max_gap=int(max_gap),
+L89         first_nan=first_nan,
+L90         last_nan=last_nan,
+L91         head_run=int(head_run),
+L92         tail_run=int(tail_run),
+L93         total_nan=int(total_nan),
+L94         dates=dates,
+L95     )
+L96
+L97 def assess(px):
+L98     details, good = [], 0
+L99     missing_brief = []  # Slack用の簡易まとめ
+L100     per_ticker_missing_dates = {}
+L101     for t in TICKERS:
+L102         if t not in px.columns:
+L103             details.append(f"{t}:NF")
+L104             missing_brief.append(f"{t}:NF")
+L105             per_ticker_missing_dates[t] = {"dates": set(), "max_gap": 0}
+L106             continue
+L107         s = px[t]
+L108         n = s.shape[0]
+L109         nn = int(s.notna().sum())
+L110         nan_ratio = 1.0 - (nn / n if n else 0.0)
+L111         prof = _nan_profile(s)
+L112
+L113         # ステータス判定
+L114         if nn == 0:
+L115             status = "EMPTY"
+L116         elif prof["total_nan"] > 0:
+L117             status = "MISSING"  # Close列にNaNが1つでもあれば欠損扱い
+L118             # 追加の安全弾（既存基準も併用）:
+L119             if nn < MIN_LEN or nan_ratio > MAX_NAN_RATIO or \
+L120                prof["head_run"] > MAX_HEAD_TAIL_NAN or prof["tail_run"] > MAX_HEAD_TAIL_NAN or \
+L121                prof["max_gap"]  > MAX_INTERNAL_N:
+L122                 status = "MISSING"
+L123         else:
+L124             # NaNゼロでも長さが短い等はBAD
+L125             status = "OK" if nn >= MIN_LEN else "BAD"
+L126
+L127         if status == "OK":
+L128             good += 1
+L129         else:
+L130             # Slackの簡易欄: 最長欠損長と先頭/末尾NaNを付ける
+L131             if status in ("MISSING", "EMPTY"):
+L132                 brief = f"{t}:{status}"
+L133                 if status == "MISSING":
+L134                     extra = []
+L135                     if prof["max_gap"]>0: extra.append(f"maxGap={prof['max_gap']}")
+L136                     if prof["head_run"]>0: extra.append(f"head={prof['head_run']}")
+L137                     if prof["tail_run"]>0: extra.append(f"tail={prof['tail_run']}")
+L138                     if prof["first_nan"]:  extra.append(f"first={prof['first_nan'].date()}")
+L139                     if prof["last_nan"]:   extra.append(f"last={prof['last_nan'].date()}")
+L140                     if extra: brief += "(" + ",".join(extra) + ")"
+L141                 missing_brief.append(brief)
+L142
+L143         # 詳細欄
+L144         det = f"{t}:{status}(len={nn},nan={nan_ratio:.2f}"
+L145         if prof["total_nan"]>0:
+L146             det += f",gaps={prof['n_gaps']},maxGap={prof['max_gap']},head={prof['head_run']},tail={prof['tail_run']}"
+L147         det += ")"
+L148         details.append(det)
+L149
+L150         per_ticker_missing_dates[t] = {"dates": prof["dates"], "max_gap": prof["max_gap"]}
+L151
+L152     ok_ratio = good / len(TICKERS) if TICKERS else 0.0
+L153     if good == len(TICKERS):
+L154         code, level, emoji = 0, "HEALTHY", "✅"
+L155     elif ok_ratio >= 0.5:
+L156         code, level, emoji = 10, "DEGRADED", "⚠️"
+L157     else:
+L158         code, level, emoji = 20, "DOWN", "🛑"
+L159
+L160     return code, level, emoji, details, missing_brief, per_ticker_missing_dates
+L161
+L162 def send_slack(text):
+L163     if not SLACK_WEBHOOK:
+L164         print("[SLACK] Missing webhook. Set 'SLACK_WEBHOOK_URL' (preferred) or 'SLACK_WEBHOOK'.")
+L165         sys.exit(78)
+L166     try:
+L167         r = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=5)
+L168         print(f"[SLACK] status={r.status_code}")
+L169         r.raise_for_status()
+L170     except Exception as e:
+L171         print(f"[SLACK] send error: {e}")
+L172
+L173 def main():
+L174     t0 = time.time()
+L175     data = yf.download(TICKERS, period=PERIOD, auto_adjust=True, progress=False, threads=True)
+L176     close = data["Close"] if isinstance(data, pd.DataFrame) and "Close" in data else pd.DataFrame()
+L177
+L178     bad = [t for t in TICKERS if (t not in close.columns) or close.get(t, pd.Series(dtype=float)).dropna().empty]
+L179     if bad and RETRY_ON_EMPTY:
+L180         close = per_ticker_retry(close, bad)
+L181
+L182     code, level, emoji, details, missing_brief, missing_dates = assess(close)
+L183
+L184     # OUTAGE判定: 過半数のティッカーが同一日を1日だけ欠損している場合
+L185     from collections import Counter
+L186
+L187     date_counter = Counter()
+L188     one_day_missing = 0
+L189     for t in TICKERS:
+L190         info = missing_dates.get(t, {"dates": set(), "max_gap": 0})
+L191         dates = info.get("dates", set())
+L192         max_gap = info.get("max_gap", 0)
+L193         if len(dates) == 1 and max_gap == 1:
+L194             one_day_missing += 1
+L195             date_counter.update(dates)
+L196     threshold = max(1, len(TICKERS) // 2)
+L197     if one_day_missing >= threshold:
+L198         common = date_counter.most_common(1)
+L199         if common:
+L200             missing_day, hits = common[0]
+L201             if hits >= threshold:
+L202                 level, emoji = "OUTAGE", "🟠"
+L203                 if not missing_brief or not missing_brief[0].startswith("common_missing_day="):
+L204                     missing_brief.insert(0, f"common_missing_day={missing_day} hits={hits}")
+L205                 code = 10  # OUTAGEは外部障害とみなしDEGRADE扱い
+L206     latency = int((time.time() - t0) * 1000)
+L207     speed = "🚀" if latency < TIMEOUT_MS_WARN else "🐢"
+L208
+L209     # Slack本文：先頭に欠損サマリを明示
+L210     missing_line = ""
+L211     if missing_brief:
+L212         # 先頭10件だけ表示、残りは省略
+L213         head = " | ".join(missing_brief[:10])
+L214         if len(missing_brief) > 10:
+L215             head += f" …(+{len(missing_brief)-10})"
+L216         prefix = "❗Missing Close" if level != "OUTAGE" else "🟠OUTAGE"
+L217         missing_line = f"\n{prefix}: {head}"
+L218
+L219     summary = (
+L220         f"{emoji} YF_HEALTH {level} ok={len([d for d in details if ':OK(' in d])}/{len(TICKERS)} "
+L221         f"latency={latency}ms {speed}"
+L222         f"{missing_line}\n" + " | ".join(details)
+L223     )
+L224
+L225     print(summary)
+L226     send_slack(summary)
+L227     if SOFT_FAIL:
+L228         sys.exit(0)
+L229     sys.exit(code)
+L230
+L231 if __name__ == "__main__":
+L232     main()
+```
+
+## <.github/workflows/yf-health-probe.yml>
+```text
+L1 name: yf-health-probe
+L2 on:
+L3   push:
+L4     branches: [ main ]
+L5
+L6 jobs:
+L7   run-probe:
+L8     runs-on: ubuntu-latest
+L9     timeout-minutes: 5
+L10     steps:
+L11       - uses: actions/checkout@v4
+L12       - uses: actions/setup-python@v5
+L13         with:
+L14           python-version: "3.11"
+L15
+L16       - name: Install deps
+L17         run: |
+L18           python -m pip install --upgrade pip
+L19           pip install yfinance pandas requests
+L20
+L21       - name: Check secret presence
+L22         env:
+L23           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+L24         run: |
+L25           if [ -z "${SLACK_WEBHOOK_URL}" ]; then
+L26             echo "::error ::Missing repository secret 'SLACK_WEBHOOK_URL'"
+L27             exit 78
+L28           else
+L29             echo "SLACK_WEBHOOK_URL is set (masked)"
+L30           fi
+L31
+L32       - name: Run probe
+L33         env:
+L34           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+L35           YF_PROBE_PERIOD: "180d"
+L36           YF_PROBE_MIN_LEN: "120"
+L37           YF_PROBE_MAX_NAN: "0.15"
+L38           YF_PROBE_RETRY: "1"
+L39           YF_PROBE_TIMEOUT_MS_WARN: "5000"
+L40           YF_PROBE_SOFT_FAIL: "1"
+L41         run: python tools/yf_health_probe.py
+```
+
+```
