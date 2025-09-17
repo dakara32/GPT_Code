@@ -58,9 +58,16 @@ def _load_universe():
 
 
 def _fetch_prices_600d(tickers):
-    data = yf.download(tickers + [BENCH], period="600d", auto_adjust=True, progress=False)
-    px   = data["Close"].dropna(how="all", axis=1)
-    spx  = data["Close"][BENCH].dropna()
+    data = yf.download(
+        tickers + [BENCH],
+        period="600d",
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+    )
+    close = data["Close"]
+    px = close.dropna(how="all", axis=1).ffill(limit=2)
+    spx = close[BENCH].reindex(px.index).ffill()
     return px, spx
 
 
@@ -74,11 +81,13 @@ def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: in
         px = px.tail(win_days)
     if px.empty:
         return pd.Series(dtype=int)
+    # 欠損吸収
+    px = px.ffill(limit=2)
     spx = spx.reindex(px.index).ffill()
 
-    ma50  = px.rolling(50).mean()
-    ma150 = px.rolling(150).mean()
-    ma200 = px.rolling(200).mean()
+    ma50  = px.rolling(50,  min_periods=50).mean()
+    ma150 = px.rolling(150, min_periods=150).mean()
+    ma200 = px.rolling(200, min_periods=200).mean()
 
     tt = (px > ma150)
     tt &= (px > ma200)
@@ -88,8 +97,8 @@ def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: in
     tt &= (ma50  > ma200)
     tt &= (px    > ma50)
 
-    lo252 = px.rolling(252).min()
-    hi252 = px.rolling(252).max()
+    lo252 = px.rolling(252, min_periods=252).min()
+    hi252 = px.rolling(252, min_periods=252).max()
     tt &= (px.divide(lo252).sub(1.0) >= 0.30)
     tt &= (px >= (0.75 * hi252))
 
