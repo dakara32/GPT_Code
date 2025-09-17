@@ -614,6 +614,7 @@ class Output:
         # 低スコア（GSC+DSC）Top10 表示/送信用
         self.low10_table = None
         self.debug_text = ""
+        self._has_debug = False  # 送信可否の明示フラグ
 
     # --- 表示（元 display_results のロジックそのまま） ---
     def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
@@ -733,6 +734,17 @@ class Output:
         def _fmt_row(s):
             return pd.Series({'RET':f"{s['RET']:.1f}%",'VOL':f"{s['VOL']:.1f}%",'SHP':f"{s['SHP']:.1f}",'MDD':f"{s['MDD']:.1f}%",'RAWρ':(f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"),'RESIDρ':(f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN"),'DIVY':f"{s['DIVY']:.1f}%"})
         self.df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1); print("Performance Comparison:"); print(self.df_metrics_fmt.to_string())
+        # === 追加: GSC+DSC が低い順 TOP10 ===
+        try:
+            all_scores = pd.DataFrame({'GSC': df_z['GSC'], 'DSC': df_z['DSC']}).copy()
+            all_scores['G_plus_D'] = all_scores['GSC'] + all_scores['DSC']
+            all_scores = all_scores.dropna(subset=['G_plus_D'])
+            self.low10_table = all_scores.sort_values('G_plus_D', ascending=True).head(10).round(3)
+            print("Low Score Candidates (GSC+DSC bottom 10):")
+            print(self.low10_table.to_string())
+        except Exception as e:
+            print(f"[warn] low-score ranking failed: {e}")
+            self.low10_table = None
         # --- ここから: デバッグ出力は _compact_debug で一本化（表示経路もSlack経路もこれだけ）---
         if debug_mode:
             from types import SimpleNamespace
@@ -755,20 +767,11 @@ class Output:
                 prevD=kwargs.get("prev_D", exist),
                 max_rows=int(os.getenv("DEBUG_MAX_ROWS", "140")),
             )
+            self._has_debug = bool((self.debug_text or "").strip())
+            print(f"[DBG] debug_mode={debug_mode}  debug_len={len(self.debug_text or '')}  low10={self.low10_table is not None}")
         else:
             self.debug_text = ""
-        # === 追加: GSC+DSC が低い順 TOP10 ===
-        try:
-            all_scores = pd.DataFrame({'GSC': df_z['GSC'], 'DSC': df_z['DSC']}).copy()
-            all_scores['G_plus_D'] = all_scores['GSC'] + all_scores['DSC']
-            all_scores = all_scores.dropna(subset=['G_plus_D'])
-            self.low10_table = all_scores.sort_values('G_plus_D', ascending=True).head(10).round(3)
-            print("Low Score Candidates (GSC+DSC bottom 10):")
-            print(self.low10_table.to_string())
-        except Exception as e:
-            print(f"[warn] low-score ranking failed: {e}")
-            self.low10_table = None
-
+            self._has_debug = False
         # Slack側で分割送信するためコンソールには出力しない
         # if debug_mode and self.debug_text:
         #     print(self.debug_text)
@@ -776,45 +779,56 @@ class Output:
     # --- Slack送信（元 notify_slack のロジックそのまま） ---
     def notify_slack(self):
         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-        if not SLACK_WEBHOOK_URL: raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+        if not SLACK_WEBHOOK_URL:
+            raise ValueError("SLACK_WEBHOOK_URL not set")
+
         def _filter_suffix_from(spec: dict, group: str) -> str:
             g = spec.get(group, {})
             parts = [str(m) for m in g.get("pre_mask", [])]
             for k, v in (g.get("pre_filter", {}) or {}).items():
                 base, op = (k[:-4], "<") if k.endswith("_max") else ((k[:-4], ">") if k.endswith("_min") else (k, "="))
                 name = {"beta": "β"}.get(base, base)
-                try: val = f"{float(v):g}"
-                except: val = str(v)
+                try:
+                    val = f"{float(v):g}"
+                except Exception:
+                    val = str(v)
                 parts.append(f"{name}{op}{val}")
             return "" if not parts else " / filter:" + " & ".join(parts)
+
         def _inject_filter_suffix(title: str, group: str) -> str:
             suf = _filter_suffix_from(FILTER_SPEC, group)
             return f"{title[:-1]}{suf}]" if suf and title.endswith("]") else (title + suf)
+
         def _blk(title, tbl, fmt=None, drop=()):
-            if tbl is None or getattr(tbl,'empty',False): return f"{title}\n(選定なし)\n"
-            if drop and hasattr(tbl,'columns'):
+            if tbl is None or getattr(tbl, 'empty', False):
+                return f"{title}\n(選定なし)\n"
+            if drop and hasattr(tbl, 'columns'):
                 keep = [c for c in tbl.columns if c not in drop]
-                tbl, fmt = tbl[keep], {k:v for k,v in (fmt or {}).items() if k in keep}
+                tbl, fmt = tbl[keep], {k: v for k, v in (fmt or {}).items() if k in keep}
             return f"{title}\n```{tbl.to_string(formatters=fmt)}```\n"
 
-        g_title = _inject_filter_suffix(self.g_title, "G")
-        d_title = _inject_filter_suffix(self.d_title, "D")
-        message  = "📈 ファクター分散最適化の結果\n"
+        message = "📈 ファクター分散最適化の結果\n"
         if self.miss_df is not None and not self.miss_df.empty:
             message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
-        message += _blk(g_title, self.g_table, self.g_formatters, drop=("TRD",))
-        message += _blk(d_title, self.d_table, self.d_formatters)
-        message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table,'empty',False) else f"```{self.io_table.to_string(index=False)}```\n")
+        message += _blk(_inject_filter_suffix(self.g_title, "G"), self.g_table, self.g_formatters, drop=("TRD",))
+        message += _blk(_inject_filter_suffix(self.d_title, "D"), self.d_table, self.d_formatters)
+        message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table, 'empty', False) else f"```{self.io_table.to_string(index=False)}```\n")
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
-        dbg_text = (getattr(self, "debug_text", "") or "").strip()
-        payload = {"text": message}
-        try:
-            resp = requests.post(SLACK_WEBHOOK_URL, json=payload); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
-        except Exception as e:
-            print(f"⚠️ Slack通知エラー: {e}")
 
-        if debug_mode and dbg_text:
-            _slack_debug(dbg_text, chunk=2800, fenced=True)
+        try:
+            resp = requests.post(SLACK_WEBHOOK_URL, json={"text": message})
+            print(f"[DBG] main_post_status={getattr(resp, 'status_code', None)}  size={len(message)}")
+            if resp is not None:
+                resp.raise_for_status()
+            print("✅ Slack: main message sent")
+        except Exception as e:
+            print(f"⚠️ Slack main message error: {e}")
+
+        if debug_mode and self._has_debug:
+            print(f"[DBG] sending debug chunks... len={len(self.debug_text)}")
+            _slack_debug(self.debug_text, chunk=2800, fenced=True)
+        else:
+            print(f"[DBG] skip debug send: debug_mode={debug_mode} _has_debug={self._has_debug}")
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
     try:
@@ -1037,12 +1051,6 @@ def run_pipeline() -> SelectionBundle:
         _post_slack({"text": f"```{low_msg}```"})
     except Exception as _e:
         _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
-
-    if debug_mode and getattr(out, "debug_text", ""):
-        try:
-            _slack_debug(out.debug_text)
-        except Exception as e:
-            print(f"[debug skipped] {e}")
 
     return sb
 
