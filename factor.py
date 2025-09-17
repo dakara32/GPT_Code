@@ -769,8 +769,9 @@ class Output:
             print(f"[warn] low-score ranking failed: {e}")
             self.low10_table = None
 
-        if debug_mode and self.debug_text:
-            print(self.debug_text)
+        # Slack側で分割送信するためコンソールには出力しない
+        # if debug_mode and self.debug_text:
+        #     print(self.debug_text)
 
     # --- Slack送信（元 notify_slack のロジックそのまま） ---
     def notify_slack(self):
@@ -805,12 +806,15 @@ class Output:
         message += _blk(d_title, self.d_table, self.d_formatters)
         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table,'empty',False) else f"```{self.io_table.to_string(index=False)}```\n")
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
-        if debug_mode and getattr(self, "debug_text", ""):
-            message += "\n```" + self.debug_text + "```"
+        dbg_text = (getattr(self, "debug_text", "") or "").strip()
         payload = {"text": message}
         try:
             resp = requests.post(SLACK_WEBHOOK_URL, json=payload); resp.raise_for_status(); print("✅ Slack（Webhook）へ送信しました")
-        except Exception as e: print(f"⚠️ Slack通知エラー: {e}")
+        except Exception as e:
+            print(f"⚠️ Slack通知エラー: {e}")
+
+        if debug_mode and dbg_text:
+            _slack_debug(dbg_text, chunk=2800, fenced=True)
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
     try:
