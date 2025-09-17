@@ -675,21 +675,6 @@ class Scorer:
             return any(k in ind for k in keys)
 
         tickers_s = pd.Index(df_z.index)
-        debug = bool(getattr(sys.modules.get("factor"), "debug_mode", False))
-        if debug:
-            print("[DEBUG: GRW]")
-            for t in tickers_s:
-                print(f"Ticker: {t}")
-                print(f"  REV_Q_YOY        : {df_z.loc[t,'REV_Q_YOY']:+.2f}")
-                print(f"  REV_YOY_ACC      : {df_z.loc[t,'REV_YOY_ACC']:+.2f}")
-                print(f"  TREND_SLOPE_REV  : {df_z.loc[t,'TREND_SLOPE_REV']:+.2f}")
-                print(f"  EPS_Q_YOY        : {df_z.loc[t,'EPS_Q_YOY']:+.2f}")
-                print(f"  TREND_SLOPE_EPS  : {df_z.loc[t,'TREND_SLOPE_EPS']:+.2f}")
-                print(f"  FCF_MGN          : {df_z.loc[t,'FCF_MGN']:+.2f}")
-                print(f"  RULE40           : {df_z.loc[t,'RULE40']:+.2f}")
-                print(f"  GRW total        : {df_z.loc[t,'GROWTH_F']:+.2f}")
-                print("")
-
         is_bio = pd.Series({t: _is_bio_like(t) for t in tickers_s})
         is_loss = pd.Series({t: (pd.notna(df.loc[t,"EPS"]) and df.loc[t,"EPS"] <= 0) for t in tickers_s})
         mask_bio_loss = (is_bio & is_loss).reindex(df_z.index).fillna(False)
