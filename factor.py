@@ -606,8 +606,8 @@ class Selector:
 # === Output：出力整形と送信（表示・Slack） ===
 class Output:
 
-    def __init__(self, debug=False):
-        self.debug = debug
+    def __init__(self, debug=None):
+        # self.debug は使わない（互換のため引数は受けるが無視）
         self.miss_df = self.g_table = self.d_table = self.io_table = self.df_metrics_fmt = self.debug_table = None
         self.g_title = self.d_title = ""
         self.g_formatters = self.d_formatters = {}
@@ -734,7 +734,7 @@ class Output:
             return pd.Series({'RET':f"{s['RET']:.1f}%",'VOL':f"{s['VOL']:.1f}%",'SHP':f"{s['SHP']:.1f}",'MDD':f"{s['MDD']:.1f}%",'RAWρ':(f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"),'RESIDρ':(f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN"),'DIVY':f"{s['DIVY']:.1f}%"})
         self.df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1); print("Performance Comparison:"); print(self.df_metrics_fmt.to_string())
         # --- ここから: デバッグ出力は _compact_debug で一本化（表示経路もSlack経路もこれだけ）---
-        if self.debug:
+        if debug_mode:
             from types import SimpleNamespace
             df_full_src    = getattr(getattr(self, "_sc", None), "_feat", None)
             df_full        = getattr(df_full_src, "df_full", None) or kwargs.get("df_full")
@@ -755,7 +755,6 @@ class Output:
                 prevD=kwargs.get("prev_D", exist),
                 max_rows=int(os.getenv("DEBUG_MAX_ROWS", "140")),
             )
-            # print(self.debug_text)
         else:
             self.debug_text = ""
         # === 追加: GSC+DSC が低い順 TOP10 ===
@@ -769,6 +768,9 @@ class Output:
         except Exception as e:
             print(f"[warn] low-score ranking failed: {e}")
             self.low10_table = None
+
+        if debug_mode and self.debug_text:
+            print(self.debug_text)
 
     # --- Slack送信（元 notify_slack のロジックそのまま） ---
     def notify_slack(self):
@@ -803,7 +805,7 @@ class Output:
         message += _blk(d_title, self.d_table, self.d_formatters)
         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table,'empty',False) else f"```{self.io_table.to_string(index=False)}```\n")
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
-        if self.debug and getattr(self, "debug_text", ""):
+        if debug_mode and getattr(self, "debug_text", ""):
             message += "\n```" + self.debug_text + "```"
         payload = {"text": message}
         try:
@@ -989,7 +991,7 @@ def run_pipeline() -> SelectionBundle:
     except Exception:
         pass
 
-    out = Output(debug=debug_mode)
+    out = Output()
     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
     try: out._sc = sc
     except Exception: pass
