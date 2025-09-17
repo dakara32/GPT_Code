@@ -203,7 +203,7 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     if not isinstance(src, pd.DataFrame) or src.empty:
         src = getattr(fb, "df_z", None)
     if not isinstance(src, pd.DataFrame) or src.empty:
-        return "df not available"
+        return ""
 
     df_show = src.apply(pd.to_numeric, errors="coerce").rename(
         columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in src.columns}
@@ -756,9 +756,11 @@ class Output:
         # --- ここから: デバッグ出力は _compact_debug で一本化（表示経路もSlack経路もこれだけ）---
         if debug_mode:
             from types import SimpleNamespace
+
             df_full_src    = getattr(getattr(self, "_sc", None), "_feat", None)
             df_full        = getattr(df_full_src, "df_full", None) or kwargs.get("df_full")
             df_full_z_pass = getattr(df_full_src, "df_full_z", None) or kwargs.get("df_full_z")
+
             fb_like = SimpleNamespace(
                 df_full=df_full,
                 df_z=df_z,
@@ -768,16 +770,33 @@ class Output:
                 missing_logs=self.miss_df,
             )
             sb_like = SimpleNamespace(top_G=top_G, top_D=top_D)
+
             self.debug_text = _compact_debug(
                 fb_like,
                 sb_like,
                 prevG=kwargs.get("prev_G", exist),
                 prevD=kwargs.get("prev_D", exist),
-                max_rows=int(os.getenv("DEBUG_MAX_ROWS", "140")),
+                max_rows=int(os.getenv("DEBUG_MAX_ROWS", "120")),
             )
+
             if not (self.debug_text or "").strip():
-                self.debug_text = "(no debug info generated)"
-            print(f"[DBG] debug_mode={debug_mode}  debug_len={len(self.debug_text or '')}  low10={self.low10_table is not None}")
+                src_df = df_full or df_full_z_pass or df_z
+                if src_df is not None and getattr(src_df, "empty", False) is False:
+                    core = [c for c in [
+                        "GRW","TR_EPS","TR_REV","EPS_Q_YOY","REV_Q_YOY","REV_YOY_ACC",
+                        "RULE40","FCF_MGN","GSC","DSC"
+                    ] if c in src_df.columns]
+                    if core:
+                        pick: list[str] = []
+                        for t in (self.g_table, self.d_table, self.low10_table):
+                            if t is not None and getattr(t, "empty", False) is False:
+                                pick += [i for i in list(t.index) if i in src_df.index]
+                        view = (src_df.loc[pick, core] if pick else src_df[core]).head(int(os.getenv("DEBUG_MAX_ROWS", "80")))
+                        self.debug_text = "DEBUG fallback\n" + view.to_string()
+                    else:
+                        self.debug_text = "(no debug columns)"
+                else:
+                    self.debug_text = "(no dataframe)"
         else:
             self.debug_text = ""
         # Slack側で分割送信するためコンソールには出力しない
@@ -832,12 +851,11 @@ class Output:
             print(f"[ERR] main_post_failed: {e}")
 
         if debug_mode:
-            header = "```DEBUG (after Low Score)```"
             try:
-                requests.post(SLACK_WEBHOOK_URL, json={"text": header})
+                requests.post(SLACK_WEBHOOK_URL, json={"text": "```DEBUG (after Low Score)```"})
             except Exception as e:
                 print(f"[ERR] debug_header_failed: {e}")
-            _slack_send_text_chunks(SLACK_WEBHOOK_URL, self.debug_text or "(empty)", chunk=2800)
+            _slack_send_text_chunks(SLACK_WEBHOOK_URL, self.debug_text, chunk=2800)
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
     try:
