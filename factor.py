@@ -105,6 +105,31 @@ class PipelineConfig:
 
 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
 
+_DEBUG_COL_ALIAS = {
+    "GROWTH_F": "GRW",
+    "GROWTH_F_RAW": "GRW_RAW",
+    "TREND_SLOPE_EPS": "TR_EPS",
+    "TREND_SLOPE_EPS_RAW": "TR_EPS_RAW",
+    "TREND_SLOPE_REV": "TR_REV",
+    "TREND_SLOPE_REV_RAW": "TR_REV_RAW",
+    "TREND_SLOPE_EPS_YR": "TR_EPS_YR",
+    "TREND_SLOPE_EPS_YR_RAW": "TR_EPS_YR_RAW",
+    "TREND_SLOPE_REV_YR": "TR_REV_YR",
+    "TREND_SLOPE_REV_YR_RAW": "TR_REV_YR_RAW",
+    "BETA": "BETA_RAW",
+}
+
+_DEBUG_COL_ORDER = [
+    "GRW", "GRW_RAW",
+    "TR_EPS", "TR_EPS_RAW", "TR_REV", "TR_REV_RAW",
+    "TR_EPS_YR", "TR_EPS_YR_RAW", "TR_REV_YR", "TR_REV_YR_RAW",
+    "EPS_Q_YOY", "EPS_Q_YOY_RAW", "EPS_YOY", "EPS_YOY_RAW",
+    "REV_Q_YOY", "REV_Q_YOY_RAW", "REV_YOY", "REV_YOY_RAW",
+    "REV_YOY_ACC", "REV_YOY_ACC_RAW", "REV_YOY_VAR", "REV_YOY_VAR_RAW", "REV_ANN_STREAK",
+    "RULE40", "RULE40_RAW", "FCF_MGN", "FCF_MGN_RAW",
+    "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK",
+]
+
 def _post_slack(payload: dict):
     url = os.getenv("SLACK_WEBHOOK_URL")
     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
@@ -116,102 +141,108 @@ def _post_slack(payload: dict):
 _slack = lambda message, code=False: _post_slack({"text": f"```{message}```" if code else message})
 
 def _slack_debug(text: str, chunk: int = 2800, fenced: bool = True) -> None:
-    s = str(text or "").rstrip("\n")
-    if not s:
+    """Slackへデバッグテキストをコードブロックで送信（行ベース分割）。"""
+    body = str(text or "").rstrip("\n")
+    if not body:
         return
-    n, i = len(s), 0
-    while i < n:
-        j = min(n, i + chunk)
-        k = s.rfind("\n", i, j)
-        if k > i + 100:
-            j = k
-        if j <= i:
-            j = min(n, i + chunk)
-            if j <= i:
-                break
-        frag = s[i:j]
-        if not frag:
-            break
-        payload = f"```\n{frag}\n```" if fenced else frag
-        _post_slack({"blocks":[{"type":"section","text":{"type":"mrkdwn","text":payload}}]})
-        i = j
+
+    def _send(lines: List[str]) -> None:
+        if not lines:
+            return
+        payload = "```\n" + "\n".join(lines) + "\n```" if fenced else "\n".join(lines)
+        _post_slack({"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": payload}}]})
+
+    block, block_len = [], 0
+    for raw in body.splitlines():
+        line = raw or ""
+        while len(line) > chunk:
+            head, line = line[:chunk], line[chunk:]
+            if block:
+                _send(block)
+                block, block_len = [], 0
+            _send([head])
+        add_len = len(line) if not block else len(line) + 1
+        if block and block_len + add_len > chunk:
+            _send(block)
+            block, block_len = [], 0
+            add_len = len(line)
+        block.append(line)
+        block_len += add_len
+    _send(block)
 
 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     df_z = getattr(fb, "df_z", None)
-    if not isinstance(df_z, pd.DataFrame):
-        df_z = pd.DataFrame()
+    if not isinstance(df_z, pd.DataFrame) or df_z.empty:
+        return "df_z not available"
 
-    alias = {
-        "GROWTH_F": "GRW",
-        "GROWTH_F_RAW": "GRW_RAW",
-        "TREND_SLOPE_EPS": "TR_EPS",
-        "TREND_SLOPE_EPS_RAW": "TR_EPS_RAW",
-        "TREND_SLOPE_REV": "TR_REV",
-        "TREND_SLOPE_REV_RAW": "TR_REV_RAW",
-        "TREND_SLOPE_EPS_YR": "TR_EPS_YR",
-        "TREND_SLOPE_EPS_YR_RAW": "TR_EPS_YR_RAW",
-        "TREND_SLOPE_REV_YR": "TR_REV_YR",
-        "TREND_SLOPE_REV_YR_RAW": "TR_REV_YR_RAW",
-        "BETA": "BETA_RAW",
-    }
-    df_show = df_z.rename(columns={k: v for k, v in alias.items() if k in df_z.columns})
-
-    want = [
-        "GRW", "GRW_RAW",
-        "TR_EPS", "TR_EPS_RAW", "TR_REV", "TR_REV_RAW",
-        "TR_EPS_YR", "TR_EPS_YR_RAW", "TR_REV_YR", "TR_REV_YR_RAW",
-        "EPS_Q_YOY", "EPS_Q_YOY_RAW", "EPS_YOY", "EPS_YOY_RAW",
-        "REV_Q_YOY", "REV_Q_YOY_RAW", "REV_YOY", "REV_YOY_RAW",
-        "REV_YOY_ACC", "REV_YOY_ACC_RAW", "REV_YOY_VAR", "REV_YOY_VAR_RAW",
-        "RULE40", "RULE40_RAW", "FCF_MGN", "FCF_MGN_RAW",
-        "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK"
-    ]
+    df_show = df_z.rename(columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in df_z.columns})
     all_cols = _env_true("DEBUG_ALL_COLS", False)
-    cols = list(df_show.columns) if all_cols else [c for c in want if c in df_show.columns]
+    cols = list(df_show.columns) if all_cols else [c for c in _DEBUG_COL_ORDER if c in df_show.columns]
+    if not cols:
+        cols = [c for c in df_show.columns if c not in ("GSC", "DSC")]
 
-    Gp, Dp = set(prevG or []), set(prevD or [])
-    g_new = [t for t in (sb.top_G or []) if t not in Gp]
-    g_out = [t for t in Gp if t not in (sb.top_G or [])]
-    d_new = [t for t in (sb.top_D or []) if t not in Dp]
-    d_out = [t for t in Dp if t not in (sb.top_D or [])]
-
+    g_series = getattr(fb, "g_score", None)
+    d_series = getattr(fb, "d_score_all", None)
     show_near = _env_true("DEBUG_NEAR5", True)
-    gs, ds = getattr(fb, "g_score", None), getattr(fb, "d_score_all", None)
-    gs = gs.sort_values(ascending=False) if show_near and hasattr(gs, "sort_values") else None
-    ds = ds.sort_values(ascending=False) if show_near and hasattr(ds, "sort_values") else None
-    g_miss = ([t for t in gs.index if t not in (sb.top_G or [])][:10]) if gs is not None else []
-    d_excl = set((sb.top_G or []) + (sb.top_D or []))
-    d_miss = ([t for t in ds.index if t not in d_excl][:10]) if ds is not None else []
+    g_sorted = g_series.sort_values(ascending=False) if show_near and hasattr(g_series, "sort_values") else None
+    d_sorted = d_series.sort_values(ascending=False) if show_near and hasattr(d_series, "sort_values") else None
+
+    g_pick = list(sb.top_G or [])
+    d_pick = list(sb.top_D or [])
+    Gp, Dp = set(prevG or []), set(prevD or [])
+    g_new = [t for t in g_pick if t not in Gp]
+    g_out = [t for t in Gp if t not in g_pick]
+    d_new = [t for t in d_pick if t not in Dp]
+    d_out = [t for t in Dp if t not in d_pick]
+
+    g_miss = [t for t in (g_sorted.index if g_sorted is not None else []) if t not in g_pick][:10]
+    used_d = set(g_pick + d_pick)
+    d_miss = [t for t in (d_sorted.index if d_sorted is not None else []) if t not in used_d][:10]
 
     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-    curr = [t for t in (exist or []) if t in df_show.index]
-    focus_pool = (df_show.index if all_rows else sorted(set(g_new + g_out + d_new + d_out + (sb.top_G or []) + (sb.top_D or []) + g_miss + d_miss + curr)))
-    focus = [t for t in focus_pool if t in df_show.index][:max_rows]
+
+    def _merge_rows(*seqs):
+        seen, out = set(), []
+        for seq in seqs:
+            for t in seq or []:
+                if t in df_show.index and t not in seen:
+                    seen.add(t)
+                    out.append(t)
+        return out
+
+    focus = df_show.index.tolist() if all_rows else _merge_rows(g_pick + d_pick, [t for t in (exist or [])], g_miss, d_miss)
+    if not focus:
+        focus = df_show.index.tolist()
+    focus = focus[:max_rows]
 
     def _fmt_near(lbl, ser, lst):
         if ser is None:
             return f"{lbl}: off"
-        g = ser.get
-        parts = [f"{t}:{g(t, float('nan')):.3f}" if pd.notna(g(t)) else f"{t}:nan" for t in lst]
+        get = ser.get
+        parts = []
+        for t in lst:
+            val = get(t, np.nan)
+            parts.append(f"{t}:{val:.3f}" if pd.notna(val) else f"{t}:nan")
         return f"{lbl}: " + (", ".join(parts) if parts else "-")
 
     head = [
         f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
-        _fmt_near("G near10", gs, g_miss),
-        _fmt_near("D near10", ds, d_miss),
+        _fmt_near("G near10", g_sorted, g_miss),
+        _fmt_near("D near10", d_sorted, d_miss),
         f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
-        f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SUBSET'}",
+        f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SELECTED+CURRENT+NEAR'}",
     ]
 
-    tbl = "(df_z or columns not available)"
-    if not df_show.empty and cols:
-        base = df_show.loc[focus, cols].round(3).copy()
-        if gs is not None:
-            base["GSC"] = [gs.get(t, np.nan) for t in base.index]
-        if ds is not None:
-            base["DSC"] = [ds.get(t, np.nan) for t in base.index]
+    if not focus or not cols:
+        body = "(no rows or columns to display)"
+    else:
+        base = df_show.loc[focus, cols].copy()
+        if "GSC" not in base.columns and g_series is not None:
+            base["GSC"] = [g_series.get(t, np.nan) if hasattr(g_series, "get") else np.nan for t in base.index]
+        if "DSC" not in base.columns and d_series is not None:
+            base["DSC"] = [d_series.get(t, np.nan) if hasattr(d_series, "get") else np.nan for t in base.index]
         out_cols = cols + [c for c in ("GSC", "DSC") if c not in cols]
-        tbl = base.reindex(columns=out_cols).to_string(max_rows=None, max_cols=None, na_rep="nan")
+        body = base.reindex(columns=out_cols).round(3).to_string(max_rows=None, max_cols=None, na_rep="nan")
 
     miss_txt = ""
     if _env_true("DEBUG_MISSING_LOGS", False):
@@ -219,7 +250,7 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
         if miss is not None and not miss.empty:
             miss_txt = "\nMissing data (head)\n" + miss.head(10).to_string(index=False)
 
-    return "\n".join(head + ["\nChanged/Selected (+ Near Miss + Current)", tbl]) + miss_txt
+    return "\n".join(head + ["\nChanged/Selected (+ Near Miss + Current)", body]) + miss_txt
 
 def _disjoint_keepG(top_G, top_D, poolD):
     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
@@ -661,7 +692,17 @@ class Output:
             return pd.Series({'RET':f"{s['RET']:.1f}%",'VOL':f"{s['VOL']:.1f}%",'SHP':f"{s['SHP']:.1f}",'MDD':f"{s['MDD']:.1f}%",'RAWρ':(f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"),'RESIDρ':(f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN"),'DIVY':f"{s['DIVY']:.1f}%"})
         self.df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1); print("Performance Comparison:"); print(self.df_metrics_fmt.to_string())
         if self.debug:
-            self.debug_table = pd.concat([df_z[['TR','EPS','REV','ROE','BETA','DIV','FCF','RS','TR_str','DIV_STREAK']], g_score.rename('GSC'), d_score_all.rename('DSC')], axis=1).round(3)
+            dbg_df = df_z.rename(columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in df_z.columns})
+            dbg_cols = [c for c in _DEBUG_COL_ORDER if c in dbg_df.columns]
+            if not dbg_cols:
+                dbg_cols = [c for c in dbg_df.columns if c not in ("GSC", "DSC")]
+            debug_tbl = dbg_df.reindex(columns=dbg_cols).copy()
+            if hasattr(g_score, "get"):
+                debug_tbl["GSC"] = [g_score.get(t, np.nan) for t in debug_tbl.index]
+            if hasattr(d_score_all, "get"):
+                debug_tbl["DSC"] = [d_score_all.get(t, np.nan) for t in debug_tbl.index]
+            order = dbg_cols + [c for c in ("GSC", "DSC") if c not in dbg_cols]
+            self.debug_table = debug_tbl.reindex(columns=order).round(3)
             print("Debug Data:"); print(self.debug_table.to_string())
 
         # === 追加: GSC+DSC が低い順 TOP10 ===
