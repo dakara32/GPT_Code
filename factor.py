@@ -3,7 +3,8 @@
 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
 SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
 SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
-import os, time, requests, logging
+import os, time, requests
+import logging
 from time import perf_counter
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -15,7 +16,14 @@ from scipy.stats import zscore  # used via scorer
 from scorer import Scorer, ttm_div_yield_portfolio
 import config
 
+# その他
+debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
+
 logger = logging.getLogger(__name__)
+if debug_mode:
+    logging.basicConfig(level=logging.INFO)
+else:
+    logging.basicConfig(level=logging.WARNING)
 
 class T:
     t = perf_counter()
@@ -46,9 +54,6 @@ except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
 # 出力関連
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
-
-# その他
-debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
 
 # === 共有DTO（クラス間I/O契約）＋ Config ===
 @dataclass(frozen=True)
@@ -854,23 +859,16 @@ class Output:
         except Exception as e:
             print(f"[ERR] main_post_failed: {e}")
 
-        debug_body = (self.debug_text or "").strip()
-        if debug_mode:
-            if debug_body:
-                try:
-                    logger.info("DEBUG (after Low Score)\n%s", debug_body)
-                    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-                    debug_path = os.path.join(RESULTS_DIR, f"debug_scores_{ts}.log")
-                    with open(debug_path, "w", encoding="utf-8") as fh:
-                        fh.write(debug_body)
-                except Exception as e:
-                    print(f"[ERR] debug_output_failed: {e}")
-            else:
-                logger.debug("skip debug output: debug_mode=True debug_text_empty=True")
+        # Debug は Slack/ファイルへ送らず、システムログみに一本化
+        if debug_mode and (self.debug_text or "").strip():
+            try:
+                logger.info("DEBUG (after Low Score)\n%s", self.debug_text)
+            except Exception as e:
+                print(f"[ERR] debug_log_failed: {e}")
         else:
             logger.debug(
-                "skip debug output: debug_mode=False debug_text_empty=%s",
-                not bool(debug_body),
+                "skip debug log: debug_mode=%s debug_text_empty=%s",
+                debug_mode, not bool((self.debug_text or '').strip())
             )
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
