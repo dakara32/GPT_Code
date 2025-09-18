@@ -809,13 +809,21 @@ class Output:
                                     self.debug_text = "(no debug columns)"
                             else:
                                 self.debug_text = "(no dataframe)"
-                        dt = (self.debug_text or "").strip()
-                        logger.info("===== DEBUG (after Low Score) START =====")
-                        if dt:
-                            logger.info("\n%s", dt)
+                        if self.debug_text is not None and hasattr(self.debug_text, "empty"):
+                            if not self.debug_text.empty:
+                                logger.info("===== DEBUG (after Low Score) START =====")
+                                logger.info("\n%s", self.debug_text)
+                                logger.info("===== DEBUG (after Low Score) END =====")
+                            else:
+                                logger.info("<empty debug_text>")
                         else:
-                            logger.info("<empty debug_text>")
-                        logger.info("===== DEBUG (after Low Score) END =====")
+                            dt = str(self.debug_text or "").strip()
+                            if dt:
+                                logger.info("===== DEBUG (after Low Score) START =====")
+                                logger.info("\n%s", dt)
+                                logger.info("===== DEBUG (after Low Score) END =====")
+                            else:
+                                logger.info("<empty debug_text>")
 
                     except Exception as e:
                         logger.warning("debug output failed: %s", e)
