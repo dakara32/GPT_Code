@@ -26,6 +26,7 @@
 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
 # =============================================================================
 
+import logging
 import os, sys, warnings
 import requests
 import numpy as np
@@ -36,6 +37,8 @@ from scipy.stats import zscore
 
 if TYPE_CHECKING:
     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
+
+logger = logging.getLogger(__name__)
 
 # ---- Dividend Helpers -------------------------------------------------------
 def _last_close(t, price_map=None):
@@ -80,6 +83,26 @@ def robust_z_keepnan(s: pd.Series) -> pd.Series:
         r = v.rank(method="average", na_option="keep")
         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
     return pd.Series(z, index=v.index, dtype=float)
+
+
+def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
+    """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
+    if not debug_mode:
+        return
+    try:
+        view = df_z.copy()
+        view = view.apply(
+            lambda s: s.round(ndigits)
+            if getattr(getattr(s, "dtype", None), "kind", "") in ("f", "i")
+            else s
+        )
+        if len(view) > max_rows:
+            view = view.iloc[:max_rows]
+        logger.info("===== DF_Z DUMP START =====")
+        logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
+        logger.info("===== DF_Z DUMP END =====")
+    except Exception as exc:
+        logger.warning("df_z dump failed: %s", exc)
 
 def _safe_div(a, b):
     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
@@ -675,6 +698,8 @@ class Scorer:
         df_z['VOL'] = robust_z(df['BETA'])
         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
+
+        _dump_dfz(df_z=df_z, debug_mode=getattr(cfg, "debug_mode", False))
 
         # === begin: BIO LOSS PENALTY =====================================
         try:
