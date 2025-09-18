@@ -98,6 +98,18 @@ def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits
         )
         if len(view) > max_rows:
             view = view.iloc[:max_rows]
+
+        # === NaNサマリ（列ごとの欠損件数 上位20） ===
+        try:
+            nan_counts = df_z.isna().sum().sort_values(ascending=False)
+            top_nan = nan_counts[nan_counts > 0].head(20)
+            if len(top_nan) > 0:
+                logger.info("NaN columns (top20):\n%s", top_nan.to_string())
+            else:
+                logger.info("NaN columns: none")
+        except Exception as exc:
+            logger.warning("nan summary failed: %s", exc)
+
         logger.info("===== DF_Z DUMP START =====")
         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
         logger.info("===== DF_Z DUMP END =====")
