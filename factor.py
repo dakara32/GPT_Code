@@ -1,4 +1,4 @@
-'''ROLE: Orchestration ONLY（外部I/O・SSOT・Slack出力）, 計算は scorer.py'''
+'''ROLE: Orchestration ONLY（外部I/O・SSOT・ログ出力）, 計算は scorer.py'''
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
 SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
@@ -153,14 +153,14 @@ def _write_debug_log(text: str, filename: str = "debug_scores.txt") -> None:
     """デバッグ本文を results/<filename> へ保存し、標準出力にも保存結果を出す。"""
     body = (text or "").strip()
     if not body:
-        print("[debug] empty debug text; skip write")
+        print("[debug] empty debug text; skip write", flush=True)
         return
     out_dir = os.path.join("results")
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
         f.write(body)
-    print(f"[debug] written: {path} ({len(body)} chars)")
+    print(f"[debug] written: {path} ({len(body)} chars)", flush=True)
 
 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     src = getattr(fb, "df_full", None)
@@ -179,9 +179,8 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     if missing:
         logger.warning("[debug] missing cols: %s", missing)
 
-    all_cols = _env_true("DEBUG_ALL_COLS", False)
     ordered = [c for c in _DEBUG_COL_ORDER if c in df_show.columns]
-    cols = list(df_show.columns) if all_cols else ordered
+    cols = ordered
     if not cols:
         cols = [c for c in df_show.columns if c not in ("GSC", "DSC")]
 
@@ -214,8 +213,7 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
                     out.append(t)
         return out
 
-    all_rows = _env_true("DEBUG_ALL_ROWS", False)
-    focus = df_show.index.tolist() if all_rows else _merge_rows(g_pick + d_pick, prevG + prevD, g_miss, d_miss)
+    focus = _merge_rows(g_pick + d_pick, prevG + prevD, g_miss, d_miss)
     if not focus:
         focus = df_show.index.tolist()
     focus = focus[:max_rows]
@@ -229,13 +227,9 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     if "DSC" not in df_focus.columns and d_series is not None:
         df_focus["DSC"] = [d_series.get(t, np.nan) if hasattr(d_series, "get") else np.nan for t in df_focus.index]
 
-    if not all_cols:
-        extra = [c for c in df_focus.columns if c not in cols]
-        cols = cols + [c for c in ("GSC", "DSC") if c not in cols]
-        cols += [c for c in extra if c not in cols]
-    else:
-        cols = [c for c in df_focus.columns if c not in ("GSC", "DSC")]
-        cols += [c for c in ("GSC", "DSC") if c not in cols]
+    extra = [c for c in df_focus.columns if c not in cols]
+    cols = cols + [c for c in ("GSC", "DSC") if c not in cols]
+    cols += [c for c in extra if c not in cols]
 
     body = df_focus.reindex(columns=cols).round(3).to_string(max_rows=None, max_cols=None, na_rep="nan") if focus else "(no rows)"
 
@@ -254,17 +248,11 @@ def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
         _fmt_near("G near10", g_sorted, g_miss),
         _fmt_near("D near10", d_sorted, d_miss),
         f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
-        f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SELECTED+CURRENT+NEAR'}",
+        "Cols=MIN  Rows=SELECTED+CURRENT+NEAR",
     ]
 
-    miss_txt = ""
-    if _env_true("DEBUG_MISSING_LOGS", False):
-        miss = getattr(fb, "missing_logs", None)
-        if miss is not None and not miss.empty:
-            miss_txt = "\nMissing data (head)\n" + miss.head(10).to_string(index=False)
-
     lines = head + ["", "Changed/Selected (+ Near Miss + Current)", "GRW深掘り表", body]
-    return "\n".join(lines) + miss_txt
+    return "\n".join(lines)
 
 def _disjoint_keepG(top_G, top_D, poolD):
     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
@@ -578,7 +566,7 @@ class Selector:
         return dict(idx=S, tickers=selected_tickers, avg_res_corr=cls.avg_corr(C_within,S), sum_score=float(score[S].sum()), objective=float(Jn))
 
     # ---- 選定（スコア Series / returns だけを受ける）----
-# === Output：出力整形と送信（表示・Slack） ===
+# === Output：出力整形と送信（表示のみ） ===
 class Output:
 
     def __init__(self, debug=None):
@@ -719,7 +707,7 @@ class Output:
         except Exception as e:
             print(f"[warn] low-score ranking failed: {e}")
             self.low10_table = None
-        # --- ここから: デバッグ出力は _compact_debug で一本化（表示経路もSlack経路もこれだけ）---
+        # --- ここから: デバッグ出力は _compact_debug で一本化（表示経路はここだけ）---
         if debug_mode:
             from types import SimpleNamespace
 
@@ -766,9 +754,14 @@ class Output:
         else:
             self.debug_text = ""
         if debug_mode and (self.debug_text or "").strip():
-            print("```DEBUG (selected + current + near-miss)```")
-            print(self.debug_text)
+            lines = (self.debug_text or "").count("\n") + 1
+            print(f"[debug] dump begin: {lines} lines", flush=True)
+            print("```DEBUG (selected + current + near-miss)```", flush=True)
+            print(self.debug_text, flush=True)
             _write_debug_log(self.debug_text, "debug_scores.txt")
+            print("[debug] dump end", flush=True)
+        else:
+            print(f"[debug] skip dump: debug_mode={debug_mode} empty={not bool((self.debug_text or '').strip())}", flush=True)
 
     def notify_slack(self):
         """[log] 互換名：本文を標準出力へ"""
@@ -919,7 +912,7 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         )
     except Exception as _e:
         print(f"[warn] sticky_keep_current skipped: {str(_e)}")
-    # --- Near-Miss: 惜しくも選ばれなかった上位10を保持（Slack表示用） ---
+    # --- Near-Miss: 惜しくも選ばれなかった上位10を保持（表示用） ---
     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
     try:
         pool = agg.drop(index=[t for t in pick if t in agg.index], errors="ignore")
@@ -938,7 +931,7 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
 def run_pipeline() -> SelectionBundle:
     """
     G/D共通フローの入口。I/Oはここだけで実施し、計算はScorerに委譲。
-    Slack文言・丸め・順序は既存の Output を用いて変更しない。
+    出力文言・丸め・順序は既存の Output を用いて変更しない。
     """
     inb = io_build_input_bundle()
     cfg = PipelineConfig(weights=WeightsConfig(g=g_weights, d=D_weights),
