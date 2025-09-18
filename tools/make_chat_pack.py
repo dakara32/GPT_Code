@@ -54,12 +54,13 @@ def read_file(path: str) -> str:
         return f.read()
 
 def header_block(file_list) -> str:
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    JST = datetime.timezone(datetime.timedelta(hours=9))
+    now = datetime.datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S")
     return textwrap.dedent(f"""\
     # === Chat Paste Pack ===
     # Repo: {OWNER}/{REPO} @ {BRANCH}
     # Files: {', '.join(file_list)}
-    # 作成日時: {now}
+    # 作成日時: {now} (JST)
     # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
     # 注記: 各ファイルは個別に L1.. で行番号付与。
     ---
