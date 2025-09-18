@@ -1,7 +1,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, factor.py, scorer.py, .github/workflows/weekly-report.yml, documents/README.md, documents/factor_design.md
-# 作成日時: 2025-09-19 08:03:14 (JST)
+# 作成日時: 2025-09-19 08:16:04 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -1060,813 +1060,825 @@ L97             else s
 L98         )
 L99         if len(view) > max_rows:
 L100             view = view.iloc[:max_rows]
-L101         logger.info("===== DF_Z DUMP START =====")
-L102         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
-L103         logger.info("===== DF_Z DUMP END =====")
-L104     except Exception as exc:
-L105         logger.warning("df_z dump failed: %s", exc)
-L106
-L107 def _safe_div(a, b):
-L108     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
-L109     except Exception: return np.nan
-L110
-L111 def _safe_last(series: pd.Series, default=np.nan):
-L112     try: return float(series.iloc[-1])
-L113     except Exception: return default
-L114
-L115 D_WEIGHTS_EFF = None  # 出力表示互換のため
-L116
-L117 # ---- Scorer 本体 -------------------------------------------------------------
-L118 class Scorer:
-L119     """
-L120     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
-L121     - cfg は必須（factor.PipelineConfig を渡す）。
-L122     - 旧カラム名を自動リネームして新スキーマに吸収します。
-L123     """
-L124
-L125     # === 先頭で旧→新カラム名マップ（移行用） ===
-L126     EPS_RENAME = {"eps_ttm":"EPS_TTM", "eps_q_recent":"EPS_Q_LastQ"}
-L127     FCF_RENAME = {"fcf_ttm":"FCF_TTM"}
+L101
+L102         # === NaNサマリ（列ごとの欠損件数 上位20） ===
+L103         try:
+L104             nan_counts = df_z.isna().sum().sort_values(ascending=False)
+L105             top_nan = nan_counts[nan_counts > 0].head(20)
+L106             if len(top_nan) > 0:
+L107                 logger.info("NaN columns (top20):\n%s", top_nan.to_string())
+L108             else:
+L109                 logger.info("NaN columns: none")
+L110         except Exception as exc:
+L111             logger.warning("nan summary failed: %s", exc)
+L112
+L113         logger.info("===== DF_Z DUMP START =====")
+L114         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
+L115         logger.info("===== DF_Z DUMP END =====")
+L116     except Exception as exc:
+L117         logger.warning("df_z dump failed: %s", exc)
+L118
+L119 def _safe_div(a, b):
+L120     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
+L121     except Exception: return np.nan
+L122
+L123 def _safe_last(series: pd.Series, default=np.nan):
+L124     try: return float(series.iloc[-1])
+L125     except Exception: return default
+L126
+L127 D_WEIGHTS_EFF = None  # 出力表示互換のため
 L128
-L129     # === スキーマ簡易チェック（最低限） ===
-L130     @staticmethod
-L131     def _validate_ib_for_scorer(ib: Any):
-L132         miss = [a for a in ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"] if not hasattr(ib,a) or getattr(ib,a) is None]
-L133         if miss: raise ValueError(f"InputBundle is missing required attributes for Scorer: {miss}")
-L134         if any(c in ib.eps_df.columns for c in Scorer.EPS_RENAME): ib.eps_df.rename(columns=Scorer.EPS_RENAME, inplace=True)
-L135         if any(c in ib.fcf_df.columns for c in Scorer.FCF_RENAME): ib.fcf_df.rename(columns=Scorer.FCF_RENAME, inplace=True)
-L136         need_eps, need_fcf = {"EPS_TTM","EPS_Q_LastQ"},{"FCF_TTM"}
-L137         if not need_eps.issubset(ib.eps_df.columns): raise ValueError(f"eps_df must contain columns {need_eps} (accepts old names via auto-rename). Got: {list(ib.eps_df.columns)}")
-L138         if not need_fcf.issubset(ib.fcf_df.columns): raise ValueError(f"fcf_df must contain columns {need_fcf} (accepts old names via auto-rename). Got: {list(ib.fcf_df.columns)}")
-L139
-L140     # ----（Scorer専用）テクニカル・指標系 ----
-L141     @staticmethod
-L142     def trend(s: pd.Series):
-L143         if len(s)<200: return np.nan
-L144         sma50, sma150, sma200 = s.rolling(50).mean().iloc[-1], s.rolling(150).mean().iloc[-1], s.rolling(200).mean().iloc[-1]
-L145         prev200, p = s.rolling(200).mean().iloc[-21], s.iloc[-1]
-L146         lo_52 = s[-252:].min() if len(s)>=252 else s.min(); hi_52 = s[-252:].max() if len(s)>=252 else s.max()
-L147         rng = (hi_52 - lo_52) if hi_52>lo_52 else np.nan
-L148         clip = lambda x,lo,hi: (np.nan if pd.isna(x) else max(lo,min(hi,x)))
-L149         a = clip(p/(s.rolling(50).mean().iloc[-1]) - 1, -0.5, 0.5)
-L150         b = clip(sma50/sma150 - 1, -0.5, 0.5)
-L151         c = clip(sma150/sma200 - 1, -0.5, 0.5)
-L152         d = clip(sma200/prev200 - 1, -0.2, 0.2)
-L153         e = clip((p - lo_52) / (rng if rng and rng>0 else np.nan) - 0.5, -0.5, 0.5)
-L154         parts = [0.0 if pd.isna(x) else x for x in (a,b,c,d,e)]
-L155         return 0.30*parts[0] + 0.20*parts[1] + 0.15*parts[2] + 0.15*parts[3] + 0.20*parts[4]
-L156
-L157     @staticmethod
-L158     def rs(s, b):
-L159         n, nb = len(s), len(b)
-L160         if n<60 or nb<60: return np.nan
-L161         L12 = 252 if n>=252 and nb>=252 else min(n,nb)-1; L1 = 22 if n>=22 and nb>=22 else max(5, min(n,nb)//3)
-L162         r12, r1, br12, br1 = s.iloc[-1]/s.iloc[-L12]-1, s.iloc[-1]/s.iloc[-L1]-1, b.iloc[-1]/b.iloc[-L12]-1, b.iloc[-1]/b.iloc[-L1]-1
-L163         return (r12 - br12)*0.7 + (r1 - br1)*0.3
-L164
-L165     @staticmethod
-L166     def tr_str(s):
-L167         if s is None:
-L168             return np.nan
-L169         s = s.ffill(limit=2).dropna()
-L170         if len(s) < 50:
-L171             return np.nan
-L172         ma50 = s.rolling(50, min_periods=50).mean()
-L173         last_ma = ma50.iloc[-1]
-L174         last_px = s.iloc[-1]
-L175         return float(last_px/last_ma - 1.0) if pd.notna(last_ma) and pd.notna(last_px) else np.nan
+L129 # ---- Scorer 本体 -------------------------------------------------------------
+L130 class Scorer:
+L131     """
+L132     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
+L133     - cfg は必須（factor.PipelineConfig を渡す）。
+L134     - 旧カラム名を自動リネームして新スキーマに吸収します。
+L135     """
+L136
+L137     # === 先頭で旧→新カラム名マップ（移行用） ===
+L138     EPS_RENAME = {"eps_ttm":"EPS_TTM", "eps_q_recent":"EPS_Q_LastQ"}
+L139     FCF_RENAME = {"fcf_ttm":"FCF_TTM"}
+L140
+L141     # === スキーマ簡易チェック（最低限） ===
+L142     @staticmethod
+L143     def _validate_ib_for_scorer(ib: Any):
+L144         miss = [a for a in ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"] if not hasattr(ib,a) or getattr(ib,a) is None]
+L145         if miss: raise ValueError(f"InputBundle is missing required attributes for Scorer: {miss}")
+L146         if any(c in ib.eps_df.columns for c in Scorer.EPS_RENAME): ib.eps_df.rename(columns=Scorer.EPS_RENAME, inplace=True)
+L147         if any(c in ib.fcf_df.columns for c in Scorer.FCF_RENAME): ib.fcf_df.rename(columns=Scorer.FCF_RENAME, inplace=True)
+L148         need_eps, need_fcf = {"EPS_TTM","EPS_Q_LastQ"},{"FCF_TTM"}
+L149         if not need_eps.issubset(ib.eps_df.columns): raise ValueError(f"eps_df must contain columns {need_eps} (accepts old names via auto-rename). Got: {list(ib.eps_df.columns)}")
+L150         if not need_fcf.issubset(ib.fcf_df.columns): raise ValueError(f"fcf_df must contain columns {need_fcf} (accepts old names via auto-rename). Got: {list(ib.fcf_df.columns)}")
+L151
+L152     # ----（Scorer専用）テクニカル・指標系 ----
+L153     @staticmethod
+L154     def trend(s: pd.Series):
+L155         if len(s)<200: return np.nan
+L156         sma50, sma150, sma200 = s.rolling(50).mean().iloc[-1], s.rolling(150).mean().iloc[-1], s.rolling(200).mean().iloc[-1]
+L157         prev200, p = s.rolling(200).mean().iloc[-21], s.iloc[-1]
+L158         lo_52 = s[-252:].min() if len(s)>=252 else s.min(); hi_52 = s[-252:].max() if len(s)>=252 else s.max()
+L159         rng = (hi_52 - lo_52) if hi_52>lo_52 else np.nan
+L160         clip = lambda x,lo,hi: (np.nan if pd.isna(x) else max(lo,min(hi,x)))
+L161         a = clip(p/(s.rolling(50).mean().iloc[-1]) - 1, -0.5, 0.5)
+L162         b = clip(sma50/sma150 - 1, -0.5, 0.5)
+L163         c = clip(sma150/sma200 - 1, -0.5, 0.5)
+L164         d = clip(sma200/prev200 - 1, -0.2, 0.2)
+L165         e = clip((p - lo_52) / (rng if rng and rng>0 else np.nan) - 0.5, -0.5, 0.5)
+L166         parts = [0.0 if pd.isna(x) else x for x in (a,b,c,d,e)]
+L167         return 0.30*parts[0] + 0.20*parts[1] + 0.15*parts[2] + 0.15*parts[3] + 0.20*parts[4]
+L168
+L169     @staticmethod
+L170     def rs(s, b):
+L171         n, nb = len(s), len(b)
+L172         if n<60 or nb<60: return np.nan
+L173         L12 = 252 if n>=252 and nb>=252 else min(n,nb)-1; L1 = 22 if n>=22 and nb>=22 else max(5, min(n,nb)//3)
+L174         r12, r1, br12, br1 = s.iloc[-1]/s.iloc[-L12]-1, s.iloc[-1]/s.iloc[-L1]-1, b.iloc[-1]/b.iloc[-L12]-1, b.iloc[-1]/b.iloc[-L1]-1
+L175         return (r12 - br12)*0.7 + (r1 - br1)*0.3
 L176
 L177     @staticmethod
-L178     def rs_line_slope(s: pd.Series, b: pd.Series, win: int) -> float:
-L179         r = (s/b).dropna()
-L180         if len(r) < win: return np.nan
-L181         y, x = np.log(r.iloc[-win:]), np.arange(win, dtype=float)
-L182         try: return float(np.polyfit(x, y, 1)[0])
-L183         except Exception: return np.nan
-L184
-L185     @staticmethod
-L186     def ev_fallback(info_t: dict, tk: yf.Ticker) -> float:
-L187         ev = info_t.get('enterpriseValue', np.nan)
-L188         if pd.notna(ev) and ev>0: return float(ev)
-L189         mc, debt, cash = info_t.get('marketCap', np.nan), np.nan, np.nan
-L190         try:
-L191             bs = tk.quarterly_balance_sheet
-L192             if bs is not None and not bs.empty:
-L193                 c = bs.columns[0]
-L194                 for k in ("Total Debt","Long Term Debt","Short Long Term Debt"):
-L195                     if k in bs.index: debt = float(bs.loc[k,c]); break
-L196                 for k in ("Cash And Cash Equivalents","Cash And Cash Equivalents And Short Term Investments","Cash"):
-L197                     if k in bs.index: cash = float(bs.loc[k,c]); break
-L198         except Exception: pass
-L199         if pd.notna(mc): return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
-L200         return np.nan
-L201
-L202     @staticmethod
-L203     def dividend_status(ticker: str) -> str:
-L204         t = yf.Ticker(ticker)
-L205         try:
-L206             if not t.dividends.empty: return "has"
-L207         except Exception: return "unknown"
-L208         try:
-L209             a = t.actions
-L210             if (a is not None and not a.empty and "Stock Splits" in a.columns and a["Stock Splits"].abs().sum()>0): return "none_confident"
-L211         except Exception: pass
-L212         try:
-L213             fi = t.fast_info
-L214             if any(getattr(fi,k,None) for k in ("last_dividend_date","dividend_rate","dividend_yield")): return "maybe_missing"
-L215         except Exception: pass
-L216         return "unknown"
-L217
-L218     @staticmethod
-L219     def div_streak(t):
+L178     def tr_str(s):
+L179         if s is None:
+L180             return np.nan
+L181         s = s.ffill(limit=2).dropna()
+L182         if len(s) < 50:
+L183             return np.nan
+L184         ma50 = s.rolling(50, min_periods=50).mean()
+L185         last_ma = ma50.iloc[-1]
+L186         last_px = s.iloc[-1]
+L187         return float(last_px/last_ma - 1.0) if pd.notna(last_ma) and pd.notna(last_px) else np.nan
+L188
+L189     @staticmethod
+L190     def rs_line_slope(s: pd.Series, b: pd.Series, win: int) -> float:
+L191         r = (s/b).dropna()
+L192         if len(r) < win: return np.nan
+L193         y, x = np.log(r.iloc[-win:]), np.arange(win, dtype=float)
+L194         try: return float(np.polyfit(x, y, 1)[0])
+L195         except Exception: return np.nan
+L196
+L197     @staticmethod
+L198     def ev_fallback(info_t: dict, tk: yf.Ticker) -> float:
+L199         ev = info_t.get('enterpriseValue', np.nan)
+L200         if pd.notna(ev) and ev>0: return float(ev)
+L201         mc, debt, cash = info_t.get('marketCap', np.nan), np.nan, np.nan
+L202         try:
+L203             bs = tk.quarterly_balance_sheet
+L204             if bs is not None and not bs.empty:
+L205                 c = bs.columns[0]
+L206                 for k in ("Total Debt","Long Term Debt","Short Long Term Debt"):
+L207                     if k in bs.index: debt = float(bs.loc[k,c]); break
+L208                 for k in ("Cash And Cash Equivalents","Cash And Cash Equivalents And Short Term Investments","Cash"):
+L209                     if k in bs.index: cash = float(bs.loc[k,c]); break
+L210         except Exception: pass
+L211         if pd.notna(mc): return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
+L212         return np.nan
+L213
+L214     @staticmethod
+L215     def dividend_status(ticker: str) -> str:
+L216         t = yf.Ticker(ticker)
+L217         try:
+L218             if not t.dividends.empty: return "has"
+L219         except Exception: return "unknown"
 L220         try:
-L221             divs = yf.Ticker(t).dividends.dropna(); ann = divs.groupby(divs.index.year).sum(); ann = ann[ann.index<pd.Timestamp.today().year]
-L222             years, streak = sorted(ann.index), 0
-L223             for i in range(len(years)-1,0,-1):
-L224                 if ann[years[i]] > ann[years[i-1]]: streak += 1
-L225                 else: break
-L226             return streak
-L227         except Exception: return 0
-L228
-L229     @staticmethod
-L230     def fetch_finnhub_metrics(symbol):
-L231         api_key = os.environ.get("FINNHUB_API_KEY")
-L232         if not api_key: return {}
-L233         url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":api_key}
-L234         try:
-L235             r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
-L236             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.get('enterpriseValue') else None}
-L237         except Exception: return {}
-L238
-L239     @staticmethod
-L240     def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
-L241         r, m = series.pct_change().dropna(), market.pct_change().dropna()
-L242         n = min(len(r), len(m), lookback)
-L243         if n<60: return np.nan
-L244         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
-L245         return np.nan if var==0 else cov/var
-L246
-L247     @staticmethod
-L248     def spx_to_alpha(spx: pd.Series, bands=(0.03,0.10), w=(0.6,0.4),
-L249                      span=5, q=(0.20,0.40), alphas=(0.05,0.08,0.10)) -> float:
-L250         """
-L251         S&P500指数のみから擬似breadthを作り、履歴分位でαを段階決定。
-L252         bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
-L253         """
-L254         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
-L255         b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
-L256         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
-L257         b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
-L258         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
-L259
-L260     @staticmethod
-L261     def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
+L221             a = t.actions
+L222             if (a is not None and not a.empty and "Stock Splits" in a.columns and a["Stock Splits"].abs().sum()>0): return "none_confident"
+L223         except Exception: pass
+L224         try:
+L225             fi = t.fast_info
+L226             if any(getattr(fi,k,None) for k in ("last_dividend_date","dividend_rate","dividend_yield")): return "maybe_missing"
+L227         except Exception: pass
+L228         return "unknown"
+L229
+L230     @staticmethod
+L231     def div_streak(t):
+L232         try:
+L233             divs = yf.Ticker(t).dividends.dropna(); ann = divs.groupby(divs.index.year).sum(); ann = ann[ann.index<pd.Timestamp.today().year]
+L234             years, streak = sorted(ann.index), 0
+L235             for i in range(len(years)-1,0,-1):
+L236                 if ann[years[i]] > ann[years[i-1]]: streak += 1
+L237                 else: break
+L238             return streak
+L239         except Exception: return 0
+L240
+L241     @staticmethod
+L242     def fetch_finnhub_metrics(symbol):
+L243         api_key = os.environ.get("FINNHUB_API_KEY")
+L244         if not api_key: return {}
+L245         url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":api_key}
+L246         try:
+L247             r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
+L248             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.get('enterpriseValue') else None}
+L249         except Exception: return {}
+L250
+L251     @staticmethod
+L252     def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
+L253         r, m = series.pct_change().dropna(), market.pct_change().dropna()
+L254         n = min(len(r), len(m), lookback)
+L255         if n<60: return np.nan
+L256         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
+L257         return np.nan if var==0 else cov/var
+L258
+L259     @staticmethod
+L260     def spx_to_alpha(spx: pd.Series, bands=(0.03,0.10), w=(0.6,0.4),
+L261                      span=5, q=(0.20,0.40), alphas=(0.05,0.08,0.10)) -> float:
 L262         """
-L263         同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
-L264         戻り値は降順ソート済み。
+L263         S&P500指数のみから擬似breadthを作り、履歴分位でαを段階決定。
+L264         bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
 L265         """
-L266         s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
-L267         cnt, pen = {}, {}
-L268         for t in order:
-L269             sec = sectors.get(t, "U"); cnt[sec] = cnt.get(sec,0) + 1; pen[t] = alpha*max(0, cnt[sec]-cap)
-L270         return (s - pd.Series(pen)).sort_values(ascending=False)
+L266         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
+L267         b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
+L268         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
+L269         b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
+L270         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
 L271
 L272     @staticmethod
-L273     def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08, hard: int|None=5) -> list[str]:
+L273     def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
 L274         """
-L275         soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
-L276         """
-L277         eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
-L278         if not hard:
-L279             return list(eff.head(N).index)
-L280         pick, used = [], {}
-L281         for t in eff.index:
-L282             s = sectors.get(t, "U")
-L283             if used.get(s,0) < hard:
-L284                 pick.append(t); used[s] = used.get(s,0) + 1
-L285             if len(pick) == N: break
-L286         return pick
-L287
-L288     @staticmethod
-L289     def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
-L290         """
-L291         各営業日の trend_template 合格本数（合格“本数”=C）を返す。
-L292         - px: 列=ticker（ベンチは含めない）
-L293         - spx: ベンチマーク Series（px.index に整列）
-L294         - win_days: 末尾の計算対象営業日数（None→全体、既定600は呼び出し側指定）
-L295         ベクトル化＆rollingのみで軽量。欠損は False 扱い。
-L296         """
-L297         import numpy as np, pandas as pd
-L298         if px is None or px.empty:
-L299             return pd.Series(dtype=int)
-L300         px = px.dropna(how="all", axis=1)
-L301         if win_days and win_days > 0:
-L302             px = px.tail(win_days)
-L303         if px.empty:
-L304             return pd.Series(dtype=int)
-L305         spx = spx.reindex(px.index).ffill()
-L306
-L307         ma50  = px.rolling(50).mean()
-L308         ma150 = px.rolling(150).mean()
-L309         ma200 = px.rolling(200).mean()
-L310
-L311         tt = (px > ma150)
-L312         tt &= (px > ma200)
-L313         tt &= (ma150 > ma200)
-L314         tt &= (ma200 - ma200.shift(21) > 0)
-L315         tt &= (ma50  > ma150)
-L316         tt &= (ma50  > ma200)
-L317         tt &= (px    > ma50)
+L275         同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
+L276         戻り値は降順ソート済み。
+L277         """
+L278         s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
+L279         cnt, pen = {}, {}
+L280         for t in order:
+L281             sec = sectors.get(t, "U"); cnt[sec] = cnt.get(sec,0) + 1; pen[t] = alpha*max(0, cnt[sec]-cap)
+L282         return (s - pd.Series(pen)).sort_values(ascending=False)
+L283
+L284     @staticmethod
+L285     def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08, hard: int|None=5) -> list[str]:
+L286         """
+L287         soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
+L288         """
+L289         eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
+L290         if not hard:
+L291             return list(eff.head(N).index)
+L292         pick, used = [], {}
+L293         for t in eff.index:
+L294             s = sectors.get(t, "U")
+L295             if used.get(s,0) < hard:
+L296                 pick.append(t); used[s] = used.get(s,0) + 1
+L297             if len(pick) == N: break
+L298         return pick
+L299
+L300     @staticmethod
+L301     def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
+L302         """
+L303         各営業日の trend_template 合格本数（合格“本数”=C）を返す。
+L304         - px: 列=ticker（ベンチは含めない）
+L305         - spx: ベンチマーク Series（px.index に整列）
+L306         - win_days: 末尾の計算対象営業日数（None→全体、既定600は呼び出し側指定）
+L307         ベクトル化＆rollingのみで軽量。欠損は False 扱い。
+L308         """
+L309         import numpy as np, pandas as pd
+L310         if px is None or px.empty:
+L311             return pd.Series(dtype=int)
+L312         px = px.dropna(how="all", axis=1)
+L313         if win_days and win_days > 0:
+L314             px = px.tail(win_days)
+L315         if px.empty:
+L316             return pd.Series(dtype=int)
+L317         spx = spx.reindex(px.index).ffill()
 L318
-L319         lo252 = px.rolling(252).min()
-L320         hi252 = px.rolling(252).max()
-L321         tt &= (px.divide(lo252).sub(1.0) >= 0.30)   # P_OVER_LOW52 >= 0.30
-L322         tt &= (px >= (0.75 * hi252))                # NEAR_52W_HIGH >= -0.25
-L323
-L324         r12  = px.divide(px.shift(252)).sub(1.0)
-L325         br12 = spx.divide(spx.shift(252)).sub(1.0)
-L326         r1   = px.divide(px.shift(22)).sub(1.0)
-L327         br1  = spx.divide(spx.shift(22)).sub(1.0)
-L328         rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
-L329         tt &= (rs >= 0.10)
+L319         ma50  = px.rolling(50).mean()
+L320         ma150 = px.rolling(150).mean()
+L321         ma200 = px.rolling(200).mean()
+L322
+L323         tt = (px > ma150)
+L324         tt &= (px > ma200)
+L325         tt &= (ma150 > ma200)
+L326         tt &= (ma200 - ma200.shift(21) > 0)
+L327         tt &= (ma50  > ma150)
+L328         tt &= (ma50  > ma200)
+L329         tt &= (px    > ma50)
 L330
-L331         return tt.fillna(False).sum(axis=1).astype(int)
-L332
-L333     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
-L334     def aggregate_scores(self, ib: Any, cfg):
-L335         if cfg is None:
-L336             raise ValueError("cfg is required; pass factor.PipelineConfig")
-L337         self._validate_ib_for_scorer(ib)
-L338
-L339         px, spx, tickers = ib.px, ib.spx, ib.tickers
-L340         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
-L341
-L342         df, missing_logs = pd.DataFrame(index=tickers), []
-L343         for t in tickers:
-L344             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
-L345             # --- 基本特徴 ---
-L346             df.loc[t,'TR']   = self.trend(s)
-L347             df.loc[t,'EPS']  = eps_df.loc[t,'EPS_TTM'] if t in eps_df.index else np.nan
-L348             df.loc[t,'REV']  = d.get('revenueGrowth',np.nan)
-L349             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
-L350             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
-L351
-L352             # --- 配当（欠損補完含む） ---
-L353             div = d.get('dividendYield') if d.get('dividendYield') is not None else d.get('trailingAnnualDividendYield')
-L354             if div is None or pd.isna(div):
-L355                 try:
-L356                     divs = yf.Ticker(t).dividends
-L357                     if divs is not None and not divs.empty:
-L358                         last_close = s.iloc[-1]; div_1y = divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum()
-L359                         if last_close and last_close>0: div = float(div_1y/last_close)
-L360                 except Exception: pass
-L361             df.loc[t,'DIV'] = 0.0 if (div is None or pd.isna(div)) else float(div)
-L362
-L363             # --- FCF/EV ---
-L364             fcf_val = fcf_df.loc[t,'FCF_TTM'] if t in fcf_df.index else np.nan
-L365             df.loc[t,'FCF'] = (fcf_val/ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev>0) else np.nan
-L366
-L367             # --- モメンタム・ボラ関連 ---
-L368             df.loc[t,'RS'], df.loc[t,'TR_str'] = self.rs(s, spx), self.tr_str(s)
-L369             r, rm = s.pct_change().dropna(), spx.pct_change().dropna()
-L370             n = int(min(len(r), len(rm)))
-L371
-L372             DOWNSIDE_DEV = np.nan
-L373             if n>=60:
-L374                 r6 = r.iloc[-min(len(r),126):]; neg = r6[r6<0]
-L375                 if len(neg)>=10: DOWNSIDE_DEV = float(neg.std(ddof=0)*np.sqrt(252))
-L376             df.loc[t,'DOWNSIDE_DEV'] = DOWNSIDE_DEV
-L377
-L378             MDD_1Y = np.nan
-L379             try:
-L380                 w = s.iloc[-min(len(s),252):].dropna()
-L381                 if len(w)>=30:
-L382                     roll_max = w.cummax(); MDD_1Y = float((w/roll_max - 1.0).min())
-L383             except Exception: pass
-L384             df.loc[t,'MDD_1Y'] = MDD_1Y
-L385
-L386             RESID_VOL = np.nan
-L387             if n>=120:
-L388                 rr, rrm = r.iloc[-n:].align(rm.iloc[-n:], join='inner')
-L389                 if len(rr)==len(rrm) and len(rr)>=120 and rrm.var()>0:
-L390                     beta = float(np.cov(rr, rrm)[0,1]/np.var(rrm)); resid = rr - beta*rrm
-L391                     RESID_VOL = float(resid.std(ddof=0)*np.sqrt(252))
-L392             df.loc[t,'RESID_VOL'] = RESID_VOL
-L393
-L394             DOWN_OUTPERF = np.nan
-L395             if n>=60:
-L396                 m, x = rm.iloc[-n:], r.iloc[-n:]; mask = m<0
-L397                 if mask.sum()>=10:
-L398                     mr, sr = float(m[mask].mean()), float(x[mask].mean())
-L399                     DOWN_OUTPERF = (sr - mr)/abs(mr) if mr!=0 else np.nan
-L400             df.loc[t,'DOWN_OUTPERF'] = DOWN_OUTPERF
-L401
-L402             # --- 長期移動平均/位置 ---
-L403             sma200 = s.rolling(200).mean(); df.loc[t,'EXT_200'] = np.nan
-L404             if pd.notna(sma200.iloc[-1]) and sma200.iloc[-1]!=0: df.loc[t,'EXT_200'] = abs(float(s.iloc[-1]/sma200.iloc[-1]-1.0))
+L331         lo252 = px.rolling(252).min()
+L332         hi252 = px.rolling(252).max()
+L333         tt &= (px.divide(lo252).sub(1.0) >= 0.30)   # P_OVER_LOW52 >= 0.30
+L334         tt &= (px >= (0.75 * hi252))                # NEAR_52W_HIGH >= -0.25
+L335
+L336         r12  = px.divide(px.shift(252)).sub(1.0)
+L337         br12 = spx.divide(spx.shift(252)).sub(1.0)
+L338         r1   = px.divide(px.shift(22)).sub(1.0)
+L339         br1  = spx.divide(spx.shift(22)).sub(1.0)
+L340         rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
+L341         tt &= (rs >= 0.10)
+L342
+L343         return tt.fillna(False).sum(axis=1).astype(int)
+L344
+L345     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
+L346     def aggregate_scores(self, ib: Any, cfg):
+L347         if cfg is None:
+L348             raise ValueError("cfg is required; pass factor.PipelineConfig")
+L349         self._validate_ib_for_scorer(ib)
+L350
+L351         px, spx, tickers = ib.px, ib.spx, ib.tickers
+L352         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
+L353
+L354         df, missing_logs = pd.DataFrame(index=tickers), []
+L355         for t in tickers:
+L356             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
+L357             # --- 基本特徴 ---
+L358             df.loc[t,'TR']   = self.trend(s)
+L359             df.loc[t,'EPS']  = eps_df.loc[t,'EPS_TTM'] if t in eps_df.index else np.nan
+L360             df.loc[t,'REV']  = d.get('revenueGrowth',np.nan)
+L361             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
+L362             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
+L363
+L364             # --- 配当（欠損補完含む） ---
+L365             div = d.get('dividendYield') if d.get('dividendYield') is not None else d.get('trailingAnnualDividendYield')
+L366             if div is None or pd.isna(div):
+L367                 try:
+L368                     divs = yf.Ticker(t).dividends
+L369                     if divs is not None and not divs.empty:
+L370                         last_close = s.iloc[-1]; div_1y = divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum()
+L371                         if last_close and last_close>0: div = float(div_1y/last_close)
+L372                 except Exception: pass
+L373             df.loc[t,'DIV'] = 0.0 if (div is None or pd.isna(div)) else float(div)
+L374
+L375             # --- FCF/EV ---
+L376             fcf_val = fcf_df.loc[t,'FCF_TTM'] if t in fcf_df.index else np.nan
+L377             df.loc[t,'FCF'] = (fcf_val/ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev>0) else np.nan
+L378
+L379             # --- モメンタム・ボラ関連 ---
+L380             df.loc[t,'RS'], df.loc[t,'TR_str'] = self.rs(s, spx), self.tr_str(s)
+L381             r, rm = s.pct_change().dropna(), spx.pct_change().dropna()
+L382             n = int(min(len(r), len(rm)))
+L383
+L384             DOWNSIDE_DEV = np.nan
+L385             if n>=60:
+L386                 r6 = r.iloc[-min(len(r),126):]; neg = r6[r6<0]
+L387                 if len(neg)>=10: DOWNSIDE_DEV = float(neg.std(ddof=0)*np.sqrt(252))
+L388             df.loc[t,'DOWNSIDE_DEV'] = DOWNSIDE_DEV
+L389
+L390             MDD_1Y = np.nan
+L391             try:
+L392                 w = s.iloc[-min(len(s),252):].dropna()
+L393                 if len(w)>=30:
+L394                     roll_max = w.cummax(); MDD_1Y = float((w/roll_max - 1.0).min())
+L395             except Exception: pass
+L396             df.loc[t,'MDD_1Y'] = MDD_1Y
+L397
+L398             RESID_VOL = np.nan
+L399             if n>=120:
+L400                 rr, rrm = r.iloc[-n:].align(rm.iloc[-n:], join='inner')
+L401                 if len(rr)==len(rrm) and len(rr)>=120 and rrm.var()>0:
+L402                     beta = float(np.cov(rr, rrm)[0,1]/np.var(rrm)); resid = rr - beta*rrm
+L403                     RESID_VOL = float(resid.std(ddof=0)*np.sqrt(252))
+L404             df.loc[t,'RESID_VOL'] = RESID_VOL
 L405
-L406             # --- 配当の詳細系 ---
-L407             DIV_TTM_PS=DIV_VAR5=DIV_YOY=DIV_FCF_COVER=np.nan
-L408             try:
-L409                 divs = yf.Ticker(t).dividends.dropna()
-L410                 if not divs.empty:
-L411                     last_close = s.iloc[-1]; div_1y = float(divs[divs.index >= (divs.index.max()-pd.Timedelta(days=365))].sum())
-L412                     DIV_TTM_PS = div_1y if div_1y>0 else np.nan
-L413                     ann = divs.groupby(divs.index.year).sum()
-L414                     if len(ann)>=2 and ann.iloc[-2]!=0: DIV_YOY = float(ann.iloc[-1]/ann.iloc[-2]-1.0)
-L415                     tail = ann.iloc[-5:] if len(ann)>=5 else ann
-L416                     if len(tail)>=3 and tail.mean()!=0: DIV_VAR5 = float(tail.std(ddof=1)/abs(tail.mean()))
-L417                 so = d.get('sharesOutstanding',None)
-L418                 if so and pd.notna(DIV_TTM_PS) and pd.notna(fcf_val) and fcf_val!=0:
-L419                     DIV_FCF_COVER = float((fcf_val)/(DIV_TTM_PS*float(so)))
-L420             except Exception: pass
-L421             df.loc[t,'DIV_TTM_PS'], df.loc[t,'DIV_VAR5'], df.loc[t,'DIV_YOY'], df.loc[t,'DIV_FCF_COVER'] = DIV_TTM_PS, DIV_VAR5, DIV_YOY, DIV_FCF_COVER
-L422
-L423             # --- 財務安定性 ---
-L424             df.loc[t,'DEBT2EQ'], df.loc[t,'CURR_RATIO'] = d.get('debtToEquity',np.nan), d.get('currentRatio',np.nan)
-L425
-L426             # --- EPS 変動 ---
-L427             EPS_VAR_8Q = np.nan
-L428             try:
-L429                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
-L430                 if qe is not None and not qe.empty and so:
-L431                     eps_q = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
-L432                     if len(eps_q)>=4: EPS_VAR_8Q = float(eps_q.iloc[-min(8,len(eps_q)):].std(ddof=1))
-L433             except Exception: pass
-L434             df.loc[t,'EPS_VAR_8Q'] = EPS_VAR_8Q
-L435
-L436             # --- サイズ/流動性 ---
-L437             df.loc[t,'MARKET_CAP'] = d.get('marketCap',np.nan); adv60 = np.nan
-L438             try:
-L439                 vol_series = ib.data['Volume'][t].dropna()
-L440                 if len(vol_series)>=5 and len(s)==len(vol_series):
-L441                     dv = (vol_series*s).rolling(60).mean(); adv60 = float(dv.iloc[-1])
-L442             except Exception: pass
-L443             df.loc[t,'ADV60_USD'] = adv60
-L444
-L445             # --- 売上/利益の加速度等 ---
-L446             REV_Q_YOY=EPS_Q_YOY=REV_YOY_ACC=REV_YOY_VAR=np.nan
-L447             REV_ANNUAL_STREAK = REV_YOY = np.nan
-L448             EPS_YOY = np.nan
-L449             try:
-L450                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
-L451                 if qe is not None and not qe.empty:
-L452                     if 'Revenue' in qe.columns:
-L453                         rev = qe['Revenue'].dropna().astype(float)
-L454                         if len(rev)>=5: REV_Q_YOY = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5])
-L455                         if len(rev)>=6:
-L456                             yoy_now = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5]); yoy_prev = _safe_div(rev.iloc[-2]-rev.iloc[-6], rev.iloc[-6])
-L457                             if pd.notna(yoy_now) and pd.notna(yoy_prev): REV_YOY_ACC = yoy_now - yoy_prev
-L458                         yoy_list=[]
-L459                         for k in range(1,5):
-L460                             if len(rev)>=4+k:
-L461                                 y = _safe_div(rev.iloc[-k]-rev.iloc[-(k+4)], rev.iloc[-(k+4)])
-L462                                 if pd.notna(y): yoy_list.append(y)
-L463                         if len(yoy_list)>=2: REV_YOY_VAR = float(np.std(yoy_list, ddof=1))
-L464                         # NEW: 年次の持続性（直近から遡って前年比プラスが何年連続か、四半期4本揃う完全年のみ）
-L465                         try:
-L466                             g = rev.groupby(rev.index.year)
-L467                             ann_sum, cnt = g.sum(), g.count()
-L468                             ann_sum = ann_sum[cnt >= 4]
-L469                             if len(ann_sum) >= 2:
-L470                                 yoy = ann_sum.pct_change().dropna()
-L471                                 if not yoy.empty:
-L472                                     REV_YOY = float(yoy.iloc[-1])
-L473                                 streak = 0
-L474                                 for v in yoy.iloc[::-1]:
-L475                                     if pd.isna(v) or v <= 0:
-L476                                         break
-L477                                     streak += 1
-L478                                 REV_ANNUAL_STREAK = float(streak)
-L479                         except Exception:
-L480                             pass
-L481                     if 'Earnings' in qe.columns and so:
-L482                         eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
-L483                         if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0:
-L484                             EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
-L485                         try:
-L486                             g_eps = eps_series.groupby(eps_series.index.year)
-L487                             ann_eps, cnt_eps = g_eps.sum(), g_eps.count()
-L488                             ann_eps = ann_eps[cnt_eps >= 4]
-L489                             if len(ann_eps) >= 2:
-L490                                 eps_yoy = ann_eps.pct_change().dropna()
-L491                                 if not eps_yoy.empty:
-L492                                     EPS_YOY = float(eps_yoy.iloc[-1])
-L493                         except Exception:
-L494                             pass
-L495             except Exception: pass
-L496             df.loc[t,'REV_Q_YOY'], df.loc[t,'EPS_Q_YOY'] = REV_Q_YOY, EPS_Q_YOY
-L497             df.loc[t,'REV_YOY_ACC'], df.loc[t,'REV_YOY_VAR'] = REV_YOY_ACC, REV_YOY_VAR
-L498             df.loc[t,'REV_YOY'] = REV_YOY
-L499             df.loc[t,'REV_ANN_STREAK'] = REV_ANNUAL_STREAK
-L500             df.loc[t,'EPS_YOY'] = EPS_YOY
-L501
-L502             # --- Rule of 40 や周辺 ---
-L503             total_rev_ttm = d.get('totalRevenue',np.nan)
-L504             FCF_MGN = _safe_div(fcf_val, total_rev_ttm)
-L505             df.loc[t,'FCF_MGN'] = FCF_MGN
-L506             rule40 = np.nan
-L507             try:
-L508                 r = df.loc[t,'REV']; rule40 = (r if pd.notna(r) else np.nan) + (FCF_MGN if pd.notna(FCF_MGN) else np.nan)
-L509             except Exception: pass
-L510             df.loc[t,'RULE40'] = rule40
-L511
-L512             # --- トレンド補助 ---
-L513             sma50  = s.rolling(50).mean()
-L514             sma150 = s.rolling(150).mean()
-L515             sma200 = s.rolling(200).mean()
-L516             p = _safe_last(s)
-L517
-L518             df.loc[t,'MA50_OVER_150'] = (_safe_last(sma50)/_safe_last(sma150) - 1
-L519                 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan)
-L520             df.loc[t,'MA150_OVER_200'] = (_safe_last(sma150)/_safe_last(sma200) - 1
-L521                 if pd.notna(_safe_last(sma150)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan)
-L522
-L523             lo52 = s[-252:].min() if len(s)>=252 else s.min()
-L524             df.loc[t,'P_OVER_LOW52'] = (p/lo52 - 1) if (lo52 and lo52>0 and pd.notna(p)) else np.nan
-L525
-L526             df.loc[t,'MA200_SLOPE_1M'] = np.nan
-L527             if len(sma200.dropna()) >= 21:
-L528                 cur200 = _safe_last(sma200)
-L529                 old2001 = float(sma200.iloc[-21])
-L530                 if old2001:
-L531                     df.loc[t,'MA200_SLOPE_1M'] = cur200/old2001 - 1
-L532
-L533             df.loc[t,'P_OVER_150'] = p/_safe_last(sma150)-1 if pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan
-L534             df.loc[t,'P_OVER_200'] = p/_safe_last(sma200)-1 if pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
-L535             df.loc[t,'MA50_OVER_200'] = _safe_last(sma50)/_safe_last(sma200)-1 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
-L536             df.loc[t,'MA200_SLOPE_5M'] = np.nan
-L537             if len(sma200.dropna())>=105:
-L538                 cur200, old200 = _safe_last(sma200), float(sma200.iloc[-105])
-L539                 if old200 and old200!=0: df.loc[t,'MA200_SLOPE_5M'] = cur200/old200 - 1
-L540             # NEW: 200日線が連続で上向きの「日数」
-L541             df.loc[t,'MA200_UP_STREAK_D'] = np.nan
-L542             try:
-L543                 s200 = sma200.dropna()
-L544                 if len(s200) >= 2:
-L545                     diff200 = s200.diff()
-L546                     up = 0
-L547                     for v in diff200.iloc[::-1]:
-L548                         if pd.isna(v) or v <= 0:
-L549                             break
-L550                         up += 1
-L551                     df.loc[t,'MA200_UP_STREAK_D'] = float(up)
-L552             except Exception:
-L553                 pass
-L554             df.loc[t,'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52<=0 or pd.isna(p)) else (p/(lo52*1.25)-1)
-L555             hi52 = s[-252:].max() if len(s)>=252 else s.max(); df.loc[t,'NEAR_52W_HIGH'] = np.nan
-L556             if hi52 and hi52>0 and pd.notna(p):
-L557                 d_hi = (p/hi52)-1.0; df.loc[t,'NEAR_52W_HIGH'] = -abs(min(0.0, d_hi))
-L558             df.loc[t,'RS_SLOPE_6W'] = self.rs_line_slope(s, ib.spx, 30)
-L559             df.loc[t,'RS_SLOPE_13W'] = self.rs_line_slope(s, ib.spx, 65)
-L560
-L561             df.loc[t,'DIV_STREAK'] = self.div_streak(t)
-L562
-L563             # --- 欠損メモ ---
-L564             fin_cols = ['REV','ROE','BETA','DIV','FCF']
-L565             need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t,col])]
-L566             if need_finnhub:
-L567                 fin_data = self.fetch_finnhub_metrics(t)
-L568                 for col in need_finnhub:
-L569                     val = fin_data.get(col)
-L570                     if val is not None and not pd.isna(val): df.loc[t,col] = val
-L571             for col in fin_cols + ['EPS','RS','TR_str','DIV_STREAK']:
-L572                 if pd.isna(df.loc[t,col]):
-L573                     if col=='DIV':
-L574                         status = self.dividend_status(t)
-L575                         if status!='none_confident': missing_logs.append({'Ticker':t,'Column':col,'Status':status})
-L576                     else:
-L577                         missing_logs.append({'Ticker':t,'Column':col})
-L578
-L579         def _trend_template_pass(row, rs_alpha_thresh=0.10):
-L580             c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
-L581             c2 = (row.get('MA150_OVER_200', np.nan) > 0)
-L582             c3 = (row.get('MA200_SLOPE_1M', np.nan) > 0)
-L583             c4 = (row.get('MA50_OVER_150', np.nan) > 0) and (row.get('MA50_OVER_200', np.nan) > 0)
-L584             c5 = (row.get('TR_str', np.nan) > 0)
-L585             c6 = (row.get('P_OVER_LOW52', np.nan) >= 0.30)
-L586             c7 = (row.get('NEAR_52W_HIGH', np.nan) >= -0.25)
-L587             c8 = (row.get('RS', np.nan) >= 0.10)
-L588             return bool(c1 and c2 and c3 and c4 and c5 and c6 and c7 and c8)
-L589
-L590         if 'trend_template' not in df.columns: df['trend_template'] = df.apply(_trend_template_pass, axis=1).fillna(False)
-L591         assert 'trend_template' in df.columns
-L592
-L593         # === Z化と合成 ===
-L594         for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
-L595
-L596         df_z = pd.DataFrame(index=df.index)
-L597         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
-L598         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
-L599         for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
-L600
-L601         # === Growth深掘り系（欠損保持z + RAW併載） ===
-L602         grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']
-L603         for col in grw_cols:
-L604             if col in df.columns:
-L605                 raw = pd.to_numeric(df[col], errors="coerce")
-L606                 df_z[col] = robust_z_keepnan(raw)
-L607                 df_z[f'{col}_RAW'] = raw
-L608         for k in ("TREND_SLOPE_EPS", "TREND_SLOPE_REV"):
-L609             if k in df.columns and k not in df_z.columns:
-L610                 raw = pd.to_numeric(df[k], errors="coerce")
-L611                 df_z[k] = robust_z_keepnan(raw)
-L612                 df_z[f'{k}_RAW'] = raw
-L613         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
-L614
-L615         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
-L616         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
-L617         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
-L618
-L619         # EPSが赤字でもFCFが黒字なら実質黒字とみなす
-L620         eps_pos_mask = (df['EPS'] > 0) | (df['FCF_MGN'] > 0)
-L621         df_z['EPS_POS'] = df_z['EPS'].where(eps_pos_mask, 0.0)
-L622
-L623         # ===== トレンドスロープ算出 =====
-L624         def zpos(x):
-L625             arr = robust_z(x)
-L626             idx = getattr(x, 'index', df_z.index)
-L627             return pd.Series(arr, index=idx).fillna(0.0)
-L628
-L629         def relu(x):
-L630             ser = x if isinstance(x, pd.Series) else pd.Series(x, index=df_z.index)
-L631             return ser.clip(lower=0).fillna(0.0)
-L632
-L633         # 売上トレンドスロープ（四半期）
-L634         slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
-L635         noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
-L636         slope_rev_combo = slope_rev - 0.25*noise_rev
-L637         df_z['TREND_SLOPE_REV_RAW'] = slope_rev_combo
-L638         df_z['TREND_SLOPE_REV'] = slope_rev_combo.clip(-3.0, 3.0)
-L639
-L640         # EPSトレンドスロープ（四半期）
-L641         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
-L642         df_z['TREND_SLOPE_EPS_RAW'] = slope_eps
-L643         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
+L406             DOWN_OUTPERF = np.nan
+L407             if n>=60:
+L408                 m, x = rm.iloc[-n:], r.iloc[-n:]; mask = m<0
+L409                 if mask.sum()>=10:
+L410                     mr, sr = float(m[mask].mean()), float(x[mask].mean())
+L411                     DOWN_OUTPERF = (sr - mr)/abs(mr) if mr!=0 else np.nan
+L412             df.loc[t,'DOWN_OUTPERF'] = DOWN_OUTPERF
+L413
+L414             # --- 長期移動平均/位置 ---
+L415             sma200 = s.rolling(200).mean(); df.loc[t,'EXT_200'] = np.nan
+L416             if pd.notna(sma200.iloc[-1]) and sma200.iloc[-1]!=0: df.loc[t,'EXT_200'] = abs(float(s.iloc[-1]/sma200.iloc[-1]-1.0))
+L417
+L418             # --- 配当の詳細系 ---
+L419             DIV_TTM_PS=DIV_VAR5=DIV_YOY=DIV_FCF_COVER=np.nan
+L420             try:
+L421                 divs = yf.Ticker(t).dividends.dropna()
+L422                 if not divs.empty:
+L423                     last_close = s.iloc[-1]; div_1y = float(divs[divs.index >= (divs.index.max()-pd.Timedelta(days=365))].sum())
+L424                     DIV_TTM_PS = div_1y if div_1y>0 else np.nan
+L425                     ann = divs.groupby(divs.index.year).sum()
+L426                     if len(ann)>=2 and ann.iloc[-2]!=0: DIV_YOY = float(ann.iloc[-1]/ann.iloc[-2]-1.0)
+L427                     tail = ann.iloc[-5:] if len(ann)>=5 else ann
+L428                     if len(tail)>=3 and tail.mean()!=0: DIV_VAR5 = float(tail.std(ddof=1)/abs(tail.mean()))
+L429                 so = d.get('sharesOutstanding',None)
+L430                 if so and pd.notna(DIV_TTM_PS) and pd.notna(fcf_val) and fcf_val!=0:
+L431                     DIV_FCF_COVER = float((fcf_val)/(DIV_TTM_PS*float(so)))
+L432             except Exception: pass
+L433             df.loc[t,'DIV_TTM_PS'], df.loc[t,'DIV_VAR5'], df.loc[t,'DIV_YOY'], df.loc[t,'DIV_FCF_COVER'] = DIV_TTM_PS, DIV_VAR5, DIV_YOY, DIV_FCF_COVER
+L434
+L435             # --- 財務安定性 ---
+L436             df.loc[t,'DEBT2EQ'], df.loc[t,'CURR_RATIO'] = d.get('debtToEquity',np.nan), d.get('currentRatio',np.nan)
+L437
+L438             # --- EPS 変動 ---
+L439             EPS_VAR_8Q = np.nan
+L440             try:
+L441                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
+L442                 if qe is not None and not qe.empty and so:
+L443                     eps_q = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
+L444                     if len(eps_q)>=4: EPS_VAR_8Q = float(eps_q.iloc[-min(8,len(eps_q)):].std(ddof=1))
+L445             except Exception: pass
+L446             df.loc[t,'EPS_VAR_8Q'] = EPS_VAR_8Q
+L447
+L448             # --- サイズ/流動性 ---
+L449             df.loc[t,'MARKET_CAP'] = d.get('marketCap',np.nan); adv60 = np.nan
+L450             try:
+L451                 vol_series = ib.data['Volume'][t].dropna()
+L452                 if len(vol_series)>=5 and len(s)==len(vol_series):
+L453                     dv = (vol_series*s).rolling(60).mean(); adv60 = float(dv.iloc[-1])
+L454             except Exception: pass
+L455             df.loc[t,'ADV60_USD'] = adv60
+L456
+L457             # --- 売上/利益の加速度等 ---
+L458             REV_Q_YOY=EPS_Q_YOY=REV_YOY_ACC=REV_YOY_VAR=np.nan
+L459             REV_ANNUAL_STREAK = REV_YOY = np.nan
+L460             EPS_YOY = np.nan
+L461             try:
+L462                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
+L463                 if qe is not None and not qe.empty:
+L464                     if 'Revenue' in qe.columns:
+L465                         rev = qe['Revenue'].dropna().astype(float)
+L466                         if len(rev)>=5: REV_Q_YOY = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5])
+L467                         if len(rev)>=6:
+L468                             yoy_now = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5]); yoy_prev = _safe_div(rev.iloc[-2]-rev.iloc[-6], rev.iloc[-6])
+L469                             if pd.notna(yoy_now) and pd.notna(yoy_prev): REV_YOY_ACC = yoy_now - yoy_prev
+L470                         yoy_list=[]
+L471                         for k in range(1,5):
+L472                             if len(rev)>=4+k:
+L473                                 y = _safe_div(rev.iloc[-k]-rev.iloc[-(k+4)], rev.iloc[-(k+4)])
+L474                                 if pd.notna(y): yoy_list.append(y)
+L475                         if len(yoy_list)>=2: REV_YOY_VAR = float(np.std(yoy_list, ddof=1))
+L476                         # NEW: 年次の持続性（直近から遡って前年比プラスが何年連続か、四半期4本揃う完全年のみ）
+L477                         try:
+L478                             g = rev.groupby(rev.index.year)
+L479                             ann_sum, cnt = g.sum(), g.count()
+L480                             ann_sum = ann_sum[cnt >= 4]
+L481                             if len(ann_sum) >= 2:
+L482                                 yoy = ann_sum.pct_change().dropna()
+L483                                 if not yoy.empty:
+L484                                     REV_YOY = float(yoy.iloc[-1])
+L485                                 streak = 0
+L486                                 for v in yoy.iloc[::-1]:
+L487                                     if pd.isna(v) or v <= 0:
+L488                                         break
+L489                                     streak += 1
+L490                                 REV_ANNUAL_STREAK = float(streak)
+L491                         except Exception:
+L492                             pass
+L493                     if 'Earnings' in qe.columns and so:
+L494                         eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
+L495                         if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0:
+L496                             EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
+L497                         try:
+L498                             g_eps = eps_series.groupby(eps_series.index.year)
+L499                             ann_eps, cnt_eps = g_eps.sum(), g_eps.count()
+L500                             ann_eps = ann_eps[cnt_eps >= 4]
+L501                             if len(ann_eps) >= 2:
+L502                                 eps_yoy = ann_eps.pct_change().dropna()
+L503                                 if not eps_yoy.empty:
+L504                                     EPS_YOY = float(eps_yoy.iloc[-1])
+L505                         except Exception:
+L506                             pass
+L507             except Exception: pass
+L508             df.loc[t,'REV_Q_YOY'], df.loc[t,'EPS_Q_YOY'] = REV_Q_YOY, EPS_Q_YOY
+L509             df.loc[t,'REV_YOY_ACC'], df.loc[t,'REV_YOY_VAR'] = REV_YOY_ACC, REV_YOY_VAR
+L510             df.loc[t,'REV_YOY'] = REV_YOY
+L511             df.loc[t,'REV_ANN_STREAK'] = REV_ANNUAL_STREAK
+L512             df.loc[t,'EPS_YOY'] = EPS_YOY
+L513
+L514             # --- Rule of 40 や周辺 ---
+L515             total_rev_ttm = d.get('totalRevenue',np.nan)
+L516             FCF_MGN = _safe_div(fcf_val, total_rev_ttm)
+L517             df.loc[t,'FCF_MGN'] = FCF_MGN
+L518             rule40 = np.nan
+L519             try:
+L520                 r = df.loc[t,'REV']; rule40 = (r if pd.notna(r) else np.nan) + (FCF_MGN if pd.notna(FCF_MGN) else np.nan)
+L521             except Exception: pass
+L522             df.loc[t,'RULE40'] = rule40
+L523
+L524             # --- トレンド補助 ---
+L525             sma50  = s.rolling(50).mean()
+L526             sma150 = s.rolling(150).mean()
+L527             sma200 = s.rolling(200).mean()
+L528             p = _safe_last(s)
+L529
+L530             df.loc[t,'MA50_OVER_150'] = (_safe_last(sma50)/_safe_last(sma150) - 1
+L531                 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan)
+L532             df.loc[t,'MA150_OVER_200'] = (_safe_last(sma150)/_safe_last(sma200) - 1
+L533                 if pd.notna(_safe_last(sma150)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan)
+L534
+L535             lo52 = s[-252:].min() if len(s)>=252 else s.min()
+L536             df.loc[t,'P_OVER_LOW52'] = (p/lo52 - 1) if (lo52 and lo52>0 and pd.notna(p)) else np.nan
+L537
+L538             df.loc[t,'MA200_SLOPE_1M'] = np.nan
+L539             if len(sma200.dropna()) >= 21:
+L540                 cur200 = _safe_last(sma200)
+L541                 old2001 = float(sma200.iloc[-21])
+L542                 if old2001:
+L543                     df.loc[t,'MA200_SLOPE_1M'] = cur200/old2001 - 1
+L544
+L545             df.loc[t,'P_OVER_150'] = p/_safe_last(sma150)-1 if pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan
+L546             df.loc[t,'P_OVER_200'] = p/_safe_last(sma200)-1 if pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
+L547             df.loc[t,'MA50_OVER_200'] = _safe_last(sma50)/_safe_last(sma200)-1 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
+L548             df.loc[t,'MA200_SLOPE_5M'] = np.nan
+L549             if len(sma200.dropna())>=105:
+L550                 cur200, old200 = _safe_last(sma200), float(sma200.iloc[-105])
+L551                 if old200 and old200!=0: df.loc[t,'MA200_SLOPE_5M'] = cur200/old200 - 1
+L552             # NEW: 200日線が連続で上向きの「日数」
+L553             df.loc[t,'MA200_UP_STREAK_D'] = np.nan
+L554             try:
+L555                 s200 = sma200.dropna()
+L556                 if len(s200) >= 2:
+L557                     diff200 = s200.diff()
+L558                     up = 0
+L559                     for v in diff200.iloc[::-1]:
+L560                         if pd.isna(v) or v <= 0:
+L561                             break
+L562                         up += 1
+L563                     df.loc[t,'MA200_UP_STREAK_D'] = float(up)
+L564             except Exception:
+L565                 pass
+L566             df.loc[t,'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52<=0 or pd.isna(p)) else (p/(lo52*1.25)-1)
+L567             hi52 = s[-252:].max() if len(s)>=252 else s.max(); df.loc[t,'NEAR_52W_HIGH'] = np.nan
+L568             if hi52 and hi52>0 and pd.notna(p):
+L569                 d_hi = (p/hi52)-1.0; df.loc[t,'NEAR_52W_HIGH'] = -abs(min(0.0, d_hi))
+L570             df.loc[t,'RS_SLOPE_6W'] = self.rs_line_slope(s, ib.spx, 30)
+L571             df.loc[t,'RS_SLOPE_13W'] = self.rs_line_slope(s, ib.spx, 65)
+L572
+L573             df.loc[t,'DIV_STREAK'] = self.div_streak(t)
+L574
+L575             # --- 欠損メモ ---
+L576             fin_cols = ['REV','ROE','BETA','DIV','FCF']
+L577             need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t,col])]
+L578             if need_finnhub:
+L579                 fin_data = self.fetch_finnhub_metrics(t)
+L580                 for col in need_finnhub:
+L581                     val = fin_data.get(col)
+L582                     if val is not None and not pd.isna(val): df.loc[t,col] = val
+L583             for col in fin_cols + ['EPS','RS','TR_str','DIV_STREAK']:
+L584                 if pd.isna(df.loc[t,col]):
+L585                     if col=='DIV':
+L586                         status = self.dividend_status(t)
+L587                         if status!='none_confident': missing_logs.append({'Ticker':t,'Column':col,'Status':status})
+L588                     else:
+L589                         missing_logs.append({'Ticker':t,'Column':col})
+L590
+L591         def _trend_template_pass(row, rs_alpha_thresh=0.10):
+L592             c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
+L593             c2 = (row.get('MA150_OVER_200', np.nan) > 0)
+L594             c3 = (row.get('MA200_SLOPE_1M', np.nan) > 0)
+L595             c4 = (row.get('MA50_OVER_150', np.nan) > 0) and (row.get('MA50_OVER_200', np.nan) > 0)
+L596             c5 = (row.get('TR_str', np.nan) > 0)
+L597             c6 = (row.get('P_OVER_LOW52', np.nan) >= 0.30)
+L598             c7 = (row.get('NEAR_52W_HIGH', np.nan) >= -0.25)
+L599             c8 = (row.get('RS', np.nan) >= 0.10)
+L600             return bool(c1 and c2 and c3 and c4 and c5 and c6 and c7 and c8)
+L601
+L602         if 'trend_template' not in df.columns: df['trend_template'] = df.apply(_trend_template_pass, axis=1).fillna(False)
+L603         assert 'trend_template' in df.columns
+L604
+L605         # === Z化と合成 ===
+L606         for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
+L607
+L608         df_z = pd.DataFrame(index=df.index)
+L609         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
+L610         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
+L611         for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
+L612
+L613         # === Growth深掘り系（欠損保持z + RAW併載） ===
+L614         grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']
+L615         for col in grw_cols:
+L616             if col in df.columns:
+L617                 raw = pd.to_numeric(df[col], errors="coerce")
+L618                 df_z[col] = robust_z_keepnan(raw)
+L619                 df_z[f'{col}_RAW'] = raw
+L620         for k in ("TREND_SLOPE_EPS", "TREND_SLOPE_REV"):
+L621             if k in df.columns and k not in df_z.columns:
+L622                 raw = pd.to_numeric(df[k], errors="coerce")
+L623                 df_z[k] = robust_z_keepnan(raw)
+L624                 df_z[f'{k}_RAW'] = raw
+L625         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
+L626
+L627         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
+L628         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
+L629         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
+L630
+L631         # EPSが赤字でもFCFが黒字なら実質黒字とみなす
+L632         eps_pos_mask = (df['EPS'] > 0) | (df['FCF_MGN'] > 0)
+L633         df_z['EPS_POS'] = df_z['EPS'].where(eps_pos_mask, 0.0)
+L634
+L635         # ===== トレンドスロープ算出 =====
+L636         def zpos(x):
+L637             arr = robust_z(x)
+L638             idx = getattr(x, 'index', df_z.index)
+L639             return pd.Series(arr, index=idx).fillna(0.0)
+L640
+L641         def relu(x):
+L642             ser = x if isinstance(x, pd.Series) else pd.Series(x, index=df_z.index)
+L643             return ser.clip(lower=0).fillna(0.0)
 L644
-L645         # 年次トレンド（サブ）
-L646         slope_rev_yr = zpos(df_z['REV_YOY'])
-L647         slope_eps_yr = zpos(df_z.get('EPS_YOY', pd.Series(0.0, index=df.index)))
-L648         streak_base = df['REV_ANN_STREAK'].clip(lower=0).fillna(0)
-L649         streak_yr = streak_base / (streak_base.abs() + 1.0)
-L650         slope_rev_yr_combo = 0.7*slope_rev_yr + 0.3*streak_yr
-L651         df_z['TREND_SLOPE_REV_YR_RAW'] = slope_rev_yr_combo
-L652         df_z['TREND_SLOPE_REV_YR'] = slope_rev_yr_combo.clip(-3.0, 3.0)
-L653         df_z['TREND_SLOPE_EPS_YR_RAW'] = slope_eps_yr
-L654         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
-L655
-L656         # ===== 新GRW合成式（SEPA寄りシフト） =====
-L657         _nz = lambda name: df_z.get(name, pd.Series(0.0, index=df_z.index)).fillna(0.0)
-L658         grw_combo = (
-L659               0.20*_nz('REV_Q_YOY')
-L660             + 0.10*_nz('REV_YOY_ACC')
-L661             + 0.10*_nz('REV_ANN_STREAK')
-L662             - 0.05*_nz('REV_YOY_VAR')
-L663             + 0.10*_nz('TREND_SLOPE_REV')
-L664             + 0.15*_nz('EPS_Q_YOY')
-L665             + 0.05*_nz('EPS_POS')
-L666             + 0.20*_nz('TREND_SLOPE_EPS')
-L667             + 0.05*_nz('TREND_SLOPE_REV_YR')
-L668             + 0.03*_nz('TREND_SLOPE_EPS_YR')
-L669             + 0.10*_nz('FCF_MGN')
-L670             + 0.05*_nz('RULE40')
-L671         )
-L672         df_z['GROWTH_F_RAW'] = grw_combo
-L673         df_z['GROWTH_F'] = robust_z(grw_combo).clip(-3.0, 3.0)
-L674
-L675         # Debug dump for GRW composition (console OFF by default; enable only with env)
-L676         if bool(os.getenv("GRW_CONSOLE_DEBUG")):
-L677             try:
-L678                 i = df_z[['GROWTH_F', 'GROWTH_F_RAW']].copy()
-L679                 i.sort_values('GROWTH_F', ascending=False, inplace=True)
-L680                 limit = max(0, min(40, len(i)))
-L681                 print("[DEBUG: GRW]")
-L682                 for t in i.index[:limit]:
-L683                     row = i.loc[t]
-L684                     parts = [f"GROWTH_F={row['GROWTH_F']:.3f}"]
-L685                     if pd.notna(row.get('GROWTH_F_RAW')):
-L686                         parts.append(f"GROWTH_F_RAW={row['GROWTH_F_RAW']:.3f}")
-L687                     print(f"Ticker: {t} | " + " ".join(parts))
-L688                 print()
-L689             except Exception as exc:
-L690                 print(f"[ERR] GRW debug dump failed: {exc}")
-L691
-L692         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
-L693             + 0.15*df_z['TR_str']
-L694             + 0.15*df_z['RS_SLOPE_6W']
-L695             + 0.15*df_z['RS_SLOPE_13W']
-L696             + 0.10*df_z['MA200_SLOPE_5M']
-L697             + 0.10*df_z['MA200_UP_STREAK_D']).clip(-3.0,3.0)
-L698         df_z['VOL'] = robust_z(df['BETA'])
-L699         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
-L700         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
-L701
-L702         _dump_dfz(df_z=df_z, debug_mode=getattr(cfg, "debug_mode", False))
+L645         # 売上トレンドスロープ（四半期）
+L646         slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
+L647         noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
+L648         slope_rev_combo = slope_rev - 0.25*noise_rev
+L649         df_z['TREND_SLOPE_REV_RAW'] = slope_rev_combo
+L650         df_z['TREND_SLOPE_REV'] = slope_rev_combo.clip(-3.0, 3.0)
+L651
+L652         # EPSトレンドスロープ（四半期）
+L653         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
+L654         df_z['TREND_SLOPE_EPS_RAW'] = slope_eps
+L655         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
+L656
+L657         # 年次トレンド（サブ）
+L658         slope_rev_yr = zpos(df_z['REV_YOY'])
+L659         slope_eps_yr = zpos(df_z.get('EPS_YOY', pd.Series(0.0, index=df.index)))
+L660         streak_base = df['REV_ANN_STREAK'].clip(lower=0).fillna(0)
+L661         streak_yr = streak_base / (streak_base.abs() + 1.0)
+L662         slope_rev_yr_combo = 0.7*slope_rev_yr + 0.3*streak_yr
+L663         df_z['TREND_SLOPE_REV_YR_RAW'] = slope_rev_yr_combo
+L664         df_z['TREND_SLOPE_REV_YR'] = slope_rev_yr_combo.clip(-3.0, 3.0)
+L665         df_z['TREND_SLOPE_EPS_YR_RAW'] = slope_eps_yr
+L666         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
+L667
+L668         # ===== 新GRW合成式（SEPA寄りシフト） =====
+L669         _nz = lambda name: df_z.get(name, pd.Series(0.0, index=df_z.index)).fillna(0.0)
+L670         grw_combo = (
+L671               0.20*_nz('REV_Q_YOY')
+L672             + 0.10*_nz('REV_YOY_ACC')
+L673             + 0.10*_nz('REV_ANN_STREAK')
+L674             - 0.05*_nz('REV_YOY_VAR')
+L675             + 0.10*_nz('TREND_SLOPE_REV')
+L676             + 0.15*_nz('EPS_Q_YOY')
+L677             + 0.05*_nz('EPS_POS')
+L678             + 0.20*_nz('TREND_SLOPE_EPS')
+L679             + 0.05*_nz('TREND_SLOPE_REV_YR')
+L680             + 0.03*_nz('TREND_SLOPE_EPS_YR')
+L681             + 0.10*_nz('FCF_MGN')
+L682             + 0.05*_nz('RULE40')
+L683         )
+L684         df_z['GROWTH_F_RAW'] = grw_combo
+L685         df_z['GROWTH_F'] = robust_z(grw_combo).clip(-3.0, 3.0)
+L686
+L687         # Debug dump for GRW composition (console OFF by default; enable only with env)
+L688         if bool(os.getenv("GRW_CONSOLE_DEBUG")):
+L689             try:
+L690                 i = df_z[['GROWTH_F', 'GROWTH_F_RAW']].copy()
+L691                 i.sort_values('GROWTH_F', ascending=False, inplace=True)
+L692                 limit = max(0, min(40, len(i)))
+L693                 print("[DEBUG: GRW]")
+L694                 for t in i.index[:limit]:
+L695                     row = i.loc[t]
+L696                     parts = [f"GROWTH_F={row['GROWTH_F']:.3f}"]
+L697                     if pd.notna(row.get('GROWTH_F_RAW')):
+L698                         parts.append(f"GROWTH_F_RAW={row['GROWTH_F_RAW']:.3f}")
+L699                     print(f"Ticker: {t} | " + " ".join(parts))
+L700                 print()
+L701             except Exception as exc:
+L702                 print(f"[ERR] GRW debug dump failed: {exc}")
 L703
-L704         # === begin: BIO LOSS PENALTY =====================================
-L705         try:
-L706             penalty_z = float(os.getenv("BIO_LOSS_PENALTY_Z", "0.8"))
-L707         except Exception:
-L708             penalty_z = 0.8
-L709
-L710         def _is_bio_like(t: str) -> bool:
-L711             inf = info.get(t, {}) if isinstance(info, dict) else {}
-L712             sec = str(inf.get("sector", "")).lower()
-L713             ind = str(inf.get("industry", "")).lower()
-L714             if "health" not in sec:
-L715                 return False
-L716             keys = ("biotech", "biopharma", "pharma")
-L717             return any(k in ind for k in keys)
-L718
-L719         tickers_s = pd.Index(df_z.index)
-L720         is_bio = pd.Series({t: _is_bio_like(t) for t in tickers_s})
-L721         is_loss = pd.Series({t: (pd.notna(df.loc[t,"EPS"]) and df.loc[t,"EPS"] <= 0) for t in tickers_s})
-L722         mask_bio_loss = (is_bio & is_loss).reindex(df_z.index).fillna(False)
-L723
-L724         if bool(mask_bio_loss.any()) and penalty_z > 0:
-L725             df_z.loc[mask_bio_loss, "GROWTH_F"] = df_z.loc[mask_bio_loss, "GROWTH_F"] - penalty_z
-L726             df_z["GROWTH_F"] = df_z["GROWTH_F"].clip(-3.0, 3.0)
-L727         # === end: BIO LOSS PENALTY =======================================
-L728
-L729         df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
-L730         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
-L731
-L732         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
-L733         df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
-L734         df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
-L735         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
-L736
-L737         # --- 重みは cfg を優先（外部があればそれを使用） ---
-L738         # ① 全銘柄で G/D スコアを算出（unmasked）
-L739         g_score_all = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
+L704         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
+L705             + 0.15*df_z['TR_str']
+L706             + 0.15*df_z['RS_SLOPE_6W']
+L707             + 0.15*df_z['RS_SLOPE_13W']
+L708             + 0.10*df_z['MA200_SLOPE_5M']
+L709             + 0.10*df_z['MA200_UP_STREAK_D']).clip(-3.0,3.0)
+L710         df_z['VOL'] = robust_z(df['BETA'])
+L711         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
+L712         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
+L713
+L714         _dump_dfz(df_z=df_z, debug_mode=getattr(cfg, "debug_mode", False))
+L715
+L716         # === begin: BIO LOSS PENALTY =====================================
+L717         try:
+L718             penalty_z = float(os.getenv("BIO_LOSS_PENALTY_Z", "0.8"))
+L719         except Exception:
+L720             penalty_z = 0.8
+L721
+L722         def _is_bio_like(t: str) -> bool:
+L723             inf = info.get(t, {}) if isinstance(info, dict) else {}
+L724             sec = str(inf.get("sector", "")).lower()
+L725             ind = str(inf.get("industry", "")).lower()
+L726             if "health" not in sec:
+L727                 return False
+L728             keys = ("biotech", "biopharma", "pharma")
+L729             return any(k in ind for k in keys)
+L730
+L731         tickers_s = pd.Index(df_z.index)
+L732         is_bio = pd.Series({t: _is_bio_like(t) for t in tickers_s})
+L733         is_loss = pd.Series({t: (pd.notna(df.loc[t,"EPS"]) and df.loc[t,"EPS"] <= 0) for t in tickers_s})
+L734         mask_bio_loss = (is_bio & is_loss).reindex(df_z.index).fillna(False)
+L735
+L736         if bool(mask_bio_loss.any()) and penalty_z > 0:
+L737             df_z.loc[mask_bio_loss, "GROWTH_F"] = df_z.loc[mask_bio_loss, "GROWTH_F"] - penalty_z
+L738             df_z["GROWTH_F"] = df_z["GROWTH_F"].clip(-3.0, 3.0)
+L739         # === end: BIO LOSS PENALTY =======================================
 L740
-L741         d_comp = pd.concat({
-L742             'QAL': df_z['D_QAL'],
-L743             'YLD': df_z['D_YLD'],
-L744             'VOL': df_z['D_VOL_RAW'],
-L745             'TRD': df_z['D_TRD']
-L746         }, axis=1)
-L747         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
-L748         globals()['D_WEIGHTS_EFF'] = dw.copy()
-L749         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
-L750
-L751         # ② テンプレ判定（既存ロジックそのまま）
-L752         mask = df['trend_template']
-L753         if not bool(mask.any()):
-L754             mask = ((df.get('P_OVER_LOW52', np.nan) >= 0.25) &
-L755                 (df.get('NEAR_52W_HIGH', np.nan) >= -0.30) &
-L756                 (df.get('RS', np.nan) >= 0.08) &
-L757                 (df.get('MA200_SLOPE_1M', np.nan) > 0) &
-L758                 (df.get('P_OVER_150', np.nan) > 0) & (df.get('P_OVER_200', np.nan) > 0) &
-L759                 (df.get('MA150_OVER_200', np.nan) > 0) &
-L760                 (df.get('MA50_OVER_150', np.nan) > 0) & (df.get('MA50_OVER_200', np.nan) > 0) &
-L761                 (df.get('TR_str', np.nan) > 0)).fillna(False)
-L762             df['trend_template'] = mask
-L763
-L764         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
-L765         g_score = g_score_all.loc[mask]
-L766         Scorer.g_score = g_score
-L767         df_z['GSC'] = g_score_all
-L768         df_z['DSC'] = d_score_all
-L769
-L770         try:
-L771             current = (pd.read_csv("current_tickers.csv")
-L772                   .iloc[:, 0]
-L773                   .str.upper()
-L774                   .tolist())
-L775         except FileNotFoundError:
-L776             warnings.warn("current_tickers.csv not found — bonus skipped")
-L777             current = []
-L778
-L779         mask_bonus = g_score.index.isin(current)
-L780         if mask_bonus.any():
-L781             # 1) factor.BONUS_COEFF から k を決め、無ければ 0.4
-L782             k = float(getattr(sys.modules.get("factor"), "BONUS_COEFF", 0.4))
-L783             # 2) g 側の σ を取り、NaN なら 0 に丸める
-L784             sigma_g = g_score.std()
-L785             if pd.isna(sigma_g):
-L786                 sigma_g = 0.0
-L787             bonus_g = round(k * sigma_g, 3)
-L788             g_score.loc[mask_bonus] += bonus_g
-L789             Scorer.g_score = g_score
-L790             # 3) D 側も同様に σ の NaN をケア
-L791             sigma_d = d_score_all.std()
-L792             if pd.isna(sigma_d):
-L793                 sigma_d = 0.0
-L794             bonus_d = round(k * sigma_d, 3)
-L795             d_score_all.loc[d_score_all.index.isin(current)] += bonus_d
-L796
-L797         try:
-L798             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
-L799         except Exception:
-L800             pass
-L801
-L802         df_full = df.copy()
-L803         df_full_z = df_z.copy()
-L804
-L805         from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
-L806         return FeatureBundle(df=df,
-L807             df_z=df_z,
-L808             g_score=g_score,
-L809             d_score_all=d_score_all,
-L810             missing_logs=pd.DataFrame(missing_logs),
-L811             df_full=df_full,
-L812             df_full_z=df_full_z,
-L813             scaler=None)
-L814
-L815 def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_pullback=5):
-L816     """
-L817     G枠ユニバースに対し、ブレイクアウト確定/押し目反発の「直近N営業日内の発火」を判定し、
-L818     次の列を feature_df に追加する（index=ticker）。
-L819       - G_BREAKOUT_recent_5d : bool
-L820       - G_BREAKOUT_last_date : str "YYYY-MM-DD"
-L821       - G_PULLBACK_recent_5d : bool
-L822       - G_PULLBACK_last_date : str "YYYY-MM-DD"
-L823       - G_PIVOT_price        : float
-L824     失敗しても例外は握り潰し、既存処理を阻害しない。
-L825     """
-L826     try:
-L827         px   = bundle.px                      # 終値 DataFrame
-L828         hi   = bundle.data['High']
-L829         lo   = bundle.data['Low']
-L830         vol  = bundle.data['Volume']
-L831         bench= bundle.spx                     # ベンチマーク Series
-L832
-L833         # Gユニバース推定：self.g_universe 優先 → feature_df['group']=='G' → 全銘柄
-L834         g_universe = getattr(self_obj, "g_universe", None)
-L835         if g_universe is None:
-L836             try:
-L837                 g_universe = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
-L838             except Exception:
-L839                 g_universe = list(feature_df.index)
-L840         if not g_universe:
-L841             return feature_df
-L842
-L843         # 指標
-L844         px = px.ffill(limit=2)
-L845         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
-L846         ma50  = px[g_universe].rolling(50).mean()
-L847         ma150 = px[g_universe].rolling(150).mean()
-L848         ma200 = px[g_universe].rolling(200).mean()
-L849         atr20 = (hi[g_universe] - lo[g_universe]).rolling(20).mean()
-L850         vol20 = vol[g_universe].rolling(20).mean()
-L851         vol50 = vol[g_universe].rolling(50).mean()
-L852
-L853         # トレンドテンプレート合格
-L854         trend_template_ok = (px[g_universe] > ma50) & (px[g_universe] > ma150) & (px[g_universe] > ma200) \
-L855                             & (ma150 > ma200) & (ma200.diff() > 0)
-L856
-L857         # 汎用ピボット：直近65営業日の高値（当日除外）
-L858         pivot_price = hi[g_universe].rolling(65).max().shift(1)
-L859
-L860         # 相対力：年内高値更新
-L861         bench_aligned = bench.reindex(px.index).ffill()
-L862         rs = px[g_universe].div(bench_aligned, axis=0)
-L863         rs_high = rs.rolling(252).max().shift(1)
+L741         df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
+L742         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
+L743
+L744         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
+L745         df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
+L746         df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
+L747         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
+L748
+L749         # --- 重みは cfg を優先（外部があればそれを使用） ---
+L750         # ① 全銘柄で G/D スコアを算出（unmasked）
+L751         g_score_all = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
+L752
+L753         d_comp = pd.concat({
+L754             'QAL': df_z['D_QAL'],
+L755             'YLD': df_z['D_YLD'],
+L756             'VOL': df_z['D_VOL_RAW'],
+L757             'TRD': df_z['D_TRD']
+L758         }, axis=1)
+L759         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
+L760         globals()['D_WEIGHTS_EFF'] = dw.copy()
+L761         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
+L762
+L763         # ② テンプレ判定（既存ロジックそのまま）
+L764         mask = df['trend_template']
+L765         if not bool(mask.any()):
+L766             mask = ((df.get('P_OVER_LOW52', np.nan) >= 0.25) &
+L767                 (df.get('NEAR_52W_HIGH', np.nan) >= -0.30) &
+L768                 (df.get('RS', np.nan) >= 0.08) &
+L769                 (df.get('MA200_SLOPE_1M', np.nan) > 0) &
+L770                 (df.get('P_OVER_150', np.nan) > 0) & (df.get('P_OVER_200', np.nan) > 0) &
+L771                 (df.get('MA150_OVER_200', np.nan) > 0) &
+L772                 (df.get('MA50_OVER_150', np.nan) > 0) & (df.get('MA50_OVER_200', np.nan) > 0) &
+L773                 (df.get('TR_str', np.nan) > 0)).fillna(False)
+L774             df['trend_template'] = mask
+L775
+L776         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
+L777         g_score = g_score_all.loc[mask]
+L778         Scorer.g_score = g_score
+L779         df_z['GSC'] = g_score_all
+L780         df_z['DSC'] = d_score_all
+L781
+L782         try:
+L783             current = (pd.read_csv("current_tickers.csv")
+L784                   .iloc[:, 0]
+L785                   .str.upper()
+L786                   .tolist())
+L787         except FileNotFoundError:
+L788             warnings.warn("current_tickers.csv not found — bonus skipped")
+L789             current = []
+L790
+L791         mask_bonus = g_score.index.isin(current)
+L792         if mask_bonus.any():
+L793             # 1) factor.BONUS_COEFF から k を決め、無ければ 0.4
+L794             k = float(getattr(sys.modules.get("factor"), "BONUS_COEFF", 0.4))
+L795             # 2) g 側の σ を取り、NaN なら 0 に丸める
+L796             sigma_g = g_score.std()
+L797             if pd.isna(sigma_g):
+L798                 sigma_g = 0.0
+L799             bonus_g = round(k * sigma_g, 3)
+L800             g_score.loc[mask_bonus] += bonus_g
+L801             Scorer.g_score = g_score
+L802             # 3) D 側も同様に σ の NaN をケア
+L803             sigma_d = d_score_all.std()
+L804             if pd.isna(sigma_d):
+L805                 sigma_d = 0.0
+L806             bonus_d = round(k * sigma_d, 3)
+L807             d_score_all.loc[d_score_all.index.isin(current)] += bonus_d
+L808
+L809         try:
+L810             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
+L811         except Exception:
+L812             pass
+L813
+L814         df_full = df.copy()
+L815         df_full_z = df_z.copy()
+L816
+L817         from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
+L818         return FeatureBundle(df=df,
+L819             df_z=df_z,
+L820             g_score=g_score,
+L821             d_score_all=d_score_all,
+L822             missing_logs=pd.DataFrame(missing_logs),
+L823             df_full=df_full,
+L824             df_full_z=df_full_z,
+L825             scaler=None)
+L826
+L827 def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_pullback=5):
+L828     """
+L829     G枠ユニバースに対し、ブレイクアウト確定/押し目反発の「直近N営業日内の発火」を判定し、
+L830     次の列を feature_df に追加する（index=ticker）。
+L831       - G_BREAKOUT_recent_5d : bool
+L832       - G_BREAKOUT_last_date : str "YYYY-MM-DD"
+L833       - G_PULLBACK_recent_5d : bool
+L834       - G_PULLBACK_last_date : str "YYYY-MM-DD"
+L835       - G_PIVOT_price        : float
+L836     失敗しても例外は握り潰し、既存処理を阻害しない。
+L837     """
+L838     try:
+L839         px   = bundle.px                      # 終値 DataFrame
+L840         hi   = bundle.data['High']
+L841         lo   = bundle.data['Low']
+L842         vol  = bundle.data['Volume']
+L843         bench= bundle.spx                     # ベンチマーク Series
+L844
+L845         # Gユニバース推定：self.g_universe 優先 → feature_df['group']=='G' → 全銘柄
+L846         g_universe = getattr(self_obj, "g_universe", None)
+L847         if g_universe is None:
+L848             try:
+L849                 g_universe = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
+L850             except Exception:
+L851                 g_universe = list(feature_df.index)
+L852         if not g_universe:
+L853             return feature_df
+L854
+L855         # 指標
+L856         px = px.ffill(limit=2)
+L857         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
+L858         ma50  = px[g_universe].rolling(50).mean()
+L859         ma150 = px[g_universe].rolling(150).mean()
+L860         ma200 = px[g_universe].rolling(200).mean()
+L861         atr20 = (hi[g_universe] - lo[g_universe]).rolling(20).mean()
+L862         vol20 = vol[g_universe].rolling(20).mean()
+L863         vol50 = vol[g_universe].rolling(50).mean()
 L864
-L865         # ブレイクアウト「発生日」：条件立ち上がり
-L866         breakout_today = trend_template_ok & (px[g_universe] > pivot_price) \
-L867                          & (vol[g_universe] >= 1.5 * vol50) & (rs > rs_high)
-L868         breakout_event = breakout_today & ~breakout_today.shift(1).fillna(False)
-L869
-L870         # 押し目反発「発生日」：EMA21帯×出来高ドライアップ×前日高値越え×終値EMA21上
-L871         near_ema21_band = px[g_universe].between(ema21 - atr20, ema21 + atr20)
-L872         volume_dryup = (vol20 / vol50) <= 1.0
-L873         pullback_bounce_confirmed = (px[g_universe] > hi[g_universe].shift(1)) & (px[g_universe] > ema21)
-L874         pullback_today = trend_template_ok & near_ema21_band & volume_dryup & pullback_bounce_confirmed
-L875         pullback_event = pullback_today & ~pullback_today.shift(1).fillna(False)
+L865         # トレンドテンプレート合格
+L866         trend_template_ok = (px[g_universe] > ma50) & (px[g_universe] > ma150) & (px[g_universe] > ma200) \
+L867                             & (ma150 > ma200) & (ma200.diff() > 0)
+L868
+L869         # 汎用ピボット：直近65営業日の高値（当日除外）
+L870         pivot_price = hi[g_universe].rolling(65).max().shift(1)
+L871
+L872         # 相対力：年内高値更新
+L873         bench_aligned = bench.reindex(px.index).ffill()
+L874         rs = px[g_universe].div(bench_aligned, axis=0)
+L875         rs_high = rs.rolling(252).max().shift(1)
 L876
-L877         # 直近N営業日内の発火 / 最終発生日
-L878         rows = []
-L879         for t in g_universe:
-L880             def _recent_and_date(s, win):
-L881                 sw = s[t].iloc[-win:]
-L882                 if sw.any():
-L883                     d = sw[sw].index[-1]
-L884                     return True, d.strftime("%Y-%m-%d")
-L885                 return False, ""
-L886             br_recent, br_date = _recent_and_date(breakout_event, win_breakout)
-L887             pb_recent, pb_date = _recent_and_date(pullback_event, win_pullback)
-L888             rows.append((t, {
-L889                 "G_BREAKOUT_recent_5d": br_recent,
-L890                 "G_BREAKOUT_last_date": br_date,
-L891                 "G_PULLBACK_recent_5d": pb_recent,
-L892                 "G_PULLBACK_last_date": pb_date,
-L893                 "G_PIVOT_price": float(pivot_price[t].iloc[-1]) if t in pivot_price.columns else float('nan'),
-L894             }))
-L895         flags = pd.DataFrame({k: v for k, v in rows}).T
-L896
-L897         # 列を作成・上書き
-L898         cols = ["G_BREAKOUT_recent_5d","G_BREAKOUT_last_date","G_PULLBACK_recent_5d","G_PULLBACK_last_date","G_PIVOT_price"]
-L899         for c in cols:
-L900             if c not in feature_df.columns:
-L901                 feature_df[c] = np.nan
-L902         feature_df.loc[flags.index, flags.columns] = flags
-L903
-L904     except Exception:
-L905         pass
-L906     return feature_df
-L907
+L877         # ブレイクアウト「発生日」：条件立ち上がり
+L878         breakout_today = trend_template_ok & (px[g_universe] > pivot_price) \
+L879                          & (vol[g_universe] >= 1.5 * vol50) & (rs > rs_high)
+L880         breakout_event = breakout_today & ~breakout_today.shift(1).fillna(False)
+L881
+L882         # 押し目反発「発生日」：EMA21帯×出来高ドライアップ×前日高値越え×終値EMA21上
+L883         near_ema21_band = px[g_universe].between(ema21 - atr20, ema21 + atr20)
+L884         volume_dryup = (vol20 / vol50) <= 1.0
+L885         pullback_bounce_confirmed = (px[g_universe] > hi[g_universe].shift(1)) & (px[g_universe] > ema21)
+L886         pullback_today = trend_template_ok & near_ema21_band & volume_dryup & pullback_bounce_confirmed
+L887         pullback_event = pullback_today & ~pullback_today.shift(1).fillna(False)
+L888
+L889         # 直近N営業日内の発火 / 最終発生日
+L890         rows = []
+L891         for t in g_universe:
+L892             def _recent_and_date(s, win):
+L893                 sw = s[t].iloc[-win:]
+L894                 if sw.any():
+L895                     d = sw[sw].index[-1]
+L896                     return True, d.strftime("%Y-%m-%d")
+L897                 return False, ""
+L898             br_recent, br_date = _recent_and_date(breakout_event, win_breakout)
+L899             pb_recent, pb_date = _recent_and_date(pullback_event, win_pullback)
+L900             rows.append((t, {
+L901                 "G_BREAKOUT_recent_5d": br_recent,
+L902                 "G_BREAKOUT_last_date": br_date,
+L903                 "G_PULLBACK_recent_5d": pb_recent,
+L904                 "G_PULLBACK_last_date": pb_date,
+L905                 "G_PIVOT_price": float(pivot_price[t].iloc[-1]) if t in pivot_price.columns else float('nan'),
+L906             }))
+L907         flags = pd.DataFrame({k: v for k, v in rows}).T
+L908
+L909         # 列を作成・上書き
+L910         cols = ["G_BREAKOUT_recent_5d","G_BREAKOUT_last_date","G_PULLBACK_recent_5d","G_PULLBACK_last_date","G_PIVOT_price"]
+L911         for c in cols:
+L912             if c not in feature_df.columns:
+L913                 feature_df[c] = np.nan
+L914         feature_df.loc[flags.index, flags.columns] = flags
+L915
+L916     except Exception:
+L917         pass
+L918     return feature_df
+L919
 ```
 
 ## <.github/workflows/weekly-report.yml>
