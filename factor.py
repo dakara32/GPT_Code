@@ -21,9 +21,9 @@ debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
 
 logger = logging.getLogger(__name__)
 if debug_mode:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, force=True)
 else:
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.WARNING, force=True)
 
 class T:
     t = perf_counter()
@@ -632,6 +632,7 @@ class Output:
         # 低スコア（GSC+DSC）Top10 表示/送信用
         self.low10_table = None
         self.debug_text = ""   # デバッグ用本文はここに一本化
+        self._debug_logged = False
 
     # --- 表示（元 display_results のロジックそのまま） ---
     def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
@@ -808,15 +809,41 @@ class Output:
                     self.debug_text = "(no dataframe)"
         else:
             self.debug_text = ""
-        # Slack側で分割送信するためコンソールには出力しない
-        # if debug_mode and self.debug_text:
-        #     print(self.debug_text)
+        if debug_mode and (self.debug_text or "").strip():
+            try:
+                logger.info("DEBUG (after Low Score)\n%s", self.debug_text)
+                self._debug_logged = True
+            except Exception as e:
+                print(f"[ERR] debug_log_failed: {e}")
+        else:
+            logger.debug(
+                "skip debug log: debug_mode=%s debug_text_empty=%s",
+                debug_mode, not bool((self.debug_text or '').strip())
+            )
+            self._debug_logged = True
 
     # --- Slack送信（元 notify_slack のロジックそのまま） ---
     def notify_slack(self):
         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+
+        if debug_mode and (self.debug_text or "").strip():
+            if not getattr(self, "_debug_logged", False):
+                try:
+                    logger.info("DEBUG (after Low Score)\n%s", self.debug_text)
+                    self._debug_logged = True
+                except Exception as e:
+                    print(f"[ERR] debug_log_failed: {e}")
+        else:
+            if not getattr(self, "_debug_logged", False):
+                logger.debug(
+                    "skip debug log: debug_mode=%s debug_text_empty=%s",
+                    debug_mode, not bool((self.debug_text or '').strip())
+                )
+                self._debug_logged = True
+
         if not SLACK_WEBHOOK_URL:
-            raise ValueError("SLACK_WEBHOOK_URL not set")
+            print("⚠️ SLACK_WEBHOOK_URL not set (main report skipped)")
+            return
 
         def _filter_suffix_from(spec: dict, group: str) -> str:
             g = spec.get(group, {})
@@ -858,18 +885,6 @@ class Output:
                 r.raise_for_status()
         except Exception as e:
             print(f"[ERR] main_post_failed: {e}")
-
-        # Debug は Slack/ファイルへ送らず、システムログみに一本化
-        if debug_mode and (self.debug_text or "").strip():
-            try:
-                logger.info("DEBUG (after Low Score)\n%s", self.debug_text)
-            except Exception as e:
-                print(f"[ERR] debug_log_failed: {e}")
-        else:
-            logger.debug(
-                "skip debug log: debug_mode=%s debug_text_empty=%s",
-                debug_mode, not bool((self.debug_text or '').strip())
-            )
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
     try:
