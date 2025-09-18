@@ -109,6 +109,7 @@ class PipelineConfig:
     weights: WeightsConfig
     drrs: DRRSParams
     price_max: float
+    debug_mode: bool = False
 
 # === 共通ユーティリティ（複数クラスで使用） ===
 # (unused local utils removed – use scorer.py versions if needed)
@@ -812,10 +813,15 @@ def run_pipeline() -> SelectionBundle:
     Slack文言・丸め・順序は既存の Output を用いて変更しない。
     """
     inb = io_build_input_bundle()
-    cfg = PipelineConfig(weights=WeightsConfig(g=g_weights, d=D_weights),
-        drrs=DRRSParams(corrM=corrM, shrink=DRRS_SHRINK,
-                         G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD),
-        price_max=CAND_PRICE_MAX)
+    cfg = PipelineConfig(
+        weights=WeightsConfig(g=g_weights, d=D_weights),
+        drrs=DRRSParams(
+            corrM=corrM, shrink=DRRS_SHRINK,
+            G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD
+        ),
+        price_max=CAND_PRICE_MAX,
+        debug_mode=debug_mode
+    )
     sc = Scorer()
     top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G)
     poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False).index)
