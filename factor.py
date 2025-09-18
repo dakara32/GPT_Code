@@ -3,7 +3,7 @@
 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
 SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
 SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
-import os, time, requests, logging
+import os, time, logging, requests
 from time import perf_counter
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -149,56 +149,18 @@ DEBUG_COLS = [
 
 MUST_DEBUG_COLS = {"TR_EPS", "TR_REV", "REV_Q_YOY", "REV_YOY_ACC", "RULE40", "FCF_MGN"}
 
-def _post_slack(payload: dict):
-    url = os.getenv("SLACK_WEBHOOK_URL")
-    if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-    try:
-        requests.post(url, json=payload).raise_for_status()
-    except Exception as e:
-        print(f"⚠️ Slack通知エラー: {e}")
-
-def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
-    """Slackへテキストを分割送信（コードブロック形式）。"""
-
-    def _post_text(payload: str) -> None:
-        try:
-            resp = requests.post(url, json={"text": payload})
-            print(f"[DBG] debug_post status={getattr(resp, 'status_code', None)} size={len(payload)}")
-            if resp is not None:
-                resp.raise_for_status()
-        except Exception as e:
-            print(f"[ERR] debug_post_failed: {e}")
-
-    body = str(text or "").strip()
+def _write_debug_log(text: str, filename: str = "debug_scores.txt") -> None:
+    """デバッグ本文を results/<filename> へ保存し、標準出力にも保存結果を出す。"""
+    body = (text or "").strip()
     if not body:
-        print("[DBG] skip debug send: empty body")
+        print("[debug] empty debug text; skip write")
         return
-
-    lines = body.splitlines()
-    block: list[str] = []
-    block_len = 0
-
-    def _flush() -> None:
-        nonlocal block, block_len
-        if not block:
-            return
-        payload = "```" + "\n".join(block) + "```"
-        _post_text(payload)
-        block, block_len = [], 0
-
-    for raw in lines:
-        line = raw or ""
-        while len(line) > chunk:
-            head, line = line[:chunk], line[chunk:]
-            _flush()
-            _post_text("```" + head + "```")
-        add_len = len(line) if not block else len(line) + 1
-        if block and block_len + add_len > chunk:
-            _flush()
-            add_len = len(line)
-        block.append(line)
-        block_len += add_len
-    _flush()
+    out_dir = os.path.join("results")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    print(f"[debug] written: {path} ({len(body)} chars)")
 
 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
     src = getattr(fb, "df_full", None)
@@ -803,15 +765,13 @@ class Output:
                     self.debug_text = "(no dataframe)"
         else:
             self.debug_text = ""
-        # Slack側で分割送信するためコンソールには出力しない
-        # if debug_mode and self.debug_text:
-        #     print(self.debug_text)
+        if debug_mode and (self.debug_text or "").strip():
+            print("```DEBUG (selected + current + near-miss)```")
+            print(self.debug_text)
+            _write_debug_log(self.debug_text, "debug_scores.txt")
 
-    # --- Slack送信（元 notify_slack のロジックそのまま） ---
     def notify_slack(self):
-        SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-        if not SLACK_WEBHOOK_URL:
-            raise ValueError("SLACK_WEBHOOK_URL not set")
+        """[log] 互換名：本文を標準出力へ"""
 
         def _filter_suffix_from(spec: dict, group: str) -> str:
             g = spec.get(group, {})
@@ -846,22 +806,11 @@ class Output:
         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table, 'empty', False) else f"```{self.io_table.to_string(index=False)}```\n")
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
 
-        try:
-            r = requests.post(SLACK_WEBHOOK_URL, json={"text": message})
-            print(f"[DBG] main_post status={getattr(r, 'status_code', None)} size={len(message)}")
-            if r is not None:
-                r.raise_for_status()
-        except Exception as e:
-            print(f"[ERR] main_post_failed: {e}")
+        print(message)
 
-        if debug_mode and (self.debug_text or "").strip():
-            try:
-                requests.post(SLACK_WEBHOOK_URL, json={"text": "```DEBUG (after Low Score)```"})
-            except Exception as e:
-                print(f"[ERR] debug_header_failed: {e}")
-            _slack_send_text_chunks(SLACK_WEBHOOK_URL, self.debug_text, chunk=2800)
-        else:
-            print(f"[DBG] skip debug send: debug_mode={debug_mode} debug_text_empty={not bool((self.debug_text or '').strip())}")
+        if (self.debug_text or "").strip():
+            print("```DEBUG (after Low Score)```")
+            print(self.debug_text)
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
     try:
@@ -1035,12 +984,9 @@ def run_pipeline() -> SelectionBundle:
     else:
         lines.append("過去5営業日の検知: なし")
 
-    try:
-        webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
-        if webhook:
-            requests.post(webhook, json={"text": "\n".join([s for s in lines if s != ""])}, timeout=10)
-    except Exception:
-        pass
+    report_text = "\n".join([s for s in lines if s])
+    if report_text:
+        print(report_text)
 
     out = Output()
     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
@@ -1072,18 +1018,6 @@ def run_pipeline() -> SelectionBundle:
         resD={"tickers": top_D, "avg_res_corr": avgD,
               "sum_score": sumD, "objective": objD},
         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
-
-    # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
-    try:
-        _low_df = (pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
-              .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
-              .sort_values("G_plus_D")
-              .head(10)
-              .round(3))
-        low_msg = "Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string(index=True, index_names=False)
-        _post_slack({"text": f"```{low_msg}```"})
-    except Exception as _e:
-        _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
 
     return sb
 
