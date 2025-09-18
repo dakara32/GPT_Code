@@ -854,14 +854,24 @@ class Output:
         except Exception as e:
             print(f"[ERR] main_post_failed: {e}")
 
-        if debug_mode and (self.debug_text or "").strip():
-            try:
-                requests.post(SLACK_WEBHOOK_URL, json={"text": "```DEBUG (after Low Score)```"})
-            except Exception as e:
-                print(f"[ERR] debug_header_failed: {e}")
-            _slack_send_text_chunks(SLACK_WEBHOOK_URL, self.debug_text, chunk=2800)
+        debug_body = (self.debug_text or "").strip()
+        if debug_mode:
+            if debug_body:
+                try:
+                    logger.info("DEBUG (after Low Score)\n%s", debug_body)
+                    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                    debug_path = os.path.join(RESULTS_DIR, f"debug_scores_{ts}.log")
+                    with open(debug_path, "w", encoding="utf-8") as fh:
+                        fh.write(debug_body)
+                except Exception as e:
+                    print(f"[ERR] debug_output_failed: {e}")
+            else:
+                logger.debug("skip debug output: debug_mode=True debug_text_empty=True")
         else:
-            print(f"[DBG] skip debug send: debug_mode={debug_mode} debug_text_empty={not bool((self.debug_text or '').strip())}")
+            logger.debug(
+                "skip debug output: debug_mode=False debug_text_empty=%s",
+                not bool(debug_body),
+            )
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
     try:
