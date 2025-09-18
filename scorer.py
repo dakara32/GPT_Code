@@ -472,44 +472,49 @@ class Scorer:
 
             # --- 売上/利益の加速度等 ---
             REV_Q_YOY=EPS_Q_YOY=REV_YOY_ACC=REV_YOY_VAR=np.nan
-            REV_ANNUAL_STREAK = REV_YOY = np.nan
+            REV_YOY = REV_ANNUAL_STREAK = np.nan
             EPS_YOY = np.nan
             try:
                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
-                if qe is not None and not qe.empty:
-                    if 'Revenue' in qe.columns:
-                        rev = qe['Revenue'].dropna().astype(float)
-                        if len(rev)>=5: REV_Q_YOY = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5])
-                        if len(rev)>=6:
-                            yoy_now = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5]); yoy_prev = _safe_div(rev.iloc[-2]-rev.iloc[-6], rev.iloc[-6])
-                            if pd.notna(yoy_now) and pd.notna(yoy_prev): REV_YOY_ACC = yoy_now - yoy_prev
-                        yoy_list=[]
-                        for k in range(1,5):
-                            if len(rev)>=4+k:
-                                y = _safe_div(rev.iloc[-k]-rev.iloc[-(k+4)], rev.iloc[-(k+4)])
-                                if pd.notna(y): yoy_list.append(y)
-                        if len(yoy_list)>=2: REV_YOY_VAR = float(np.std(yoy_list, ddof=1))
-                        # NEW: 年次の持続性（直近から遡って前年比プラスが何年連続か、四半期4本揃う完全年のみ）
+                rev_series = None
+                if qe is not None and not qe.empty and 'Revenue' in qe.columns:
+                    rev_series = pd.to_numeric(qe['Revenue'], errors='coerce')
+                else:
+                    qf = tickers_bulk.tickers[t].quarterly_financials
+                    if qf is not None and not qf.empty and 'Total Revenue' in qf.index:
+                        rev_series = pd.to_numeric(qf.loc['Total Revenue'], errors='coerce')
                         try:
-                            g = rev.groupby(rev.index.year)
-                            ann_sum, cnt = g.sum(), g.count()
-                            ann_sum = ann_sum[cnt >= 4]
-                            if len(ann_sum) >= 2:
-                                yoy = ann_sum.pct_change().dropna()
-                                if not yoy.empty:
-                                    REV_YOY = float(yoy.iloc[-1])
-                                streak = 0
-                                for v in yoy.iloc[::-1]:
-                                    if pd.isna(v) or v <= 0:
-                                        break
-                                    streak += 1
-                                REV_ANNUAL_STREAK = float(streak)
+                            rev_series = rev_series.sort_index()
                         except Exception:
                             pass
-                    if 'Earnings' in qe.columns and so:
-                        eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
-                        if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0:
-                            EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
+
+                if rev_series is not None and rev_series.dropna().shape[0] >= 2:
+                    r = rev_series.dropna().astype(float)
+                    yoy = r.pct_change(4).replace([np.inf, -np.inf], np.nan)
+                    yoy_valid = yoy.dropna()
+                    if not yoy_valid.empty:
+                        REV_Q_YOY = float(yoy_valid.iloc[-1])
+                        if len(yoy_valid) >= 2:
+                            yoy_delta = yoy_valid.diff().dropna()
+                            if not yoy_delta.empty:
+                                REV_YOY_ACC = float(yoy_delta.iloc[-1])
+                            tail_len = min(4, len(yoy_valid))
+                            tail = yoy_valid.iloc[-tail_len:]
+                            if len(tail) >= 2:
+                                REV_YOY_VAR = float(tail.std(ddof=1))
+                    if len(r) >= 8:
+                        annual = r.rolling(4).sum().dropna()
+                        if len(annual) >= 2:
+                            prev = annual.iloc[-2]
+                            if prev not in (None, 0) and not pd.isna(prev):
+                                REV_YOY = float((annual.iloc[-1] - prev) / prev)
+                            streak_series = (annual.diff() > 0).astype(int).rolling(4, min_periods=1).sum()
+                            if not streak_series.empty and pd.notna(streak_series.iloc[-1]):
+                                REV_ANNUAL_STREAK = int(streak_series.iloc[-1])
+                if qe is not None and not getattr(qe, "empty", True) and 'Earnings' in qe.columns and so:
+                    eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
+                    if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0:
+                        EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
                         try:
                             g_eps = eps_series.groupby(eps_series.index.year)
                             ann_eps, cnt_eps = g_eps.sum(), g_eps.count()
