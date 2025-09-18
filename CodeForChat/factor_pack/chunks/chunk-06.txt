@@ -1,72 +1,5 @@
 ```text
-er.py>
-```text
-L1 # scorer.py
-L2 # kawatest
-L3 # =============================================================================
-L4 # Scorer: ファクター/指標の生成と合成スコア算出を担う純粋層
-L5 #
-L6 # 【このファイルだけ読めば分かるポイント】
-L7 # - 入力(InputBundle)は「価格/出来高/ベンチ/基本情報/EPS/FCF/リターン」を含むDTO
-L8 # - 出力(FeatureBundle)は「raw特徴量 df」「標準化 df_z」「G/D スコア」「欠損ログ」
-L9 # - 重み等のコンフィグ(PipelineConfig)は factor から渡す（cfg 必須）
-L10 # - 旧カラム名は Scorer 内で自動リネームして受け入れ（後方互換）
-L11 #   例) eps_ttm -> EPS_TTM, eps_q_recent -> EPS_Q_LastQ, fcf_ttm -> FCF_TTM
-L12 #
-L13 # 【I/O契約（Scorerが参照するInputBundleフィールド）】
-L14 #   - cand: List[str]    … 候補銘柄（単体実行では未使用）
-L15 #   - tickers: List[str] … 対象銘柄リスト
-L16 #   - bench: str         … ベンチマークティッカー（例 '^GSPC'）
-L17 #   - data: pd.DataFrame … yfinance download結果 ('Close','Volume' 等の階層列)
-L18 #   - px: pd.DataFrame   … data['Close'] 相当（終値）
-L19 #   - spx: pd.Series     … ベンチマークの終値
-L20 #   - tickers_bulk: object         … yfinance.Tickers
-L21 #   - info: Dict[str, dict]        … yfinance info per ticker
-L22 #   - eps_df: pd.DataFrame         … 必須列: EPS_TTM, EPS_Q_LastQ（旧名も可）
-L23 #   - fcf_df: pd.DataFrame         … 必須列: FCF_TTM（旧名も可）
-L24 #   - returns: pd.DataFrame        … px[tickers].pct_change() 相当
-L25 #
-L26 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
-L27 # =============================================================================
-L28
-L29 import os, sys, warnings
-L30 import requests
-L31 import numpy as np
-L32 import pandas as pd
-L33 import yfinance as yf
-L34 from typing import Any, TYPE_CHECKING
-L35 from scipy.stats import zscore
-L36
-L37 if TYPE_CHECKING:
-L38     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
-L39
-L40 # ---- Dividend Helpers -------------------------------------------------------
-L41 def _last_close(t, price_map=None):
-L42     if price_map and (c := price_map.get(t)) is not None: return float(c)
-L43     try:
-L44         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
-L45         return float(h.iloc[-1]) if len(h) else np.nan
-L46     except Exception:
-L47         return np.nan
-L48
-L49 def _ttm_div_sum(t, lookback_days=400):
-L50     try:
-L51         div = yf.Ticker(t).dividends
-L52         if div is None or len(div) == 0: return 0.0
-L53         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
-L54         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
-L55         return ttm if ttm > 0 else float(div.tail(4).sum())
-L56     except Exception:
-L57         return 0.0
-L58
-L59 def ttm_div_yield_portfolio(tickers, price_map=None):
-L60     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
-L61     return float(np.mean(ys)) if ys else 0.0
-L62
-L63 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
-L64 def winsorize_s(s: pd.Series, p=0.02):
-L65     if s is None or s.dropna().empty: return s
-L66     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+*p, 100*(1-p)]); return s.clip(lo, hi)
 L67
 L68 def robust_z(s: pd.Series, p=0.02):
 L69     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
@@ -235,5 +168,73 @@ L231         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
 L232         b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
 L233         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
 L234         b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
-L235         return alphas[0] if b < lo else alphas[1] if 
+L235         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
+L236
+L237     @staticmethod
+L238     def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
+L239         """
+L240         同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
+L241         戻り値は降順ソート済み。
+L242         """
+L243         s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
+L244         cnt, pen = {}, {}
+L245         for t in order:
+L246             sec = sectors.get(t, "U"); cnt[sec] = cnt.get(sec,0) + 1; pen[t] = alpha*max(0, cnt[sec]-cap)
+L247         return (s - pd.Series(pen)).sort_values(ascending=False)
+L248
+L249     @staticmethod
+L250     def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08, hard: int|None=5) -> list[str]:
+L251         """
+L252         soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
+L253         """
+L254         eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
+L255         if not hard:
+L256             return list(eff.head(N).index)
+L257         pick, used = [], {}
+L258         for t in eff.index:
+L259             s = sectors.get(t, "U")
+L260             if used.get(s,0) < hard:
+L261                 pick.append(t); used[s] = used.get(s,0) + 1
+L262             if len(pick) == N: break
+L263         return pick
+L264
+L265     @staticmethod
+L266     def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
+L267         """
+L268         各営業日の trend_template 合格本数（合格“本数”=C）を返す。
+L269         - px: 列=ticker（ベンチは含めない）
+L270         - spx: ベンチマーク Series（px.index に整列）
+L271         - win_days: 末尾の計算対象営業日数（None→全体、既定600は呼び出し側指定）
+L272         ベクトル化＆rollingのみで軽量。欠損は False 扱い。
+L273         """
+L274         import numpy as np, pandas as pd
+L275         if px is None or px.empty:
+L276             return pd.Series(dtype=int)
+L277         px = px.dropna(how="all", axis=1)
+L278         if win_days and win_days > 0:
+L279             px = px.tail(win_days)
+L280         if px.empty:
+L281             return pd.Series(dtype=int)
+L282         spx = spx.reindex(px.index).ffill()
+L283
+L284         ma50  = px.rolling(50).mean()
+L285         ma150 = px.rolling(150).mean()
+L286         ma200 = px.rolling(200).mean()
+L287
+L288         tt = (px > ma150)
+L289         tt &= (px > ma200)
+L290         tt &= (ma150 > ma200)
+L291         tt &= (ma200 - ma200.shift(21) > 0)
+L292         tt &= (ma50  > ma150)
+L293         tt &= (ma50  > ma200)
+L294         tt &= (px    > ma50)
+L295
+L296         lo252 = px.rolling(252).min()
+L297         hi252 = px.rolling(252).max()
+L298         tt &= (px.divide(lo252).sub(1.0) >= 0.30)   # P_OVER_LOW52 >= 0.30
+L299         tt &= (px >= (0.75 * hi252))                # NEAR_52W_HIGH >= -0.25
+L300
+L301         r12  = px.divide(px.shift(252)).sub(1.0)
+L302         br12 = spx.divide(spx.shift(252)).sub(1.0)
+L303         r1   = px.divide(px.shift(22
 ```

@@ -44,7 +44,7 @@ L2 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安�
 L3 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
 L4 SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
 L5 SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
-L6 import os, time, requests, logging
+L6 import os, time, logging, requests
 L7 from time import perf_counter
 L8 from dataclasses import dataclass
 L9 from typing import Any, Dict, List
@@ -190,124 +190,110 @@ L148 ]
 L149
 L150 MUST_DEBUG_COLS = {"TR_EPS", "TR_REV", "REV_Q_YOY", "REV_YOY_ACC", "RULE40", "FCF_MGN"}
 L151
-L152 def _post_slack(payload: dict):
-L153     url = os.getenv("SLACK_WEBHOOK_URL")
-L154     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-L155     try:
-L156         requests.post(url, json=payload).raise_for_status()
-L157     except Exception as e:
-L158         print(f"⚠️ Slack通知エラー: {e}")
-L159
-L160 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
-L161     """Slackへテキストを分割送信（コードブロック形式）。"""
-L162
-L163     def _post_text(payload: str) -> None:
-L164         try:
-L165             resp = requests.post(url, json={"text": payload})
-L166             print(f"[DBG] debug_post status={getattr(resp, 'status_code', None)} size={len(payload)}")
-L167             if resp is not None:
-L168                 resp.raise_for_status()
-L169         except Exception as e:
-L170             print(f"[ERR] debug_post_failed: {e}")
-L171
-L172     body = str(text or "").strip()
-L173     if not body:
-L174         print("[DBG] skip debug send: empty body")
-L175         return
-L176
-L177     lines = body.splitlines()
-L178     block: list[str] = []
-L179     block_len = 0
-L180
-L181     def _flush() -> None:
-L182         nonlocal block, block_len
-L183         if not block:
-L184             return
-L185         payload = "```" + "\n".join(block) + "```"
-L186         _post_text(payload)
-L187         block, block_len = [], 0
-L188
-L189     for raw in lines:
-L190         line = raw or ""
-L191         while len(line) > chunk:
-L192             head, line = line[:chunk], line[chunk:]
-L193             _flush()
-L194             _post_text("```" + head + "```")
-L195         add_len = len(line) if not block else len(line) + 1
-L196         if block and block_len + add_len > chunk:
-L197             _flush()
-L198             add_len = len(line)
-L199         block.append(line)
-L200         block_len += add_len
-L201     _flush()
-L202
-L203 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-L204     src = getattr(fb, "df_full", None)
-L205     if not isinstance(src, pd.DataFrame) or src.empty:
-L206         src = getattr(fb, "df_full_z", None)
-L207     if not isinstance(src, pd.DataFrame) or src.empty:
-L208         src = getattr(fb, "df_z", None)
-L209     if not isinstance(src, pd.DataFrame) or src.empty:
-L210         return ""
-L211
-L212     df_show = src.apply(pd.to_numeric, errors="coerce").rename(
-L213         columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in src.columns}
-L214     )
-L215
-L216     missing = sorted(c for c in MUST_DEBUG_COLS if c not in df_show.columns)
-L217     if missing:
-L218         logger.warning("[debug] missing cols: %s", missing)
-L219
-L220     all_cols = _env_true("DEBUG_ALL_COLS", False)
-L221     ordered = [c for c in _DEBUG_COL_ORDER if c in df_show.columns]
-L222     cols = list(df_show.columns) if all_cols else ordered
-L223     if not cols:
-L224         cols = [c for c in df_show.columns if c not in ("GSC", "DSC")]
-L225
-L226     g_series = getattr(fb, "g_score", None)
-L227     d_series = getattr(fb, "d_score_all", None)
-L228     show_near = _env_true("DEBUG_NEAR5", True)
-L229     g_sorted = g_series.sort_values(ascending=False) if show_near and hasattr(g_series, "sort_values") else None
-L230     d_sorted = d_series.sort_values(ascending=False) if show_near and hasattr(d_series, "sort_values") else None
+L152 def _write_debug_log(text: str, filename: str = "debug_scores.txt") -> None:
+L153     """デバッグ本文を results/<filename> へ保存し、標準出力にも保存結果を出す。"""
+L154     body = (text or "").strip()
+L155     if not body:
+L156         print("[debug] empty debug text; skip write")
+L157         return
+L158     out_dir = os.path.join("results")
+L159     os.makedirs(out_dir, exist_ok=True)
+L160     path = os.path.join(out_dir, filename)
+L161     with open(path, "w", encoding="utf-8") as f:
+L162         f.write(body)
+L163     print(f"[debug] written: {path} ({len(body)} chars)")
+L164
+L165 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
+L166     src = getattr(fb, "df_full", None)
+L167     if not isinstance(src, pd.DataFrame) or src.empty:
+L168         src = getattr(fb, "df_full_z", None)
+L169     if not isinstance(src, pd.DataFrame) or src.empty:
+L170         src = getattr(fb, "df_z", None)
+L171     if not isinstance(src, pd.DataFrame) or src.empty:
+L172         return ""
+L173
+L174     df_show = src.apply(pd.to_numeric, errors="coerce").rename(
+L175         columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in src.columns}
+L176     )
+L177
+L178     missing = sorted(c for c in MUST_DEBUG_COLS if c not in df_show.columns)
+L179     if missing:
+L180         logger.warning("[debug] missing cols: %s", missing)
+L181
+L182     all_cols = _env_true("DEBUG_ALL_COLS", False)
+L183     ordered = [c for c in _DEBUG_COL_ORDER if c in df_show.columns]
+L184     cols = list(df_show.columns) if all_cols else ordered
+L185     if not cols:
+L186         cols = [c for c in df_show.columns if c not in ("GSC", "DSC")]
+L187
+L188     g_series = getattr(fb, "g_score", None)
+L189     d_series = getattr(fb, "d_score_all", None)
+L190     show_near = _env_true("DEBUG_NEAR5", True)
+L191     g_sorted = g_series.sort_values(ascending=False) if show_near and hasattr(g_series, "sort_values") else None
+L192     d_sorted = d_series.sort_values(ascending=False) if show_near and hasattr(d_series, "sort_values") else None
+L193
+L194     g_pick = list(getattr(sb, "top_G", []) or [])
+L195     d_pick = list(getattr(sb, "top_D", []) or [])
+L196     prevG = list(prevG or [])
+L197     prevD = list(prevD or [])
+L198     Gp, Dp = set(prevG), set(prevD)
+L199     g_new = [t for t in g_pick if t not in Gp]
+L200     g_out = [t for t in prevG if t not in g_pick]
+L201     d_new = [t for t in d_pick if t not in Dp]
+L202     d_out = [t for t in prevD if t not in d_pick]
+L203
+L204     g_miss = [t for t in (g_sorted.index if g_sorted is not None else []) if t not in g_pick][:10]
+L205     used_d = set(g_pick + d_pick)
+L206     d_miss = [t for t in (d_sorted.index if d_sorted is not None else []) if t not in used_d][:10]
+L207
+L208     def _merge_rows(*seqs):
+L209         seen, out = set(), []
+L210         for seq in seqs:
+L211             for t in seq or []:
+L212                 if t in df_show.index and t not in seen:
+L213                     seen.add(t)
+L214                     out.append(t)
+L215         return out
+L216
+L217     all_rows = _env_true("DEBUG_ALL_ROWS", False)
+L218     focus = df_show.index.tolist() if all_rows else _merge_rows(g_pick + d_pick, prevG + prevD, g_miss, d_miss)
+L219     if not focus:
+L220         focus = df_show.index.tolist()
+L221     focus = focus[:max_rows]
+L222
+L223     if cols:
+L224         df_focus = df_show.loc[focus, cols].copy()
+L225     else:
+L226         df_focus = df_show.loc[focus].copy()
+L227     if "GSC" not in df_focus.columns and g_series is not None:
+L228         df_focus["GSC"] = [g_series.get(t, np.nan) if hasattr(g_series, "get") else np.nan for t in df_focus.index]
+L229     if "DSC" not in df_focus.columns and d_series is not None:
+L230         df_focus["DSC"] = [d_series.get(t, np.nan) if hasattr(d_series, "get") else np.nan for t in df_focus.index]
 L231
-L232     g_pick = list(getattr(sb, "top_G", []) or [])
-L233     d_pick = list(getattr(sb, "top_D", []) or [])
-L234     prevG = list(prevG or [])
-L235     prevD = list(prevD or [])
-L236     Gp, Dp = set(prevG), set(prevD)
-L237     g_new = [t for t in g_pick if t not in Gp]
-L238     g_out = [t for t in prevG if t not in g_pick]
-L239     d_new = [t for t in d_pick if t not in Dp]
-L240     d_out = [t for t in prevD if t not in d_pick]
+L232     if not all_cols:
+L233         extra = [c for c in df_focus.columns if c not in cols]
+L234         cols = cols + [c for c in ("GSC", "DSC") if c not in cols]
+L235         cols += [c for c in extra if c not in cols]
+L236     else:
+L237         cols = [c for c in df_focus.columns if c not in ("GSC", "DSC")]
+L238         cols += [c for c in ("GSC", "DSC") if c not in cols]
+L239
+L240     body = df_focus.reindex(columns=cols).round(3).to_string(max_rows=None, max_cols=None, na_rep="nan") if focus else "(no rows)"
 L241
-L242     g_miss = [t for t in (g_sorted.index if g_sorted is not None else []) if t not in g_pick][:10]
-L243     used_d = set(g_pick + d_pick)
-L244     d_miss = [t for t in (d_sorted.index if d_sorted is not None else []) if t not in used_d][:10]
-L245
-L246     def _merge_rows(*seqs):
-L247         seen, out = set(), []
-L248         for seq in seqs:
-L249             for t in seq or []:
-L250                 if t in df_show.index and t not in seen:
-L251                     seen.add(t)
-L252                     out.append(t)
-L253         return out
-L254
-L255     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-L256     focus = df_show.index.tolist() if all_rows else _merge_rows(g_pick + d_pick, prevG + prevD, g_miss, d_miss)
-L257     if not focus:
-L258         focus = df_show.index.tolist()
-L259     focus = focus[:max_rows]
-L260
-L261     if cols:
-L262         df_focus = df_show.loc[focus, cols].copy()
-L263     else:
-L264         df_focus = df_show.loc[focus].copy()
-L265     if "GSC" not in df_focus.columns and g_series is not None:
-L266         df_focus["GSC"] = [g_series.get(t, np.nan) if hasattr(g_series, "get") else np.nan for t in df_focus.index]
-L267     if "DSC" not in df_focus.columns and d_series is not None:
-L268         df_focus["DSC"] = [d_series.get(t, np.nan) if hasattr(d_series, "get") else np.nan for t in df_focus.index]
-L269
-L270     if not all_cols:
-L271         extra = [c fo
+L242     def _fmt_near(lbl, ser, lst):
+L243         if ser is None:
+L244             return f"{lbl}: off"
+L245         get = ser.get
+L246         parts = []
+L247         for t in lst:
+L248             val = get(t, np.nan)
+L249             parts.append(f"{t}:{val:.3f}" if pd.notna(val) else f"{t}:nan")
+L250         return f"{lbl}: " + (", ".join(parts) if parts else "-")
+L251
+L252     head = [
+L253         f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
+L254         _fmt_near("G near10", g_sorted, g_miss),
+L255         _fmt_near("D near10", d_sorted, d_miss),
+L256         f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
+L257         f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SELECTED+CURRENT+NEAR'}",
 ```
