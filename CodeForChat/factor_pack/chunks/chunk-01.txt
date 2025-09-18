@@ -39,7 +39,7 @@ L27
 
 ## <factor.py>
 ```text
-L1 '''ROLE: Orchestration ONLY（外部I/O・SSOT・Slack出力）, 計算は scorer.py'''
+L1 '''ROLE: Orchestration ONLY（外部I/O・SSOT・ログ出力）, 計算は scorer.py'''
 L2 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
 L3 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
 L4 SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
@@ -194,14 +194,14 @@ L152 def _write_debug_log(text: str, filename: str = "debug_scores.txt") -> None
 L153     """デバッグ本文を results/<filename> へ保存し、標準出力にも保存結果を出す。"""
 L154     body = (text or "").strip()
 L155     if not body:
-L156         print("[debug] empty debug text; skip write")
+L156         print("[debug] empty debug text; skip write", flush=True)
 L157         return
 L158     out_dir = os.path.join("results")
 L159     os.makedirs(out_dir, exist_ok=True)
 L160     path = os.path.join(out_dir, filename)
 L161     with open(path, "w", encoding="utf-8") as f:
 L162         f.write(body)
-L163     print(f"[debug] written: {path} ({len(body)} chars)")
+L163     print(f"[debug] written: {path} ({len(body)} chars)", flush=True)
 L164
 L165 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
 L166     src = getattr(fb, "df_full", None)
@@ -220,80 +220,85 @@ L178     missing = sorted(c for c in MUST_DEBUG_COLS if c not in df_show.columns
 L179     if missing:
 L180         logger.warning("[debug] missing cols: %s", missing)
 L181
-L182     all_cols = _env_true("DEBUG_ALL_COLS", False)
-L183     ordered = [c for c in _DEBUG_COL_ORDER if c in df_show.columns]
-L184     cols = list(df_show.columns) if all_cols else ordered
-L185     if not cols:
-L186         cols = [c for c in df_show.columns if c not in ("GSC", "DSC")]
-L187
-L188     g_series = getattr(fb, "g_score", None)
-L189     d_series = getattr(fb, "d_score_all", None)
-L190     show_near = _env_true("DEBUG_NEAR5", True)
-L191     g_sorted = g_series.sort_values(ascending=False) if show_near and hasattr(g_series, "sort_values") else None
-L192     d_sorted = d_series.sort_values(ascending=False) if show_near and hasattr(d_series, "sort_values") else None
-L193
-L194     g_pick = list(getattr(sb, "top_G", []) or [])
-L195     d_pick = list(getattr(sb, "top_D", []) or [])
-L196     prevG = list(prevG or [])
-L197     prevD = list(prevD or [])
-L198     Gp, Dp = set(prevG), set(prevD)
-L199     g_new = [t for t in g_pick if t not in Gp]
-L200     g_out = [t for t in prevG if t not in g_pick]
-L201     d_new = [t for t in d_pick if t not in Dp]
-L202     d_out = [t for t in prevD if t not in d_pick]
-L203
-L204     g_miss = [t for t in (g_sorted.index if g_sorted is not None else []) if t not in g_pick][:10]
-L205     used_d = set(g_pick + d_pick)
-L206     d_miss = [t for t in (d_sorted.index if d_sorted is not None else []) if t not in used_d][:10]
-L207
-L208     def _merge_rows(*seqs):
-L209         seen, out = set(), []
-L210         for seq in seqs:
-L211             for t in seq or []:
-L212                 if t in df_show.index and t not in seen:
-L213                     seen.add(t)
-L214                     out.append(t)
-L215         return out
-L216
-L217     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-L218     focus = df_show.index.tolist() if all_rows else _merge_rows(g_pick + d_pick, prevG + prevD, g_miss, d_miss)
-L219     if not focus:
-L220         focus = df_show.index.tolist()
-L221     focus = focus[:max_rows]
-L222
-L223     if cols:
-L224         df_focus = df_show.loc[focus, cols].copy()
-L225     else:
-L226         df_focus = df_show.loc[focus].copy()
-L227     if "GSC" not in df_focus.columns and g_series is not None:
-L228         df_focus["GSC"] = [g_series.get(t, np.nan) if hasattr(g_series, "get") else np.nan for t in df_focus.index]
-L229     if "DSC" not in df_focus.columns and d_series is not None:
-L230         df_focus["DSC"] = [d_series.get(t, np.nan) if hasattr(d_series, "get") else np.nan for t in df_focus.index]
-L231
-L232     if not all_cols:
-L233         extra = [c for c in df_focus.columns if c not in cols]
-L234         cols = cols + [c for c in ("GSC", "DSC") if c not in cols]
-L235         cols += [c for c in extra if c not in cols]
-L236     else:
-L237         cols = [c for c in df_focus.columns if c not in ("GSC", "DSC")]
-L238         cols += [c for c in ("GSC", "DSC") if c not in cols]
-L239
-L240     body = df_focus.reindex(columns=cols).round(3).to_string(max_rows=None, max_cols=None, na_rep="nan") if focus else "(no rows)"
-L241
-L242     def _fmt_near(lbl, ser, lst):
-L243         if ser is None:
-L244             return f"{lbl}: off"
-L245         get = ser.get
-L246         parts = []
-L247         for t in lst:
-L248             val = get(t, np.nan)
-L249             parts.append(f"{t}:{val:.3f}" if pd.notna(val) else f"{t}:nan")
-L250         return f"{lbl}: " + (", ".join(parts) if parts else "-")
-L251
-L252     head = [
-L253         f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
-L254         _fmt_near("G near10", g_sorted, g_miss),
-L255         _fmt_near("D near10", d_sorted, d_miss),
-L256         f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
-L257         f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SELECTED+CURRENT+NEAR'}",
+L182     ordered = [c for c in _DEBUG_COL_ORDER if c in df_show.columns]
+L183     cols = ordered
+L184     if not cols:
+L185         cols = [c for c in df_show.columns if c not in ("GSC", "DSC")]
+L186
+L187     g_series = getattr(fb, "g_score", None)
+L188     d_series = getattr(fb, "d_score_all", None)
+L189     show_near = _env_true("DEBUG_NEAR5", True)
+L190     g_sorted = g_series.sort_values(ascending=False) if show_near and hasattr(g_series, "sort_values") else None
+L191     d_sorted = d_series.sort_values(ascending=False) if show_near and hasattr(d_series, "sort_values") else None
+L192
+L193     g_pick = list(getattr(sb, "top_G", []) or [])
+L194     d_pick = list(getattr(sb, "top_D", []) or [])
+L195     prevG = list(prevG or [])
+L196     prevD = list(prevD or [])
+L197     Gp, Dp = set(prevG), set(prevD)
+L198     g_new = [t for t in g_pick if t not in Gp]
+L199     g_out = [t for t in prevG if t not in g_pick]
+L200     d_new = [t for t in d_pick if t not in Dp]
+L201     d_out = [t for t in prevD if t not in d_pick]
+L202
+L203     g_miss = [t for t in (g_sorted.index if g_sorted is not None else []) if t not in g_pick][:10]
+L204     used_d = set(g_pick + d_pick)
+L205     d_miss = [t for t in (d_sorted.index if d_sorted is not None else []) if t not in used_d][:10]
+L206
+L207     def _merge_rows(*seqs):
+L208         seen, out = set(), []
+L209         for seq in seqs:
+L210             for t in seq or []:
+L211                 if t in df_show.index and t not in seen:
+L212                     seen.add(t)
+L213                     out.append(t)
+L214         return out
+L215
+L216     focus = _merge_rows(g_pick + d_pick, prevG + prevD, g_miss, d_miss)
+L217     if not focus:
+L218         focus = df_show.index.tolist()
+L219     focus = focus[:max_rows]
+L220
+L221     if cols:
+L222         df_focus = df_show.loc[focus, cols].copy()
+L223     else:
+L224         df_focus = df_show.loc[focus].copy()
+L225     if "GSC" not in df_focus.columns and g_series is not None:
+L226         df_focus["GSC"] = [g_series.get(t, np.nan) if hasattr(g_series, "get") else np.nan for t in df_focus.index]
+L227     if "DSC" not in df_focus.columns and d_series is not None:
+L228         df_focus["DSC"] = [d_series.get(t, np.nan) if hasattr(d_series, "get") else np.nan for t in df_focus.index]
+L229
+L230     extra = [c for c in df_focus.columns if c not in cols]
+L231     cols = cols + [c for c in ("GSC", "DSC") if c not in cols]
+L232     cols += [c for c in extra if c not in cols]
+L233
+L234     body = df_focus.reindex(columns=cols).round(3).to_string(max_rows=None, max_cols=None, na_rep="nan") if focus else "(no rows)"
+L235
+L236     def _fmt_near(lbl, ser, lst):
+L237         if ser is None:
+L238             return f"{lbl}: off"
+L239         get = ser.get
+L240         parts = []
+L241         for t in lst:
+L242             val = get(t, np.nan)
+L243             parts.append(f"{t}:{val:.3f}" if pd.notna(val) else f"{t}:nan")
+L244         return f"{lbl}: " + (", ".join(parts) if parts else "-")
+L245
+L246     head = [
+L247         f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
+L248         _fmt_near("G near10", g_sorted, g_miss),
+L249         _fmt_near("D near10", d_sorted, d_miss),
+L250         f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
+L251         "Cols=MIN  Rows=SELECTED+CURRENT+NEAR",
+L252     ]
+L253
+L254     lines = head + ["", "Changed/Selected (+ Near Miss + Current)", "GRW深掘り表", body]
+L255     return "\n".join(lines)
+L256
+L257 def _disjoint_keepG(top_G, top_D, poolD):
+L258     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
+L259     used, D, i = set(top_G), list(top_D), 0
+L260     for j, t in enumerate(D):
+L261         if t in used:
+L262             while i < len(poolD) and (poolD[i] in used or pool
 ```
