@@ -789,9 +789,24 @@ class Output:
                             max_rows=int(os.getenv("DEBUG_MAX_ROWS", "120")),
                         )
 
-                        logger.info("📌 after _compact_debug call, length=%s", len(self.debug_text or ""))
+                        # 安全に長さを把握（DataFrame でも真偽値評価しない）
+                        try:
+                            if hasattr(self.debug_text, "empty"):
+                                _len = 0 if self.debug_text is None else int(getattr(self.debug_text, "shape", (0,))[0])
+                            else:
+                                text_value = self.debug_text if self.debug_text is not None else ""
+                                _len = len(str(text_value))
+                        except Exception:
+                            _len = -1
+                        logger.info("📌 after _compact_debug call, length=%s", _len)
 
-                        if not (self.debug_text or "").strip():
+                        # まずは“本文が空か”を型別に判定（DataFrame を真偽値評価しない）
+                        if hasattr(self.debug_text, "empty"):
+                            is_empty = bool(self.debug_text.empty)
+                        else:
+                            text_value = self.debug_text if self.debug_text is not None else ""
+                            is_empty = (str(text_value).strip() == "")
+                        if is_empty:
                             src_df = df_full or df_full_z_pass or df_z
                             if src_df is not None and getattr(src_df, "empty", False) is False:
                                 core = [c for c in [
@@ -809,15 +824,17 @@ class Output:
                                     self.debug_text = "(no debug columns)"
                             else:
                                 self.debug_text = "(no dataframe)"
-                        if self.debug_text is not None and hasattr(self.debug_text, "empty"):
+                        # 型ごとに出力（DataFrame を真偽値評価しない）
+                        if hasattr(self.debug_text, "empty"):
                             if not self.debug_text.empty:
                                 logger.info("===== DEBUG (after Low Score) START =====")
-                                logger.info("\n%s", self.debug_text)
+                                logger.info("\n%s", self.debug_text.to_string(max_rows=None, max_cols=None))
                                 logger.info("===== DEBUG (after Low Score) END =====")
                             else:
                                 logger.info("<empty debug_text>")
                         else:
-                            dt = str(self.debug_text or "").strip()
+                            text_value = self.debug_text if self.debug_text is not None else ""
+                            dt = str(text_value).strip()
                             if dt:
                                 logger.info("===== DEBUG (after Low Score) START =====")
                                 logger.info("\n%s", dt)
