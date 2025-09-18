@@ -516,13 +516,16 @@ class Input:
         if clip_days > 0:
             px  = px.tail(clip_days + 1)
             spx = spx.tail(clip_days + 1)
-            print(f"[T] price window clipped by env: {len(px)} rows (PRICE_CLIP_DAYS={clip_days})")
+            logger.info("[T] price window clipped by env: %d rows (PRICE_CLIP_DAYS=%d)", len(px), clip_days)
         else:
-            print(f"[T] price window clip skipped; rows={len(px)}")
+            logger.info("[T] price window clip skipped; rows=%d", len(px))
         tickers_bulk, info = yf.Tickers(" ".join(tickers)), {}
         for t in tickers:
-            try: info[t] = tickers_bulk.tickers[t].info
-            except Exception as e: print(f"{t}: info fetch failed ({e})"); info[t] = {}
+            try:
+                info[t] = tickers_bulk.tickers[t].info
+            except Exception as e:
+                logger.info("[warn] %s: info fetch failed (%s)", t, e)
+                info[t] = {}
         eps_df = self._build_eps_df(tickers, tickers_bulk, info)
         fcf_df = self.compute_fcf_with_fallback(tickers, finnhub_api_key=self.api_key)
         T.log("eps/fcf prep done")
