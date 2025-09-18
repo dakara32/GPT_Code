@@ -791,12 +791,12 @@ class Output:
 
             if debug_mode:
                 dt = (self.debug_text or "").strip()
-                print("===== DEBUG START =====")
+                print("::group::DEBUG (after Low Score)")
                 if dt:
                     print(dt)
                 else:
                     print("<empty debug_text>")
-                print("===== DEBUG END =====")
+                print("::endgroup::")
                 sys.stdout.flush()
 
             if not (self.debug_text or "").strip():
