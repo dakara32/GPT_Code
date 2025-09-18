@@ -9,7 +9,6 @@ from time import perf_counter
 from dataclasses import dataclass
 from typing import Any, Dict, List
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -116,45 +115,6 @@ class PipelineConfig:
 
 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
 
-_DEBUG_COL_ALIAS = {
-    "GROWTH_F": "GRW",
-    "GROWTH_F_RAW": "GRW_RAW",
-    "TREND_SLOPE_EPS": "TR_EPS",
-    "TREND_SLOPE_EPS_RAW": "TR_EPS_RAW",
-    "TREND_SLOPE_REV": "TR_REV",
-    "TREND_SLOPE_REV_RAW": "TR_REV_RAW",
-    "TREND_SLOPE_EPS_YR": "TR_EPS_YR",
-    "TREND_SLOPE_EPS_YR_RAW": "TR_EPS_YR_RAW",
-    "TREND_SLOPE_REV_YR": "TR_REV_YR",
-    "TREND_SLOPE_REV_YR_RAW": "TR_REV_YR_RAW",
-    "BETA": "BETA_RAW",
-}
-
-_DEBUG_COL_ORDER = [
-    "GRW", "GRW_RAW",
-    "TR_EPS", "TR_EPS_RAW", "TR_REV", "TR_REV_RAW",
-    "TR_EPS_YR", "TR_EPS_YR_RAW", "TR_REV_YR", "TR_REV_YR_RAW",
-    "EPS_Q_YOY", "EPS_Q_YOY_RAW", "EPS_YOY", "EPS_YOY_RAW",
-    "REV_Q_YOY", "REV_Q_YOY_RAW", "REV_YOY", "REV_YOY_RAW",
-    "REV_YOY_ACC", "REV_YOY_ACC_RAW", "REV_YOY_VAR", "REV_YOY_VAR_RAW", "REV_ANN_STREAK",
-    "RULE40", "RULE40_RAW", "FCF_MGN", "FCF_MGN_RAW",
-    "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK",
-]
-
-DEBUG_COLS = [
-    "GRW", "GRW_RAW",
-    "TR_EPS", "TR_EPS_RAW", "TR_REV", "TR_REV_RAW",
-    "TR_EPS_YR", "TR_EPS_YR_RAW", "TR_REV_YR", "TR_REV_YR_RAW",
-    "EPS_Q_YOY", "EPS_Q_YOY_RAW", "EPS_YOY", "EPS_YOY_RAW",
-    "REV_Q_YOY", "REV_Q_YOY_RAW", "REV_YOY", "REV_YOY_RAW",
-    "REV_YOY_ACC", "REV_YOY_ACC_RAW", "REV_YOY_VAR", "REV_YOY_VAR_RAW",
-    "REV_ANN_STREAK", "RULE40", "RULE40_RAW",
-    "FCF_MGN", "FCF_MGN_RAW", "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK",
-    "GSC", "DSC"
-]
-
-MUST_DEBUG_COLS = {"TR_EPS", "TR_REV", "REV_Q_YOY", "REV_YOY_ACC", "RULE40", "FCF_MGN"}
-
 def _post_slack(payload: dict):
     url = os.getenv("SLACK_WEBHOOK_URL")
     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
@@ -205,110 +165,6 @@ def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
         block.append(line)
         block_len += add_len
     _flush()
-
-def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-    src = getattr(fb, "df_full", None)
-    if not isinstance(src, pd.DataFrame) or src.empty:
-        src = getattr(fb, "df_full_z", None)
-    if not isinstance(src, pd.DataFrame) or src.empty:
-        src = getattr(fb, "df_z", None)
-    if not isinstance(src, pd.DataFrame) or src.empty:
-        return ""
-
-    df_show = src.apply(pd.to_numeric, errors="coerce").rename(
-        columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in src.columns}
-    )
-
-    missing = sorted(c for c in MUST_DEBUG_COLS if c not in df_show.columns)
-    if missing:
-        logger.warning("[debug] missing cols: %s", missing)
-
-    all_cols = _env_true("DEBUG_ALL_COLS", False)
-    ordered = [c for c in _DEBUG_COL_ORDER if c in df_show.columns]
-    cols = list(df_show.columns) if all_cols else ordered
-    if not cols:
-        cols = [c for c in df_show.columns if c not in ("GSC", "DSC")]
-
-    g_series = getattr(fb, "g_score", None)
-    d_series = getattr(fb, "d_score_all", None)
-    show_near = _env_true("DEBUG_NEAR5", True)
-    g_sorted = g_series.sort_values(ascending=False) if show_near and hasattr(g_series, "sort_values") else None
-    d_sorted = d_series.sort_values(ascending=False) if show_near and hasattr(d_series, "sort_values") else None
-
-    g_pick = list(getattr(sb, "top_G", []) or [])
-    d_pick = list(getattr(sb, "top_D", []) or [])
-    prevG = list(prevG or [])
-    prevD = list(prevD or [])
-    Gp, Dp = set(prevG), set(prevD)
-    g_new = [t for t in g_pick if t not in Gp]
-    g_out = [t for t in prevG if t not in g_pick]
-    d_new = [t for t in d_pick if t not in Dp]
-    d_out = [t for t in prevD if t not in d_pick]
-
-    g_miss = [t for t in (g_sorted.index if g_sorted is not None else []) if t not in g_pick][:10]
-    used_d = set(g_pick + d_pick)
-    d_miss = [t for t in (d_sorted.index if d_sorted is not None else []) if t not in used_d][:10]
-
-    def _merge_rows(*seqs):
-        seen, out = set(), []
-        for seq in seqs:
-            for t in seq or []:
-                if t in df_show.index and t not in seen:
-                    seen.add(t)
-                    out.append(t)
-        return out
-
-    all_rows = _env_true("DEBUG_ALL_ROWS", False)
-    focus = df_show.index.tolist() if all_rows else _merge_rows(g_pick + d_pick, prevG + prevD, g_miss, d_miss)
-    if not focus:
-        focus = df_show.index.tolist()
-    focus = focus[:max_rows]
-
-    if cols:
-        df_focus = df_show.loc[focus, cols].copy()
-    else:
-        df_focus = df_show.loc[focus].copy()
-    if "GSC" not in df_focus.columns and g_series is not None:
-        df_focus["GSC"] = [g_series.get(t, np.nan) if hasattr(g_series, "get") else np.nan for t in df_focus.index]
-    if "DSC" not in df_focus.columns and d_series is not None:
-        df_focus["DSC"] = [d_series.get(t, np.nan) if hasattr(d_series, "get") else np.nan for t in df_focus.index]
-
-    if not all_cols:
-        extra = [c for c in df_focus.columns if c not in cols]
-        cols = cols + [c for c in ("GSC", "DSC") if c not in cols]
-        cols += [c for c in extra if c not in cols]
-    else:
-        cols = [c for c in df_focus.columns if c not in ("GSC", "DSC")]
-        cols += [c for c in ("GSC", "DSC") if c not in cols]
-
-    body = df_focus.reindex(columns=cols).round(3).to_string(max_rows=None, max_cols=None, na_rep="nan") if focus else "(no rows)"
-
-    def _fmt_near(lbl, ser, lst):
-        if ser is None:
-            return f"{lbl}: off"
-        get = ser.get
-        parts = []
-        for t in lst:
-            val = get(t, np.nan)
-            parts.append(f"{t}:{val:.3f}" if pd.notna(val) else f"{t}:nan")
-        return f"{lbl}: " + (", ".join(parts) if parts else "-")
-
-    head = [
-        f"G new/out: {len(g_new)}/{len(g_out)}  D new/out: {len(d_new)}/{len(d_out)}",
-        _fmt_near("G near10", g_sorted, g_miss),
-        _fmt_near("D near10", d_sorted, d_miss),
-        f"Filters: G pre_mask=['trend_template'], D pre_filter={{'beta_max': {D_BETA_MAX}}}",
-        f"Cols={'ALL' if all_cols else 'MIN'}  Rows={'ALL' if all_rows else 'SELECTED+CURRENT+NEAR'}",
-    ]
-
-    miss_txt = ""
-    if _env_true("DEBUG_MISSING_LOGS", False):
-        miss = getattr(fb, "missing_logs", None)
-        if miss is not None and not miss.empty:
-            miss_txt = "\nMissing data (head)\n" + miss.head(10).to_string(index=False)
-
-    lines = head + ["", "Changed/Selected (+ Near Miss + Current)", "GRW深掘り表", body]
-    return "\n".join(lines) + miss_txt
 
 def _disjoint_keepG(top_G, top_D, poolD):
     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
@@ -765,100 +621,18 @@ class Output:
             self.low10_table = all_scores.sort_values('G_plus_D', ascending=True).head(10).round(3)
             print("Low Score Candidates (GSC+DSC bottom 10):")
             print(self.low10_table.to_string())
-            try:
-                df_full_src = getattr(getattr(self, "_sc", None), "_feat", None)
-                df_full = getattr(df_full_src, "df_full", None) or kwargs.get("df_full")
-                df_full_z_pass = getattr(df_full_src, "df_full_z", None) or kwargs.get("df_full_z")
-                fb_like = SimpleNamespace(
-                    df_full=df_full,
-                    df_z=df_z,
-                    df_full_z=df_full_z_pass,
-                    g_score=g_score,
-                    d_score_all=d_score_all,
-                    missing_logs=self.miss_df,
-                )
-                sb_like = SimpleNamespace(top_G=top_G, top_D=top_D)
-                if debug_mode:
-                    logger.info("📌 entering debug output block")
-                    try:
-                        # 既に self.debug_text が生成済みでも上書きでOK（常に最新を採用）
-                        self.debug_text = _compact_debug(
-                            fb_like, sb_like,
-                            prevG=kwargs.get("prev_G", exist),
-                            prevD=kwargs.get("prev_D", exist),
-                            max_rows=int(os.getenv("DEBUG_MAX_ROWS", "120")),
-                        )
-
-                        # 安全に長さを把握（DataFrame でも真偽値評価しない）
-                        try:
-                            if hasattr(self.debug_text, "empty"):
-                                _len = 0 if self.debug_text is None else int(getattr(self.debug_text, "shape", (0,))[0])
-                            else:
-                                text_value = self.debug_text if self.debug_text is not None else ""
-                                _len = len(str(text_value))
-                        except Exception:
-                            _len = -1
-                        logger.info("📌 after _compact_debug call, length=%s", _len)
-
-                        # まずは“本文が空か”を型別に判定（DataFrame を真偽値評価しない）
-                        if hasattr(self.debug_text, "empty"):
-                            is_empty = bool(self.debug_text.empty)
-                        else:
-                            text_value = self.debug_text if self.debug_text is not None else ""
-                            is_empty = (str(text_value).strip() == "")
-                        if is_empty:
-                            src_df = df_full or df_full_z_pass or df_z
-                            if src_df is not None and getattr(src_df, "empty", False) is False:
-                                core = [c for c in [
-                                    "GRW","TR_EPS","TR_REV","EPS_Q_YOY","REV_Q_YOY","REV_YOY_ACC",
-                                    "RULE40","FCF_MGN","GSC","DSC"
-                                ] if c in src_df.columns]
-                                if core:
-                                    pick: list[str] = []
-                                    for t in (self.g_table, self.d_table, self.low10_table):
-                                        if t is not None and getattr(t, "empty", False) is False:
-                                            pick += [i for i in list(t.index) if i in src_df.index]
-                                    view = (src_df.loc[pick, core] if pick else src_df[core]).head(int(os.getenv("DEBUG_MAX_ROWS", "80")))
-                                    self.debug_text = "DEBUG fallback\n" + view.to_string()
-                                else:
-                                    self.debug_text = "(no debug columns)"
-                            else:
-                                self.debug_text = "(no dataframe)"
-                        # 型ごとに出力（DataFrame を真偽値評価しない）
-                        if hasattr(self.debug_text, "empty"):
-                            if not self.debug_text.empty:
-                                logger.info("===== DEBUG (after Low Score) START =====")
-                                logger.info("\n%s", self.debug_text.to_string(max_rows=None, max_cols=None))
-                                logger.info("===== DEBUG (after Low Score) END =====")
-                            else:
-                                logger.info("<empty debug_text>")
-                        else:
-                            text_value = self.debug_text if self.debug_text is not None else ""
-                            dt = str(text_value).strip()
-                            if dt:
-                                logger.info("===== DEBUG (after Low Score) START =====")
-                                logger.info("\n%s", dt)
-                                logger.info("===== DEBUG (after Low Score) END =====")
-                            else:
-                                logger.info("<empty debug_text>")
-
-                    except Exception as e:
-                        logger.warning("debug output failed: %s", e)
-            except Exception as e:
-                logger.warning("debug dump failed: %s", e)
         except Exception as e:
             print(f"[warn] low-score ranking failed: {e}")
             self.low10_table = None
-        if not debug_mode:
-            self.debug_text = ""
+        self.debug_text = ""
         if debug_mode:
-            self._debug_logged = True
+            logger.info("debug_mode=True: df_z dump handled in scorer; skipping factor-side debug output")
         else:
             logger.debug(
                 "skip debug log: debug_mode=%s debug_text_empty=%s",
-                debug_mode, not bool((self.debug_text or '').strip())
+                debug_mode, True
             )
-            self._debug_logged = True
+        self._debug_logged = True
 
     # --- Slack送信（元 notify_slack のロジックそのまま） ---
     def notify_slack(self):
