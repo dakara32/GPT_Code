@@ -44,270 +44,272 @@ L2 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安�
 L3 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
 L4 SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
 L5 SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
-L6 import os, time, requests, logging
-L7 from time import perf_counter
-L8 from dataclasses import dataclass
-L9 from typing import Any, Dict, List
-L10 from concurrent.futures import ThreadPoolExecutor
-L11 import numpy as np
-L12 import pandas as pd
-L13 import yfinance as yf
-L14 from scipy.stats import zscore  # used via scorer
-L15 from scorer import Scorer, ttm_div_yield_portfolio
-L16 import config
-L17
-L18 logger = logging.getLogger(__name__)
-L19
-L20 class T:
-L21     t = perf_counter()
-L22     log = staticmethod(lambda tag: (lambda now=perf_counter(): (print(f"[T] {tag}: {now - T.t:.2f}s"), setattr(T, "t", now))[-1])())
-L23
-L24 T.log("start")
-L25
-L26 # === ユニバースと定数（冒頭に固定） ===
-L27 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
-L28 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
-L29 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
-L30 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
-L31 g_weights = {'GROWTH_F':0.35,'MOM':0.55,'VOL':-0.10}
-L32 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
-L33 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
-L34 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
-L35 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
-L36
-L37 # DRRS 初期プール・各種パラメータ
-L38 corrM = 45
-L39 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
-L40 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
-L41
-L42 # クロス相関ペナルティ（未定義なら設定）
-L43 try: CROSS_MU_GD
-L44 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
-L45
-L46 # 出力関連
-L47 RESULTS_DIR = "results"
-L48 os.makedirs(RESULTS_DIR, exist_ok=True)
+L6 import os, time, requests
+L7 import logging
+L8 from time import perf_counter
+L9 from dataclasses import dataclass
+L10 from typing import Any, Dict, List
+L11 from concurrent.futures import ThreadPoolExecutor
+L12 import numpy as np
+L13 import pandas as pd
+L14 import yfinance as yf
+L15 from scipy.stats import zscore  # used via scorer
+L16 from scorer import Scorer, ttm_div_yield_portfolio
+L17 import config
+L18
+L19 # その他
+L20 debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
+L21
+L22 logger = logging.getLogger(__name__)
+L23 if debug_mode:
+L24     logging.basicConfig(level=logging.INFO)
+L25 else:
+L26     logging.basicConfig(level=logging.WARNING)
+L27
+L28 class T:
+L29     t = perf_counter()
+L30     log = staticmethod(lambda tag: (lambda now=perf_counter(): (print(f"[T] {tag}: {now - T.t:.2f}s"), setattr(T, "t", now))[-1])())
+L31
+L32 T.log("start")
+L33
+L34 # === ユニバースと定数（冒頭に固定） ===
+L35 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
+L36 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
+L37 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
+L38 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
+L39 g_weights = {'GROWTH_F':0.35,'MOM':0.55,'VOL':-0.10}
+L40 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
+L41 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
+L42 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
+L43 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
+L44
+L45 # DRRS 初期プール・各種パラメータ
+L46 corrM = 45
+L47 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
+L48 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
 L49
-L50 # その他
-L51 debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
-L52
-L53 # === 共有DTO（クラス間I/O契約）＋ Config ===
-L54 @dataclass(frozen=True)
-L55 class InputBundle:
-L56     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
-L57     cand: List[str]
-L58     tickers: List[str]
-L59     bench: str
-L60     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
-L61     px: pd.DataFrame                # data['Close']
-L62     spx: pd.Series                  # data['Close'][bench]
-L63     tickers_bulk: object            # yfinance.Tickers
-L64     info: Dict[str, dict]           # yfinance info per ticker
-L65     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
-L66     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
-L67     returns: pd.DataFrame           # px[tickers].pct_change()
-L68
-L69 @dataclass(frozen=True)
-L70 class FeatureBundle:
-L71     df: pd.DataFrame
-L72     df_z: pd.DataFrame
-L73     g_score: pd.Series
-L74     d_score_all: pd.Series
-L75     missing_logs: pd.DataFrame
-L76     df_full: pd.DataFrame | None = None
-L77     df_full_z: pd.DataFrame | None = None
-L78     scaler: Any | None = None
-L79
-L80 @dataclass(frozen=True)
-L81 class SelectionBundle:
-L82     resG: dict
-L83     resD: dict
-L84     top_G: List[str]
-L85     top_D: List[str]
-L86     init_G: List[str]
-L87     init_D: List[str]
-L88
-L89 @dataclass(frozen=True)
-L90 class WeightsConfig:
-L91     g: Dict[str,float]
-L92     d: Dict[str,float]
+L50 # クロス相関ペナルティ（未定義なら設定）
+L51 try: CROSS_MU_GD
+L52 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+L53
+L54 # 出力関連
+L55 RESULTS_DIR = "results"
+L56 os.makedirs(RESULTS_DIR, exist_ok=True)
+L57
+L58 # === 共有DTO（クラス間I/O契約）＋ Config ===
+L59 @dataclass(frozen=True)
+L60 class InputBundle:
+L61     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
+L62     cand: List[str]
+L63     tickers: List[str]
+L64     bench: str
+L65     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
+L66     px: pd.DataFrame                # data['Close']
+L67     spx: pd.Series                  # data['Close'][bench]
+L68     tickers_bulk: object            # yfinance.Tickers
+L69     info: Dict[str, dict]           # yfinance info per ticker
+L70     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
+L71     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
+L72     returns: pd.DataFrame           # px[tickers].pct_change()
+L73
+L74 @dataclass(frozen=True)
+L75 class FeatureBundle:
+L76     df: pd.DataFrame
+L77     df_z: pd.DataFrame
+L78     g_score: pd.Series
+L79     d_score_all: pd.Series
+L80     missing_logs: pd.DataFrame
+L81     df_full: pd.DataFrame | None = None
+L82     df_full_z: pd.DataFrame | None = None
+L83     scaler: Any | None = None
+L84
+L85 @dataclass(frozen=True)
+L86 class SelectionBundle:
+L87     resG: dict
+L88     resD: dict
+L89     top_G: List[str]
+L90     top_D: List[str]
+L91     init_G: List[str]
+L92     init_D: List[str]
 L93
 L94 @dataclass(frozen=True)
-L95 class DRRSParams:
-L96     corrM: int
-L97     shrink: float
-L98     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
-L99     D: Dict[str,float]
-L100     cross_mu_gd: float
-L101
-L102 @dataclass(frozen=True)
-L103 class PipelineConfig:
-L104     weights: WeightsConfig
-L105     drrs: DRRSParams
-L106     price_max: float
-L107
-L108 # === 共通ユーティリティ（複数クラスで使用） ===
-L109 # (unused local utils removed – use scorer.py versions if needed)
-L110
-L111 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
+L95 class WeightsConfig:
+L96     g: Dict[str,float]
+L97     d: Dict[str,float]
+L98
+L99 @dataclass(frozen=True)
+L100 class DRRSParams:
+L101     corrM: int
+L102     shrink: float
+L103     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
+L104     D: Dict[str,float]
+L105     cross_mu_gd: float
+L106
+L107 @dataclass(frozen=True)
+L108 class PipelineConfig:
+L109     weights: WeightsConfig
+L110     drrs: DRRSParams
+L111     price_max: float
 L112
-L113 _DEBUG_COL_ALIAS = {
-L114     "GROWTH_F": "GRW",
-L115     "GROWTH_F_RAW": "GRW_RAW",
-L116     "TREND_SLOPE_EPS": "TR_EPS",
-L117     "TREND_SLOPE_EPS_RAW": "TR_EPS_RAW",
-L118     "TREND_SLOPE_REV": "TR_REV",
-L119     "TREND_SLOPE_REV_RAW": "TR_REV_RAW",
-L120     "TREND_SLOPE_EPS_YR": "TR_EPS_YR",
-L121     "TREND_SLOPE_EPS_YR_RAW": "TR_EPS_YR_RAW",
-L122     "TREND_SLOPE_REV_YR": "TR_REV_YR",
-L123     "TREND_SLOPE_REV_YR_RAW": "TR_REV_YR_RAW",
-L124     "BETA": "BETA_RAW",
-L125 }
-L126
-L127 _DEBUG_COL_ORDER = [
-L128     "GRW", "GRW_RAW",
-L129     "TR_EPS", "TR_EPS_RAW", "TR_REV", "TR_REV_RAW",
-L130     "TR_EPS_YR", "TR_EPS_YR_RAW", "TR_REV_YR", "TR_REV_YR_RAW",
-L131     "EPS_Q_YOY", "EPS_Q_YOY_RAW", "EPS_YOY", "EPS_YOY_RAW",
-L132     "REV_Q_YOY", "REV_Q_YOY_RAW", "REV_YOY", "REV_YOY_RAW",
-L133     "REV_YOY_ACC", "REV_YOY_ACC_RAW", "REV_YOY_VAR", "REV_YOY_VAR_RAW", "REV_ANN_STREAK",
-L134     "RULE40", "RULE40_RAW", "FCF_MGN", "FCF_MGN_RAW",
-L135     "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK",
-L136 ]
-L137
-L138 DEBUG_COLS = [
-L139     "GRW", "GRW_RAW",
-L140     "TR_EPS", "TR_EPS_RAW", "TR_REV", "TR_REV_RAW",
-L141     "TR_EPS_YR", "TR_EPS_YR_RAW", "TR_REV_YR", "TR_REV_YR_RAW",
-L142     "EPS_Q_YOY", "EPS_Q_YOY_RAW", "EPS_YOY", "EPS_YOY_RAW",
-L143     "REV_Q_YOY", "REV_Q_YOY_RAW", "REV_YOY", "REV_YOY_RAW",
-L144     "REV_YOY_ACC", "REV_YOY_ACC_RAW", "REV_YOY_VAR", "REV_YOY_VAR_RAW",
-L145     "REV_ANN_STREAK", "RULE40", "RULE40_RAW",
-L146     "FCF_MGN", "FCF_MGN_RAW", "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK",
-L147     "GSC", "DSC"
-L148 ]
-L149
-L150 MUST_DEBUG_COLS = {"TR_EPS", "TR_REV", "REV_Q_YOY", "REV_YOY_ACC", "RULE40", "FCF_MGN"}
-L151
-L152 def _post_slack(payload: dict):
-L153     url = os.getenv("SLACK_WEBHOOK_URL")
-L154     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-L155     try:
-L156         requests.post(url, json=payload).raise_for_status()
-L157     except Exception as e:
-L158         print(f"⚠️ Slack通知エラー: {e}")
-L159
-L160 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
-L161     """Slackへテキストを分割送信（コードブロック形式）。"""
-L162
-L163     def _post_text(payload: str) -> None:
-L164         try:
-L165             resp = requests.post(url, json={"text": payload})
-L166             print(f"[DBG] debug_post status={getattr(resp, 'status_code', None)} size={len(payload)}")
-L167             if resp is not None:
-L168                 resp.raise_for_status()
-L169         except Exception as e:
-L170             print(f"[ERR] debug_post_failed: {e}")
-L171
-L172     body = str(text or "").strip()
-L173     if not body:
-L174         print("[DBG] skip debug send: empty body")
-L175         return
+L113 # === 共通ユーティリティ（複数クラスで使用） ===
+L114 # (unused local utils removed – use scorer.py versions if needed)
+L115
+L116 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
+L117
+L118 _DEBUG_COL_ALIAS = {
+L119     "GROWTH_F": "GRW",
+L120     "GROWTH_F_RAW": "GRW_RAW",
+L121     "TREND_SLOPE_EPS": "TR_EPS",
+L122     "TREND_SLOPE_EPS_RAW": "TR_EPS_RAW",
+L123     "TREND_SLOPE_REV": "TR_REV",
+L124     "TREND_SLOPE_REV_RAW": "TR_REV_RAW",
+L125     "TREND_SLOPE_EPS_YR": "TR_EPS_YR",
+L126     "TREND_SLOPE_EPS_YR_RAW": "TR_EPS_YR_RAW",
+L127     "TREND_SLOPE_REV_YR": "TR_REV_YR",
+L128     "TREND_SLOPE_REV_YR_RAW": "TR_REV_YR_RAW",
+L129     "BETA": "BETA_RAW",
+L130 }
+L131
+L132 _DEBUG_COL_ORDER = [
+L133     "GRW", "GRW_RAW",
+L134     "TR_EPS", "TR_EPS_RAW", "TR_REV", "TR_REV_RAW",
+L135     "TR_EPS_YR", "TR_EPS_YR_RAW", "TR_REV_YR", "TR_REV_YR_RAW",
+L136     "EPS_Q_YOY", "EPS_Q_YOY_RAW", "EPS_YOY", "EPS_YOY_RAW",
+L137     "REV_Q_YOY", "REV_Q_YOY_RAW", "REV_YOY", "REV_YOY_RAW",
+L138     "REV_YOY_ACC", "REV_YOY_ACC_RAW", "REV_YOY_VAR", "REV_YOY_VAR_RAW", "REV_ANN_STREAK",
+L139     "RULE40", "RULE40_RAW", "FCF_MGN", "FCF_MGN_RAW",
+L140     "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK",
+L141 ]
+L142
+L143 DEBUG_COLS = [
+L144     "GRW", "GRW_RAW",
+L145     "TR_EPS", "TR_EPS_RAW", "TR_REV", "TR_REV_RAW",
+L146     "TR_EPS_YR", "TR_EPS_YR_RAW", "TR_REV_YR", "TR_REV_YR_RAW",
+L147     "EPS_Q_YOY", "EPS_Q_YOY_RAW", "EPS_YOY", "EPS_YOY_RAW",
+L148     "REV_Q_YOY", "REV_Q_YOY_RAW", "REV_YOY", "REV_YOY_RAW",
+L149     "REV_YOY_ACC", "REV_YOY_ACC_RAW", "REV_YOY_VAR", "REV_YOY_VAR_RAW",
+L150     "REV_ANN_STREAK", "RULE40", "RULE40_RAW",
+L151     "FCF_MGN", "FCF_MGN_RAW", "FCF", "ROE", "RS", "TR_str", "BETA_RAW", "DIV_STREAK",
+L152     "GSC", "DSC"
+L153 ]
+L154
+L155 MUST_DEBUG_COLS = {"TR_EPS", "TR_REV", "REV_Q_YOY", "REV_YOY_ACC", "RULE40", "FCF_MGN"}
+L156
+L157 def _post_slack(payload: dict):
+L158     url = os.getenv("SLACK_WEBHOOK_URL")
+L159     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+L160     try:
+L161         requests.post(url, json=payload).raise_for_status()
+L162     except Exception as e:
+L163         print(f"⚠️ Slack通知エラー: {e}")
+L164
+L165 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
+L166     """Slackへテキストを分割送信（コードブロック形式）。"""
+L167
+L168     def _post_text(payload: str) -> None:
+L169         try:
+L170             resp = requests.post(url, json={"text": payload})
+L171             print(f"[DBG] debug_post status={getattr(resp, 'status_code', None)} size={len(payload)}")
+L172             if resp is not None:
+L173                 resp.raise_for_status()
+L174         except Exception as e:
+L175             print(f"[ERR] debug_post_failed: {e}")
 L176
-L177     lines = body.splitlines()
-L178     block: list[str] = []
-L179     block_len = 0
-L180
-L181     def _flush() -> None:
-L182         nonlocal block, block_len
-L183         if not block:
-L184             return
-L185         payload = "```" + "\n".join(block) + "```"
-L186         _post_text(payload)
-L187         block, block_len = [], 0
-L188
-L189     for raw in lines:
-L190         line = raw or ""
-L191         while len(line) > chunk:
-L192             head, line = line[:chunk], line[chunk:]
-L193             _flush()
-L194             _post_text("```" + head + "```")
-L195         add_len = len(line) if not block else len(line) + 1
-L196         if block and block_len + add_len > chunk:
-L197             _flush()
-L198             add_len = len(line)
-L199         block.append(line)
-L200         block_len += add_len
-L201     _flush()
-L202
-L203 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
-L204     src = getattr(fb, "df_full", None)
-L205     if not isinstance(src, pd.DataFrame) or src.empty:
-L206         src = getattr(fb, "df_full_z", None)
-L207     if not isinstance(src, pd.DataFrame) or src.empty:
-L208         src = getattr(fb, "df_z", None)
-L209     if not isinstance(src, pd.DataFrame) or src.empty:
-L210         return ""
-L211
-L212     df_show = src.apply(pd.to_numeric, errors="coerce").rename(
-L213         columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in src.columns}
-L214     )
-L215
-L216     missing = sorted(c for c in MUST_DEBUG_COLS if c not in df_show.columns)
-L217     if missing:
-L218         logger.warning("[debug] missing cols: %s", missing)
-L219
-L220     all_cols = _env_true("DEBUG_ALL_COLS", False)
-L221     ordered = [c for c in _DEBUG_COL_ORDER if c in df_show.columns]
-L222     cols = list(df_show.columns) if all_cols else ordered
-L223     if not cols:
-L224         cols = [c for c in df_show.columns if c not in ("GSC", "DSC")]
-L225
-L226     g_series = getattr(fb, "g_score", None)
-L227     d_series = getattr(fb, "d_score_all", None)
-L228     show_near = _env_true("DEBUG_NEAR5", True)
-L229     g_sorted = g_series.sort_values(ascending=False) if show_near and hasattr(g_series, "sort_values") else None
-L230     d_sorted = d_series.sort_values(ascending=False) if show_near and hasattr(d_series, "sort_values") else None
-L231
-L232     g_pick = list(getattr(sb, "top_G", []) or [])
-L233     d_pick = list(getattr(sb, "top_D", []) or [])
-L234     prevG = list(prevG or [])
-L235     prevD = list(prevD or [])
-L236     Gp, Dp = set(prevG), set(prevD)
-L237     g_new = [t for t in g_pick if t not in Gp]
-L238     g_out = [t for t in prevG if t not in g_pick]
-L239     d_new = [t for t in d_pick if t not in Dp]
-L240     d_out = [t for t in prevD if t not in d_pick]
-L241
-L242     g_miss = [t for t in (g_sorted.index if g_sorted is not None else []) if t not in g_pick][:10]
-L243     used_d = set(g_pick + d_pick)
-L244     d_miss = [t for t in (d_sorted.index if d_sorted is not None else []) if t not in used_d][:10]
-L245
-L246     def _merge_rows(*seqs):
-L247         seen, out = set(), []
-L248         for seq in seqs:
-L249             for t in seq or []:
-L250                 if t in df_show.index and t not in seen:
-L251                     seen.add(t)
-L252                     out.append(t)
-L253         return out
-L254
-L255     all_rows = _env_true("DEBUG_ALL_ROWS", False)
-L256     focus = df_show.index.tolist() if all_rows else _merge_rows(g_pick + d_pick, prevG + prevD, g_miss, d_miss)
-L257     if not focus:
-L258         focus = df_show.index.tolist()
-L259     focus = focus[:max_rows]
-L260
-L261     if cols:
-L262         df_focus = df_show.loc[focus, cols].copy()
-L263     else:
-L264         df_focus = df_show.loc[focus].copy()
-L265     if "GSC" not in df_focus.columns and g_series is not None:
-L266         df_focus["GSC"] = [g_series.get(t, np.nan) if hasattr(g_series, "get") else np.nan for t in df_focus.index]
-L267     if "DSC" not in df_focus.columns and d_series is not None:
-L268         df_focus["DSC"] = [d_series.get(t, np.nan) if hasattr(d_series, "get") else np.nan for t in df_focus.index]
-L269
-L270     if not all_cols:
-L271         extra = [c fo
+L177     body = str(text or "").strip()
+L178     if not body:
+L179         print("[DBG] skip debug send: empty body")
+L180         return
+L181
+L182     lines = body.splitlines()
+L183     block: list[str] = []
+L184     block_len = 0
+L185
+L186     def _flush() -> None:
+L187         nonlocal block, block_len
+L188         if not block:
+L189             return
+L190         payload = "```" + "\n".join(block) + "```"
+L191         _post_text(payload)
+L192         block, block_len = [], 0
+L193
+L194     for raw in lines:
+L195         line = raw or ""
+L196         while len(line) > chunk:
+L197             head, line = line[:chunk], line[chunk:]
+L198             _flush()
+L199             _post_text("```" + head + "```")
+L200         add_len = len(line) if not block else len(line) + 1
+L201         if block and block_len + add_len > chunk:
+L202             _flush()
+L203             add_len = len(line)
+L204         block.append(line)
+L205         block_len += add_len
+L206     _flush()
+L207
+L208 def _compact_debug(fb, sb, prevG, prevD, max_rows=140):
+L209     src = getattr(fb, "df_full", None)
+L210     if not isinstance(src, pd.DataFrame) or src.empty:
+L211         src = getattr(fb, "df_full_z", None)
+L212     if not isinstance(src, pd.DataFrame) or src.empty:
+L213         src = getattr(fb, "df_z", None)
+L214     if not isinstance(src, pd.DataFrame) or src.empty:
+L215         return ""
+L216
+L217     df_show = src.apply(pd.to_numeric, errors="coerce").rename(
+L218         columns={k: v for k, v in _DEBUG_COL_ALIAS.items() if k in src.columns}
+L219     )
+L220
+L221     missing = sorted(c for c in MUST_DEBUG_COLS if c not in df_show.columns)
+L222     if missing:
+L223         logger.warning("[debug] missing cols: %s", missing)
+L224
+L225     all_cols = _env_true("DEBUG_ALL_COLS", False)
+L226     ordered = [c for c in _DEBUG_COL_ORDER if c in df_show.columns]
+L227     cols = list(df_show.columns) if all_cols else ordered
+L228     if not cols:
+L229         cols = [c for c in df_show.columns if c not in ("GSC", "DSC")]
+L230
+L231     g_series = getattr(fb, "g_score", None)
+L232     d_series = getattr(fb, "d_score_all", None)
+L233     show_near = _env_true("DEBUG_NEAR5", True)
+L234     g_sorted = g_series.sort_values(ascending=False) if show_near and hasattr(g_series, "sort_values") else None
+L235     d_sorted = d_series.sort_values(ascending=False) if show_near and hasattr(d_series, "sort_values") else None
+L236
+L237     g_pick = list(getattr(sb, "top_G", []) or [])
+L238     d_pick = list(getattr(sb, "top_D", []) or [])
+L239     prevG = list(prevG or [])
+L240     prevD = list(prevD or [])
+L241     Gp, Dp = set(prevG), set(prevD)
+L242     g_new = [t for t in g_pick if t not in Gp]
+L243     g_out = [t for t in prevG if t not in g_pick]
+L244     d_new = [t for t in d_pick if t not in Dp]
+L245     d_out = [t for t in prevD if t not in d_pick]
+L246
+L247     g_miss = [t for t in (g_sorted.index if g_sorted is not None else []) if t not in g_pick][:10]
+L248     used_d = set(g_pick + d_pick)
+L249     d_miss = [t for t in (d_sorted.index if d_sorted is not None else []) if t not in used_d][:10]
+L250
+L251     def _merge_rows(*seqs):
+L252         seen, out = set(), []
+L253         for seq in seqs:
+L254             for t in seq or []:
+L255                 if t in df_show.index and t not in seen:
+L256                     seen.add(t)
+L257                     out.append(t)
+L258         return out
+L259
+L260     all_rows = _env_true("DEBUG_ALL_ROWS", False)
+L261     focus = df_show.index.tolist() if all_rows else _merge_rows(g_pick + d_pick, prevG + prevD, g_miss, d_miss)
+L262     if not focus:
+L263         focus = df_show.index.tolist()
+L264     focus = focus[:max_rows]
+L265
+L266     if cols:
+L267         df_focus = df_show.loc[focus, cols].copy()
+L268     else:
+L269         df_focus = df_show.loc[focus].copy()
+L270     if "GSC" not in df_focus.columns and g_series is not None:
+L271         df_focus["GSC"] = [g_series.get(t, np.nan) if hasattr(g_series, "get") else np.nan for t in df_focus.index]
+L272     if "DSC" not in df_focus.columns and d_series is not None:
+L273         df_focus["DSC"] = [d_s
 ```
