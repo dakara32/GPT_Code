@@ -769,48 +769,56 @@ class Output:
                 df_full_src = getattr(getattr(self, "_sc", None), "_feat", None)
                 df_full = getattr(df_full_src, "df_full", None) or kwargs.get("df_full")
                 df_full_z_pass = getattr(df_full_src, "df_full_z", None) or kwargs.get("df_full_z")
-                if not (getattr(self, "debug_text", None) or "").strip():
-                    fb_like = SimpleNamespace(
-                        df_full=df_full,
-                        df_z=df_z,
-                        df_full_z=df_full_z_pass,
-                        g_score=g_score,
-                        d_score_all=d_score_all,
-                        missing_logs=self.miss_df,
-                    )
-                    sb_like = SimpleNamespace(top_G=top_G, top_D=top_D)
-                    self.debug_text = _compact_debug(
-                        fb_like,
-                        sb_like,
-                        prevG=kwargs.get("prev_G", exist),
-                        prevD=kwargs.get("prev_D", exist),
-                        max_rows=int(os.getenv("DEBUG_MAX_ROWS", "120")),
-                    )
-                if not (self.debug_text or "").strip():
-                    src_df = df_full or df_full_z_pass or df_z
-                    if src_df is not None and getattr(src_df, "empty", False) is False:
-                        core = [c for c in [
-                            "GRW","TR_EPS","TR_REV","EPS_Q_YOY","REV_Q_YOY","REV_YOY_ACC",
-                            "RULE40","FCF_MGN","GSC","DSC"
-                        ] if c in src_df.columns]
-                        if core:
-                            pick: list[str] = []
-                            for t in (self.g_table, self.d_table, self.low10_table):
-                                if t is not None and getattr(t, "empty", False) is False:
-                                    pick += [i for i in list(t.index) if i in src_df.index]
-                            view = (src_df.loc[pick, core] if pick else src_df[core]).head(int(os.getenv("DEBUG_MAX_ROWS", "80")))
-                            self.debug_text = "DEBUG fallback\n" + view.to_string()
+                fb_like = SimpleNamespace(
+                    df_full=df_full,
+                    df_z=df_z,
+                    df_full_z=df_full_z_pass,
+                    g_score=g_score,
+                    d_score_all=d_score_all,
+                    missing_logs=self.miss_df,
+                )
+                sb_like = SimpleNamespace(top_G=top_G, top_D=top_D)
+                if debug_mode:
+                    logger.info("📌 entering debug output block")
+                    try:
+                        # 既に self.debug_text が生成済みでも上書きでOK（常に最新を採用）
+                        self.debug_text = _compact_debug(
+                            fb_like, sb_like,
+                            prevG=kwargs.get("prev_G", exist),
+                            prevD=kwargs.get("prev_D", exist),
+                            max_rows=int(os.getenv("DEBUG_MAX_ROWS", "120")),
+                        )
+
+                        logger.info("📌 after _compact_debug call, length=%s", len(self.debug_text or ""))
+
+                        if not (self.debug_text or "").strip():
+                            src_df = df_full or df_full_z_pass or df_z
+                            if src_df is not None and getattr(src_df, "empty", False) is False:
+                                core = [c for c in [
+                                    "GRW","TR_EPS","TR_REV","EPS_Q_YOY","REV_Q_YOY","REV_YOY_ACC",
+                                    "RULE40","FCF_MGN","GSC","DSC"
+                                ] if c in src_df.columns]
+                                if core:
+                                    pick: list[str] = []
+                                    for t in (self.g_table, self.d_table, self.low10_table):
+                                        if t is not None and getattr(t, "empty", False) is False:
+                                            pick += [i for i in list(t.index) if i in src_df.index]
+                                    view = (src_df.loc[pick, core] if pick else src_df[core]).head(int(os.getenv("DEBUG_MAX_ROWS", "80")))
+                                    self.debug_text = "DEBUG fallback\n" + view.to_string()
+                                else:
+                                    self.debug_text = "(no debug columns)"
+                            else:
+                                self.debug_text = "(no dataframe)"
+                        dt = (self.debug_text or "").strip()
+                        logger.info("===== DEBUG (after Low Score) START =====")
+                        if dt:
+                            logger.info("\n%s", dt)
                         else:
-                            self.debug_text = "(no debug columns)"
-                    else:
-                        self.debug_text = "(no dataframe)"
-                dt = (self.debug_text or "").strip()
-                logger.info("===== DEBUG (after Low Score) START =====")
-                if dt:
-                    logger.info("\n%s", dt)
-                else:
-                    logger.info("<empty debug_text>")
-                logger.info("===== DEBUG (after Low Score) END =====")
+                            logger.info("<empty debug_text>")
+                        logger.info("===== DEBUG (after Low Score) END =====")
+
+                    except Exception as e:
+                        logger.warning("debug output failed: %s", e)
             except Exception as e:
                 logger.warning("debug dump failed: %s", e)
         except Exception as e:
