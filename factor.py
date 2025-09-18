@@ -3,7 +3,7 @@
 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
 SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
 SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
-import os, time, requests
+import os, time, requests, sys
 import logging
 from time import perf_counter
 from dataclasses import dataclass
@@ -789,6 +789,16 @@ class Output:
                 max_rows=int(os.getenv("DEBUG_MAX_ROWS", "120")),
             )
 
+            if debug_mode:
+                dt = (self.debug_text or "").strip()
+                print("===== DEBUG START =====")
+                if dt:
+                    print(dt)
+                else:
+                    print("<empty debug_text>")
+                print("===== DEBUG END =====")
+                sys.stdout.flush()
+
             if not (self.debug_text or "").strip():
                 src_df = df_full or df_full_z_pass or df_z
                 if src_df is not None and getattr(src_df, "empty", False) is False:
@@ -825,21 +835,6 @@ class Output:
     # --- Slack送信（元 notify_slack のロジックそのまま） ---
     def notify_slack(self):
         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-
-        if debug_mode and (self.debug_text or "").strip():
-            if not getattr(self, "_debug_logged", False):
-                try:
-                    logger.info("DEBUG (after Low Score)\n%s", self.debug_text)
-                    self._debug_logged = True
-                except Exception as e:
-                    print(f"[ERR] debug_log_failed: {e}")
-        else:
-            if not getattr(self, "_debug_logged", False):
-                logger.debug(
-                    "skip debug log: debug_mode=%s debug_text_empty=%s",
-                    debug_mode, not bool((self.debug_text or '').strip())
-                )
-                self._debug_logged = True
 
         if not SLACK_WEBHOOK_URL:
             print("⚠️ SLACK_WEBHOOK_URL not set (main report skipped)")
