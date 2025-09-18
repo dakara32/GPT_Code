@@ -799,11 +799,11 @@ class Output:
         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table, 'empty', False) else f"```{self.io_table.to_string(index=False)}```\n")
         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
 
-        print(message)
+        print(message, flush=True)
 
         if (self.debug_text or "").strip():
-            print("```DEBUG (after Low Score)```")
-            print(self.debug_text)
+            print("```DEBUG (after Low Score)```", flush=True)
+            print(self.debug_text, flush=True)
 
 def _infer_g_universe(feature_df, selected12=None, near5=None):
     try:
