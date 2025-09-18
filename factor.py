@@ -638,6 +638,7 @@ class Output:
     # --- 表示（元 display_results のロジックそのまま） ---
     def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
                         init_G, init_D, top_G, top_D, **kwargs):
+        logger.info("📌 reached display_results")
         pd.set_option('display.float_format','{:.3f}'.format)
         print("📈 ファクター分散最適化の結果")
         if self.miss_df is not None and not self.miss_df.empty:
