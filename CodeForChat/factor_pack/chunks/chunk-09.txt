@@ -1,84 +1,92 @@
 ```text
-       hi   = bundle.data['High']
-L857         lo   = bundle.data['Low']
-L858         vol  = bundle.data['Volume']
-L859         bench= bundle.spx                     # ベンチマーク Series
-L860
-L861         # Gユニバース推定：self.g_universe 優先 → feature_df['group']=='G' → 全銘柄
-L862         g_universe = getattr(self_obj, "g_universe", None)
-L863         if g_universe is None:
-L864             try:
-L865                 g_universe = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
-L866             except Exception:
-L867                 g_universe = list(feature_df.index)
-L868         if not g_universe:
-L869             return feature_df
-L870
-L871         # 指標
-L872         px = px.ffill(limit=2)
-L873         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
-L874         ma50  = px[g_universe].rolling(50).mean()
-L875         ma150 = px[g_universe].rolling(150).mean()
-L876         ma200 = px[g_universe].rolling(200).mean()
-L877         atr20 = (hi[g_universe] - lo[g_universe]).rolling(20).mean()
-L878         vol20 = vol[g_universe].rolling(20).mean()
-L879         vol50 = vol[g_universe].rolling(50).mean()
-L880
-L881         # トレンドテンプレート合格
-L882         trend_template_ok = (px[g_universe] > ma50) & (px[g_universe] > ma150) & (px[g_universe] > ma200) \
-L883                             & (ma150 > ma200) & (ma200.diff() > 0)
-L884
-L885         # 汎用ピボット：直近65営業日の高値（当日除外）
-L886         pivot_price = hi[g_universe].rolling(65).max().shift(1)
-L887
-L888         # 相対力：年内高値更新
-L889         bench_aligned = bench.reindex(px.index).ffill()
-L890         rs = px[g_universe].div(bench_aligned, axis=0)
-L891         rs_high = rs.rolling(252).max().shift(1)
+       - G_BREAKOUT_last_date : str "YYYY-MM-DD"
+L854       - G_PULLBACK_recent_5d : bool
+L855       - G_PULLBACK_last_date : str "YYYY-MM-DD"
+L856       - G_PIVOT_price        : float
+L857     失敗しても例外は握り潰し、既存処理を阻害しない。
+L858     """
+L859     try:
+L860         px   = bundle.px                      # 終値 DataFrame
+L861         hi   = bundle.data['High']
+L862         lo   = bundle.data['Low']
+L863         vol  = bundle.data['Volume']
+L864         bench= bundle.spx                     # ベンチマーク Series
+L865
+L866         # Gユニバース推定：self.g_universe 優先 → feature_df['group']=='G' → 全銘柄
+L867         g_universe = getattr(self_obj, "g_universe", None)
+L868         if g_universe is None:
+L869             try:
+L870                 g_universe = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
+L871             except Exception:
+L872                 g_universe = list(feature_df.index)
+L873         if not g_universe:
+L874             return feature_df
+L875
+L876         # 指標
+L877         px = px.ffill(limit=2)
+L878         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
+L879         ma50  = px[g_universe].rolling(50).mean()
+L880         ma150 = px[g_universe].rolling(150).mean()
+L881         ma200 = px[g_universe].rolling(200).mean()
+L882         atr20 = (hi[g_universe] - lo[g_universe]).rolling(20).mean()
+L883         vol20 = vol[g_universe].rolling(20).mean()
+L884         vol50 = vol[g_universe].rolling(50).mean()
+L885
+L886         # トレンドテンプレート合格
+L887         trend_template_ok = (px[g_universe] > ma50) & (px[g_universe] > ma150) & (px[g_universe] > ma200) \
+L888                             & (ma150 > ma200) & (ma200.diff() > 0)
+L889
+L890         # 汎用ピボット：直近65営業日の高値（当日除外）
+L891         pivot_price = hi[g_universe].rolling(65).max().shift(1)
 L892
-L893         # ブレイクアウト「発生日」：条件立ち上がり
-L894         breakout_today = trend_template_ok & (px[g_universe] > pivot_price) \
-L895                          & (vol[g_universe] >= 1.5 * vol50) & (rs > rs_high)
-L896         breakout_event = breakout_today & ~breakout_today.shift(1).fillna(False)
+L893         # 相対力：年内高値更新
+L894         bench_aligned = bench.reindex(px.index).ffill()
+L895         rs = px[g_universe].div(bench_aligned, axis=0)
+L896         rs_high = rs.rolling(252).max().shift(1)
 L897
-L898         # 押し目反発「発生日」：EMA21帯×出来高ドライアップ×前日高値越え×終値EMA21上
-L899         near_ema21_band = px[g_universe].between(ema21 - atr20, ema21 + atr20)
-L900         volume_dryup = (vol20 / vol50) <= 1.0
-L901         pullback_bounce_confirmed = (px[g_universe] > hi[g_universe].shift(1)) & (px[g_universe] > ema21)
-L902         pullback_today = trend_template_ok & near_ema21_band & volume_dryup & pullback_bounce_confirmed
-L903         pullback_event = pullback_today & ~pullback_today.shift(1).fillna(False)
-L904
-L905         # 直近N営業日内の発火 / 最終発生日
-L906         rows = []
-L907         for t in g_universe:
-L908             def _recent_and_date(s, win):
-L909                 sw = s[t].iloc[-win:]
-L910                 if sw.any():
-L911                     d = sw[sw].index[-1]
-L912                     return True, d.strftime("%Y-%m-%d")
-L913                 return False, ""
-L914             br_recent, br_date = _recent_and_date(breakout_event, win_breakout)
-L915             pb_recent, pb_date = _recent_and_date(pullback_event, win_pullback)
-L916             rows.append((t, {
-L917                 "G_BREAKOUT_recent_5d": br_recent,
-L918                 "G_BREAKOUT_last_date": br_date,
-L919                 "G_PULLBACK_recent_5d": pb_recent,
-L920                 "G_PULLBACK_last_date": pb_date,
-L921                 "G_PIVOT_price": float(pivot_price[t].iloc[-1]) if t in pivot_price.columns else float('nan'),
-L922             }))
-L923         flags = pd.DataFrame({k: v for k, v in rows}).T
-L924
-L925         # 列を作成・上書き
-L926         cols = ["G_BREAKOUT_recent_5d","G_BREAKOUT_last_date","G_PULLBACK_recent_5d","G_PULLBACK_last_date","G_PIVOT_price"]
-L927         for c in cols:
-L928             if c not in feature_df.columns:
-L929                 feature_df[c] = np.nan
-L930         feature_df.loc[flags.index, flags.columns] = flags
-L931
-L932     except Exception:
-L933         pass
-L934     return feature_df
-L935
+L898         # ブレイクアウト「発生日」：条件立ち上がり
+L899         breakout_today = trend_template_ok & (px[g_universe] > pivot_price) \
+L900                          & (vol[g_universe] >= 1.5 * vol50) & (rs > rs_high)
+L901         breakout_event = breakout_today & ~breakout_today.shift(1).fillna(False)
+L902
+L903         # 押し目反発「発生日」：EMA21帯×出来高ドライアップ×前日高値越え×終値EMA21上
+L904         near_ema21_band = px[g_universe].between(ema21 - atr20, ema21 + atr20)
+L905         volume_dryup = (vol20 / vol50) <= 1.0
+L906         pullback_bounce_confirmed = (px[g_universe] > hi[g_universe].shift(1)) & (px[g_universe] > ema21)
+L907         pullback_today = trend_template_ok & near_ema21_band & volume_dryup & pullback_bounce_confirmed
+L908         pullback_event = pullback_today & ~pullback_today.shift(1).fillna(False)
+L909
+L910         # 直近N営業日内の発火 / 最終発生日
+L911         rows = []
+L912         for t in g_universe:
+L913             def _recent_and_date(s, win):
+L914                 sw = s[t].iloc[-win:]
+L915                 if sw.any():
+L916                     d = sw[sw].index[-1]
+L917                     return True, d.strftime("%Y-%m-%d")
+L918                 return False, ""
+L919             br_recent, br_date = _recent_and_date(breakout_event, win_breakout)
+L920             pb_recent, pb_date = _recent_and_date(pullback_event, win_pullback)
+L921             rows.append((t, {
+L922                 "G_BREAKOUT_recent_5d": br_recent,
+L923                 "G_BREAKOUT_last_date": br_date,
+L924                 "G_PULLBACK_recent_5d": pb_recent,
+L925                 "G_PULLBACK_last_date": pb_date,
+L926                 "G_PIVOT_price": float(pivot_price[t].iloc[-1]) if t in pivot_price.columns else float('nan'),
+L927             }))
+L928         flags = pd.DataFrame({k: v for k, v in rows}).T
+L929
+L930         # 列を作成・上書き
+L931         cols = ["G_BREAKOUT_recent_5d","G_BREAKOUT_last_date","G_PULLBACK_recent_5d","G_PULLBACK_last_date","G_PIVOT_price"]
+L932         for c in cols:
+L933             if c not in feature_df.columns:
+L934                 feature_df[c] = np.nan
+L935         feature_df.loc[flags.index, flags.columns] = flags
+L936
+L937     except Exception:
+L938         pass
+L939     return feature_df
+L940
 ```
 
 ## <.github/workflows/weekly-report.yml>
@@ -314,16 +322,5 @@ L88 | `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御
 L89 | `shrink` | 残差相関のシュリンク率 | `residual_corr`の対角強調 |
 L90 | `G` | Gバケット用パラメータdict（`lookback`等） | `select_bucket_drrs`設定 |
 L91 | `D` | Dバケット用パラメータdict | 同上 |
-L92 | `cross_mu_gd` | G-Dクロス相関ペナルティ係数μ | `select_buckets`の目的関数 |
-L93
-L94 ### PipelineConfig
-L95 | 変数 | 内容 | 主な用途 |
-L96 | --- | --- | --- |
-L97 | `weights` | `WeightsConfig`のインスタンス | スコア合成の重み参照 |
-L98 | `drrs` | `DRRSParams`のインスタンス | 選定ステップの設定値 |
-L99 | `price_max` | 候補銘柄の許容価格上限 | Input段階でのフィルタ |
-L100
-L101 ## 共通ユーティリティ
-L102 - `winsorize_s` / `robust_z` : 外れ値処理とZスコア化。
-L103 - `_saf
+L92 | `cross_mu_gd` | G-Dクロス相関ペナルティ係数μ | `select_buckets`の目的関
 ```
