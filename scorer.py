@@ -110,6 +110,22 @@ def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits
         except Exception as exc:
             logger.warning("nan summary failed: %s", exc)
 
+        # === Zeroサマリ（列ごとのゼロ比率 上位20） ===
+        try:
+            zero_counts = ((df_z == 0) & (~df_z.isna())).sum()
+            nonnull_counts = (~df_z.isna()).sum()
+            zero_ratio = (zero_counts / nonnull_counts).sort_values(ascending=False)
+            top_zero = zero_ratio[zero_ratio > 0].head(20)
+            if len(top_zero) > 0:
+                logger.info(
+                    "Zero-dominated columns (top20):\n%s",
+                    top_zero.to_string(float_format=lambda x: f"{x:.2%}"),
+                )
+            else:
+                logger.info("Zero-dominated columns: none")
+        except Exception as exc:
+            logger.warning("zero summary failed: %s", exc)
+
         logger.info("===== DF_Z DUMP START =====")
         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
         logger.info("===== DF_Z DUMP END =====")
