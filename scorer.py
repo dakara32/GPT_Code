@@ -1142,13 +1142,34 @@ class Scorer:
         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
 
-        # シンプル版: df_zをそのままログに出す
+        # シンプル版（全明細）：df_zをページングでログ出力
         if getattr(cfg, "debug_mode", False):
-            import io
-            buf = io.StringIO()
-            # 上位50行だけ出力（必要に応じて行数調整可）
-            df_z.head(50).to_string(buf)
-            logger.info("=== df_z snapshot ===\n%s", buf.getvalue())
+            pd.set_option("display.max_columns", None)
+            pd.set_option("display.max_colwidth", None)
+            pd.set_option("display.width", None)
+            page = int(getattr(cfg, "debug_dfz_page", 200))  # 1ページの行数（必要に応じて調整）
+            n = len(df_z)
+            logger.info("=== df_z FULL DUMP start === rows=%d cols=%d page=%d", n, df_z.shape[1], page)
+            for i in range(0, n, page):
+                j = min(i + page, n)
+                print(f"--- df_z rows {i}..{j-1} ---")
+                # print() はActionsの折り返しに強い。列数多くても素で出す
+                try:
+                    print(df_z.iloc[i:j].to_string())
+                except Exception:
+                    # 巨大列やdtype問題へのフォールバック
+                    print(df_z.iloc[i:j].astype(str).to_string())
+            logger.info("=== df_z FULL DUMP end ===")
+
+            # （任意）CSVにも保存：後でArtifactsからDL
+            try:
+                import os
+                os.makedirs("out", exist_ok=True)
+                csv_path = "out/df_z_latest.csv"
+                df_z.to_csv(csv_path)
+                logger.info("df_z CSV saved: %s (rows=%d cols=%d)", csv_path, n, df_z.shape[1])
+            except Exception as e:
+                logger.warning("df_z CSV save failed: %s", e)
 
         # === begin: BIO LOSS PENALTY =====================================
         try:
