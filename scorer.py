@@ -796,13 +796,11 @@ class Scorer:
             EPS_YOY = np.nan
             try:
                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
-                sec_rev_series = (d.get('SEC_REV_Q_SERIES') or [])
-                if sec_rev_series:
-                    rev = pd.Series(sec_rev_series, dtype=float).dropna()
-                elif qe is not None and not qe.empty and 'Revenue' in qe.columns:
-                    rev = qe['Revenue'].dropna().astype(float)
-                else:
-                    rev = pd.Series([], dtype=float)
+                # 型に依存しない安全な取り出し（list/np.array/pd.Series どれでもOK）
+                sec_rev_series = d.get('SEC_REV_Q_SERIES')
+                rev = _ensure_series(sec_rev_series)
+                if rev.empty and qe is not None and not qe.empty and 'Revenue' in qe.columns:
+                    rev = pd.to_numeric(qe['Revenue'], errors='coerce').dropna()
                 if not rev.empty:
                     if len(rev)>=5: REV_Q_YOY = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5])
                     if len(rev)>=6:
@@ -832,13 +830,10 @@ class Scorer:
                                 REV_ANNUAL_STREAK = float(streak)
                     except Exception:
                         pass
-                sec_eps_series = (d.get('SEC_EPS_Q_SERIES') or [])
-                if sec_eps_series:
-                    eps_series = pd.Series(sec_eps_series, dtype=float).replace([np.inf,-np.inf],np.nan)
-                elif qe is not None and not qe.empty and 'Earnings' in qe.columns and so:
-                    eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
-                else:
-                    eps_series = pd.Series([], dtype=float)
+                sec_eps_series = d.get('SEC_EPS_Q_SERIES')
+                eps_series = _ensure_series(sec_eps_series).replace([np.inf,-np.inf], np.nan)
+                if eps_series.empty and qe is not None and not qe.empty and 'Earnings' in qe.columns and so:
+                    eps_series = (pd.to_numeric(qe['Earnings'], errors='coerce')/float(so)).replace([np.inf,-np.inf],np.nan).dropna()
                 if not eps_series.empty:
                     if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0:
                         EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
@@ -853,7 +848,9 @@ class Scorer:
                                     EPS_YOY = float(eps_yoy.iloc[-1])
                     except Exception:
                         pass
-            except Exception: pass
+            except Exception as e:
+                # 型バグを見逃さないため、ここだけは原因を一行で可視化
+                print(f"[WARN][{t}] growth-derivatives skipped: {type(e).__name__}: {e}")
             df.loc[t,'REV_Q_YOY'], df.loc[t,'EPS_Q_YOY'] = REV_Q_YOY, EPS_Q_YOY
             df.loc[t,'REV_YOY_ACC'], df.loc[t,'REV_YOY_VAR'] = REV_YOY_ACC, REV_YOY_VAR
             df.loc[t,'REV_YOY'] = REV_YOY
