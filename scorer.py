@@ -566,15 +566,45 @@ class Scorer:
                             rev_series = rev_series.sort_index()
                         except Exception:
                             pass
-                    needs_fallback = True
-                    if isinstance(rev_series, pd.Series):
-                        needs_fallback = rev_series.dropna().empty
-                    if needs_fallback:
-                        fallback = _fetch_revenue_quarterly_via_finnhub(t)
-                        if isinstance(fallback, pd.Series) and not fallback.dropna().empty:
-                            rev_series = fallback
 
-                if rev_series is not None and rev_series.dropna().shape[0] >= 2:
+                def _valid_len(s):
+                    try:
+                        return 0 if s is None else int(pd.Series(s).dropna().shape[0])
+                    except Exception:
+                        return 0
+
+                before_len = _valid_len(rev_series)
+                need_fallback = before_len < 5
+                if need_fallback:
+                    fallback = _fetch_revenue_quarterly_via_finnhub(t)
+                    if isinstance(fallback, pd.Series) and not fallback.dropna().empty:
+                        if isinstance(rev_series, pd.Series) and not rev_series.dropna().empty:
+                            yf_series = pd.Series(
+                                rev_series.values,
+                                index=pd.RangeIndex(len(rev_series)),
+                                dtype=float,
+                            )
+                            fh_series = pd.Series(
+                                fallback.values,
+                                index=pd.RangeIndex(len(fallback)),
+                                dtype=float,
+                            )
+                            total_len = max(len(yf_series), len(fh_series))
+                            yf_series = yf_series.reindex(pd.RangeIndex(total_len))
+                            fh_series = fh_series.reindex(pd.RangeIndex(total_len))
+                            rev_series = yf_series.where(yf_series.notna(), fh_series)
+                        else:
+                            rev_series = fallback
+                        if debug_mode:
+                            try:
+                                base = qe['Revenue'] if (qe is not None and 'Revenue' in qe.columns) else None
+                                before_n = _valid_len(base)
+                            except Exception:
+                                before_n = _valid_len(None)
+                            after_n = _valid_len(rev_series)
+                            logger.info("[REV Fallback] %s: len %d -> %d", t, before_n, after_n)
+
+                if rev_series is not None and _valid_len(rev_series) >= 5:
                     r = rev_series.dropna().astype(float)
                     yoy = r.pct_change(4).replace([np.inf, -np.inf], np.nan)
                     yoy_valid = yoy.dropna()
