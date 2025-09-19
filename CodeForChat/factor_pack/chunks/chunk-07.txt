@@ -1,307 +1,320 @@
 ```text
-sc, "D_WEIGHTS_EFF", {}).keys():
-L88             if k in df_z.columns:
-L89                 used.add(k)
-L90     except Exception:
-L91         pass
-L92
-L93     for k in [
-L94         "GROWTH_F",
-L95         "MOM",
-L96         "TRD",
-L97         "VOL",
-L98         "D_QAL",
-L99         "D_YLD",
-L100         "D_VOL_RAW",
-L101         "D_TRD",
-L102     ]:
-L103         if k in df_z.columns:
-L104             used.add(k)
-L105
-L106     grw_cols = [
-L107         "GRW_PATH",
-L108         "GRW_FLEX_SCORE",
-L109         "GROWTH_F",
-L110         "GRW_REV_YOY_Q",
-L111         "GRW_REV_ACC_Q",
-L112         "GRW_REV_QOQ",
-L113         "GRW_REV_TTM2",
-L114         "GRW_REV_YOY_Y",
-L115         "GRW_PRICE_PROXY",
-L116     ]
-L117     for k in grw_cols:
-L118         if (k in df.columns) or (k in df_z.columns):
-L119             used.add(k)
-L120
-L121     for c in df_z.columns:
-L122         if isinstance(c, str) and c.startswith("D_"):
-L123             used.add(c)
+lpers -------------------------------------------------------
+L72 def _last_close(t, price_map=None):
+L73     if price_map and (c := price_map.get(t)) is not None: return float(c)
+L74     try:
+L75         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
+L76         return float(h.iloc[-1]) if len(h) else np.nan
+L77     except Exception:
+L78         return np.nan
+L79
+L80 def _ttm_div_sum(t, lookback_days=400):
+L81     try:
+L82         div = yf.Ticker(t).dividends
+L83         if div is None or len(div) == 0: return 0.0
+L84         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
+L85         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
+L86         return ttm if ttm > 0 else float(div.tail(4).sum())
+L87     except Exception:
+L88         return 0.0
+L89
+L90 def ttm_div_yield_portfolio(tickers, price_map=None):
+L91     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
+L92     return float(np.mean(ys)) if ys else 0.0
+L93
+L94 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
+L95 def winsorize_s(s: pd.Series, p=0.02):
+L96     if s is None or s.dropna().empty: return s
+L97     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L98
+L99 def robust_z(s: pd.Series, p=0.02):
+L100     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L101
+L102 def robust_z_keepnan(s: pd.Series) -> pd.Series:
+L103     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
+L104     if s is None:
+L105         return pd.Series(dtype=float)
+L106     v = pd.to_numeric(s, errors="coerce")
+L107     m = np.nanmedian(v)
+L108     mad = np.nanmedian(np.abs(v - m))
+L109     z = (v - m) / (1.4826 * mad + 1e-9)
+L110     if np.nanstd(z) < 1e-9:
+L111         r = v.rank(method="average", na_option="keep")
+L112         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
+L113     return pd.Series(z, index=v.index, dtype=float)
+L114
+L115
+L116 def _safe_div(a, b):
+L117     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
+L118     except Exception: return np.nan
+L119
+L120 def _safe_last(series: pd.Series, default=np.nan):
+L121     try: return float(series.iloc[-1])
+L122     except Exception: return default
+L123
 L124
-L125     num = df_z.select_dtypes(include=["number"])
-L126     if not num.empty:
-L127         var_top = num.var().sort_values(ascending=False).head(20).index.tolist()
-L128         used.update(var_top)
-L129
-L130     return sorted(used)
-L131
-L132
-L133 def _reorder_for_debug(df, df_z, factor_cols=FACTOR_COLUMNS):
-L134     cols: list[str] = []
-L135     for fac in ["GRW", "MOM", "VOL", "QUAL", "VAL"]:
-L136         for c in factor_cols.get(fac, []):
-L137             if c in getattr(df_z, "columns", []) or c in getattr(df, "columns", []):
-L138                 cols.append(c)
-L139     seen: set[str] = set()
-L140     ordered: list[str] = []
-L141     for c in cols:
-L142         if c not in seen:
-L143             ordered.append(c)
-L144             seen.add(c)
-L145     return ordered
+L125 def _ensure_series(x):
+L126     if x is None:
+L127         return pd.Series(dtype=float)
+L128     if isinstance(x, pd.Series):
+L129         return x.dropna()
+L130     if isinstance(x, (list, tuple)):
+L131         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
+L132             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
+L133             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
+L134             return pd.Series(v, index=dt).dropna()
+L135         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
+L136     try:
+L137         return pd.Series(x).dropna()
+L138     except Exception:
+L139         return pd.Series(dtype=float)
+L140
+L141
+L142 def _to_quarterly(s: pd.Series) -> pd.Series:
+L143     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
+L144         return s
+L145     return s.resample("Q").last().dropna()
 L146
 L147
-L148 def dump_dfz_scoped(df, df_z, *, topk=20, logger=None):
-L149     import numpy as np, pandas as pd, logging
-L150
-L151     lg = logger or logging.getLogger(__name__)
-L152
-L153     if not DEBUG_SCOPE_STRICT:
-L154         dfz = df_z.copy()
-L155         lg.info("DEBUG scope: disabled (showing ALL %d columns).", dfz.shape[1])
-L156     else:
-L157         rel = _detect_used_cols(df, df_z)
-L158         dfz = df_z[[c for c in rel if c in df_z.columns]].copy()
-L159         if dfz.shape[1] < 15:
-L160             num = df_z.select_dtypes(include=["number"])
-L161             add = []
-L162             if not num.empty:
-L163                 add = [
-L164                     c
-L165                     for c in num.var().sort_values(ascending=False).head(30).index
-L166                     if c not in dfz.columns
-L167                 ]
-L168                 if dfz.shape[1] < 15:
-L169                     add = add[: 15 - dfz.shape[1]]
-L170                 else:
-L171                     add = []
-L172             dfz = pd.concat([dfz, df_z[add]], axis=1)
-L173             lg.info("DEBUG scope too small → fallback add %d cols", len(add))
-L174         excluded = [c for c in df_z.columns if c not in dfz.columns]
-L175         lg.info(
-L176             "DEBUG scope: %d relevant cols kept, %d excluded.",
-L177             dfz.shape[1],
-L178             len(excluded),
-L179         )
-L180
-L181     nan_top = dfz.isna().sum().sort_values(ascending=False).head(topk)
-L182     lg.info("scorer:NaN columns (top%d):", topk)
-L183     for c, n in nan_top.items():
-L184         lg.info("%s\t%d", c, int(n))
+L148 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
+L149     if qs is None or qs.empty:
+L150         return pd.Series(dtype=float)
+L151     ttm = qs.rolling(4, min_periods=2).sum()
+L152     yoy = ttm.pct_change(4)
+L153     return yoy
+L154
+L155
+L156 def _nz(x) -> float:
+L157     if x is None:
+L158         return 0.0
+L159     try:
+L160         value = float(x)
+L161     except Exception:
+L162         return 0.0
+L163     if not np.isfinite(value):
+L164         return 0.0
+L165     return value
+L166
+L167
+L168 def _winsor(x, lo=-2.0, hi=2.0) -> float:
+L169     v = _nz(x)
+L170     if v < lo:
+L171         return float(lo)
+L172     if v > hi:
+L173         return float(hi)
+L174     return float(v)
+L175
+L176
+L177 def _round_debug(x, ndigits: int = 4):
+L178     try:
+L179         value = float(x)
+L180     except Exception:
+L181         return None
+L182     if not np.isfinite(value):
+L183         return None
+L184     return round(value, ndigits)
 L185
-L186     num_dfz = dfz.select_dtypes(include=["number"])
-L187     if not num_dfz.empty:
-L188         ztop = (num_dfz == 0).mean().sort_values(ascending=False).head(topk)
-L189         lg.info("scorer:Zero-dominated columns (top%d):", topk)
-L190         for c, r in ztop.items():
-L191             lg.info("%s\t%.2f%%", c, 100.0 * float(r))
-L192
-L193     return dfz
+L186
+L187 def _calc_grw_flexible(
+L188     ticker: str,
+L189     info_entry: dict | None,
+L190     close_series: pd.Series | None,
+L191     volume_series: pd.Series | None,
+L192 ):
+L193     info_entry = info_entry if isinstance(info_entry, dict) else {}
 L194
-L195
-L196 def save_factor_debug_csv(df, df_z, path="out/factor_debug_latest.csv"):
-L197     import os, pandas as pd, logging
+L195     s_rev_q = _ensure_series(info_entry.get("SEC_REV_Q_SERIES"))
+L196     s_eps_q = _ensure_series(info_entry.get("SEC_EPS_Q_SERIES"))
+L197     s_rev_y = _ensure_series(info_entry.get("SEC_REV_Y_SERIES"))
 L198
-L199     lg = logging.getLogger(__name__)
-L200     try:
-L201         cols = _reorder_for_debug(df, df_z)
-L202         dump = pd.DataFrame(index=df.index)
-L203         for c in cols:
-L204             if c in getattr(df, "columns", []):
-L205                 dump[c] = df[c]
-L206             if c in getattr(df_z, "columns", []):
-L207                 dump[c] = df_z[c]
-L208         dump.reset_index(names=["symbol"], inplace=True)
-L209         if path:
-L210             dirpath = os.path.dirname(path) or "."
-L211             os.makedirs(dirpath, exist_ok=True)
-L212             dump.to_csv(path, index=False)
-L213         lg.info(
-L214             "factor debug CSV saved: %s (cols=%d rows=%d)",
-L215             path,
-L216             dump.shape[1],
-L217             dump.shape[0],
-L218         )
-L219     except Exception as e:
-L220         lg.warning("factor debug CSV failed: %s", e)
-L221
-L222
-L223 def log_grw_stats(df, df_z, logger):
-L224     import numpy as np, pandas as pd
-L225
-L226     try:
-L227         s = pd.to_numeric(df.get("GRW_FLEX_SCORE", pd.Series(dtype=float)), errors="coerce")
-L228         z = pd.to_numeric(df_z.get("GROWTH_F", pd.Series(dtype=float)), errors="coerce")
-L229         if s.size:
-L230             logger.info(
-L231                 "GRW raw stats: n=%d, median=%.3f, mad=%.3f, std=%.3f",
-L232                 s.count(),
-L233                 np.nanmedian(s),
-L234                 np.nanmedian(np.abs(s - np.nanmedian(s))),
-L235                 np.nanstd(s),
-L236             )
-L237         if z.size and not z.dropna().empty:
-L238             clip_hi = float((z >= 2.95).mean() * 100.0)
-L239             clip_lo = float((z <= -2.95).mean() * 100.0)
-L240             logger.info(
-L241                 "GRW z stats: min=%.2f, p25=%.2f, med=%.2f, p75=%.2f, max=%.2f, clipped_hi=%.1f%%, clipped_lo=%.1f%%",
-L242                 np.nanmin(z),
-L243                 np.nanpercentile(z.dropna(), 25),
-L244                 np.nanmedian(z),
-L245                 np.nanpercentile(z.dropna(), 75),
-L246                 np.nanmax(z),
-L247                 clip_hi,
-L248                 clip_lo,
-L249             )
-L250         if "GRW_PATH" in getattr(df, "columns", []):
-L251             logger.info(
-L252                 "GRW path breakdown: %s",
-L253                 df["GRW_PATH"].value_counts(dropna=False).to_dict(),
-L254             )
-L255     except Exception as e:
-L256         logger.warning("GRW stats log failed: %s", e)
-L257
-L258
-L259 def _grw_record_to_df(t: str, info_t: dict, df):
-L260     if not isinstance(df, pd.DataFrame):
-L261         return
-L262     raw_parts = info_t.get("DEBUG_GRW_PARTS") if isinstance(info_t, dict) else None
-L263     parts: dict[str, Any] = {}
-L264     if isinstance(raw_parts, str):
-L265         try:
-L266             parts = json.loads(raw_parts)
-L267         except Exception:
-L268             parts = {}
-L269     elif isinstance(raw_parts, dict):
-L270         parts = raw_parts
-L271     path = info_t.get("DEBUG_GRW_PATH") if isinstance(info_t, dict) else None
-L272     score = info_t.get("GRW_SCORE") if isinstance(info_t, dict) else None
-L273
-L274     def _part_value(key: str):
-L275         value = parts.get(key) if isinstance(parts, dict) else None
-L276         if value is None:
-L277             return np.nan
-L278         try:
-L279             return float(value)
-L280         except Exception:
-L281             return np.nan
-L282
-L283     df.loc[t, "GRW_PATH"] = path
-L284     df.loc[t, "GRW_FLEX_SCORE"] = np.nan if score is None else float(score)
-L285     df.loc[t, "GRW_REV_YOY_Q"] = _part_value("rev_yoy_q")
-L286     df.loc[t, "GRW_REV_ACC_Q"] = _part_value("rev_acc_q")
-L287     df.loc[t, "GRW_REV_QOQ"] = _part_value("rev_qoq")
-L288     df.loc[t, "GRW_REV_TTM2"] = _part_value("rev_ttm2")
-L289     df.loc[t, "GRW_REV_YOY_Y"] = _part_value("rev_yoy_y")
-L290     df.loc[t, "GRW_PRICE_PROXY"] = _part_value("price_proxy")
-L291
-L292 # ---- Dividend Helpers -------------------------------------------------------
-L293 def _last_close(t, price_map=None):
-L294     if price_map and (c := price_map.get(t)) is not None: return float(c)
-L295     try:
-L296         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
-L297         return float(h.iloc[-1]) if len(h) else np.nan
-L298     except Exception:
-L299         return np.nan
-L300
-L301 def _ttm_div_sum(t, lookback_days=400):
-L302     try:
-L303         div = yf.Ticker(t).dividends
-L304         if div is None or len(div) == 0: return 0.0
-L305         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
-L306         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
-L307         return ttm if ttm > 0 else float(div.tail(4).sum())
-L308     except Exception:
-L309         return 0.0
-L310
-L311 def ttm_div_yield_portfolio(tickers, price_map=None):
-L312     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
-L313     return float(np.mean(ys)) if ys else 0.0
-L314
-L315 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
-L316 def winsorize_s(s: pd.Series, p=0.02):
-L317     if s is None or s.dropna().empty: return s
-L318     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
-L319
-L320 def robust_z(s: pd.Series, p=0.02):
-L321     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L199     nQ = int(getattr(s_rev_q, "size", 0))
+L200     nY = int(getattr(s_rev_y, "size", 0))
+L201
+L202     parts: dict[str, Any] = {"nQ": nQ, "nY": nY}
+L203     path = "NONE"
+L204     w = 0.0
+L205
+L206     def _valid_ratio(a, b):
+L207         try:
+L208             na, nb = float(a), float(b)
+L209         except Exception:
+L210             return None
+L211         if not np.isfinite(na) or not np.isfinite(nb) or nb == 0:
+L212             return None
+L213         return na, nb
+L214
+L215     def yoy_q(series: pd.Series) -> float | None:
+L216         s = _ensure_series(series)
+L217         if s.empty:
+L218             return None
+L219         s = s.sort_index()
+L220         if isinstance(s.index, pd.DatetimeIndex):
+L221             last_idx = s.index[-1]
+L222             window_start = last_idx - pd.DateOffset(months=15)
+L223             window_end = last_idx - pd.DateOffset(months=9)
+L224             candidates = s.loc[(s.index >= window_start) & (s.index <= window_end)]
+L225             if candidates.empty:
+L226                 candidates = s.loc[s.index <= window_end]
+L227             if candidates.empty:
+L228                 return None
+L229             v1 = candidates.iloc[-1]
+L230             v0 = s.iloc[-1]
+L231         else:
+L232             if s.size < 5:
+L233                 return None
+L234             v0 = s.iloc[-1]
+L235             v1 = s.iloc[-5]
+L236         pair = _valid_ratio(v0, v1)
+L237         if pair is None:
+L238             return None
+L239         a, b = pair
+L240         return float(a / b - 1.0)
+L241
+L242     def qoq(series: pd.Series) -> float | None:
+L243         s = _ensure_series(series)
+L244         if s.size < 2:
+L245             return None
+L246         s = s.sort_index()
+L247         v0, v1 = s.iloc[-1], s.iloc[-2]
+L248         pair = _valid_ratio(v0, v1)
+L249         if pair is None:
+L250             return None
+L251         a, b = pair
+L252         return float(a / b - 1.0)
+L253
+L254     def ttm_delta(series: pd.Series) -> float | None:
+L255         s = _ensure_series(series)
+L256         if s.size < 2:
+L257             return None
+L258         s = s.sort_index()
+L259         k = int(min(4, s.size))
+L260         cur_slice = s.iloc[-k:]
+L261         prev_slice = s.iloc[:-k]
+L262         if prev_slice.empty:
+L263             return None
+L264         prev_k = int(min(k, prev_slice.size))
+L265         cur_sum = float(cur_slice.sum())
+L266         prev_sum = float(prev_slice.iloc[-prev_k:].sum())
+L267         pair = _valid_ratio(cur_sum, prev_sum)
+L268         if pair is None:
+L269             return None
+L270         a, b = pair
+L271         return float(a / b - 1.0)
+L272
+L273     def yoy_y(series: pd.Series) -> float | None:
+L274         s = _ensure_series(series)
+L275         if s.size < 2:
+L276             return None
+L277         s = s.sort_index()
+L278         v0, v1 = s.iloc[-1], s.iloc[-2]
+L279         pair = _valid_ratio(v0, v1)
+L280         if pair is None:
+L281             return None
+L282         a, b = pair
+L283         return float(a / b - 1.0)
+L284
+L285     def price_proxy_growth() -> float | None:
+L286         if not isinstance(close_series, pd.Series):
+L287             return None
+L288         close = close_series.sort_index().dropna()
+L289         if close.empty:
+L290             return None
+L291         hh_window = int(min(126, len(close)))
+L292         if hh_window < 20:
+L293             return None
+L294         hh = close.rolling(hh_window).max().iloc[-1]
+L295         prox = None
+L296         if np.isfinite(hh) and hh > 0:
+L297             prox = float(close.iloc[-1] / hh)
+L298         rs6 = None
+L299         if len(close) >= 63:
+L300             rs6 = float(close.pct_change(63).iloc[-1])
+L301         rs12 = None
+L302         if len(close) >= 126:
+L303             rs12 = float(close.pct_change(126).iloc[-1])
+L304         vexp = None
+L305         if isinstance(volume_series, pd.Series):
+L306             vol = volume_series.reindex(close.index).dropna()
+L307             if len(vol) >= 50:
+L308                 v20 = vol.rolling(20).mean().iloc[-1]
+L309                 v50 = vol.rolling(50).mean().iloc[-1]
+L310                 if np.isfinite(v20) and np.isfinite(v50) and v50 > 0:
+L311                     vexp = float(v20 / v50 - 1.0)
+L312         prox = 0.0 if prox is None or not np.isfinite(prox) else prox
+L313         rs6 = 0.0 if rs6 is None or not np.isfinite(rs6) else rs6
+L314         rs12 = 0.0 if rs12 is None or not np.isfinite(rs12) else rs12
+L315         vexp = 0.0 if vexp is None or not np.isfinite(vexp) else vexp
+L316         return 0.5 * prox + 0.3 * rs6 + 0.2 * rs12 + 0.2 * vexp
+L317
+L318     price_alt = price_proxy_growth() or 0.0
+L319     core = 0.0
+L320     core_raw = 0.0
+L321     price_raw = price_alt
 L322
-L323 def robust_z_keepnan(s: pd.Series) -> pd.Series:
-L324     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
-L325     if s is None:
-L326         return pd.Series(dtype=float)
-L327     v = pd.to_numeric(s, errors="coerce")
-L328     m = np.nanmedian(v)
-L329     mad = np.nanmedian(np.abs(v - m))
-L330     z = (v - m) / (1.4826 * mad + 1e-9)
-L331     if np.nanstd(z) < 1e-9:
-L332         r = v.rank(method="average", na_option="keep")
-L333         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
-L334     return pd.Series(z, index=v.index, dtype=float)
-L335
-L336
-L337 def _dump_dfz(
-L338     df: pd.DataFrame,
-L339     df_z: pd.DataFrame,
-L340     debug_mode: bool,
-L341     max_rows: int = 400,
-L342     ndigits: int = 3,
-L343 ) -> None:
-L344     """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
-L345
-L346     if not debug_mode:
-L347         return
-L348     try:
-L349         dfz_scoped = dump_dfz_scoped(df, df_z, topk=20, logger=logger)
-L350         ordered = _reorder_for_debug(df, df_z)
-L351         rel_set = set(dfz_scoped.columns)
-L352         view_cols = [c for c in ordered if c in rel_set]
-L353         if not view_cols:
-L354             view_cols = list(dfz_scoped.columns)
-L355         view = dfz_scoped[view_cols].copy()
-L356         view = view.apply(
-L357             lambda s: s.round(ndigits)
-L358             if getattr(getattr(s, "dtype", None), "kind", "") in ("f", "i")
-L359             else s
-L360         )
-L361         if len(view) > max_rows:
-L362             view = view.iloc[:max_rows]
-L363
-L364         logger.info("===== DF_Z DUMP START =====")
-L365         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
-L366         logger.info("===== DF_Z DUMP END =====")
-L367     except Exception as exc:
-L368         logger.warning("df_z dump failed: %s", exc)
-L369
-L370 def _safe_div(a, b):
-L371     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
-L372     except Exception: return np.nan
-L373
-L374 def _safe_last(series: pd.Series, default=np.nan):
-L375     try: return float(series.iloc[-1])
-L376     except Exception: return default
-L377
-L378
-L379 def _ensure_series(x):
-L380     if x is None:
-L381         return pd.Series(dtype=float)
-L382     if isinstance(x, pd.Series):
-L383         return x.dropna()
-L384     if isinstance(x, (list, tuple)):
-L385         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
-L386             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
-L387             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
-L388             return pd.Series(v, index=dt).dropna()
-L389         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
-L390     try:
-L391   
+L323     if nQ >= 5:
+L324         path = "P5"
+L325         yq = yoy_q(s_rev_q)
+L326         parts["rev_yoy_q"] = yq
+L327         tmp_prev = s_rev_q.iloc[:-1] if s_rev_q.size > 1 else s_rev_q
+L328         acc = None
+L329         if tmp_prev.size >= 5 and yq is not None:
+L330             yq_prev = yoy_q(tmp_prev)
+L331             if yq_prev is not None:
+L332                 acc = float(yq - yq_prev)
+L333         parts["rev_acc_q"] = acc
+L334         eps_yoy = yoy_q(s_eps_q) if s_eps_q.size >= 5 else None
+L335         parts["eps_yoy_q"] = eps_yoy
+L336         eps_acc = None
+L337         if eps_yoy is not None and s_eps_q.size > 5:
+L338             eps_prev = s_eps_q.iloc[:-1]
+L339             if eps_prev.size >= 5:
+L340                 eps_prev_yoy = yoy_q(eps_prev)
+L341                 if eps_prev_yoy is not None:
+L342                     eps_acc = float(eps_yoy - eps_prev_yoy)
+L343         parts["eps_acc_q"] = eps_acc
+L344         w = 1.0
+L345         core_raw = (
+L346             0.60 * _nz(yq)
+L347             + 0.20 * _nz(acc)
+L348             + 0.15 * _nz(eps_yoy)
+L349             + 0.05 * _nz(eps_acc)
+L350         )
+L351         price_alt = 0.0
+L352     elif 2 <= nQ <= 4:
+L353         path = "P24"
+L354         rev_qoq = qoq(s_rev_q)
+L355         rev_ttm2 = ttm_delta(s_rev_q)
+L356         parts["rev_qoq"] = rev_qoq
+L357         parts["rev_ttm2"] = rev_ttm2
+L358         eps_qoq = qoq(s_eps_q) if s_eps_q.size >= 2 else None
+L359         parts["eps_qoq"] = eps_qoq
+L360         w = min(1.0, nQ / 5.0)
+L361         core_raw = 0.6 * _nz(rev_qoq) + 0.3 * _nz(rev_ttm2) + 0.1 * _nz(eps_qoq)
+L362     else:
+L363         path = "P1Y"
+L364         rev_yoy_y = yoy_y(s_rev_y) if nY >= 2 else None
+L365         parts["rev_yoy_y"] = rev_yoy_y
+L366         w = 0.6 * min(1.0, nY / 3.0) if nY >= 2 else 0.4
+L367         core_raw = _nz(rev_yoy_y)
+L368         if nQ <= 1 and nY < 2 and price_alt == 0.0:
+L369             price_alt = price_proxy_growth() or 0.0
+L370
+L371     core = _winsor(core_raw, lo=-1.5, hi=1.5)
+L372     price_alt = _winsor(price_alt, lo=-1.5, hi=1.5)
+L373     grw = _winsor(w * core + (1.0 - w) * (0.5 * _nz(price_alt)), lo=-2.0, hi=2.0)
+L374
+L375     parts.update(
+L376         {
+L377             "core_raw": core_raw,
+L378             "core": core,
+L379             "price_proxy_raw": price_raw,
+L380             "price_proxy": price_alt,
+L381             "weight": w,
+L382             "score": grw,
+L383         }
+L384     )
+L385
+L386     parts_out: dict[str, Any] = {
+L387         "nQ": nQ,
+L388       
 ```
