@@ -1,5 +1,85 @@
 ```text
-  if not g_universe:
+ (df.get('MA50_OVER_200', np.nan) > 0) &
+L826                 (df.get('TR_str', np.nan) > 0)).fillna(False)
+L827             df['trend_template'] = mask
+L828
+L829         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
+L830         g_score = g_score_all.loc[mask]
+L831         Scorer.g_score = g_score
+L832         df_z['GSC'] = g_score_all
+L833         df_z['DSC'] = d_score_all
+L834
+L835         try:
+L836             current = (pd.read_csv("current_tickers.csv")
+L837                   .iloc[:, 0]
+L838                   .str.upper()
+L839                   .tolist())
+L840         except FileNotFoundError:
+L841             warnings.warn("current_tickers.csv not found — bonus skipped")
+L842             current = []
+L843
+L844         mask_bonus = g_score.index.isin(current)
+L845         if mask_bonus.any():
+L846             # 1) factor.BONUS_COEFF から k を決め、無ければ 0.4
+L847             k = float(getattr(sys.modules.get("factor"), "BONUS_COEFF", 0.4))
+L848             # 2) g 側の σ を取り、NaN なら 0 に丸める
+L849             sigma_g = g_score.std()
+L850             if pd.isna(sigma_g):
+L851                 sigma_g = 0.0
+L852             bonus_g = round(k * sigma_g, 3)
+L853             g_score.loc[mask_bonus] += bonus_g
+L854             Scorer.g_score = g_score
+L855             # 3) D 側も同様に σ の NaN をケア
+L856             sigma_d = d_score_all.std()
+L857             if pd.isna(sigma_d):
+L858                 sigma_d = 0.0
+L859             bonus_d = round(k * sigma_d, 3)
+L860             d_score_all.loc[d_score_all.index.isin(current)] += bonus_d
+L861
+L862         try:
+L863             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
+L864         except Exception:
+L865             pass
+L866
+L867         df_full = df.copy()
+L868         df_full_z = df_z.copy()
+L869
+L870         from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
+L871         return FeatureBundle(df=df,
+L872             df_z=df_z,
+L873             g_score=g_score,
+L874             d_score_all=d_score_all,
+L875             missing_logs=pd.DataFrame(missing_logs),
+L876             df_full=df_full,
+L877             df_full_z=df_full_z,
+L878             scaler=None)
+L879
+L880 def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_pullback=5):
+L881     """
+L882     G枠ユニバースに対し、ブレイクアウト確定/押し目反発の「直近N営業日内の発火」を判定し、
+L883     次の列を feature_df に追加する（index=ticker）。
+L884       - G_BREAKOUT_recent_5d : bool
+L885       - G_BREAKOUT_last_date : str "YYYY-MM-DD"
+L886       - G_PULLBACK_recent_5d : bool
+L887       - G_PULLBACK_last_date : str "YYYY-MM-DD"
+L888       - G_PIVOT_price        : float
+L889     失敗しても例外は握り潰し、既存処理を阻害しない。
+L890     """
+L891     try:
+L892         px   = bundle.px                      # 終値 DataFrame
+L893         hi   = bundle.data['High']
+L894         lo   = bundle.data['Low']
+L895         vol  = bundle.data['Volume']
+L896         bench= bundle.spx                     # ベンチマーク Series
+L897
+L898         # Gユニバース推定：self.g_universe 優先 → feature_df['group']=='G' → 全銘柄
+L899         g_universe = getattr(self_obj, "g_universe", None)
+L900         if g_universe is None:
+L901             try:
+L902                 g_universe = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
+L903             except Exception:
+L904                 g_universe = list(feature_df.index)
+L905         if not g_universe:
 L906             return feature_df
 L907
 L908         # 指標
@@ -242,86 +322,5 @@ L28 | `bench` | ベンチマークティッカー | 相対強さ・β算出、�
 L29 | `CAND_PRICE_MAX` | 候補銘柄の許容価格上限 | 高額銘柄の事前除外 |
 L30 | `N_G` / `N_D` | G/D採用枠の件数（**既定: 12 / 8**） | 最終的に選ぶ銘柄数の制約 |
 L31 | `g_weights` / `D_weights` | 各因子の重みdict | G/Dスコア合成 |
-L32 | `D_BETA_MAX` | Dバケットの許容β上限 | 高β銘柄の除外フィルタ |
-L33 | `FILTER_SPEC` | G/Dごとの前処理フィルタ | トレンドマスクやβ上限設定 |
-L34 | `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
-L35 | `DRRS_G` / `DRRS_D` | DRRSパラメータdict | バケット別の相関低減設定 |
-L36 | `DRRS_SHRINK` | 残差相関の対角シュリンク率 | `residual_corr`の安定化 |
-L37 | `CROSS_MU_GD` | G-D間クロス相関ペナルティμ | 2バケット同時最適化で相関抑制 |
-L38 | `RESULTS_DIR` | 選定結果保存ディレクトリ | `_save_sel`/`_load_prev`の入出力 |
-L39
-L40 選定結果は`results/`配下にJSONとして保存し、次回実行時に`_load_prev`で読み込んで選定条件に反映。
-L41
-L42 ## DTO/Config
-L43 各ステップ間で受け渡すデータ構造と設定値。変数の意味合いと利用箇所を以下に示す。
-L44
-L45 ### InputBundle（Input → Scorer）
-L46 | 変数 | 内容 | 主な用途 |
-L47 | --- | --- | --- |
-L48 | `cand` | 候補銘柄ティッカーのリスト | OUTテーブルや低スコアランキング対象の母集団 |
-L49 | `tickers` | 現行+候補を合わせたティッカー一覧 | 価格・出来高ダウンロード、リターン計算 |
-L50 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
-L51 | `data` | yfinanceのダウンロード結果（階層列） | `px`/`spx`/リターン等の基礎データ |
-L52 | `px` | `data['Close']`だけを抜き出した価格系列 | 指標計算・リターン生成 |
-L53 | `spx` | `data['Close'][bench]` のSeries | `rs`や`calc_beta`の基準指数 |
-L54 | `tickers_bulk` | `yf.Tickers`オブジェクト | `info`等の一括取得 |
-L55 | `info` | ティッカー別のyfinance情報dict | セクター判定やEPS補完 |
-L56 | `eps_df` | EPS TTM/直近EPS等をまとめた表 | 成長指標の算出 |
-L57 | `fcf_df` | CFO・CapEx・FCF TTMと情報源フラグ | FCF/EVや配当カバレッジ |
-L58 | `returns` | `px.pct_change()`のリターン表 | 相関行列・DRRS計算 |
-L59
-L60 ### FeatureBundle（Scorer → Selector）
-L61 | 変数 | 内容 | 主な用途 |
-L62 | --- | --- | --- |
-L63 | `df` | 計算済み指標の生値テーブル | デバッグ・出力表示 |
-L64 | `df_z` | ウィンザー後Zスコア化した指標表 | 因子スコア合成、選定基準 |
-L65 | `g_score` | Gバケット総合スコア | G選定、IN/OUT比較 |
-L66 | `d_score_all` | Dバケット総合スコア（全銘柄） | D選定、低スコアランキング |
-L67 | `missing_logs` | 欠損指標と補完状況のログ | データ品質チェック |
-L68
-L69 ### SelectionBundle（Selector → Output）
-L70 | 変数 | 内容 | 主な用途 |
-L71 | --- | --- | --- |
-L72 | `resG` | G選定結果の詳細dict（`tickers`、目的値等） | 結果保存・平均相関などの指標表示 |
-L73 | `resD` | D選定結果の詳細dict | 同上 |
-L74 | `top_G` | 最終採用Gティッカー | 新ポートフォリオ構築 |
-L75 | `top_D` | 最終採用Dティッカー | 同上 |
-L76 | `init_G` | DRRS前のG初期候補 | 惜しくも外れた銘柄表示 |
-L77 | `init_D` | DRRS前のD初期候補 | 同上 |
-L78
-L79 ### WeightsConfig
-L80 | 変数 | 内容 | 主な用途 |
-L81 | --- | --- | --- |
-L82 | `g` | G因子（GRW/MOM/VOL）の重みdict | `g_score`合成 |
-L83 | `d` | D因子（D_QAL/D_YLD/D_VOL_RAW/D_TRD）の重みdict | `d_score_all`合成 |
-L84
-L85 ### DRRSParams
-L86 | 変数 | 内容 | 主な用途 |
-L87 | --- | --- | --- |
-L88 | `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
-L89 | `shrink` | 残差相関のシュリンク率 | `residual_corr`の対角強調 |
-L90 | `G` | Gバケット用パラメータdict（`lookback`等） | `select_bucket_drrs`設定 |
-L91 | `D` | Dバケット用パラメータdict | 同上 |
-L92 | `cross_mu_gd` | G-Dクロス相関ペナルティ係数μ | `select_buckets`の目的関数 |
-L93
-L94 ### PipelineConfig
-L95 | 変数 | 内容 | 主な用途 |
-L96 | --- | --- | --- |
-L97 | `weights` | `WeightsConfig`のインスタンス | スコア合成の重み参照 |
-L98 | `drrs` | `DRRSParams`のインスタンス | 選定ステップの設定値 |
-L99 | `price_max` | 候補銘柄の許容価格上限 | Input段階でのフィルタ |
-L100
-L101 ## 共通ユーティリティ
-L102 - `winsorize_s` / `robust_z` : 外れ値処理とZスコア化。
-L103 - `_safe_div` / `_safe_last` : 例外を潰した分割・末尾取得。
-L104 - `_load_prev` / `_save_sel` : 選定結果の読み書き。
-L105
-L106 ## クラス設計
-L107 ### Step1: Input
-L108 `current_tickers.csv`の現行銘柄と`candidate_tickers.csv`の検討中銘柄を起点にデータを集約する。外部I/Oと前処理を担当し、`prepare_data`で`InputBundle`を生成。価格・財務データの取得は**yfinanceを優先し、欠損がある指標のみFinnhub APIで補完**する。
-L109 主なメソッド:
-L110 - `impute_eps_ttm` : 四半期EPS×4でTTMを推定し欠損時のみ差し替え。
-L111 - `fetch_cfo_capex_ttm_yf` : yfinanceの四半期/年次キャッシュフローからCFO・CapEx・FCF TTMを算出。
-L112 - `fetch_cfo_capex_ttm_finnhub` : yfinanceで欠けた銘柄のみFinnhub APIで補完。
-L113 - `compute_fcf_with_fallback` : yfinance値を基準にFinnhub値で穴埋めし、CFO/CapEx/FCFと情報
+L32 | `D_BETA_MAX` | Dバケットの許容β上限 | 高β銘柄の除外フィルタ
 ```

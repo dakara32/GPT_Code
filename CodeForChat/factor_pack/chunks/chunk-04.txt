@@ -1,185 +1,183 @@
 ```text
- col_pos = {c:i for i,c in enumerate(Rdf_all.columns)}; pool_pos = [col_pos[t] for t in pool_eff]
-L701         C_within, C_cross = C_all[np.ix_(pool_pos,pool_pos)], None
-L702         if len(g_eff)>0 and mu>0.0:
-L703             g_pos = [col_pos[t] for t in g_eff]; C_cross = C_all[np.ix_(pool_pos,g_pos)]
-L704         R_pool = Rdf_all[pool_eff].to_numpy(); S0 = cls.rrqr_like_det(R_pool, score, k, gamma=gamma)
-L705         S, Jn = (cls.swap_local_det_cross(C_within, C_cross, score, S0, lam=lam, mu=mu, max_pass=15) if C_cross is not None else cls.swap_local_det(C_within, score, S0, lam=lam, max_pass=15))
-L706         selected_tickers = [pool_eff[i] for i in S]
-L707         return dict(idx=S, tickers=selected_tickers, avg_res_corr=cls.avg_corr(C_within,S), sum_score=float(score[S].sum()), objective=float(Jn))
-L708
-L709     # ---- 選定（スコア Series / returns だけを受ける）----
-L710 # === Output：出力整形と送信（表示・Slack） ===
-L711 class Output:
-L712
-L713     def __init__(self, debug=None):
-L714         # self.debug は使わない（互換のため引数は受けるが無視）
-L715         self.miss_df = self.g_table = self.d_table = self.io_table = self.df_metrics_fmt = self.debug_table = None
-L716         self.g_title = self.d_title = ""
-L717         self.g_formatters = self.d_formatters = {}
-L718         # 低スコア（GSC+DSC）Top10 表示/送信用
-L719         self.low10_table = None
-L720         self.debug_text = ""   # デバッグ用本文はここに一本化
-L721         self._debug_logged = False
-L722
-L723     # --- 表示（元 display_results のロジックそのまま） ---
-L724     def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
-L725                         init_G, init_D, top_G, top_D, **kwargs):
-L726         logger.info("📌 reached display_results")
-L727         pd.set_option('display.float_format','{:.3f}'.format)
-L728         print("📈 ファクター分散最適化の結果")
-L729         if self.miss_df is not None and not self.miss_df.empty:
-L730             print("Missing Data:")
-L731             print(self.miss_df.to_string(index=False))
+wap_local_det(cls, corrM: np.ndarray, score: np.ndarray, idx, lam: float=0.6, max_pass: int=15):
+L715         S, best, improved, passes = sorted(idx), cls._obj(corrM, score, idx, lam), True, 0
+L716         while improved and passes<max_pass:
+L717             improved, passes = False, passes+1
+L718             for i,out in enumerate(list(S)):
+L719                 for inn in range(len(score)):
+L720                     if inn in S: continue
+L721                     cand = sorted(S[:i]+[inn]+S[i+1:]); v = cls._obj(corrM, score, cand, lam)
+L722                     if v>best+1e-10: S, best, improved = cand, v, True; break
+L723                 if improved: break
+L724         return S, best
+L725
+L726     @staticmethod
+L727     def _obj_with_cross(C_within: np.ndarray, C_cross: np.ndarray|None, score: np.ndarray, idx, lam: float, mu: float) -> float:
+L728         idx = list(idx); P = C_within[np.ix_(idx, idx)]; s = (score-score.mean())/(score.std()+1e-9)
+L729         within = (P.sum()-np.trace(P))/2.0; cross = 0.0
+L730         if C_cross is not None and C_cross.size>0: cross = C_cross[idx,:].sum()
+L731         return float(s[idx].sum() - lam*within - mu*cross)
 L732
-L733         # ---- 表示用：Changes/Near-Miss のスコア源を“最終集計”に統一するプロキシ ----
-L734         try:
-L735             sc = getattr(self, "_sc", None)
-L736             agg_G = getattr(sc, "_agg_G", None)
-L737             agg_D = getattr(sc, "_agg_D", None)
-L738         except Exception:
-L739             sc = agg_G = agg_D = None
-L740         class _SeriesProxy:
-L741             __slots__ = ("primary", "fallback")
-L742             def __init__(self, primary, fallback): self.primary, self.fallback = primary, fallback
-L743             def get(self, key, default=None):
-L744                 try:
-L745                     v = self.primary.get(key) if hasattr(self.primary, "get") else None
-L746                     if v is not None and not (isinstance(v, float) and v != v):
-L747                         return v
-L748                 except Exception:
-L749                     pass
-L750                 try:
-L751                     return self.fallback.get(key) if hasattr(self.fallback, "get") else default
-L752                 except Exception:
-L753                     return default
-L754         g_score = _SeriesProxy(agg_G, g_score)
-L755         d_score_all = _SeriesProxy(agg_D, d_score_all)
-L756         near_G = getattr(sc, "_near_G", []) if sc else []
-L757         near_D = getattr(sc, "_near_D", []) if sc else []
-L758
-L759         extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
-L760         gsc_series = pd.Series({t: g_score.get(t) for t in G_UNI}, name='GSC')
-L761         self.g_table = pd.concat([df_z.loc[G_UNI,['GROWTH_F','MOM','TRD','VOL']], gsc_series], axis=1)
-L762         self.g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
-L763         self.g_formatters = {col:"{:.2f}".format for col in ['GROWTH_F','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
-L764         self.g_title = (f"[G枠 / {N_G} / {_fmt_w(g_weights)} / corrM={corrM} / "
-L765                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
-L766         if near_G:
-L767             add = [t for t in near_G if t not in set(G_UNI)][:10]
-L768             if len(add) < 10:
-L769                 try:
-L770                     aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False)
-L771                     out_now = sorted(set(exist) - set(top_G + top_D))  # 今回 OUT
-L772                     used = set(G_UNI + add)
-L773                     def _push(lst):
-L774                         nonlocal add, used
-L775                         for t in lst:
-L776                             if len(add) == 10: break
-L777                             if t in aggG.index and t not in used:
-L778                                 add.append(t); used.add(t)
-L779                     _push(out_now)           # ① 今回 OUT を優先
-L780                     _push(list(aggG.index))  # ② まだ足りなければ上位で充填
-L781                 except Exception:
-L782                     pass
-L783             if add:
-L784                 near_tbl = pd.concat([df_z.loc[add,['GROWTH_F','MOM','TRD','VOL']], pd.Series({t: g_score.get(t) for t in add}, name='GSC')], axis=1)
-L785                 self.g_table = pd.concat([self.g_table, near_tbl], axis=0)
-L786         print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
-L787
-L788         extra_D = [t for t in init_D if t not in top_D][:5]; D_UNI = top_D + extra_D
-L789         cols_D = ['QAL','YLD','VOL','TRD']; d_disp = pd.DataFrame(index=D_UNI)
-L790         d_disp['QAL'], d_disp['YLD'], d_disp['VOL'], d_disp['TRD'] = df_z.loc[D_UNI,'D_QAL'], df_z.loc[D_UNI,'D_YLD'], df_z.loc[D_UNI,'D_VOL_RAW'], df_z.loc[D_UNI,'D_TRD']
-L791         dsc_series = pd.Series({t: d_score_all.get(t) for t in D_UNI}, name='DSC')
-L792         self.d_table = pd.concat([d_disp, dsc_series], axis=1); self.d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
-L793         self.d_formatters = {col:"{:.2f}".format for col in cols_D}; self.d_formatters['DSC']="{:.3f}".format
-L794         import scorer
-L795         dw_eff = scorer.D_WEIGHTS_EFF
-L796         self.d_title = (f"[D枠 / {N_D} / {_fmt_w(dw_eff)} / corrM={corrM} / "
-L797                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
-L798         if near_D:
-L799             add = [t for t in near_D if t not in set(D_UNI)][:10]
-L800             if add:
-L801                 d_disp2 = pd.DataFrame(index=add)
-L802                 d_disp2['QAL'], d_disp2['YLD'], d_disp2['VOL'], d_disp2['TRD'] = df_z.loc[add,'D_QAL'], df_z.loc[add,'D_YLD'], df_z.loc[add,'D_VOL_RAW'], df_z.loc[add,'D_TRD']
-L803                 near_tbl = pd.concat([d_disp2, pd.Series({t: d_score_all.get(t) for t in add}, name='DSC')], axis=1)
-L804                 self.d_table = pd.concat([self.d_table, near_tbl], axis=0)
-L805         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
-L806
-L807         # === Changes（IN の GSC/DSC を表示。OUT は銘柄名のみ） ===
-L808         in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
-L809         out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
-L810
-L811         self.io_table = pd.DataFrame({
-L812             'IN': pd.Series(in_list),
-L813             '/ OUT': pd.Series(out_list)
-L814         })
-L815         g_list = [f"{g_score.get(t):.3f}" if pd.notna(g_score.get(t)) else '—' for t in out_list]
-L816         d_list = [f"{d_score_all.get(t):.3f}" if pd.notna(d_score_all.get(t)) else '—' for t in out_list]
-L817         self.io_table['GSC'] = pd.Series(g_list)
-L818         self.io_table['DSC'] = pd.Series(d_list)
-L819
-L820         print("Changes:")
-L821         print(self.io_table.to_string(index=False))
-L822
-L823         all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False, threads=False)['Close'].ffill(limit=2)
-L824         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
-L825         for name,ticks in portfolios.items():
-L826             pr = ret[ticks].mean(axis=1, skipna=True).dropna(); cum = (1+pr).cumprod()-1; n = len(pr)
-L827             if n>=252: ann_ret, ann_vol = (1+cum.iloc[-1])**(252/n)-1, pr.std()*np.sqrt(252)
-L828             else: ann_ret, ann_vol = cum.iloc[-1], pr.std()*np.sqrt(n)
-L829             sharpe, drawdown = ann_ret/ann_vol, (cum - cum.cummax()).min()
-L830             if len(ticks)>=2:
-L831                 C_raw = ret[ticks].corr(); RAW_rho = C_raw.mask(np.eye(len(ticks), dtype=bool)).stack().mean()
-L832                 R = ret[ticks].dropna().to_numpy(); C_resid = Selector.residual_corr(R, n_pc=3, shrink=DRRS_SHRINK)
-L833                 RESID_rho = float((C_resid.sum()-np.trace(C_resid))/(C_resid.shape[0]*(C_resid.shape[0]-1)))
-L834             else: RAW_rho = RESID_rho = np.nan
-L835             divy = ttm_div_yield_portfolio(ticks); metrics[name] = {'RET':ann_ret,'VOL':ann_vol,'SHP':sharpe,'MDD':drawdown,'RAWρ':RAW_rho,'RESIDρ':RESID_rho,'DIVY':divy}
-L836         df_metrics = pd.DataFrame(metrics).T; df_metrics_pct = df_metrics.copy(); self.df_metrics = df_metrics
-L837         for col in ['RET','VOL','MDD','DIVY']: df_metrics_pct[col] = df_metrics_pct[col]*100
-L838         cols_order = ['RET','VOL','SHP','MDD','RAWρ','RESIDρ','DIVY']; df_metrics_pct = df_metrics_pct.reindex(columns=cols_order)
-L839         def _fmt_row(s):
-L840             return pd.Series({'RET':f"{s['RET']:.1f}%",'VOL':f"{s['VOL']:.1f}%",'SHP':f"{s['SHP']:.1f}",'MDD':f"{s['MDD']:.1f}%",'RAWρ':(f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"),'RESIDρ':(f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN"),'DIVY':f"{s['DIVY']:.1f}%"})
-L841         self.df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1); print("Performance Comparison:"); print(self.df_metrics_fmt.to_string())
-L842         # === 追加: GSC+DSC が低い順 TOP10 ===
-L843         try:
-L844             all_scores = pd.DataFrame({'GSC': df_z['GSC'], 'DSC': df_z['DSC']}).copy()
-L845             all_scores['G_plus_D'] = all_scores['GSC'] + all_scores['DSC']
-L846             all_scores = all_scores.dropna(subset=['G_plus_D'])
-L847             self.low10_table = all_scores.sort_values('G_plus_D', ascending=True).head(10).round(3)
-L848             print("Low Score Candidates (GSC+DSC bottom 10):")
-L849             print(self.low10_table.to_string())
-L850         except Exception as e:
-L851             print(f"[warn] low-score ranking failed: {e}")
-L852             self.low10_table = None
-L853         self.debug_text = ""
-L854         if debug_mode:
-L855             logger.info("debug_mode=True: df_z dump handled in scorer; skipping factor-side debug output")
-L856         else:
-L857             logger.debug(
-L858                 "skip debug log: debug_mode=%s debug_text_empty=%s",
-L859                 debug_mode, True
-L860             )
-L861         self._debug_logged = True
-L862
-L863     # --- Slack送信（元 notify_slack のロジックそのまま） ---
-L864     def notify_slack(self):
-L865         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-L866
-L867         if not SLACK_WEBHOOK_URL:
-L868             print("⚠️ SLACK_WEBHOOK_URL not set (main report skipped)")
-L869             return
-L870
-L871         def _filter_suffix_from(spec: dict, group: str) -> str:
-L872             g = spec.get(group, {})
-L873             parts = [str(m) for m in g.get("pre_mask", [])]
-L874             for k, v in (g.get("pre_filter", {}) or {}).items():
-L875                 base, op = (k[:-4], "<") if k.endswith("_max") else ((k[:-4], ">") if k.endswith("_min") else (k, "="))
-L876                 name = {"beta": "β"}.get(base, base)
-L877                 try:
-L878                     val = f"{float(v):g}"
-L879                 except Exception:
-L880                     val = str(v)
-L881                 parts.append(f"{name}{op}{val}")
-L882             return "" if not parts else " / filter:" + " & ".join(
+L733     @classmethod
+L734     def swap_local_det_cross(cls, C_within: np.ndarray, C_cross: np.ndarray|None, score: np.ndarray, idx, lam: float=0.6, mu: float=0.3, max_pass: int=15):
+L735         S, best, improved, passes, N = sorted(idx), cls._obj_with_cross(C_within,C_cross,score,idx,lam,mu), True, 0, len(score)
+L736         while improved and passes<max_pass:
+L737             improved, passes = False, passes+1
+L738             for i,out in enumerate(list(S)):
+L739                 for inn in range(N):
+L740                     if inn in S: continue
+L741                     cand = sorted(S[:i]+[inn]+S[i+1:]); v = cls._obj_with_cross(C_within,C_cross,score,cand,lam,mu)
+L742                     if v>best+1e-10: S, best, improved = cand, v, True; break
+L743                 if improved: break
+L744         return S, best
+L745
+L746     @staticmethod
+L747     def avg_corr(C: np.ndarray, idx) -> float:
+L748         k = len(idx); P = C[np.ix_(idx, idx)]
+L749         return float((P.sum()-np.trace(P))/(k*(k-1)+1e-12))
+L750
+L751     @classmethod
+L752     def select_bucket_drrs(cls, returns_df: pd.DataFrame, score_ser: pd.Series, pool_tickers: list[str], k: int, *, n_pc: int, gamma: float, lam: float, lookback: int, shrink: float=0.10, g_fixed_tickers: list[str]|None=None, mu: float=0.0):
+L753         g_fixed = [t for t in (g_fixed_tickers or []) if t in returns_df.columns]
+L754         union = [t for t in pool_tickers if t in returns_df.columns]
+L755         for t in g_fixed:
+L756             if t not in union: union.append(t)
+L757         Rdf_all = returns_df[union]; Rdf_all = Rdf_all.iloc[-lookback:] if len(Rdf_all)>=lookback else Rdf_all; Rdf_all = Rdf_all.dropna()
+L758         pool_eff, g_eff = [t for t in pool_tickers if t in Rdf_all.columns], [t for t in g_fixed if t in Rdf_all.columns]
+L759         if len(pool_eff)==0: return dict(idx=[], tickers=[], avg_res_corr=np.nan, sum_score=0.0, objective=-np.inf)
+L760         score = score_ser.reindex(pool_eff).to_numpy(dtype=np.float32)
+L761         C_all = cls.residual_corr(Rdf_all.to_numpy(), n_pc=n_pc, shrink=shrink)
+L762         col_pos = {c:i for i,c in enumerate(Rdf_all.columns)}; pool_pos = [col_pos[t] for t in pool_eff]
+L763         C_within, C_cross = C_all[np.ix_(pool_pos,pool_pos)], None
+L764         if len(g_eff)>0 and mu>0.0:
+L765             g_pos = [col_pos[t] for t in g_eff]; C_cross = C_all[np.ix_(pool_pos,g_pos)]
+L766         R_pool = Rdf_all[pool_eff].to_numpy(); S0 = cls.rrqr_like_det(R_pool, score, k, gamma=gamma)
+L767         S, Jn = (cls.swap_local_det_cross(C_within, C_cross, score, S0, lam=lam, mu=mu, max_pass=15) if C_cross is not None else cls.swap_local_det(C_within, score, S0, lam=lam, max_pass=15))
+L768         selected_tickers = [pool_eff[i] for i in S]
+L769         return dict(idx=S, tickers=selected_tickers, avg_res_corr=cls.avg_corr(C_within,S), sum_score=float(score[S].sum()), objective=float(Jn))
+L770
+L771     # ---- 選定（スコア Series / returns だけを受ける）----
+L772 # === Output：出力整形と送信（表示・Slack） ===
+L773 class Output:
+L774
+L775     def __init__(self, debug=None):
+L776         # self.debug は使わない（互換のため引数は受けるが無視）
+L777         self.miss_df = self.g_table = self.d_table = self.io_table = self.df_metrics_fmt = self.debug_table = None
+L778         self.g_title = self.d_title = ""
+L779         self.g_formatters = self.d_formatters = {}
+L780         # 低スコア（GSC+DSC）Top10 表示/送信用
+L781         self.low10_table = None
+L782         self.debug_text = ""   # デバッグ用本文はここに一本化
+L783         self._debug_logged = False
+L784
+L785     # --- 表示（元 display_results のロジックそのまま） ---
+L786     def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
+L787                         init_G, init_D, top_G, top_D, **kwargs):
+L788         logger.info("📌 reached display_results")
+L789         pd.set_option('display.float_format','{:.3f}'.format)
+L790         print("📈 ファクター分散最適化の結果")
+L791         if self.miss_df is not None and not self.miss_df.empty:
+L792             print("Missing Data:")
+L793             print(self.miss_df.to_string(index=False))
+L794
+L795         # ---- 表示用：Changes/Near-Miss のスコア源を“最終集計”に統一するプロキシ ----
+L796         try:
+L797             sc = getattr(self, "_sc", None)
+L798             agg_G = getattr(sc, "_agg_G", None)
+L799             agg_D = getattr(sc, "_agg_D", None)
+L800         except Exception:
+L801             sc = agg_G = agg_D = None
+L802         class _SeriesProxy:
+L803             __slots__ = ("primary", "fallback")
+L804             def __init__(self, primary, fallback): self.primary, self.fallback = primary, fallback
+L805             def get(self, key, default=None):
+L806                 try:
+L807                     v = self.primary.get(key) if hasattr(self.primary, "get") else None
+L808                     if v is not None and not (isinstance(v, float) and v != v):
+L809                         return v
+L810                 except Exception:
+L811                     pass
+L812                 try:
+L813                     return self.fallback.get(key) if hasattr(self.fallback, "get") else default
+L814                 except Exception:
+L815                     return default
+L816         g_score = _SeriesProxy(agg_G, g_score)
+L817         d_score_all = _SeriesProxy(agg_D, d_score_all)
+L818         near_G = getattr(sc, "_near_G", []) if sc else []
+L819         near_D = getattr(sc, "_near_D", []) if sc else []
+L820
+L821         extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
+L822         gsc_series = pd.Series({t: g_score.get(t) for t in G_UNI}, name='GSC')
+L823         self.g_table = pd.concat([df_z.loc[G_UNI,['GROWTH_F','MOM','TRD','VOL']], gsc_series], axis=1)
+L824         self.g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
+L825         self.g_formatters = {col:"{:.2f}".format for col in ['GROWTH_F','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
+L826         self.g_title = (f"[G枠 / {N_G} / {_fmt_w(g_weights)} / corrM={corrM} / "
+L827                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
+L828         if near_G:
+L829             add = [t for t in near_G if t not in set(G_UNI)][:10]
+L830             if len(add) < 10:
+L831                 try:
+L832                     aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False)
+L833                     out_now = sorted(set(exist) - set(top_G + top_D))  # 今回 OUT
+L834                     used = set(G_UNI + add)
+L835                     def _push(lst):
+L836                         nonlocal add, used
+L837                         for t in lst:
+L838                             if len(add) == 10: break
+L839                             if t in aggG.index and t not in used:
+L840                                 add.append(t); used.add(t)
+L841                     _push(out_now)           # ① 今回 OUT を優先
+L842                     _push(list(aggG.index))  # ② まだ足りなければ上位で充填
+L843                 except Exception:
+L844                     pass
+L845             if add:
+L846                 near_tbl = pd.concat([df_z.loc[add,['GROWTH_F','MOM','TRD','VOL']], pd.Series({t: g_score.get(t) for t in add}, name='GSC')], axis=1)
+L847                 self.g_table = pd.concat([self.g_table, near_tbl], axis=0)
+L848         print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
+L849
+L850         extra_D = [t for t in init_D if t not in top_D][:5]; D_UNI = top_D + extra_D
+L851         cols_D = ['QAL','YLD','VOL','TRD']; d_disp = pd.DataFrame(index=D_UNI)
+L852         d_disp['QAL'], d_disp['YLD'], d_disp['VOL'], d_disp['TRD'] = df_z.loc[D_UNI,'D_QAL'], df_z.loc[D_UNI,'D_YLD'], df_z.loc[D_UNI,'D_VOL_RAW'], df_z.loc[D_UNI,'D_TRD']
+L853         dsc_series = pd.Series({t: d_score_all.get(t) for t in D_UNI}, name='DSC')
+L854         self.d_table = pd.concat([d_disp, dsc_series], axis=1); self.d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
+L855         self.d_formatters = {col:"{:.2f}".format for col in cols_D}; self.d_formatters['DSC']="{:.3f}".format
+L856         import scorer
+L857         dw_eff = scorer.D_WEIGHTS_EFF
+L858         self.d_title = (f"[D枠 / {N_D} / {_fmt_w(dw_eff)} / corrM={corrM} / "
+L859                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
+L860         if near_D:
+L861             add = [t for t in near_D if t not in set(D_UNI)][:10]
+L862             if add:
+L863                 d_disp2 = pd.DataFrame(index=add)
+L864                 d_disp2['QAL'], d_disp2['YLD'], d_disp2['VOL'], d_disp2['TRD'] = df_z.loc[add,'D_QAL'], df_z.loc[add,'D_YLD'], df_z.loc[add,'D_VOL_RAW'], df_z.loc[add,'D_TRD']
+L865                 near_tbl = pd.concat([d_disp2, pd.Series({t: d_score_all.get(t) for t in add}, name='DSC')], axis=1)
+L866                 self.d_table = pd.concat([self.d_table, near_tbl], axis=0)
+L867         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
+L868
+L869         # === Changes（IN の GSC/DSC を表示。OUT は銘柄名のみ） ===
+L870         in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
+L871         out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
+L872
+L873         self.io_table = pd.DataFrame({
+L874             'IN': pd.Series(in_list),
+L875             '/ OUT': pd.Series(out_list)
+L876         })
+L877         g_list = [f"{g_score.get(t):.3f}" if pd.notna(g_score.get(t)) else '—' for t in out_list]
+L878         d_list = [f"{d_score_all.get(t):.3f}" if pd.notna(d_score_all.get(t)) else '—' for t in out_list]
+L879         self.io_table['GSC'] = pd.Series(g_list)
+L880         self.io_table['DSC'] = pd.Series(d_list)
+L881
+L882         print("Changes:")
+L883         print(self.io_table.to_string(index=False))
+L884
+L885         all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False, threads=False)['Close'].ffill(limit=2)
+L886         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
+L887         for name,ticks in portfolios.items():
+L888             pr = ret[ticks].mean(axis=1, skipna=True).dropna(); cum = (1+pr).cumprod()-1; n = len(pr)
+L889             if n>=252: ann_ret, ann_vol = (1+cum.iloc[-1])**(252/n)-1, pr.std()*np.sqrt(252)
+L890             else: ann_ret, ann_vol = cum.iloc[-1], pr.std()*np.sqrt(n)
+L891             sharpe, drawdown = ann_ret/ann_vol, (cum - cum.cummax()).min()
+L892             if len(ticks)>=2:
+L893                 C_raw = ret[ticks].corr(); RAW_rho = C_raw.mask(np.eye(len(ticks), dtype=bool)).stack().mean()
+L894                 R = ret[ticks].dropna().to_numpy(); C_resid = Selector.resid
 ```
