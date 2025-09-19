@@ -1,312 +1,299 @@
 ```text
-n 0.0
-L65         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
-L66         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
-L67         return ttm if ttm > 0 else float(div.tail(4).sum())
-L68     except Exception:
-L69         return 0.0
-L70
-L71 def ttm_div_yield_portfolio(tickers, price_map=None):
-L72     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
-L73     return float(np.mean(ys)) if ys else 0.0
-L74
-L75 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
-L76 def winsorize_s(s: pd.Series, p=0.02):
-L77     if s is None or s.dropna().empty: return s
-L78     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
-L79
-L80 def robust_z(s: pd.Series, p=0.02):
-L81     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
-L82
-L83 def robust_z_keepnan(s: pd.Series) -> pd.Series:
-L84     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
-L85     if s is None:
-L86         return pd.Series(dtype=float)
-L87     v = pd.to_numeric(s, errors="coerce")
-L88     m = np.nanmedian(v)
-L89     mad = np.nanmedian(np.abs(v - m))
-L90     z = (v - m) / (1.4826 * mad + 1e-9)
-L91     if np.nanstd(z) < 1e-9:
-L92         r = v.rank(method="average", na_option="keep")
-L93         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
-L94     return pd.Series(z, index=v.index, dtype=float)
+ollect_relevant_cols(df, df_z, *, weight_dict=None):
+L72     use: set[str] = set()
+L73     if weight_dict:
+L74         try:
+L75             items = weight_dict.items() if hasattr(weight_dict, "items") else []
+L76         except Exception:
+L77             items = []
+L78         for col, w in items:
+L79             try:
+L80                 weight = float(w or 0)
+L81             except Exception:
+L82                 weight = 0.0
+L83             if abs(weight) > 0 and col in getattr(df_z, "columns", []):
+L84                 use.add(col)
+L85     for fac in ("GRW",):
+L86         for c in FACTOR_COLUMNS.get(fac, []):
+L87             if c in getattr(df, "columns", []) or c in getattr(df_z, "columns", []):
+L88                 use.add(c)
+L89     for fac in ["MOM", "VOL", "QUAL", "VAL"]:
+L90         for c in FACTOR_COLUMNS.get(fac, []):
+L91             if c in getattr(df, "columns", []) or c in getattr(df_z, "columns", []):
+L92                 use.add(c)
+L93     return sorted(use)
+L94
 L95
-L96
-L97 def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
-L98     """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
-L99     if not debug_mode:
-L100         return
-L101     try:
-L102         view = df_z.copy()
-L103         view = view.apply(
-L104             lambda s: s.round(ndigits)
-L105             if getattr(getattr(s, "dtype", None), "kind", "") in ("f", "i")
-L106             else s
-L107         )
-L108         if len(view) > max_rows:
-L109             view = view.iloc[:max_rows]
+L96 def _reorder_for_debug(df, df_z, factor_cols=FACTOR_COLUMNS):
+L97     cols: list[str] = []
+L98     for fac in ["GRW", "MOM", "VOL", "QUAL", "VAL"]:
+L99         for c in factor_cols.get(fac, []):
+L100             if c in getattr(df_z, "columns", []) or c in getattr(df, "columns", []):
+L101                 cols.append(c)
+L102     seen: set[str] = set()
+L103     ordered: list[str] = []
+L104     for c in cols:
+L105         if c not in seen:
+L106             ordered.append(c)
+L107             seen.add(c)
+L108     return ordered
+L109
 L110
-L111         # === NaNサマリ（列ごとの欠損件数 上位20） ===
-L112         try:
-L113             nan_counts = df_z.isna().sum().sort_values(ascending=False)
-L114             top_nan = nan_counts[nan_counts > 0].head(20)
-L115             if len(top_nan) > 0:
-L116                 logger.info("NaN columns (top20):\n%s", top_nan.to_string())
-L117             else:
-L118                 logger.info("NaN columns: none")
-L119         except Exception as exc:
-L120             logger.warning("nan summary failed: %s", exc)
-L121
-L122         # === Zeroサマリ（列ごとのゼロ比率 上位20） ===
-L123         try:
-L124             zero_counts = ((df_z == 0) & (~df_z.isna())).sum()
-L125             nonnull_counts = (~df_z.isna()).sum()
-L126             zero_ratio = (zero_counts / nonnull_counts).sort_values(ascending=False)
-L127             top_zero = zero_ratio[zero_ratio > 0].head(20)
-L128             if len(top_zero) > 0:
-L129                 logger.info(
-L130                     "Zero-dominated columns (top20):\n%s",
-L131                     top_zero.to_string(float_format=lambda x: f"{x:.2%}"),
-L132                 )
-L133             else:
-L134                 logger.info("Zero-dominated columns: none")
-L135         except Exception as exc:
-L136             logger.warning("zero summary failed: %s", exc)
-L137
-L138         logger.info("===== DF_Z DUMP START =====")
-L139         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
-L140         logger.info("===== DF_Z DUMP END =====")
-L141     except Exception as exc:
-L142         logger.warning("df_z dump failed: %s", exc)
-L143
-L144 def _safe_div(a, b):
-L145     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
-L146     except Exception: return np.nan
-L147
-L148 def _safe_last(series: pd.Series, default=np.nan):
-L149     try: return float(series.iloc[-1])
-L150     except Exception: return default
-L151
-L152
-L153 def _ensure_series(x):
-L154     if x is None:
-L155         return pd.Series(dtype=float)
-L156     if isinstance(x, pd.Series):
-L157         return x.dropna()
-L158     if isinstance(x, (list, tuple)):
-L159         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
-L160             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
-L161             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
-L162             return pd.Series(v, index=dt).dropna()
-L163         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
-L164     try:
-L165         return pd.Series(x).dropna()
-L166     except Exception:
-L167         return pd.Series(dtype=float)
-L168
-L169
-L170 def _to_quarterly(s: pd.Series) -> pd.Series:
-L171     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
-L172         return s
-L173     return s.resample("Q").last().dropna()
-L174
-L175
-L176 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
-L177     if qs is None or qs.empty:
-L178         return pd.Series(dtype=float)
-L179     ttm = qs.rolling(4, min_periods=2).sum()
-L180     yoy = ttm.pct_change(4)
-L181     return yoy
-L182
-L183
-L184 def _nz(x) -> float:
-L185     if x is None:
-L186         return 0.0
-L187     try:
-L188         value = float(x)
-L189     except Exception:
-L190         return 0.0
-L191     if not np.isfinite(value):
-L192         return 0.0
-L193     return value
-L194
-L195
-L196 def _winsor(x, lo=-2.0, hi=2.0) -> float:
-L197     v = _nz(x)
-L198     if v < lo:
-L199         return float(lo)
-L200     if v > hi:
-L201         return float(hi)
-L202     return float(v)
-L203
-L204
-L205 def _round_debug(x, ndigits: int = 4):
-L206     try:
-L207         value = float(x)
-L208     except Exception:
-L209         return None
-L210     if not np.isfinite(value):
-L211         return None
-L212     return round(value, ndigits)
-L213
-L214
-L215 def _calc_grw_flexible(
-L216     ticker: str,
-L217     info_entry: dict | None,
-L218     close_series: pd.Series | None,
-L219     volume_series: pd.Series | None,
-L220 ):
-L221     info_entry = info_entry if isinstance(info_entry, dict) else {}
-L222
-L223     s_rev_q = _ensure_series(info_entry.get("SEC_REV_Q_SERIES"))
-L224     s_eps_q = _ensure_series(info_entry.get("SEC_EPS_Q_SERIES"))
-L225     s_rev_y = _ensure_series(info_entry.get("SEC_REV_Y_SERIES"))
+L111 def dump_dfz_scoped(df, df_z, *, weight_dict=None, topk=20, logger=None):
+L112     import pandas as pd, logging
+L113
+L114     logger = logger or logging.getLogger(__name__)
+L115     rel = _collect_relevant_cols(df, df_z, weight_dict=weight_dict)
+L116     rel_df = [c for c in rel if c in getattr(df_z, "columns", [])]
+L117     dfz = df_z[rel_df].copy() if rel_df else df_z.copy()
+L118     logger.info("DEBUG scope: %d relevant cols (of %d total).", dfz.shape[1], df_z.shape[1])
+L119     nan_top = dfz.isna().sum().sort_values(ascending=False).head(topk)
+L120     logger.info("scorer:NaN columns (top%d):", topk)
+L121     for c, n in nan_top.items():
+L122         logger.info("%s\t%d", c, int(n))
+L123     num_dfz = dfz.select_dtypes(include=["number"])
+L124     if not num_dfz.empty:
+L125         ztop = (num_dfz == 0).mean().sort_values(ascending=False).head(topk)
+L126         logger.info("scorer:Zero-dominated columns (top%d):", topk)
+L127         for c, r in ztop.items():
+L128             logger.info("%s\t%.2f%%", c, 100.0 * float(r))
+L129
+L130
+L131 def save_factor_debug_csv(df, df_z, path="out/factor_debug_latest.csv"):
+L132     import os, pandas as pd, logging
+L133
+L134     lg = logging.getLogger(__name__)
+L135     try:
+L136         cols = _reorder_for_debug(df, df_z)
+L137         dump = pd.DataFrame(index=df.index)
+L138         for c in cols:
+L139             if c in getattr(df, "columns", []):
+L140                 dump[c] = df[c]
+L141             if c in getattr(df_z, "columns", []):
+L142                 dump[c] = df_z[c]
+L143         dump.reset_index(names=["symbol"], inplace=True)
+L144         if path:
+L145             dirpath = os.path.dirname(path) or "."
+L146             os.makedirs(dirpath, exist_ok=True)
+L147             dump.to_csv(path, index=False)
+L148         lg.info(
+L149             "factor debug CSV saved: %s (cols=%d rows=%d)",
+L150             path,
+L151             dump.shape[1],
+L152             dump.shape[0],
+L153         )
+L154     except Exception as e:
+L155         lg.warning("factor debug CSV failed: %s", e)
+L156
+L157
+L158 def log_grw_stats(df, df_z, logger):
+L159     import numpy as np, pandas as pd
+L160
+L161     try:
+L162         s = pd.to_numeric(df.get("GRW_FLEX_SCORE", pd.Series(dtype=float)), errors="coerce")
+L163         z = pd.to_numeric(df_z.get("GROWTH_F", pd.Series(dtype=float)), errors="coerce")
+L164         if s.size:
+L165             logger.info(
+L166                 "GRW raw stats: n=%d, median=%.3f, mad=%.3f, std=%.3f",
+L167                 s.count(),
+L168                 np.nanmedian(s),
+L169                 np.nanmedian(np.abs(s - np.nanmedian(s))),
+L170                 np.nanstd(s),
+L171             )
+L172         if z.size and not z.dropna().empty:
+L173             clip_hi = float((z >= 2.95).mean() * 100.0)
+L174             clip_lo = float((z <= -2.95).mean() * 100.0)
+L175             logger.info(
+L176                 "GRW z stats: min=%.2f, p25=%.2f, med=%.2f, p75=%.2f, max=%.2f, clipped_hi=%.1f%%, clipped_lo=%.1f%%",
+L177                 np.nanmin(z),
+L178                 np.nanpercentile(z.dropna(), 25),
+L179                 np.nanmedian(z),
+L180                 np.nanpercentile(z.dropna(), 75),
+L181                 np.nanmax(z),
+L182                 clip_hi,
+L183                 clip_lo,
+L184             )
+L185         if "GRW_PATH" in getattr(df, "columns", []):
+L186             logger.info(
+L187                 "GRW path breakdown: %s",
+L188                 df["GRW_PATH"].value_counts(dropna=False).to_dict(),
+L189             )
+L190     except Exception as e:
+L191         logger.warning("GRW stats log failed: %s", e)
+L192
+L193
+L194 def _grw_record_to_df(t: str, info_t: dict, df):
+L195     if not isinstance(df, pd.DataFrame):
+L196         return
+L197     raw_parts = info_t.get("DEBUG_GRW_PARTS") if isinstance(info_t, dict) else None
+L198     parts: dict[str, Any] = {}
+L199     if isinstance(raw_parts, str):
+L200         try:
+L201             parts = json.loads(raw_parts)
+L202         except Exception:
+L203             parts = {}
+L204     elif isinstance(raw_parts, dict):
+L205         parts = raw_parts
+L206     path = info_t.get("DEBUG_GRW_PATH") if isinstance(info_t, dict) else None
+L207     score = info_t.get("GRW_SCORE") if isinstance(info_t, dict) else None
+L208
+L209     def _part_value(key: str):
+L210         value = parts.get(key) if isinstance(parts, dict) else None
+L211         if value is None:
+L212             return np.nan
+L213         try:
+L214             return float(value)
+L215         except Exception:
+L216             return np.nan
+L217
+L218     df.loc[t, "GRW_PATH"] = path
+L219     df.loc[t, "GRW_FLEX_SCORE"] = np.nan if score is None else float(score)
+L220     df.loc[t, "GRW_REV_YOY_Q"] = _part_value("rev_yoy_q")
+L221     df.loc[t, "GRW_REV_ACC_Q"] = _part_value("rev_acc_q")
+L222     df.loc[t, "GRW_REV_QOQ"] = _part_value("rev_qoq")
+L223     df.loc[t, "GRW_REV_TTM2"] = _part_value("rev_ttm2")
+L224     df.loc[t, "GRW_REV_YOY_Y"] = _part_value("rev_yoy_y")
+L225     df.loc[t, "GRW_PRICE_PROXY"] = _part_value("price_proxy")
 L226
-L227     nQ = int(getattr(s_rev_q, "size", 0))
-L228     nY = int(getattr(s_rev_y, "size", 0))
-L229
-L230     parts: dict[str, Any] = {"nQ": nQ, "nY": nY}
-L231     path = "NONE"
-L232     w = 0.0
-L233
-L234     def _valid_ratio(a, b):
-L235         try:
-L236             na, nb = float(a), float(b)
-L237         except Exception:
-L238             return None
-L239         if not np.isfinite(na) or not np.isfinite(nb) or nb == 0:
-L240             return None
-L241         return na, nb
-L242
-L243     def yoy_q(series: pd.Series) -> float | None:
-L244         s = _ensure_series(series)
-L245         if s.empty:
-L246             return None
-L247         s = s.sort_index()
-L248         if isinstance(s.index, pd.DatetimeIndex):
-L249             last_idx = s.index[-1]
-L250             window_start = last_idx - pd.DateOffset(months=15)
-L251             window_end = last_idx - pd.DateOffset(months=9)
-L252             candidates = s.loc[(s.index >= window_start) & (s.index <= window_end)]
-L253             if candidates.empty:
-L254                 candidates = s.loc[s.index <= window_end]
-L255             if candidates.empty:
-L256                 return None
-L257             v1 = candidates.iloc[-1]
-L258             v0 = s.iloc[-1]
-L259         else:
-L260             if s.size < 5:
-L261                 return None
-L262             v0 = s.iloc[-1]
-L263             v1 = s.iloc[-5]
-L264         pair = _valid_ratio(v0, v1)
-L265         if pair is None:
-L266             return None
-L267         a, b = pair
-L268         return float(a / b - 1.0)
-L269
-L270     def qoq(series: pd.Series) -> float | None:
-L271         s = _ensure_series(series)
-L272         if s.size < 2:
-L273             return None
-L274         s = s.sort_index()
-L275         v0, v1 = s.iloc[-1], s.iloc[-2]
-L276         pair = _valid_ratio(v0, v1)
-L277         if pair is None:
-L278             return None
-L279         a, b = pair
-L280         return float(a / b - 1.0)
-L281
-L282     def ttm_delta(series: pd.Series) -> float | None:
-L283         s = _ensure_series(series)
-L284         if s.size < 2:
-L285             return None
-L286         s = s.sort_index()
-L287         k = int(min(4, s.size))
-L288         cur_slice = s.iloc[-k:]
-L289         prev_slice = s.iloc[:-k]
-L290         if prev_slice.empty:
-L291             return None
-L292         prev_k = int(min(k, prev_slice.size))
-L293         cur_sum = float(cur_slice.sum())
-L294         prev_sum = float(prev_slice.iloc[-prev_k:].sum())
-L295         pair = _valid_ratio(cur_sum, prev_sum)
-L296         if pair is None:
-L297             return None
-L298         a, b = pair
-L299         return float(a / b - 1.0)
+L227 # ---- Dividend Helpers -------------------------------------------------------
+L228 def _last_close(t, price_map=None):
+L229     if price_map and (c := price_map.get(t)) is not None: return float(c)
+L230     try:
+L231         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
+L232         return float(h.iloc[-1]) if len(h) else np.nan
+L233     except Exception:
+L234         return np.nan
+L235
+L236 def _ttm_div_sum(t, lookback_days=400):
+L237     try:
+L238         div = yf.Ticker(t).dividends
+L239         if div is None or len(div) == 0: return 0.0
+L240         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
+L241         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
+L242         return ttm if ttm > 0 else float(div.tail(4).sum())
+L243     except Exception:
+L244         return 0.0
+L245
+L246 def ttm_div_yield_portfolio(tickers, price_map=None):
+L247     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
+L248     return float(np.mean(ys)) if ys else 0.0
+L249
+L250 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
+L251 def winsorize_s(s: pd.Series, p=0.02):
+L252     if s is None or s.dropna().empty: return s
+L253     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L254
+L255 def robust_z(s: pd.Series, p=0.02):
+L256     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L257
+L258 def robust_z_keepnan(s: pd.Series) -> pd.Series:
+L259     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
+L260     if s is None:
+L261         return pd.Series(dtype=float)
+L262     v = pd.to_numeric(s, errors="coerce")
+L263     m = np.nanmedian(v)
+L264     mad = np.nanmedian(np.abs(v - m))
+L265     z = (v - m) / (1.4826 * mad + 1e-9)
+L266     if np.nanstd(z) < 1e-9:
+L267         r = v.rank(method="average", na_option="keep")
+L268         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
+L269     return pd.Series(z, index=v.index, dtype=float)
+L270
+L271
+L272 def _dump_dfz(
+L273     df: pd.DataFrame,
+L274     df_z: pd.DataFrame,
+L275     debug_mode: bool,
+L276     max_rows: int = 400,
+L277     ndigits: int = 3,
+L278     *,
+L279     weight_dict=None,
+L280 ) -> None:
+L281     """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
+L282
+L283     if not debug_mode:
+L284         return
+L285     try:
+L286         rel = _collect_relevant_cols(df, df_z, weight_dict=weight_dict)
+L287         ordered = _reorder_for_debug(df, df_z)
+L288         rel_set = set(rel)
+L289         view_cols = [c for c in ordered if c in rel_set and c in df_z.columns]
+L290         if not view_cols:
+L291             view_cols = list(df_z.columns)
+L292         view = df_z[view_cols].copy()
+L293         view = view.apply(
+L294             lambda s: s.round(ndigits)
+L295             if getattr(getattr(s, "dtype", None), "kind", "") in ("f", "i")
+L296             else s
+L297         )
+L298         if len(view) > max_rows:
+L299             view = view.iloc[:max_rows]
 L300
-L301     def yoy_y(series: pd.Series) -> float | None:
-L302         s = _ensure_series(series)
-L303         if s.size < 2:
-L304             return None
-L305         s = s.sort_index()
-L306         v0, v1 = s.iloc[-1], s.iloc[-2]
-L307         pair = _valid_ratio(v0, v1)
-L308         if pair is None:
-L309             return None
-L310         a, b = pair
-L311         return float(a / b - 1.0)
+L301         dump_dfz_scoped(df, df_z, weight_dict=weight_dict, topk=20, logger=logger)
+L302
+L303         logger.info("===== DF_Z DUMP START =====")
+L304         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
+L305         logger.info("===== DF_Z DUMP END =====")
+L306     except Exception as exc:
+L307         logger.warning("df_z dump failed: %s", exc)
+L308
+L309 def _safe_div(a, b):
+L310     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
+L311     except Exception: return np.nan
 L312
-L313     def price_proxy_growth() -> float | None:
-L314         if not isinstance(close_series, pd.Series):
-L315             return None
-L316         close = close_series.sort_index().dropna()
-L317         if close.empty:
-L318             return None
-L319         hh_window = int(min(126, len(close)))
-L320         if hh_window < 20:
-L321             return None
-L322         hh = close.rolling(hh_window).max().iloc[-1]
-L323         prox = None
-L324         if np.isfinite(hh) and hh > 0:
-L325             prox = float(close.iloc[-1] / hh)
-L326         rs6 = None
-L327         if len(close) >= 63:
-L328             rs6 = float(close.pct_change(63).iloc[-1])
-L329         rs12 = None
-L330         if len(close) >= 126:
-L331             rs12 = float(close.pct_change(126).iloc[-1])
-L332         vexp = None
-L333         if isinstance(volume_series, pd.Series):
-L334             vol = volume_series.reindex(close.index).dropna()
-L335             if len(vol) >= 50:
-L336                 v20 = vol.rolling(20).mean().iloc[-1]
-L337                 v50 = vol.rolling(50).mean().iloc[-1]
-L338                 if np.isfinite(v20) and np.isfinite(v50) and v50 > 0:
-L339                     vexp = float(v20 / v50 - 1.0)
-L340         prox = 0.0 if prox is None or not np.isfinite(prox) else prox
-L341         rs6 = 0.0 if rs6 is None or not np.isfinite(rs6) else rs6
-L342         rs12 = 0.0 if rs12 is None or not np.isfinite(rs12) else rs12
-L343         vexp = 0.0 if vexp is None or not np.isfinite(vexp) else vexp
-L344         return 0.5 * prox + 0.3 * rs6 + 0.2 * rs12 + 0.2 * vexp
-L345
-L346     price_alt = price_proxy_growth() or 0.0
-L347     core = 0.0
-L348     core_raw = 0.0
-L349     price_raw = price_alt
-L350
-L351     if nQ >= 5:
-L352         path = "P5"
-L353         yq = yoy_q(s_rev_q)
-L354         parts["rev_yoy_q"] = yq
-L355         tmp_prev = s_rev_q.iloc[:-1] if s_rev_q.size > 1 else s_rev_q
-L356         acc = None
-L357         if tmp_prev.size >= 5 and yq is not None:
-L358             yq_prev = yoy_q(tmp_prev)
-L359             if yq_prev is not None:
-L360                 acc = float(yq - yq_prev)
-L361         parts["rev_acc_q"] = acc
-L362         eps_yoy = yoy_q(s_eps_q) if s_eps_q.size >= 5 else None
-L363         parts["eps_yoy_q"] = eps_yoy
-L364         eps_acc = None
-L365         if eps_yoy is not None and s_eps_q.size > 5:
-L366             eps_prev = s_eps_q.iloc[:-1]
-L367             if eps_prev.size >= 5:
-L368                 eps_prev_yoy = yoy_q(eps_prev)
-L369                 if eps_prev_yoy is not None:
-L370                     eps_acc = float(eps_yoy - eps_prev_yoy)
-L371         parts["eps_acc_q"] = eps_acc
-L372         w = 1.0
-L373         core_raw = 
+L313 def _safe_last(series: pd.Series, default=np.nan):
+L314     try: return float(series.iloc[-1])
+L315     except Exception: return default
+L316
+L317
+L318 def _ensure_series(x):
+L319     if x is None:
+L320         return pd.Series(dtype=float)
+L321     if isinstance(x, pd.Series):
+L322         return x.dropna()
+L323     if isinstance(x, (list, tuple)):
+L324         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
+L325             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
+L326             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
+L327             return pd.Series(v, index=dt).dropna()
+L328         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
+L329     try:
+L330         return pd.Series(x).dropna()
+L331     except Exception:
+L332         return pd.Series(dtype=float)
+L333
+L334
+L335 def _to_quarterly(s: pd.Series) -> pd.Series:
+L336     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
+L337         return s
+L338     return s.resample("Q").last().dropna()
+L339
+L340
+L341 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
+L342     if qs is None or qs.empty:
+L343         return pd.Series(dtype=float)
+L344     ttm = qs.rolling(4, min_periods=2).sum()
+L345     yoy = ttm.pct_change(4)
+L346     return yoy
+L347
+L348
+L349 def _nz(x) -> float:
+L350     if x is None:
+L351         return 0.0
+L352     try:
+L353         value = float(x)
+L354     except Exception:
+L355         return 0.0
+L356     if not np.isfinite(value):
+L357         return 0.0
+L358     return value
+L359
+L360
+L361 def _winsor(x, lo=-2.0, hi=2.0) -> float:
+L362     v = _nz(x)
+L363     if v < lo:
+L364         return float(lo)
+L365     if v > hi:
+L366         return float(hi)
+L367    
 ```
