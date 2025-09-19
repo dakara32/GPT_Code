@@ -86,10 +86,10 @@ def robust_z_keepnan(s: pd.Series) -> pd.Series:
     return pd.Series(z, index=v.index, dtype=float)
 
 
-def _fetch_revenue_quarterly_via_finnhub(symbol: str):
+def _fetch_revenue_quarterly_via_finnhub(symbol: str, api_key: str|None=None):
     """Finnhub financials-reported endpoint から四半期売上を取得する."""
 
-    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+    api_key = (api_key or os.getenv("FINNHUB_API_KEY", "")).strip()
     if not api_key:
         return None
 
@@ -160,6 +160,36 @@ def _fetch_revenue_quarterly_via_finnhub(symbol: str):
         return None if s.dropna().empty else s
     except Exception:
         return None
+
+
+def _fetch_rev_quarterly_with_retry(symbol: str, api_key: str, debug: bool=False):
+    """Finnhub売上データ取得をドット/ハイフン置換つきでリトライする."""
+
+    tried: list[tuple[str, bool]] = []
+    candidates = [symbol]
+    if "-" in symbol:
+        candidates.append(symbol.replace("-", "."))
+    elif "." in symbol:
+        candidates.append(symbol.replace(".", "-"))
+
+    seen = set()
+    for sym in candidates:
+        if sym in seen:
+            continue
+        seen.add(sym)
+        data = _fetch_revenue_quarterly_via_finnhub(sym, api_key=api_key)
+        success = isinstance(data, pd.Series) and not data.dropna().empty
+        tried.append((sym, success))
+        if success:
+            if debug and sym != symbol:
+                logger.info("[REV Fallback] %s: hit via alias '%s'", symbol, sym)
+            return data
+
+    if debug:
+        for sym, success in tried:
+            if not success:
+                logger.info("[REV Fallback] %s: miss via '%s'", symbol, sym)
+    return None
 
 
 def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
@@ -575,34 +605,43 @@ class Scorer:
 
                 before_len = _valid_len(rev_series)
                 need_fallback = before_len < 5
+                fallback = None
+                attempted_finnhub = False
                 if need_fallback:
-                    fallback = _fetch_revenue_quarterly_via_finnhub(t)
-                    if isinstance(fallback, pd.Series) and not fallback.dropna().empty:
-                        if isinstance(rev_series, pd.Series) and not rev_series.dropna().empty:
-                            yf_series = pd.Series(
-                                rev_series.values,
-                                index=pd.RangeIndex(len(rev_series)),
-                                dtype=float,
-                            )
-                            fh_series = pd.Series(
-                                fallback.values,
-                                index=pd.RangeIndex(len(fallback)),
-                                dtype=float,
-                            )
-                            total_len = max(len(yf_series), len(fh_series))
-                            yf_series = yf_series.reindex(pd.RangeIndex(total_len))
-                            fh_series = fh_series.reindex(pd.RangeIndex(total_len))
-                            rev_series = yf_series.where(yf_series.notna(), fh_series)
-                        else:
-                            rev_series = fallback
+                    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+                    if not api_key:
                         if debug_mode:
-                            try:
-                                base = qe['Revenue'] if (qe is not None and 'Revenue' in qe.columns) else None
-                                before_n = _valid_len(base)
-                            except Exception:
-                                before_n = _valid_len(None)
-                            after_n = _valid_len(rev_series)
-                            logger.info("[REV Fallback] %s: len %d -> %d", t, before_n, after_n)
+                            logger.info("[REV Fallback] %s: skip (FINNHUB_API_KEY not set)", t)
+                    else:
+                        attempted_finnhub = True
+                        fallback = _fetch_rev_quarterly_with_retry(t, api_key=api_key, debug=debug_mode)
+
+                if isinstance(fallback, pd.Series) and not fallback.dropna().empty:
+                    def _to_yyyyq(s):
+                        if s is None:
+                            return None
+                        try:
+                            idx = s.index
+                            if isinstance(idx, pd.DatetimeIndex):
+                                qidx = idx.to_period("Q").strftime("%YQ%q")
+                                return pd.Series(pd.to_numeric(s, errors="coerce").values, index=qidx, dtype=float)
+                            return pd.Series(pd.to_numeric(s, errors="coerce").values, index=[str(i) for i in s.index], dtype=float)
+                        except Exception:
+                            return pd.to_numeric(s, errors="coerce")
+
+                    yf_q = _to_yyyyq(rev_series)
+                    fh_q = _to_yyyyq(fallback)
+                    if isinstance(yf_q, pd.Series) and not yf_q.dropna().empty:
+                        rev_series = yf_q.combine_first(fh_q)
+                    else:
+                        rev_series = fh_q
+
+                    if debug_mode:
+                        before_n = before_len
+                        after_n = _valid_len(rev_series)
+                        logger.info("[REV Fallback] %s: len %d -> %d (union by quarter)", t, before_n, after_n)
+                elif debug_mode and need_fallback and attempted_finnhub:
+                    logger.info("[REV Fallback] %s: miss (no data from Finnhub)", t)
 
                 if rev_series is not None and _valid_len(rev_series) >= 5:
                     r = rev_series.dropna().astype(float)
