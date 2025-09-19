@@ -85,6 +85,55 @@ def robust_z_keepnan(s: pd.Series) -> pd.Series:
     return pd.Series(z, index=v.index, dtype=float)
 
 
+def _fetch_revenue_quarterly_via_finnhub(symbol: str):
+    """Fetch quarterly revenue via Finnhub when yfinance data is unavailable.
+
+    Returns a pandas.Series indexed by "YYYYQn" (ascending) or ``None`` when
+    an API token is missing, data is not found, or any error occurs. No
+    exception is propagated to keep behaviour identical without a token.
+    """
+    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        url = "https://finnhub.io/api/v1/stock/financials-reported"
+        params = {"symbol": symbol, "token": api_key}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        payload = r.json() or {}
+        rows = []
+        for item in payload.get("data", []) or []:
+            rep = (item or {}).get("report", {})
+            ic = rep.get("ic", {}) if isinstance(rep, dict) else {}
+            rev_val = None
+            if isinstance(ic, dict):
+                revenue_node = ic.get("revenue")
+                if isinstance(revenue_node, dict):
+                    rev_val = revenue_node.get("value")
+                if rev_val is None:
+                    total_node = ic.get("totalRevenue")
+                    if isinstance(total_node, dict):
+                        rev_val = total_node.get("value")
+            if rev_val is None:
+                continue
+            year = item.get("year")
+            quarter = item.get("quarter")
+            if year is None or quarter is None:
+                continue
+            try:
+                rows.append((int(year), int(quarter), float(rev_val)))
+            except Exception:
+                continue
+        if not rows:
+            return None
+        rows.sort(key=lambda x: (x[0], x[1]))
+        idx = [f"{y}Q{q}" for y, q, _ in rows]
+        vals = [v for _, _, v in rows]
+        return pd.Series(vals, index=idx, name="Revenue")
+    except Exception:
+        return None
+
+
 def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
     """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
     if not debug_mode:
@@ -487,6 +536,8 @@ class Scorer:
                             rev_series = rev_series.sort_index()
                         except Exception:
                             pass
+                    if rev_series is None or rev_series.dropna().empty:
+                        rev_series = _fetch_revenue_quarterly_via_finnhub(t)
 
                 if rev_series is not None and rev_series.dropna().shape[0] >= 2:
                     r = rev_series.dropna().astype(float)
