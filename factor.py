@@ -243,6 +243,23 @@ class Input:
                 pass
         return mp
 
+    # --- 追加: ADR/OTC向けの簡易正規化（末尾Y/F, ドット等） ---
+    @staticmethod
+    def _normalize_ticker(sym: str) -> list[str]:
+        s = (sym or "").upper().strip()
+        cand: list[str] = []
+
+        def add(x: str) -> None:
+            if x and x not in cand:
+                cand.append(x)
+
+        add(s)
+        add(s.replace(".", ""))
+        if len(s) >= 2 and s[-1] in {"Y", "F"}:
+            add(s[:-1])
+        add(s.replace("-", "").replace(".", ""))
+        return cand
+
     @staticmethod
     def _sec_companyfacts(cik: str):
         return Input._sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
@@ -309,10 +326,28 @@ class Input:
     def fetch_eps_rev_from_sec(self, tickers: list[str]) -> dict:
         out = {}
         t2cik = self._sec_ticker_map()
+        n_map = n_rev = n_eps = 0
+        miss_map: list[str] = []
+        miss_facts: list[str] = []
         for t in tickers:
-            cik = t2cik.get(t.upper())
+            candidates: list[str] = []
+
+            def add(key: str) -> None:
+                if key and key not in candidates:
+                    candidates.append(key)
+
+            add(t.upper())
+            for key in self._normalize_ticker(t):
+                add(key)
+
+            cik = None
+            for key in candidates:
+                cik = t2cik.get(key)
+                if cik:
+                    break
             if not cik:
                 out[t] = {}
+                miss_map.append(t)
                 continue
             try:
                 j = self._sec_companyfacts(cik)
@@ -349,9 +384,25 @@ class Input:
                     "eps_q_series": eps_vals[:8],
                     "rev_q_series": rev_vals[:8],
                 }
+                n_map += 1
+                if rev_vals:
+                    n_rev += 1
+                if eps_vals:
+                    n_eps += 1
             except Exception:
                 out[t] = {}
+                miss_facts.append(t)
             time.sleep(0.12)
+        # 取得サマリをログ（Actionsで確認しやすいよう print）
+        try:
+            total = len(tickers)
+            print(f"[SEC] map={n_map}/{total}  rev_q_hit={n_rev}  eps_q_hit={n_eps}")
+            if miss_map:
+                print(f"[SEC] no CIK map: {len(miss_map)} (例) {miss_map[:12]}")
+            if miss_facts:
+                print(f"[SEC] CIKあり だが対象factなし: {len(miss_facts)} (例) {miss_facts[:12]}")
+        except Exception:
+            pass
         return out
     @staticmethod
     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
@@ -550,6 +601,14 @@ class Input:
             REV_TTM=eps_df["rev_ttm"],
             REV_Q_LastQ=eps_df["rev_q_recent"],
         )
+        # ここで非NaN件数をサマリ表示（欠損状況の即時把握用）
+        try:
+            n = len(eps_df)
+            c_eps = int(eps_df["EPS_TTM"].notna().sum())
+            c_rev = int(eps_df["REV_TTM"].notna().sum())
+            print(f"[SEC] eps_ttm non-NaN: {c_eps}/{n}  rev_ttm non-NaN: {c_rev}/{n}")
+        except Exception:
+            pass
         fcf_df = self.compute_fcf_with_fallback(tickers, finnhub_api_key=self.api_key)
         T.log("eps/fcf prep done")
         returns = px[tickers].pct_change()
