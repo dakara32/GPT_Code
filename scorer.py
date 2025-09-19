@@ -54,7 +54,7 @@ def _dump_dfz(df_z, *, topk: int = 20, logger=None):
     try:
         lg.info("=== df_z snapshot === rows=%d cols=%d", df_z.shape[0], df_z.shape[1])
         head_txt = df_z.head(3).to_string()
-        print(head_txt)
+        lg.info("%s", head_txt)
         nan_top = df_z.isna().sum().sort_values(ascending=False).head(topk)
         lg.info("NaN columns (top%d):", topk)
         for c, n in nan_top.items():
@@ -1163,6 +1163,7 @@ class Scorer:
         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
 
+        # dump df_z snapshot / NaN / Zero dominated columns
         if getattr(cfg, "debug_mode", False):
             _dump_dfz(df_z, topk=20, logger=logger)
 
