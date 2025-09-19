@@ -37,6 +37,24 @@ from typing import Any, TYPE_CHECKING
 from scipy.stats import zscore
 from datetime import datetime as _dt
 
+FACTOR_COLUMNS = {
+    "GRW": [
+        "GROWTH_F",
+        "GRW_FLEX_SCORE",
+        "GRW_REV_YOY_Q",
+        "GRW_REV_ACC_Q",
+        "GRW_REV_QOQ",
+        "GRW_REV_TTM2",
+        "GRW_REV_YOY_Y",
+        "GRW_PRICE_PROXY",
+        "GRW_PATH",
+    ],
+    "MOM": ["MOM", "MOM_RAW", "MOM_P12M", "MOM_P6M", "MOM_P1M"],
+    "VOL": ["VOL", "VOL_SD", "VOL_BETA"],
+    "QUAL": ["QUAL", "ROE", "ROA", "FCF_MGN"],
+    "VAL": ["VAL", "PE", "PB", "PS", "EVEBITDA"],
+}
+
 if TYPE_CHECKING:
     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
 
@@ -48,6 +66,163 @@ def _log(stage, msg):
         print(f"[DBG][{_dt.utcnow().isoformat(timespec='seconds')}Z][{stage}] {msg}")
     except Exception:
         print(f"[DBG][{stage}] {msg}")
+
+
+def _collect_relevant_cols(df, df_z, *, weight_dict=None):
+    use: set[str] = set()
+    if weight_dict:
+        try:
+            items = weight_dict.items() if hasattr(weight_dict, "items") else []
+        except Exception:
+            items = []
+        for col, w in items:
+            try:
+                weight = float(w or 0)
+            except Exception:
+                weight = 0.0
+            if abs(weight) > 0 and col in getattr(df_z, "columns", []):
+                use.add(col)
+    for fac in ("GRW",):
+        for c in FACTOR_COLUMNS.get(fac, []):
+            if c in getattr(df, "columns", []) or c in getattr(df_z, "columns", []):
+                use.add(c)
+    for fac in ["MOM", "VOL", "QUAL", "VAL"]:
+        for c in FACTOR_COLUMNS.get(fac, []):
+            if c in getattr(df, "columns", []) or c in getattr(df_z, "columns", []):
+                use.add(c)
+    return sorted(use)
+
+
+def _reorder_for_debug(df, df_z, factor_cols=FACTOR_COLUMNS):
+    cols: list[str] = []
+    for fac in ["GRW", "MOM", "VOL", "QUAL", "VAL"]:
+        for c in factor_cols.get(fac, []):
+            if c in getattr(df_z, "columns", []) or c in getattr(df, "columns", []):
+                cols.append(c)
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for c in cols:
+        if c not in seen:
+            ordered.append(c)
+            seen.add(c)
+    return ordered
+
+
+def dump_dfz_scoped(df, df_z, *, weight_dict=None, topk=20, logger=None):
+    import pandas as pd, logging
+
+    logger = logger or logging.getLogger(__name__)
+    rel = _collect_relevant_cols(df, df_z, weight_dict=weight_dict)
+    rel_df = [c for c in rel if c in getattr(df_z, "columns", [])]
+    dfz = df_z[rel_df].copy() if rel_df else df_z.copy()
+    logger.info("DEBUG scope: %d relevant cols (of %d total).", dfz.shape[1], df_z.shape[1])
+    nan_top = dfz.isna().sum().sort_values(ascending=False).head(topk)
+    logger.info("scorer:NaN columns (top%d):", topk)
+    for c, n in nan_top.items():
+        logger.info("%s\t%d", c, int(n))
+    num_dfz = dfz.select_dtypes(include=["number"])
+    if not num_dfz.empty:
+        ztop = (num_dfz == 0).mean().sort_values(ascending=False).head(topk)
+        logger.info("scorer:Zero-dominated columns (top%d):", topk)
+        for c, r in ztop.items():
+            logger.info("%s\t%.2f%%", c, 100.0 * float(r))
+
+
+def save_factor_debug_csv(df, df_z, path="out/factor_debug_latest.csv"):
+    import os, pandas as pd, logging
+
+    lg = logging.getLogger(__name__)
+    try:
+        cols = _reorder_for_debug(df, df_z)
+        dump = pd.DataFrame(index=df.index)
+        for c in cols:
+            if c in getattr(df, "columns", []):
+                dump[c] = df[c]
+            if c in getattr(df_z, "columns", []):
+                dump[c] = df_z[c]
+        dump.reset_index(names=["symbol"], inplace=True)
+        if path:
+            dirpath = os.path.dirname(path) or "."
+            os.makedirs(dirpath, exist_ok=True)
+            dump.to_csv(path, index=False)
+        lg.info(
+            "factor debug CSV saved: %s (cols=%d rows=%d)",
+            path,
+            dump.shape[1],
+            dump.shape[0],
+        )
+    except Exception as e:
+        lg.warning("factor debug CSV failed: %s", e)
+
+
+def log_grw_stats(df, df_z, logger):
+    import numpy as np, pandas as pd
+
+    try:
+        s = pd.to_numeric(df.get("GRW_FLEX_SCORE", pd.Series(dtype=float)), errors="coerce")
+        z = pd.to_numeric(df_z.get("GROWTH_F", pd.Series(dtype=float)), errors="coerce")
+        if s.size:
+            logger.info(
+                "GRW raw stats: n=%d, median=%.3f, mad=%.3f, std=%.3f",
+                s.count(),
+                np.nanmedian(s),
+                np.nanmedian(np.abs(s - np.nanmedian(s))),
+                np.nanstd(s),
+            )
+        if z.size and not z.dropna().empty:
+            clip_hi = float((z >= 2.95).mean() * 100.0)
+            clip_lo = float((z <= -2.95).mean() * 100.0)
+            logger.info(
+                "GRW z stats: min=%.2f, p25=%.2f, med=%.2f, p75=%.2f, max=%.2f, clipped_hi=%.1f%%, clipped_lo=%.1f%%",
+                np.nanmin(z),
+                np.nanpercentile(z.dropna(), 25),
+                np.nanmedian(z),
+                np.nanpercentile(z.dropna(), 75),
+                np.nanmax(z),
+                clip_hi,
+                clip_lo,
+            )
+        if "GRW_PATH" in getattr(df, "columns", []):
+            logger.info(
+                "GRW path breakdown: %s",
+                df["GRW_PATH"].value_counts(dropna=False).to_dict(),
+            )
+    except Exception as e:
+        logger.warning("GRW stats log failed: %s", e)
+
+
+def _grw_record_to_df(t: str, info_t: dict, df):
+    if not isinstance(df, pd.DataFrame):
+        return
+    raw_parts = info_t.get("DEBUG_GRW_PARTS") if isinstance(info_t, dict) else None
+    parts: dict[str, Any] = {}
+    if isinstance(raw_parts, str):
+        try:
+            parts = json.loads(raw_parts)
+        except Exception:
+            parts = {}
+    elif isinstance(raw_parts, dict):
+        parts = raw_parts
+    path = info_t.get("DEBUG_GRW_PATH") if isinstance(info_t, dict) else None
+    score = info_t.get("GRW_SCORE") if isinstance(info_t, dict) else None
+
+    def _part_value(key: str):
+        value = parts.get(key) if isinstance(parts, dict) else None
+        if value is None:
+            return np.nan
+        try:
+            return float(value)
+        except Exception:
+            return np.nan
+
+    df.loc[t, "GRW_PATH"] = path
+    df.loc[t, "GRW_FLEX_SCORE"] = np.nan if score is None else float(score)
+    df.loc[t, "GRW_REV_YOY_Q"] = _part_value("rev_yoy_q")
+    df.loc[t, "GRW_REV_ACC_Q"] = _part_value("rev_acc_q")
+    df.loc[t, "GRW_REV_QOQ"] = _part_value("rev_qoq")
+    df.loc[t, "GRW_REV_TTM2"] = _part_value("rev_ttm2")
+    df.loc[t, "GRW_REV_YOY_Y"] = _part_value("rev_yoy_y")
+    df.loc[t, "GRW_PRICE_PROXY"] = _part_value("price_proxy")
 
 # ---- Dividend Helpers -------------------------------------------------------
 def _last_close(t, price_map=None):
@@ -94,12 +269,27 @@ def robust_z_keepnan(s: pd.Series) -> pd.Series:
     return pd.Series(z, index=v.index, dtype=float)
 
 
-def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
+def _dump_dfz(
+    df: pd.DataFrame,
+    df_z: pd.DataFrame,
+    debug_mode: bool,
+    max_rows: int = 400,
+    ndigits: int = 3,
+    *,
+    weight_dict=None,
+) -> None:
     """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
+
     if not debug_mode:
         return
     try:
-        view = df_z.copy()
+        rel = _collect_relevant_cols(df, df_z, weight_dict=weight_dict)
+        ordered = _reorder_for_debug(df, df_z)
+        rel_set = set(rel)
+        view_cols = [c for c in ordered if c in rel_set and c in df_z.columns]
+        if not view_cols:
+            view_cols = list(df_z.columns)
+        view = df_z[view_cols].copy()
         view = view.apply(
             lambda s: s.round(ndigits)
             if getattr(getattr(s, "dtype", None), "kind", "") in ("f", "i")
@@ -108,32 +298,7 @@ def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits
         if len(view) > max_rows:
             view = view.iloc[:max_rows]
 
-        # === NaNサマリ（列ごとの欠損件数 上位20） ===
-        try:
-            nan_counts = df_z.isna().sum().sort_values(ascending=False)
-            top_nan = nan_counts[nan_counts > 0].head(20)
-            if len(top_nan) > 0:
-                logger.info("NaN columns (top20):\n%s", top_nan.to_string())
-            else:
-                logger.info("NaN columns: none")
-        except Exception as exc:
-            logger.warning("nan summary failed: %s", exc)
-
-        # === Zeroサマリ（列ごとのゼロ比率 上位20） ===
-        try:
-            zero_counts = ((df_z == 0) & (~df_z.isna())).sum()
-            nonnull_counts = (~df_z.isna()).sum()
-            zero_ratio = (zero_counts / nonnull_counts).sort_values(ascending=False)
-            top_zero = zero_ratio[zero_ratio > 0].head(20)
-            if len(top_zero) > 0:
-                logger.info(
-                    "Zero-dominated columns (top20):\n%s",
-                    top_zero.to_string(float_format=lambda x: f"{x:.2%}"),
-                )
-            else:
-                logger.info("Zero-dominated columns: none")
-        except Exception as exc:
-            logger.warning("zero summary failed: %s", exc)
+        dump_dfz_scoped(df, df_z, weight_dict=weight_dict, topk=20, logger=logger)
 
         logger.info("===== DF_Z DUMP START =====")
         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
@@ -695,6 +860,7 @@ class Scorer:
                 volume_series_full = None
 
             grw_result = _calc_grw_flexible(t, d, s, volume_series_full)
+            _grw_record_to_df(t, d, df)
             df.loc[t,'GRW_FLEX_SCORE'] = grw_result.get('score')
             df.loc[t,'GRW_FLEX_WEIGHT'] = grw_result.get('weight')
             df.loc[t,'GRW_FLEX_CORE'] = grw_result.get('core')
@@ -1191,7 +1357,15 @@ class Scorer:
         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
 
-        _dump_dfz(df_z=df_z, debug_mode=getattr(cfg, "debug_mode", False))
+        _dump_dfz(
+            df=df,
+            df_z=df_z,
+            debug_mode=getattr(cfg, "debug_mode", False),
+            weight_dict=getattr(getattr(cfg, "weights", None), "g", None),
+        )
+        if getattr(cfg, "debug_mode", False):
+            log_grw_stats(df, df_z, logger)
+        save_factor_debug_csv(df, df_z)
 
         # === begin: BIO LOSS PENALTY =====================================
         try:
