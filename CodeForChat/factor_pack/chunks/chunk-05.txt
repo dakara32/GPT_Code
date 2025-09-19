@@ -1,77 +1,179 @@
 ```text
-cted12, near_G)
-L846     try:
-L847         fire_recent = [t for t in guni
-L848                        if (str(df.at[t, "G_BREAKOUT_recent_5d"]) == "True") or
-L849                           (str(df.at[t, "G_PULLBACK_recent_5d"]) == "True")]
-L850     except Exception: fire_recent = []
-L851
-L852     lines = [
-L853         "【G枠レポート｜週次モニタ（直近5営業日）】",
-L854         "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
-L855         f"選定{N_G}: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else f"選定{N_G}: なし",
-L856         f"次点10: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点10: なし",]
-L857
-L858     if fire_recent:
-L859         fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
-L860         lines.append(f"過去5営業日の検知: {fire_list}")
-L861     else:
-L862         lines.append("過去5営業日の検知: なし")
-L863
-L864     try:
-L865         webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
-L866         if webhook:
-L867             requests.post(webhook, json={"text": "\n".join([s for s in lines if s != ""])}, timeout=10)
-L868     except Exception:
-L869         pass
-L870
-L871     out = Output()
-L872     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
-L873     try: out._sc = sc
-L874     except Exception: pass
-L875     if hasattr(sc, "_feat"):
-L876         try:
-L877             fb = sc._feat
-L878             out.miss_df = fb.missing_logs
-L879             out.display_results(
-L880                 exist=exist,
-L881                 bench=bench,
-L882                 df_z=fb.df_z,
-L883                 g_score=fb.g_score,
-L884                 d_score_all=fb.d_score_all,
-L885                 init_G=top_G,
-L886                 init_D=top_D,
-L887                 top_G=top_G,
-L888                 top_D=top_D,
-L889                 df_full_z=getattr(fb, "df_full_z", None),
-L890                 prev_G=getattr(sc, "_prev_G", exist),
-L891                 prev_D=getattr(sc, "_prev_D", exist),
-L892             )
-L893         except Exception:
-L894             pass
-L895     out.notify_slack()
-L896     sb = SelectionBundle(resG={"tickers": top_G, "avg_res_corr": avgG,
-L897               "sum_score": sumG, "objective": objG},
-L898         resD={"tickers": top_D, "avg_res_corr": avgD,
-L899               "sum_score": sumD, "objective": objD},
-L900         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
-L901
-L902     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
-L903     try:
-L904         _low_df = (pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
-L905               .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
-L906               .sort_values("G_plus_D")
-L907               .head(10)
-L908               .round(3))
-L909         low_msg = "Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string(index=True, index_names=False)
-L910         _post_slack({"text": f"```{low_msg}```"})
-L911     except Exception as _e:
-L912         _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
-L913
-L914     return sb
-L915
-L916 if __name__ == "__main__":
-L917     run_pipeline()
+feat_logged = True
+L858         agg = sc.score_aggregate(feat, group, cfg) if hasattr(sc, "score_aggregate") else feat
+L859     else:
+L860         fb = sc.aggregate_scores(inb, cfg)
+L861         if not hasattr(sc, "_feat_logged"):
+L862             T.log("features built (scorer)")
+L863             sc._feat_logged = True
+L864         sc._feat = fb
+L865         agg = fb.g_score if group == "G" else fb.d_score_all
+L866         if group == "D" and hasattr(fb, "df"):
+L867             agg = agg[fb.df['BETA'] < D_BETA_MAX]
+L868
+L869     if hasattr(sc, "filter_candidates"):
+L870         agg = agg[sc.filter_candidates(inb, agg, group, cfg)]
+L871
+L872     selector = Selector()
+L873     if hasattr(sc, "select_diversified"):
+L874         pick, avg_r, sum_sc, obj = sc.select_diversified(agg, group, cfg, n_target,
+L875             selector=selector, prev_tickers=None,
+L876             corrM=cfg.drrs.corrM, shrink=cfg.drrs.shrink,
+L877             cross_mu=cfg.drrs.cross_mu_gd)
+L878     else:
+L879         if group == "G":
+L880             init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
+L881             res = selector.select_bucket_drrs(returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
+L882                 n_pc=cfg.drrs.G.get("n_pc", 3), gamma=cfg.drrs.G.get("gamma", 1.2),
+L883                 lam=cfg.drrs.G.get("lam", 0.68),
+L884                 lookback=cfg.drrs.G.get("lookback", 252),
+L885                 shrink=cfg.drrs.shrink, g_fixed_tickers=None, mu=0.0)
+L886         else:
+L887             init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
+L888             g_fixed = getattr(sc, "_top_G", None)
+L889             res = selector.select_bucket_drrs(returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
+L890                 n_pc=cfg.drrs.D.get("n_pc", 4), gamma=cfg.drrs.D.get("gamma", 0.8),
+L891                 lam=cfg.drrs.D.get("lam", 0.85),
+L892                 lookback=cfg.drrs.D.get("lookback", 504),
+L893                 shrink=cfg.drrs.shrink, g_fixed_tickers=g_fixed,
+L894                 mu=cfg.drrs.cross_mu_gd)
+L895         pick = res["tickers"]; avg_r = res["avg_res_corr"]
+L896         sum_sc = res["sum_score"]; obj = res["objective"]
+L897         if group == "D":
+L898             _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
+L899             T.log("selection finalized (G/D)")
+L900     try:
+L901         inc = [t for t in exist if t in agg.index]
+L902         pick = _sticky_keep_current(
+L903             agg=agg, pick=pick, incumbents=inc, n_target=n_target,
+L904             delta_z=SWAP_DELTA_Z, keep_buffer=SWAP_KEEP_BUFFER
+L905         )
+L906     except Exception as _e:
+L907         print(f"[warn] sticky_keep_current skipped: {str(_e)}")
+L908     # --- Near-Miss: 惜しくも選ばれなかった上位10を保持（Slack表示用） ---
+L909     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
+L910     try:
+L911         pool = agg.drop(index=[t for t in pick if t in agg.index], errors="ignore")
+L912         near10 = list(pool.sort_values(ascending=False).head(10).index)
+L913         setattr(sc, f"_near_{group}", near10)
+L914         setattr(sc, f"_agg_{group}", agg)
+L915     except Exception:
+L916         pass
+L917
+L918     if group == "D":
+L919         T.log("save done")
+L920     if group == "G":
+L921         sc._top_G = pick
+L922     return pick, avg_r, sum_sc, obj
+L923
+L924 def run_pipeline() -> SelectionBundle:
+L925     """
+L926     G/D共通フローの入口。I/Oはここだけで実施し、計算はScorerに委譲。
+L927     Slack文言・丸め・順序は既存の Output を用いて変更しない。
+L928     """
+L929     inb = io_build_input_bundle()
+L930     cfg = PipelineConfig(
+L931         weights=WeightsConfig(g=g_weights, d=D_weights),
+L932         drrs=DRRSParams(
+L933             corrM=corrM, shrink=DRRS_SHRINK,
+L934             G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD
+L935         ),
+L936         price_max=CAND_PRICE_MAX,
+L937         debug_mode=debug_mode
+L938     )
+L939     sc = Scorer()
+L940     top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G)
+L941     poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False).index)
+L942     alpha = Scorer.spx_to_alpha(inb.spx)
+L943     sectors = {t:(inb.info.get(t,{}).get("sector") or "U") for t in poolG}; scores = {t:Scorer.g_score.get(t,0.0) for t in poolG}
+L944     top_G = Scorer.pick_top_softcap(scores, sectors, N=N_G, cap=2, alpha=alpha, hard=5)
+L945     sc._top_G = top_G
+L946     try:
+L947         aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False)
+L948         sc._near_G = [t for t in aggG.index if t not in set(top_G)][:10]
+L949     except Exception:
+L950         pass
+L951     base = sum(Scorer.g_score.get(t,0.0) for t in poolG[:N_G])
+L952     effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
+L953     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
+L954     top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D)
+L955     fb = getattr(sc, "_feat", None)
+L956     near_G = getattr(sc, "_near_G", [])
+L957     selected12 = list(top_G)
+L958     df = fb.df if fb is not None else pd.DataFrame()
+L959     guni = _infer_g_universe(df, selected12, near_G)
+L960     try:
+L961         fire_recent = [t for t in guni
+L962                        if (str(df.at[t, "G_BREAKOUT_recent_5d"]) == "True") or
+L963                           (str(df.at[t, "G_PULLBACK_recent_5d"]) == "True")]
+L964     except Exception: fire_recent = []
+L965
+L966     lines = [
+L967         "【G枠レポート｜週次モニタ（直近5営業日）】",
+L968         "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
+L969         f"選定{N_G}: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else f"選定{N_G}: なし",
+L970         f"次点10: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点10: なし",]
+L971
+L972     if fire_recent:
+L973         fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
+L974         lines.append(f"過去5営業日の検知: {fire_list}")
+L975     else:
+L976         lines.append("過去5営業日の検知: なし")
+L977
+L978     try:
+L979         webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+L980         if webhook:
+L981             requests.post(webhook, json={"text": "\n".join([s for s in lines if s != ""])}, timeout=10)
+L982     except Exception:
+L983         pass
+L984
+L985     out = Output()
+L986     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
+L987     try: out._sc = sc
+L988     except Exception: pass
+L989     if hasattr(sc, "_feat"):
+L990         try:
+L991             fb = sc._feat
+L992             out.miss_df = fb.missing_logs
+L993             out.display_results(
+L994                 exist=exist,
+L995                 bench=bench,
+L996                 df_z=fb.df_z,
+L997                 g_score=fb.g_score,
+L998                 d_score_all=fb.d_score_all,
+L999                 init_G=top_G,
+L1000                 init_D=top_D,
+L1001                 top_G=top_G,
+L1002                 top_D=top_D,
+L1003                 df_full_z=getattr(fb, "df_full_z", None),
+L1004                 prev_G=getattr(sc, "_prev_G", exist),
+L1005                 prev_D=getattr(sc, "_prev_D", exist),
+L1006             )
+L1007         except Exception:
+L1008             pass
+L1009     out.notify_slack()
+L1010     sb = SelectionBundle(resG={"tickers": top_G, "avg_res_corr": avgG,
+L1011               "sum_score": sumG, "objective": objG},
+L1012         resD={"tickers": top_D, "avg_res_corr": avgD,
+L1013               "sum_score": sumD, "objective": objD},
+L1014         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
+L1015
+L1016     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
+L1017     try:
+L1018         _low_df = (pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
+L1019               .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
+L1020               .sort_values("G_plus_D")
+L1021               .head(10)
+L1022               .round(3))
+L1023         low_msg = "Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string(index=True, index_names=False)
+L1024         _post_slack({"text": f"```{low_msg}```"})
+L1025     except Exception as _e:
+L1026         _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
+L1027
+L1028     return sb
+L1029
+L1030 if __name__ == "__main__":
+L1031     run_pipeline()
 ```
 
 ## <scorer.py>
@@ -163,105 +265,5 @@ L84         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
 L85     return pd.Series(z, index=v.index, dtype=float)
 L86
 L87
-L88 def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
-L89     """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
-L90     if not debug_mode:
-L91         return
-L92     try:
-L93         view = df_z.copy()
-L94         view = view.apply(
-L95             lambda s: s.round(ndigits)
-L96             if getattr(getattr(s, "dtype", None), "kind", "") in ("f", "i")
-L97             else s
-L98         )
-L99         if len(view) > max_rows:
-L100             view = view.iloc[:max_rows]
-L101
-L102         # === NaNサマリ（列ごとの欠損件数 上位20） ===
-L103         try:
-L104             nan_counts = df_z.isna().sum().sort_values(ascending=False)
-L105             top_nan = nan_counts[nan_counts > 0].head(20)
-L106             if len(top_nan) > 0:
-L107                 logger.info("NaN columns (top20):\n%s", top_nan.to_string())
-L108             else:
-L109                 logger.info("NaN columns: none")
-L110         except Exception as exc:
-L111             logger.warning("nan summary failed: %s", exc)
-L112
-L113         # === Zeroサマリ（列ごとのゼロ比率 上位20） ===
-L114         try:
-L115             zero_counts = ((df_z == 0) & (~df_z.isna())).sum()
-L116             nonnull_counts = (~df_z.isna()).sum()
-L117             zero_ratio = (zero_counts / nonnull_counts).sort_values(ascending=False)
-L118             top_zero = zero_ratio[zero_ratio > 0].head(20)
-L119             if len(top_zero) > 0:
-L120                 logger.info(
-L121                     "Zero-dominated columns (top20):\n%s",
-L122                     top_zero.to_string(float_format=lambda x: f"{x:.2%}"),
-L123                 )
-L124             else:
-L125                 logger.info("Zero-dominated columns: none")
-L126         except Exception as exc:
-L127             logger.warning("zero summary failed: %s", exc)
-L128
-L129         logger.info("===== DF_Z DUMP START =====")
-L130         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
-L131         logger.info("===== DF_Z DUMP END =====")
-L132     except Exception as exc:
-L133         logger.warning("df_z dump failed: %s", exc)
-L134
-L135 def _safe_div(a, b):
-L136     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
-L137     except Exception: return np.nan
-L138
-L139 def _safe_last(series: pd.Series, default=np.nan):
-L140     try: return float(series.iloc[-1])
-L141     except Exception: return default
-L142
-L143 D_WEIGHTS_EFF = None  # 出力表示互換のため
-L144
-L145 # ---- Scorer 本体 -------------------------------------------------------------
-L146 class Scorer:
-L147     """
-L148     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
-L149     - cfg は必須（factor.PipelineConfig を渡す）。
-L150     - 旧カラム名を自動リネームして新スキーマに吸収します。
-L151     """
-L152
-L153     # === 先頭で旧→新カラム名マップ（移行用） ===
-L154     EPS_RENAME = {"eps_ttm":"EPS_TTM", "eps_q_recent":"EPS_Q_LastQ"}
-L155     FCF_RENAME = {"fcf_ttm":"FCF_TTM"}
-L156
-L157     # === スキーマ簡易チェック（最低限） ===
-L158     @staticmethod
-L159     def _validate_ib_for_scorer(ib: Any):
-L160         miss = [a for a in ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"] if not hasattr(ib,a) or getattr(ib,a) is None]
-L161         if miss: raise ValueError(f"InputBundle is missing required attributes for Scorer: {miss}")
-L162         if any(c in ib.eps_df.columns for c in Scorer.EPS_RENAME): ib.eps_df.rename(columns=Scorer.EPS_RENAME, inplace=True)
-L163         if any(c in ib.fcf_df.columns for c in Scorer.FCF_RENAME): ib.fcf_df.rename(columns=Scorer.FCF_RENAME, inplace=True)
-L164         need_eps, need_fcf = {"EPS_TTM","EPS_Q_LastQ"},{"FCF_TTM"}
-L165         if not need_eps.issubset(ib.eps_df.columns): raise ValueError(f"eps_df must contain columns {need_eps} (accepts old names via auto-rename). Got: {list(ib.eps_df.columns)}")
-L166         if not need_fcf.issubset(ib.fcf_df.columns): raise ValueError(f"fcf_df must contain columns {need_fcf} (accepts old names via auto-rename). Got: {list(ib.fcf_df.columns)}")
-L167
-L168     # ----（Scorer専用）テクニカル・指標系 ----
-L169     @staticmethod
-L170     def trend(s: pd.Series):
-L171         if len(s)<200: return np.nan
-L172         sma50, sma150, sma200 = s.rolling(50).mean().iloc[-1], s.rolling(150).mean().iloc[-1], s.rolling(200).mean().iloc[-1]
-L173         prev200, p = s.rolling(200).mean().iloc[-21], s.iloc[-1]
-L174         lo_52 = s[-252:].min() if len(s)>=252 else s.min(); hi_52 = s[-252:].max() if len(s)>=252 else s.max()
-L175         rng = (hi_52 - lo_52) if hi_52>lo_52 else np.nan
-L176         clip = lambda x,lo,hi: (np.nan if pd.isna(x) else max(lo,min(hi,x)))
-L177         a = clip(p/(s.rolling(50).mean().iloc[-1]) - 1, -0.5, 0.5)
-L178         b = clip(sma50/sma150 - 1, -0.5, 0.5)
-L179         c = clip(sma150/sma200 - 1, -0.5, 0.5)
-L180         d = clip(sma200/prev200 - 1, -0.2, 0.2)
-L181         e = clip((p - lo_52) / (rng if rng and rng>0 else np.nan) - 0.5, -0.5, 0.5)
-L182         parts = [0.0 if pd.isna(x) else x for x in (a,b,c,d,e)]
-L183         return 0.30*parts[0] + 0.20*parts[1] + 0.15*parts[2] + 0.15*parts[3] + 0.20*parts[4]
-L184
-L185     @staticmethod
-L186     def rs(s, b):
-L187         n, nb = len(s), len(b)
-L188         if n<60 or nb<60: return np
+L88 def _d
 ```
