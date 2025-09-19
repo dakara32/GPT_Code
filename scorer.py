@@ -26,10 +26,7 @@
 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
 # =============================================================================
 
-import logging
-import os, sys, warnings
-import json
-import requests
+import json, logging, os, requests, sys, warnings
 import numpy as np
 import pandas as pd
 import yfinance as yf

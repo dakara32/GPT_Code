@@ -1,6 +1,4 @@
 # 共通設定（factor / drift から参照）
-from dataclasses import dataclass
-
 TOTAL_TARGETS = 20
 
 # 基準のバケット数（NORMAL）

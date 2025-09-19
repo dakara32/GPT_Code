@@ -3,16 +3,17 @@
 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
 SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
 SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
-import os, time, requests
-import logging
-from time import perf_counter
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+import logging, os, time, requests
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from time import perf_counter
+from typing import Any, Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import zscore  # used via scorer
+
 from scorer import Scorer, ttm_div_yield_portfolio, _log
 import config
 
@@ -20,14 +21,16 @@ import config
 debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
 
 logger = logging.getLogger(__name__)
-if debug_mode:
-    logging.basicConfig(level=logging.INFO, force=True)
-else:
-    logging.basicConfig(level=logging.WARNING, force=True)
+logging.basicConfig(level=(logging.INFO if debug_mode else logging.WARNING), force=True)
 
 class T:
     t = perf_counter()
-    log = staticmethod(lambda tag: (lambda now=perf_counter(): (print(f"[T] {tag}: {now - T.t:.2f}s"), setattr(T, "t", now))[-1])())
+
+    @staticmethod
+    def log(tag):
+        now = perf_counter()
+        print(f"[T] {tag}: {now - T.t:.2f}s")
+        T.t = now
 
 T.log("start")
 
@@ -130,30 +133,26 @@ def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
     def _post_text(payload: str) -> None:
         try:
             resp = requests.post(url, json={"text": payload})
-            print(f"[DBG] debug_post status={getattr(resp, 'status_code', None)} size={len(payload)}")
+            print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
             if resp is not None:
                 resp.raise_for_status()
         except Exception as e:
             print(f"[ERR] debug_post_failed: {e}")
 
-    body = str(text or "").strip()
+    body = (text or "").strip()
     if not body:
         print("[DBG] skip debug send: empty body")
         return
 
-    lines = body.splitlines()
-    block: list[str] = []
-    block_len = 0
+    block, block_len = [], 0
 
-    def _flush() -> None:
+    def _flush():
         nonlocal block, block_len
-        if not block:
-            return
-        payload = "```" + "\n".join(block) + "```"
-        _post_text(payload)
-        block, block_len = [], 0
+        if block:
+            _post_text("```" + "\n".join(block) + "```")
+            block, block_len = [], 0
 
-    for raw in lines:
+    for raw in body.splitlines():
         line = raw or ""
         while len(line) > chunk:
             head, line = line[:chunk], line[chunk:]
@@ -161,8 +160,7 @@ def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
             _post_text("```" + head + "```")
         add_len = len(line) if not block else len(line) + 1
         if block and block_len + add_len > chunk:
-            _flush()
-            add_len = len(line)
+            _flush(); add_len = len(line)
         block.append(line)
         block_len += add_len
     _flush()
@@ -171,11 +169,12 @@ def _disjoint_keepG(top_G, top_D, poolD):
     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
     used, D, i = set(top_G), list(top_D), 0
     for j, t in enumerate(D):
-        if t in used:
-            while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
-                i += 1
-            if i < len(poolD):
-                D[j] = poolD[i]; used.add(D[j]); i += 1
+        if t not in used:
+            continue
+        while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
+            i += 1
+        if i < len(poolD):
+            D[j] = poolD[i]; used.add(D[j]); i += 1
     return top_G, D
 
 
@@ -186,19 +185,22 @@ def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
     if not sel: return sel
     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
-    sigma = float(agg.std()) if pd.notna(agg.std()) else 0.0
+    std = agg.std()
+    sigma = float(std) if pd.notna(std) else 0.0
     thresh = kth - delta_z * sigma
     ranked_all = agg.sort_values(ascending=False)
     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
     for t in cand:
-        within_score = (pd.notna(agg[t]) and agg[t] >= thresh)
-        within_rank  = (t in ranked_all.index) and (ranked_all.index.get_loc(t) < n_target + keep_buffer)
-        if within_score or within_rank:
-            non_inc = [x for x in sel if x not in incumbents]
-            if not non_inc: break
-            weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
-            if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
-                sel.remove(weakest); sel.append(t)
+        within_score = pd.notna(agg[t]) and agg[t] >= thresh
+        within_rank = t in ranked_all.index and ranked_all.index.get_loc(t) < n_target + keep_buffer
+        if not (within_score or within_rank):
+            continue
+        non_inc = [x for x in sel if x not in incumbents]
+        if not non_inc:
+            break
+        weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
+        if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
+            sel.remove(weakest); sel.append(t)
     if len(sel) > n_target:
         sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
     return sel
@@ -215,11 +217,7 @@ class Input:
     def _sec_headers():
         mail = (os.getenv("SEC_CONTACT_EMAIL") or "yasonba55@gmail.com").strip()
         app = (os.getenv("SEC_APP_NAME") or "FactorBot/1.0").strip()
-        return {
-            "User-Agent": f"{app} ({mail})",
-            "From": mail,
-            "Accept": "application/json",
-        }
+        return {"User-Agent": f"{app} ({mail})", "From": mail, "Accept": "application/json"}
 
     @staticmethod
     def _sec_get(url: str, retries: int = 3, backoff: float = 0.5):
@@ -228,8 +226,7 @@ class Input:
             if r.status_code in (429, 503, 403):
                 time.sleep(min(2 ** i * backoff, 8.0))
                 continue
-            r.raise_for_status()
-            return r.json()
+            r.raise_for_status(); return r.json()
         r.raise_for_status()
 
     @staticmethod
@@ -240,7 +237,7 @@ class Input:
             try:
                 mp[str(v["ticker"]).upper()] = f"{int(v['cik_str']):010d}"
             except Exception:
-                pass
+                continue
         return mp
 
     # --- 追加: ADR/OTC向けの簡易正規化（末尾Y/F, ドット等） ---
@@ -279,12 +276,9 @@ class Input:
     def _units_for_tags(facts: dict, namespaces: list[str], tags: list[str]) -> list[dict]:
         """facts から namespace/tag を横断して units 配列を収集（存在順に連結）。"""
         out: list[dict] = []
-        facts = facts or {}
+        facts = (facts or {}).get("facts", {})
         for ns in namespaces:
-            try:
-                node = facts.get("facts", {}).get(ns, {})
-            except Exception:
-                node = {}
+            node = facts.get(ns, {}) if isinstance(facts, dict) else {}
             for tg in tags:
                 try:
                     units = node[tg]["units"]
@@ -312,14 +306,15 @@ class Input:
         if not arr:
             return []
         q_forms = {"10-Q", "10-Q/A", "6-K"}
-
-        def is_q(x: dict) -> bool:
-            frame = (x.get("frame") or "").upper()
-            fp = (x.get("fp") or "").upper()
-            form = (x.get("form") or "").upper()
-            return ("Q" in frame) or (fp in {"Q1", "Q2", "Q3", "Q4"}) or (form in q_forms)
-
-        out = [x for x in arr if is_q(x)]
+        out = [
+            x
+            for x in arr
+            if (
+                "Q" in (x.get("frame") or "").upper()
+                or (x.get("fp") or "").upper() in {"Q1", "Q2", "Q3", "Q4"}
+                or (x.get("form") or "").upper() in q_forms
+            )
+        ]
         out.sort(key=lambda x: (x.get("end") or ""), reverse=True)
         return out
 
@@ -329,14 +324,13 @@ class Input:
         out: List[Tuple[str, float]] = []
         for x in (arr or []):
             try:
-                v = x.get(key_val)
                 d = x.get(key_dt)
                 if d is None:
                     continue
+                v = x.get(key_val)
                 out.append((str(d), normalize(v) if v is not None else float("nan")))
             except Exception:
                 continue
-        # end(=日付)の降順にソート（最新→古い）
         out.sort(key=lambda t: t[0], reverse=True)
         return out
 
@@ -347,21 +341,12 @@ class Input:
         miss_map: list[str] = []
         miss_facts: list[str] = []
         for t in tickers:
+            base = (t or "").upper()
             candidates: list[str] = []
-
-            def add(key: str) -> None:
+            for key in [base, *self._normalize_ticker(t)]:
                 if key and key not in candidates:
                     candidates.append(key)
-
-            add((t or "").upper())
-            for key in self._normalize_ticker(t):
-                add(key)
-
-            cik = None
-            for key in candidates:
-                cik = t2cik.get(key)
-                if cik:
-                    break
+            cik = next((t2cik.get(key) for key in candidates if t2cik.get(key)), None)
             if not cik:
                 out[t] = {}
                 miss_map.append(t)
@@ -394,8 +379,8 @@ class Input:
                 eps_vals = [v for (_d, v) in eps_pairs]
                 rev_q = float(rev_vals[0]) if rev_vals else float("nan")
                 eps_q = float(eps_vals[0]) if eps_vals else float("nan")
-                rev_ttm = float(sum([v for v in rev_vals[:4] if v == v])) if rev_vals else float("nan")
-                eps_ttm = float(sum([v for v in eps_vals[:4] if v == v])) if eps_vals else float("nan")
+                rev_ttm = float(sum(v for v in rev_vals[:4] if v == v)) if rev_vals else float("nan")
+                eps_ttm = float(sum(v for v in eps_vals[:4] if v == v)) if eps_vals else float("nan")
                 out[t] = {
                     "eps_q_recent": eps_q,
                     "eps_ttm": eps_ttm,
@@ -637,11 +622,17 @@ class Input:
     def prepare_data(self):
         """Fetch price and fundamental data for all tickers."""
         self.sec_dryrun_sample()
-        cand_info = yf.Tickers(" ".join(self.cand)); cand_prices = {}
-        for t in self.cand:
-            try: cand_prices[t] = cand_info.tickers[t].fast_info.get("lastPrice", np.inf)
-            except Exception as e: print(f"{t}: price fetch failed ({e})"); cand_prices[t] = np.inf
-        cand_f = [t for t,p in cand_prices.items() if p<=self.price_max]
+        cand_info = yf.Tickers(" ".join(self.cand))
+
+        def _price(t: str) -> float:
+            try:
+                return cand_info.tickers[t].fast_info.get("lastPrice", np.inf)
+            except Exception as e:
+                print(f"{t}: price fetch failed ({e})")
+                return np.inf
+
+        cand_prices = {t: _price(t) for t in self.cand}
+        cand_f = [t for t, p in cand_prices.items() if p <= self.price_max]
         T.log("price cap filter done (CAND_PRICE_MAX)")
         # 入力ティッカーの重複を除去し、現行→候補の順序を維持
         tickers = list(dict.fromkeys(self.exist + cand_f))
@@ -653,8 +644,7 @@ class Input:
         spx = data["Close"][self.bench].reindex(px.index).ffill()
         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
         if clip_days > 0:
-            px  = px.tail(clip_days + 1)
-            spx = spx.tail(clip_days + 1)
+            px, spx = px.tail(clip_days + 1), spx.tail(clip_days + 1)
             logger.info("[T] price window clipped by env: %d rows (PRICE_CLIP_DAYS=%d)", len(px), clip_days)
         else:
             logger.info("[T] price window clip skipped; rows=%d", len(px))
@@ -908,10 +898,10 @@ class Output:
             def get(self, key, default=None):
                 try:
                     v = self.primary.get(key) if hasattr(self.primary, "get") else None
-                    if v is not None and not (isinstance(v, float) and v != v):
-                        return v
                 except Exception:
-                    pass
+                    v = None
+                if v is not None and not (isinstance(v, float) and v != v):
+                    return v
                 try:
                     return self.fallback.get(key) if hasattr(self.fallback, "get") else default
                 except Exception:
