@@ -47,27 +47,6 @@ def _log(stage, msg):
         print(f"[DBG][{stage}] {msg}")
 
 
-def _dump_dfz(df_z, *, topk: int = 20, logger=None):
-    import numpy as np, pandas as pd, logging
-
-    lg = logger or logging.getLogger(__name__)
-    try:
-        lg.info("=== df_z snapshot === rows=%d cols=%d", df_z.shape[0], df_z.shape[1])
-        head_txt = df_z.head(3).to_string()
-        lg.info("%s", head_txt)
-        nan_top = df_z.isna().sum().sort_values(ascending=False).head(topk)
-        lg.info("NaN columns (top%d):", topk)
-        for c, n in nan_top.items():
-            lg.info("%s\t%d", c, int(n))
-        num = df_z.select_dtypes(include=["number"])
-        if not num.empty:
-            zero_top = (num == 0).mean().sort_values(ascending=False).head(topk)
-            lg.info("Zero-dominated columns (top%d):", topk)
-            for c, r in zero_top.items():
-                lg.info("%s\t%.2f%%", c, 100.0 * float(r))
-    except Exception as e:
-        lg.warning("dump_dfz failed: %s", e)
-
 # ---- Dividend Helpers -------------------------------------------------------
 def _last_close(t, price_map=None):
     if price_map and (c := price_map.get(t)) is not None: return float(c)
@@ -1163,9 +1142,13 @@ class Scorer:
         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
 
-        # dump df_z snapshot / NaN / Zero dominated columns
+        # シンプル版: df_zをそのままログに出す
         if getattr(cfg, "debug_mode", False):
-            _dump_dfz(df_z, topk=20, logger=logger)
+            import io
+            buf = io.StringIO()
+            # 上位50行だけ出力（必要に応じて行数調整可）
+            df_z.head(50).to_string(buf)
+            logger.info("=== df_z snapshot ===\n%s", buf.getvalue())
 
         # === begin: BIO LOSS PENALTY =====================================
         try:
