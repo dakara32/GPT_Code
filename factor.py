@@ -667,64 +667,95 @@ class Input:
                 info[t] = {}
         try:
             sec_map = self.fetch_eps_rev_from_sec(tickers)
-            for t in tickers:
-                if t in info and sec_map.get(t):
-                    # (date,value) を優先採用。なければ従来の値だけ配列。
-                    pairs_r = sec_map[t].get("rev_q_series_pairs") or []
-                    pairs_e = sec_map[t].get("eps_q_series_pairs") or []
-                    if pairs_r:
-                        idx = pd.to_datetime([d for (d, _v) in pairs_r], errors="coerce")
-                        val = pd.to_numeric([v for (_d, v) in pairs_r], errors="coerce")
-                        s = pd.Series(val, index=idx).sort_index()  # 古い→新しい（YoY等の直感に合わせる）
-                        info[t]["SEC_REV_Q_SERIES"] = s
-                    else:
-                        info[t]["SEC_REV_Q_SERIES"] = sec_map[t].get("rev_q_series") or []
-                    if pairs_e:
-                        idx = pd.to_datetime([d for (d, _v) in pairs_e], errors="coerce")
-                        val = pd.to_numeric([v for (_d, v) in pairs_e], errors="coerce")
-                        s = pd.Series(val, index=idx).sort_index()
-                        info[t]["SEC_EPS_Q_SERIES"] = s
-                    else:
-                        info[t]["SEC_EPS_Q_SERIES"] = sec_map[t].get("eps_q_series") or []
-            def _brief_len(s):
+        except Exception as e:
+            logger.warning("[SEC] fetch_eps_rev_from_sec failed: %s", e)
+            sec_map = {}
+
+        def _brief_len(s):
+            try:
+                if isinstance(s, pd.Series):
+                    return int(s.dropna().size)
+                if isinstance(s, (list, tuple)):
+                    return len([v for v in s if pd.notna(v)])
+                if isinstance(s, np.ndarray):
+                    return int(np.count_nonzero(~pd.isna(s)))
+                return int(bool(s))
+            except Exception:
+                return 0
+
+        def _has_entries(val) -> bool:
+            try:
+                if isinstance(val, pd.Series):
+                    return not val.dropna().empty
+                if isinstance(val, (list, tuple)):
+                    return any(pd.notna(v) for v in val)
+                return bool(val)
+            except Exception:
+                return False
+
+        have_rev = 0
+        have_eps = 0
+        rev_lens: list[int] = []
+        eps_lens: list[int] = []
+        samples: list[tuple[str, int, str, float | None, int, str, float | None]] = []
+
+        for t in tickers:
+            entry = info.get(t, {})
+            m = (sec_map or {}).get(t) or {}
+            if entry is None or not isinstance(entry, dict):
+                entry = {}
+                info[t] = entry
+
+            if m:
+                pairs_r = m.get("rev_q_series_pairs") or []
+                pairs_e = m.get("eps_q_series_pairs") or []
+                if pairs_r:
+                    idx = pd.to_datetime([d for (d, _v) in pairs_r], errors="coerce")
+                    val = pd.to_numeric([v for (_d, v) in pairs_r], errors="coerce")
+                    s = pd.Series(val, index=idx).sort_index()
+                    entry["SEC_REV_Q_SERIES"] = s
+                else:
+                    entry["SEC_REV_Q_SERIES"] = m.get("rev_q_series") or []
+                if pairs_e:
+                    idx = pd.to_datetime([d for (d, _v) in pairs_e], errors="coerce")
+                    val = pd.to_numeric([v for (_d, v) in pairs_e], errors="coerce")
+                    s = pd.Series(val, index=idx).sort_index()
+                    entry["SEC_EPS_Q_SERIES"] = s
+                else:
+                    entry["SEC_EPS_Q_SERIES"] = m.get("eps_q_series") or []
+
+            r = entry.get("SEC_REV_Q_SERIES")
+            e = entry.get("SEC_EPS_Q_SERIES")
+            if _has_entries(r):
+                have_rev += 1
+            if _has_entries(e):
+                have_eps += 1
+            lr = _brief_len(r)
+            le = _brief_len(e)
+            rev_lens.append(lr)
+            eps_lens.append(le)
+            if len(samples) < 8:
                 try:
-                    return int(getattr(s.dropna(), "size", 0))
+                    rd = getattr(r, "index", [])[-1] if lr > 0 else None
+                    rv = float(r.iloc[-1]) if lr > 0 else None
+                    ed = getattr(e, "index", [])[-1] if le > 0 else None
+                    ev = float(e.iloc[-1]) if le > 0 else None
+                    samples.append((t, lr, str(rd) if rd is not None else "-", rv, le, str(ed) if ed is not None else "-", ev))
                 except Exception:
-                    return 0
+                    samples.append((t, lr, "-", None, le, "-", None))
 
-            rev_lens = []
-            eps_lens = []
-            samples = []
+        logger.info("[SEC] series attach: rev_q=%d/%d, eps_q=%d/%d", have_rev, len(tickers), have_eps, len(tickers))
 
-            for t in tickers:
-                r = info.get(t, {}).get("SEC_REV_Q_SERIES", None)
-                e = info.get(t, {}).get("SEC_EPS_Q_SERIES", None)
-                lr = _brief_len(r)
-                le = _brief_len(e)
-                rev_lens.append(lr)
-                eps_lens.append(le)
-                if len(samples) < 8:
-                    try:
-                        rd = getattr(r, "index", [])[-1] if lr > 0 else None
-                        rv = float(r.iloc[-1]) if lr > 0 else None
-                        ed = getattr(e, "index", [])[-1] if le > 0 else None
-                        ev = float(e.iloc[-1]) if le > 0 else None
-                        samples.append((t, lr, str(rd) if rd is not None else "-", rv, le, str(ed) if ed is not None else "-", ev))
-                    except Exception:
-                        samples.append((t, lr, "-", None, le, "-", None))
-
-            if rev_lens:
-                rev_lens_sorted = sorted(rev_lens)
-                eps_lens_sorted = sorted(eps_lens)
-                _log(
-                    "SEC_SERIES",
-                    f"rev_len min/med/max={rev_lens_sorted[0]}/{rev_lens_sorted[len(rev_lens)//2]}/{rev_lens_sorted[-1]} "
-                    f"eps_len min/med/max={eps_lens_sorted[0]}/{eps_lens_sorted[len(eps_lens)//2]}/{eps_lens_sorted[-1]}",
-                )
-            for (t, lr, rd, rv, le, ed, ev) in samples:
-                _log("SEC_SERIES_SMP", f"{t}  rev_len={lr} last=({rd},{rv})  eps_len={le} last=({ed},{ev})")
-        except Exception:
-            sec_map = None
+        if rev_lens:
+            rev_lens_sorted = sorted(rev_lens)
+            eps_lens_sorted = sorted(eps_lens)
+            _log(
+                "SEC_SERIES",
+                f"rev_len min/med/max={rev_lens_sorted[0]}/{rev_lens_sorted[len(rev_lens)//2]}/{rev_lens_sorted[-1]} "
+                f"eps_len min/med/max={eps_lens_sorted[0]}/{eps_lens_sorted[len(eps_lens)//2]}/{eps_lens_sorted[-1]}",
+            )
+        for (t, lr, rd, rv, le, ed, ev) in samples:
+            _log("SEC_SERIES_SMP", f"{t}  rev_len={lr} last=({rd},{rv})  eps_len={le} last=({ed},{ev})")
         eps_df = self._build_eps_df(tickers, tickers_bulk, info, sec_map=sec_map)
         # index 重複があると .loc[t, col] が Series になり代入時に ValueError を誘発する
         if not eps_df.index.is_unique:

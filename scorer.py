@@ -903,6 +903,35 @@ class Scorer:
                 return val
             return None
 
+        def _has_sec_series(val) -> bool:
+            try:
+                if isinstance(val, pd.Series):
+                    return not val.dropna().empty
+                if isinstance(val, (list, tuple)):
+                    return any(pd.notna(v) for v in val)
+                return bool(val)
+            except Exception:
+                return False
+
+        def _series_len(val) -> int:
+            try:
+                if isinstance(val, pd.Series):
+                    return int(val.dropna().size)
+                if isinstance(val, (list, tuple)):
+                    return len(val)
+                return int(bool(val))
+            except Exception:
+                return 0
+
+        cnt_rev_series = sum(1 for _t, d in info.items() if _has_sec_series(d.get("SEC_REV_Q_SERIES")))
+        cnt_eps_series = sum(1 for _t, d in info.items() if _has_sec_series(d.get("SEC_EPS_Q_SERIES")))
+        logger.info(
+            "[DERIV] SEC series presence: REV_Q=%d, EPS_Q=%d (universe=%d)",
+            cnt_rev_series,
+            cnt_eps_series,
+            len(info),
+        )
+
         rev_q_ge5 = 0
         ttm_yoy_avail = 0
         wrote_growth = 0
@@ -910,6 +939,21 @@ class Scorer:
         for t in tickers:
             try:
                 d = info.get(t, {}) or {}
+                rev_series = d.get("SEC_REV_Q_SERIES")
+                eps_series = d.get("SEC_EPS_Q_SERIES")
+                fallback_qearn = False
+                try:
+                    qe = tickers_bulk.tickers[t].quarterly_earnings
+                    fallback_qearn = bool(qe is not None and not getattr(qe, "empty", True))
+                except Exception:
+                    qe = None
+                logger.debug(
+                    "[DERIV] %s: rev_q_len=%s eps_q_len=%s fallback_qearn=%s",
+                    t,
+                    _series_len(rev_series),
+                    _series_len(eps_series),
+                    fallback_qearn,
+                )
 
                 r_src = _pick_series(d, ["SEC_REV_Q_SERIES", "rev_q_series_pairs", "rev_q_series"])
                 e_src = _pick_series(d, ["SEC_EPS_Q_SERIES", "eps_q_series_pairs", "eps_q_series"])
@@ -986,6 +1030,7 @@ class Scorer:
                 )
 
             except Exception as e:
+                logger.warning("[DERIV_WARN] %s growth-derivatives failed: %s", t, e)
                 _log("DERIV_WARN", f"{t} {type(e).__name__}: {e}")
 
         _log("DERIV_SUMMARY", f"rev_q_len>=5: {rev_q_ge5}/{len(tickers)}  ttm_yoy_available: {ttm_yoy_avail}  wrote_growth_for: {wrote_growth}")
