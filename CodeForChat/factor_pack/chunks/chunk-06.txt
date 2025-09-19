@@ -1,5 +1,50 @@
 ```text
-.4826 * mad + 1e-9)
+cipy.stats import zscore
+L37
+L38 if TYPE_CHECKING:
+L39     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
+L40
+L41 logger = logging.getLogger(__name__)
+L42
+L43 # ---- Dividend Helpers -------------------------------------------------------
+L44 def _last_close(t, price_map=None):
+L45     if price_map and (c := price_map.get(t)) is not None: return float(c)
+L46     try:
+L47         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
+L48         return float(h.iloc[-1]) if len(h) else np.nan
+L49     except Exception:
+L50         return np.nan
+L51
+L52 def _ttm_div_sum(t, lookback_days=400):
+L53     try:
+L54         div = yf.Ticker(t).dividends
+L55         if div is None or len(div) == 0: return 0.0
+L56         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
+L57         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
+L58         return ttm if ttm > 0 else float(div.tail(4).sum())
+L59     except Exception:
+L60         return 0.0
+L61
+L62 def ttm_div_yield_portfolio(tickers, price_map=None):
+L63     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
+L64     return float(np.mean(ys)) if ys else 0.0
+L65
+L66 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
+L67 def winsorize_s(s: pd.Series, p=0.02):
+L68     if s is None or s.dropna().empty: return s
+L69     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L70
+L71 def robust_z(s: pd.Series, p=0.02):
+L72     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L73
+L74 def robust_z_keepnan(s: pd.Series) -> pd.Series:
+L75     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
+L76     if s is None:
+L77         return pd.Series(dtype=float)
+L78     v = pd.to_numeric(s, errors="coerce")
+L79     m = np.nanmedian(v)
+L80     mad = np.nanmedian(np.abs(v - m))
+L81     z = (v - m) / (1.4826 * mad + 1e-9)
 L82     if np.nanstd(z) < 1e-9:
 L83         r = v.rank(method="average", na_option="keep")
 L84         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
@@ -203,42 +248,5 @@ L281         if not api_key: return {}
 L282         url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":api_key}
 L283         try:
 L284             r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
-L285             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.get('enterpriseValue') else None}
-L286         except Exception: return {}
-L287
-L288     @staticmethod
-L289     def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
-L290         r, m = series.pct_change().dropna(), market.pct_change().dropna()
-L291         n = min(len(r), len(m), lookback)
-L292         if n<60: return np.nan
-L293         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
-L294         return np.nan if var==0 else cov/var
-L295
-L296     @staticmethod
-L297     def spx_to_alpha(spx: pd.Series, bands=(0.03,0.10), w=(0.6,0.4),
-L298                      span=5, q=(0.20,0.40), alphas=(0.05,0.08,0.10)) -> float:
-L299         """
-L300         S&P500指数のみから擬似breadthを作り、履歴分位でαを段階決定。
-L301         bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
-L302         """
-L303         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
-L304         b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
-L305         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
-L306         b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
-L307         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
-L308
-L309     @staticmethod
-L310     def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
-L311         """
-L312         同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
-L313         戻り値は降順ソート済み。
-L314         """
-L315         s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
-L316         cnt, pen = {}, {}
-L317         for t in order:
-L318             sec = sectors.get(t, "U"); cnt[sec] = cnt.get(sec,0) + 1; pen[t] = alpha*max(0, cnt[sec]-cap)
-L319         return (s - pd.Series(pen)).sort_values(ascending=False)
-L320
-L321     @staticmethod
-L322     def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, a
+L285             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('fr
 ```
