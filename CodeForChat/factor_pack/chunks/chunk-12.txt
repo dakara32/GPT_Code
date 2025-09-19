@@ -1,5 +1,120 @@
 ```text
-益が **+30% / +60% / +100%** 到達で、基本から **-3pt / -6pt / -8pt** 引き上げ
+def _recent_and_date(s, win):
+L1328                 sw = s[t].iloc[-win:]
+L1329                 if sw.any():
+L1330                     d = sw[sw].index[-1]
+L1331                     return True, d.strftime("%Y-%m-%d")
+L1332                 return False, ""
+L1333             br_recent, br_date = _recent_and_date(breakout_event, win_breakout)
+L1334             pb_recent, pb_date = _recent_and_date(pullback_event, win_pullback)
+L1335             rows.append((t, {
+L1336                 "G_BREAKOUT_recent_5d": br_recent,
+L1337                 "G_BREAKOUT_last_date": br_date,
+L1338                 "G_PULLBACK_recent_5d": pb_recent,
+L1339                 "G_PULLBACK_last_date": pb_date,
+L1340                 "G_PIVOT_price": float(pivot_price[t].iloc[-1]) if t in pivot_price.columns else float('nan'),
+L1341             }))
+L1342         flags = pd.DataFrame({k: v for k, v in rows}).T
+L1343
+L1344         # 列を作成・上書き
+L1345         cols = ["G_BREAKOUT_recent_5d","G_BREAKOUT_last_date","G_PULLBACK_recent_5d","G_PULLBACK_last_date","G_PIVOT_price"]
+L1346         for c in cols:
+L1347             if c not in feature_df.columns:
+L1348                 feature_df[c] = np.nan
+L1349         feature_df.loc[flags.index, flags.columns] = flags
+L1350
+L1351     except Exception:
+L1352         pass
+L1353     return feature_df
+L1354
+```
+
+## <.github/workflows/weekly-report.yml>
+```text
+L1 name: Weekly Stock Report
+L2
+L3 on:
+L4   push:
+L5     branches: [ main ]
+L6     paths-ignore:
+L7       - 'CodeForChat/**'
+L8   schedule:
+L9     - cron: '0 0 * * 6'  # UTC 00:00 → JST 09:00（土）
+L10   workflow_dispatch:
+L11
+L12 jobs:
+L13   build-and-report:
+L14     runs-on: ubuntu-latest
+L15     permissions:
+L16       contents: write
+L17
+L18     steps:
+L19       - name: Debug start
+L20         run: echo '🚀 DEBUGstarted'
+L21               
+L22       - name: Checkout repository
+L23         uses: actions/checkout@v3
+L24
+L25       - name: Setup Python
+L26         uses: actions/setup-python@v5
+L27         with:
+L28           python-version: '3.x'
+L29           cache: 'pip'
+L30           cache-dependency-path: requirements.txt
+L31
+L32       - name: Install dependencies
+L33         run: pip install -r requirements.txt
+L34
+L35       - name: Prepare results directory
+L36         run: mkdir -p results
+L37
+L38       - name: Run factor & scoring
+L39         env:
+L40           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+L41           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+L42           FIN_THREADS: "8"
+L43         run: python factor.py
+```
+
+## <documents/README.md>
+```text
+L1 # 運用ルール
+L2
+L3 ## 基本構成
+L4 - 20銘柄を均等配分（現金を除き1銘柄あたり5%）
+L5 - moomoo証券で運用
+L6 - **Growth枠 12銘柄 / Defense枠 8銘柄**（NORMAL 基準）
+L7
+L8 ## Barbell Growth-Defense方針
+L9 - Growth枠 **12銘柄**：高成長で乖離源となる攻めの銘柄
+L10 - Defense枠 **8銘柄**：低ボラで安定成長し配当を増やす守りの銘柄
+L11 - 「猛烈に伸びる攻め × 着実に稼ぐ盾」の組合せで乖離→半戻しプレミアムを狙う
+L12
+L13 ## レジーム判定（trend_template 合格“本数”で判定）
+L14 - 合格本数 = current+candidate 全体のうち、trend_template 条件を満たした銘柄の**本数(C)**（基準 N_G=12）
+L15 - しきい値は過去~600営業日の分布から**毎回自動採用**（分位点と運用“床”のmax）
+L16   - 緊急入り: `max(q05, 12本)`（= N_G）
+L17   - 緊急解除: `max(q20, 18本)`（= ceil(1.5×12)）
+L18   - 通常復帰: `max(q60, 36本)`（= 3×N_G）
+L19 - ヒステリシス: 前回モードに依存（EMERG→解除は23本以上、CAUTION→通常は45本以上）
+L20
+L21 ## レジーム別の現金・ドリフト
+L22  - **通常(NORMAL)** : 現金 **10%** / ドリフト閾値 **12%**
+L23  - **警戒(CAUTION)** : 現金 **12.5%** / ドリフト閾値 **14%**
+L24  - **緊急(EMERG)** : 現金 **20%** / **ドリフト売買停止**（20×5%に全戻しのみ）
+L25
+L26 ## モード別の推奨“保有銘柄数”（MMF≒現金）
+L27 *各枠=5%（20銘柄均等）。モード移行時は**Gの枠数のみ**調整し、外した枠は現金として保持。*
+L28
+L29 - **NORMAL:** G **12** / D **8** / 現金化枠 **0**  
+L30 - **CAUTION:** G **10** / D **8** / 現金化枠 **2**（= 10%）  
+L31 - **EMERG:** G **8**  / D **8** / 現金化枠 **4**（= 20%）  
+L32
+L33 > 実運用：⭐️低スコアのGから順に外す。解除時はfactor上位から補充。
+L34
+L35 ## トレーリングストップ
+L36 - **基本TS (モード別):** NORMAL **15%** / CAUTION **13%** / EMERG **10%**
+L37 - 含み益が **+30% / +60% / +100%** 到達で、基本から **-3pt / -6pt / -8pt** 引き上げ
 L38 - TS発動で減少した銘柄は翌日以降に補充（※緊急モード中は補充しない）
 L39
 L40 ## 半戻し（リバランス）手順
@@ -209,70 +324,5 @@ L150    - **配当**: `DIV`、`DIV_TTM_PS`、`DIV_VAR5`、`DIV_YOY`、`DIV_FCF_C
 L151    - **財務・成長**: `EPS`、`REV`、`ROE`、`FCF/EV`、`REV_Q_YOY`、`EPS_Q_YOY`、`REV_YOY_ACC`、`REV_YOY_VAR`、`REV_ANN_STREAK`、`RULE40`、`FCF_MGN` 等。
 L152    - **安定性/サイズ**: `DEBT2EQ`、`CURR_RATIO`、`MARKET_CAP`、`ADV60_USD`、`EPS_VAR_8Q`など。
 L153 2. 指標欠損はFinnhub API等で補完し、未取得項目を`missing_logs`に記録。
-L154 3. `winsorize_s`→`robust_z`で標準化し`df_z`へ保存。サイズ・流動性は対数変換。
-L155 4. 正規化済指標から因子スコアを合成。
-L156    - 各因子の構成と重みは以下の通り。
-L157      - **GRW**: 0.30×`REV` + 0.20×`EPS_Q_YOY` + 0.15×`REV_Q_YOY` + 0.15×`REV_YOY_ACC` + 0.10×`RULE40` + 0.10×`FCF_MGN` + 0.10×`REV_ANN_STREAK` − 0.05×`REV_YOY_VAR`。
-L158      - **MOM**: 0.40×`RS` + 0.15×`TR_str` + 0.15×`RS_SLOPE_6W` + 0.15×`RS_SLOPE_13W` + 0.10×`MA200_SLOPE_5M` + 0.10×`MA200_UP_STREAK_D`。
-L159      - **VOL**: `BETA`単体を使用。
-L160      - **QAL**: 0.60×`FCF_W` + 0.40×`ROE_W`で作成。
-L161      - **YLD**: 0.30×`DIV` + 0.70×`DIV_STREAK`。
-L162      - **D_QAL**: 0.35×`QAL` + 0.20×`FCF` + 0.15×`CURR_RATIO` − 0.15×`DEBT2EQ` − 0.15×`EPS_VAR_8Q`。
-L163      - **D_YLD**: 0.45×`DIV` + 0.25×`DIV_STREAK` + 0.20×`DIV_FCF_COVER` − 0.10×`DIV_VAR5`。
-L164      - **D_VOL_RAW**: 0.40×`DOWNSIDE_DEV` + 0.22×`RESID_VOL` + 0.18×`MDD_1Y` − 0.10×`DOWN_OUTPERF` − 0.05×`EXT_200` − 0.08×`SIZE` − 0.10×`LIQ` + 0.10×`BETA`。
-L165      - **D_TRD**: 0.40×`MA200_SLOPE_5M` − 0.30×`EXT_200` + 0.15×`NEAR_52W_HIGH` + 0.15×`TR`。
-L166     - 主な指標の略称と意味:
-L167
-L168       | 略称 | 補助関数 | 概要 |
-L169       | --- | --- | --- |
-L170       | TR | `trend` | 50/150/200日移動平均と52週レンジを組み合わせたトレンド総合値 |
-L171       | RS | `rs` | ベンチマークに対する相対強さ（12M/1Mリターン差） |
-L172       | TR_str | `tr_str` | 価格と50日移動平均の乖離 |
-L173       | RS_SLOPE_6W | `rs_line_slope` | 相対強さ線の6週回帰傾き |
-L174       | RS_SLOPE_13W | `rs_line_slope` | 相対強さ線の13週回帰傾き |
-L175       | MA200_SLOPE_5M | - | 200日移動平均の5か月騰落率 |
-L176       | MA200_UP_STREAK_D | - | 200日線が連続で上向いた日数 |
-L177       | BETA | `calc_beta` | ベンチマークに対するβ |
-L178       | DOWNSIDE_DEV | - | 下方リターンのみの年率化標準偏差 |
-L179       | RESID_VOL | - | βで調整した残差リターンの年率化標準偏差 |
-L180       | MDD_1Y | - | 過去1年の最大ドローダウン |
-L181       | DOWN_OUTPERF | - | 市場下落日に対する平均超過リターン |
-L182       | EXT_200 | - | 200日移動平均からの絶対乖離率 |
-L183       | NEAR_52W_HIGH | - | 52週高値までの下方距離（0=高値） |
-L184       | FCF_W | - | ウィンザー処理後のFCF/EV |
-L185       | ROE_W | - | ウィンザー処理後のROE |
-L186       | FCF | - | FCF/EV |
-L187       | QAL | - | FCF_WとROE_Wを組み合わせた品質スコア |
-L188       | CURR_RATIO | - | 流動比率 |
-L189       | DEBT2EQ | - | 負債資本倍率 |
-L190       | EPS_VAR_8Q | - | EPSの8四半期標準偏差 |
-L191       | DIV | - | 年率換算配当利回り |
-L192       | DIV_STREAK | `div_streak` | 連続増配年数 |
-L193       | DIV_FCF_COVER | - | 配当のFCFカバレッジ |
-L194       | DIV_VAR5 | - | 5年配当変動率 |
-L195       | DIV_TTM_PS | - | 1株当たりTTM配当 |
-L196       | DIV_YOY | - | 前年比配当成長率 |
-L197       | REV | - | 売上成長率TTM |
-L198       | EPS_Q_YOY | - | 四半期EPSの前年同期比 |
-L199       | REV_Q_YOY | - | 四半期売上の前年同期比 |
-L200       | REV_YOY_ACC | - | 売上成長率の加速分 |
-L201       | RULE40 | - | 売上成長率とFCFマージンの合計 |
-L202       | FCF_MGN | - | FCFマージン |
-L203       | REV_ANN_STREAK | - | 年次売上成長の連続年数 |
-L204       | REV_YOY_VAR | - | 年次売上成長率の変動性 |
-L205       | SIZE | - | 時価総額の対数値 |
-L206       | LIQ | - | 60日平均出来高ドルの対数値 |
-L207    - Gバケット: `GRW`、`MOM`、`VOL`を`cfg.weights.g`（0.40/0.45/-0.15）で加重し`g_score`を得る。
-L208    - Dバケット: `D_QAL`、`D_YLD`、`D_VOL_RAW`、`D_TRD`を`cfg.weights.d`（0.15/0.15/-0.45/0.25）で加重し`d_score_all`を算出。
-L209    - セクターcapによる`soft_cap_effective_scores`を適用し、G採用銘柄にはトレンドテンプレートフィルタを適用。
-L210 5. `_apply_growth_entry_flags`でブレイクアウト/押し目発火状況を付加し、`FeatureBundle`を返す。
-L211
-L212 ### Step3: Correlation Reduction & Selection (Selector)
-L213 DRRSアルゴリズムで相関を抑えた銘柄選定を行い、`SelectionBundle`を返す。`results/`に保存された前回選定（`G_selection.json` / `D_selection.json`）を`_load_prev`で読み込み、目的値が大きく悪化しない限り維持する。新しい採用集合は`_save_sel`でJSONに書き出し次回以降の入力に備える。
-L214 主なメソッド:
-L215 - `residual_corr` : 収益率行列をZスコア化し、上位主成分を除去した残差から相関行列を求め、平均相関に応じてシュリンク。
-L216 - `rrqr_like_det` : スコアを重み付けしたQR分解風の手順で初期候補をk件抽出し、スコアの高い非相関な集合を得る。
-L217 - `swap_local_det` / `swap_local_det_cross` : `sum(score) - λ*within_corr - μ*cross_corr`を目的関数として、入れ替え探索で局所的に最適化。
-L218 - `select_bucket_drrs` : プール銘柄とスコアから残差相関を計算し、上記2段階(初期選択→入れ替え)でk銘柄を決定。過去採用銘柄との比較で目的値が劣化しなければ維持する。
-L219 - `select_buckets` : Gバケットを選定後、その結果を除いた候補からDバケットを選ぶ。D選定時はGとの相関ペナルティμ
+L154 3. `winsorize_s`→`robust_z`で標準化し`df_z`へ保存。サイズ・
 ```
