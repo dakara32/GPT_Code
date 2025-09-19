@@ -27,6 +27,7 @@
 # =============================================================================
 
 import logging
+import math
 import os, sys, warnings
 import requests
 import numpy as np
@@ -86,50 +87,86 @@ def robust_z_keepnan(s: pd.Series) -> pd.Series:
 
 
 def _fetch_revenue_quarterly_via_finnhub(symbol: str):
-    """Fetch quarterly revenue via Finnhub when yfinance data is unavailable.
-
-    Returns a pandas.Series indexed by "YYYYQn" (ascending) or ``None`` when
-    an API token is missing, data is not found, or any error occurs. No
-    exception is propagated to keep behaviour identical without a token.
     """
+    Finnhub 'Financials As Reported' から四半期売上を Series で返す。
+    スキーマ揺れに対応: income statement(ic)配下の複数キー候補を順探索。
+    返却: pandas.Series(index="YYYYQn", name="Revenue") or None
+    """
+
     api_key = os.getenv("FINNHUB_API_KEY", "").strip()
     if not api_key:
         return None
+
     try:
         url = "https://finnhub.io/api/v1/stock/financials-reported"
-        params = {"symbol": symbol, "token": api_key}
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params={"symbol": symbol, "token": api_key}, timeout=10)
         r.raise_for_status()
         payload = r.json() or {}
+        data = payload.get("data", []) or []
+
+        CAND_KEYS = [
+            "revenue",
+            "totalRevenue",
+            "netSales",
+            "salesRevenueNet",
+            "operatingRevenue",
+            "totalOperatingRevenue",
+            "totalRevenueFromOperations",
+            "turnover",
+        ]
+
+        def _first_number(v):
+            try:
+                if isinstance(v, dict):
+                    v = v.get("value")
+                if v is None:
+                    return None
+                x = float(v)
+                if math.isfinite(x):
+                    return x
+            except Exception:
+                return None
+            return None
+
         rows = []
-        for item in payload.get("data", []) or []:
+        for item in data:
             rep = (item or {}).get("report", {})
             ic = rep.get("ic", {}) if isinstance(rep, dict) else {}
+
+            if isinstance(ic, list):
+                ic_dict = {}
+                for entry in ic:
+                    if isinstance(entry, dict) and "concept" in entry:
+                        ic_dict[entry["concept"]] = {"value": entry.get("value")}
+                ic = ic_dict
+
             rev_val = None
             if isinstance(ic, dict):
-                revenue_node = ic.get("revenue")
-                if isinstance(revenue_node, dict):
-                    rev_val = revenue_node.get("value")
-                if rev_val is None:
-                    total_node = ic.get("totalRevenue")
-                    if isinstance(total_node, dict):
-                        rev_val = total_node.get("value")
+                for key in CAND_KEYS:
+                    if key in ic:
+                        rev_val = _first_number(ic.get(key))
+                        if rev_val is not None:
+                            break
             if rev_val is None:
                 continue
+
             year = item.get("year")
             quarter = item.get("quarter")
             if year is None or quarter is None:
                 continue
-            try:
-                rows.append((int(year), int(quarter), float(rev_val)))
-            except Exception:
-                continue
+
+            rows.append((int(year), int(quarter), rev_val))
+
         if not rows:
             return None
+
         rows.sort(key=lambda x: (x[0], x[1]))
         idx = [f"{y}Q{q}" for y, q, _ in rows]
         vals = [v for _, _, v in rows]
-        return pd.Series(vals, index=idx, name="Revenue")
+        s = pd.Series(vals, index=idx, name="Revenue")
+        if s.dropna().empty:
+            return None
+        return s
     except Exception:
         return None
 
@@ -536,7 +573,9 @@ class Scorer:
                             rev_series = rev_series.sort_index()
                         except Exception:
                             pass
-                    if rev_series is None or rev_series.dropna().empty:
+                    if rev_series is None or getattr(
+                        rev_series, "dropna", lambda: pd.Series(dtype=float)
+                    )().empty:
                         rev_series = _fetch_revenue_quarterly_via_finnhub(t)
 
                 if rev_series is not None and rev_series.dropna().shape[0] >= 2:
