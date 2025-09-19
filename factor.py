@@ -225,8 +225,8 @@ class Input:
     def _sec_get(url: str, retries: int = 3, backoff: float = 0.5):
         for i in range(retries):
             r = requests.get(url, headers=Input._sec_headers(), timeout=20)
-            if r.status_code in (429, 503):
-                time.sleep(min(2 ** i * backoff, 4.0))
+            if r.status_code in (429, 503, 403):
+                time.sleep(min(2 ** i * backoff, 8.0))
                 continue
             r.raise_for_status()
             return r.json()
@@ -247,17 +247,28 @@ class Input:
     @staticmethod
     def _normalize_ticker(sym: str) -> list[str]:
         s = (sym or "").upper().strip()
+        # 追加: 先頭の$や全角の記号を除去
+        s = s.lstrip("$").replace("＄", "").replace("．", ".").replace("－", "-")
         cand: list[str] = []
 
         def add(x: str) -> None:
             if x and x not in cand:
                 cand.append(x)
 
+        # 1) 原文を最優先（SECは BRK.B, BF.B など . を正式採用）
         add(s)
-        add(s.replace(".", ""))
+        # 2) Yahoo系バリアント（. と - の揺れを相互に）
+        if "." in s:
+            add(s.replace(".", "-"))
+            add(s.replace(".", ""))
+        if "-" in s:
+            add(s.replace("-", "."))
+            add(s.replace("-", ""))
+        # 3) ドット・ハイフン・ピリオド無し版（最後の保険）
+        add(s.replace("-", "").replace(".", ""))
+        # 4) ADR簡易：末尾Y/Fの除去（SECマップは本体ティッカーを持つことがある）
         if len(s) >= 2 and s[-1] in {"Y", "F"}:
             add(s[:-1])
-        add(s.replace("-", "").replace(".", ""))
         return cand
 
     @staticmethod
@@ -336,7 +347,7 @@ class Input:
                 if key and key not in candidates:
                     candidates.append(key)
 
-            add(t.upper())
+            add((t or "").upper())
             for key in self._normalize_ticker(t):
                 add(key)
 
@@ -392,18 +403,46 @@ class Input:
             except Exception:
                 out[t] = {}
                 miss_facts.append(t)
-            time.sleep(0.12)
+            time.sleep(0.30)
         # 取得サマリをログ（Actionsで確認しやすいよう print）
         try:
             total = len(tickers)
             print(f"[SEC] map={n_map}/{total}  rev_q_hit={n_rev}  eps_q_hit={n_eps}")
             if miss_map:
-                print(f"[SEC] no CIK map: {len(miss_map)} (例) {miss_map[:12]}")
+                print(f"[SEC] no CIK map: {len(miss_map)} (サンプル例) {miss_map[:20]}")
             if miss_facts:
-                print(f"[SEC] CIKあり だが対象factなし: {len(miss_facts)} (例) {miss_facts[:12]}")
+                print(f"[SEC] CIKあり だが対象factなし: {len(miss_facts)} (サンプル例) {miss_facts[:20]}")
         except Exception:
             pass
         return out
+
+    def sec_dryrun_sample(self, tickers: list[str] | None = None) -> None:
+        if not _env_true("SEC_DRYRUN_SAMPLE", False):
+            return
+        sample = tickers or ["BRK.B", "BF.B", "GOOGL", "META", "UBER", "PBR.A", "TSM", "NARI", "EVBN", "SWAV"]
+        print(f"[SEC-DRYRUN] sample tickers: {sample}")
+        try:
+            t2cik = self._sec_ticker_map()
+            hits = 0
+            for sym in sample:
+                candidates: list[str] = []
+
+                def add(key: str) -> None:
+                    if key and key not in candidates:
+                        candidates.append(key)
+
+                add((sym or "").upper())
+                for alt in self._normalize_ticker(sym):
+                    add(alt)
+                if any(t2cik.get(key) for key in candidates):
+                    hits += 1
+            sec_data = self.fetch_eps_rev_from_sec(sample)
+            rev_hits = sum(1 for v in sec_data.values() if v.get("rev_q_series"))
+            eps_hits = sum(1 for v in sec_data.values() if v.get("eps_q_series"))
+            total = len(sample)
+            print(f"[SEC-DRYRUN] CIK map hit: {hits}/{total}  rev_q_series hits: {rev_hits}  eps_q_series hits: {eps_hits}")
+        except Exception as e:
+            print(f"[SEC-DRYRUN] error: {e}")
     @staticmethod
     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
         out_col = out_col or ttm_col; df = df.copy(); df["eps_imputed"] = False
@@ -550,11 +589,34 @@ class Input:
             except Exception: pass
             rev_ttm = sec_t.get("rev_ttm", np.nan)
             rev_q = sec_t.get("rev_q_recent", np.nan)
+            if (not sec_t) or pd.isna(rev_ttm):
+                try:
+                    tk = tickers_bulk.tickers[t]
+                    qfin = getattr(tk, "quarterly_financials", None)
+                    if qfin is not None and not qfin.empty:
+                        idx_lower = {str(i).lower(): i for i in qfin.index}
+                        rev_idx = None
+                        for name in ("Total Revenue", "TotalRevenue"):
+                            key = name.lower()
+                            if key in idx_lower:
+                                rev_idx = idx_lower[key]
+                                break
+                        if rev_idx is not None:
+                            rev_series = pd.to_numeric(qfin.loc[rev_idx], errors="coerce").dropna()
+                            if not rev_series.empty:
+                                rev_ttm_yf = float(rev_series.head(4).sum())
+                                if pd.isna(rev_ttm):
+                                    rev_ttm = rev_ttm_yf
+                                if pd.isna(rev_q):
+                                    rev_q = float(rev_series.iloc[0])
+                except Exception:
+                    pass
             eps_rows.append({"ticker":t,"eps_ttm":eps_ttm,"eps_q_recent":eps_q,"rev_ttm":rev_ttm,"rev_q_recent":rev_q})
         return self.impute_eps_ttm(pd.DataFrame(eps_rows).set_index("ticker"))
 
     def prepare_data(self):
         """Fetch price and fundamental data for all tickers."""
+        self.sec_dryrun_sample()
         cand_info = yf.Tickers(" ".join(self.cand)); cand_prices = {}
         for t in self.cand:
             try: cand_prices[t] = cand_info.tickers[t].fast_info.get("lastPrice", np.inf)
