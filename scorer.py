@@ -35,11 +35,19 @@ import pandas as pd
 import yfinance as yf
 from typing import Any, TYPE_CHECKING
 from scipy.stats import zscore
+from datetime import datetime as _dt
 
 if TYPE_CHECKING:
     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
 
 logger = logging.getLogger(__name__)
+
+
+def _log(stage, msg):
+    try:
+        print(f"[DBG][{_dt.utcnow().isoformat(timespec='seconds')}Z][{stage}] {msg}")
+    except Exception:
+        print(f"[DBG][{stage}] {msg}")
 
 # ---- Dividend Helpers -------------------------------------------------------
 def _last_close(t, price_map=None):
@@ -142,22 +150,35 @@ def _safe_last(series: pd.Series, default=np.nan):
     except Exception: return default
 
 
-def _ensure_series(data) -> pd.Series:
-    if isinstance(data, pd.Series):
-        return data.dropna()
-    if data is None:
+def _ensure_series(x):
+    if x is None:
         return pd.Series(dtype=float)
-    if isinstance(data, (list, tuple, np.ndarray)):
-        try:
-            return pd.Series(list(data), dtype=float).dropna()
-        except Exception:
-            return pd.Series(dtype=float)
+    if isinstance(x, pd.Series):
+        return x.dropna()
+    if isinstance(x, (list, tuple)):
+        if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
+            dt = pd.to_datetime([d for d, _ in x], errors="coerce")
+            v = pd.to_numeric([_v for _, _v in x], errors="coerce")
+            return pd.Series(v, index=dt).dropna()
+        return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
     try:
-        if hasattr(data, "values") and hasattr(data, "index"):
-            return pd.Series(data).dropna()
+        return pd.Series(x).dropna()
     except Exception:
-        pass
-    return pd.Series(dtype=float)
+        return pd.Series(dtype=float)
+
+
+def _to_quarterly(s: pd.Series) -> pd.Series:
+    if s.empty or not isinstance(s.index, pd.DatetimeIndex):
+        return s
+    return s.resample("Q").last().dropna()
+
+
+def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
+    if qs is None or qs.empty:
+        return pd.Series(dtype=float)
+    ttm = qs.rolling(4, min_periods=2).sum()
+    yoy = ttm.pct_change(4)
+    return yoy
 
 
 def _nz(x) -> float:
@@ -790,73 +811,6 @@ class Scorer:
                 pass
             df.loc[t,'ADV60_USD'] = adv60
 
-            # --- 売上/利益の加速度等 ---
-            REV_Q_YOY=EPS_Q_YOY=REV_YOY_ACC=REV_YOY_VAR=np.nan
-            REV_ANNUAL_STREAK = REV_YOY = np.nan
-            EPS_YOY = np.nan
-            try:
-                qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
-                # 型に依存しない安全な取り出し（list/np.array/pd.Series どれでもOK）
-                sec_rev_series = d.get('SEC_REV_Q_SERIES')
-                rev = _ensure_series(sec_rev_series)
-                if rev.empty and qe is not None and not qe.empty and 'Revenue' in qe.columns:
-                    rev = pd.to_numeric(qe['Revenue'], errors='coerce').dropna()
-                if not rev.empty:
-                    if len(rev)>=5: REV_Q_YOY = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5])
-                    if len(rev)>=6:
-                        yoy_now = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5]); yoy_prev = _safe_div(rev.iloc[-2]-rev.iloc[-6], rev.iloc[-6])
-                        if pd.notna(yoy_now) and pd.notna(yoy_prev): REV_YOY_ACC = yoy_now - yoy_prev
-                    yoy_list=[]
-                    for k in range(1,5):
-                        if len(rev)>=4+k:
-                            y = _safe_div(rev.iloc[-k]-rev.iloc[-(k+4)], rev.iloc[-(k+4)])
-                            if pd.notna(y): yoy_list.append(y)
-                    if len(yoy_list)>=2: REV_YOY_VAR = float(np.std(yoy_list, ddof=1))
-                    # NEW: 年次の持続性（直近から遡って前年比プラスが何年連続か、四半期4本揃う完全年のみ）
-                    try:
-                        if isinstance(rev.index, pd.DatetimeIndex):
-                            g = rev.groupby(rev.index.year)
-                            ann_sum, cnt = g.sum(), g.count()
-                            ann_sum = ann_sum[cnt >= 4]
-                            if len(ann_sum) >= 2:
-                                yoy = ann_sum.pct_change().dropna()
-                                if not yoy.empty:
-                                    REV_YOY = float(yoy.iloc[-1])
-                                streak = 0
-                                for v in yoy.iloc[::-1]:
-                                    if pd.isna(v) or v <= 0:
-                                        break
-                                    streak += 1
-                                REV_ANNUAL_STREAK = float(streak)
-                    except Exception:
-                        pass
-                sec_eps_series = d.get('SEC_EPS_Q_SERIES')
-                eps_series = _ensure_series(sec_eps_series).replace([np.inf,-np.inf], np.nan)
-                if eps_series.empty and qe is not None and not qe.empty and 'Earnings' in qe.columns and so:
-                    eps_series = (pd.to_numeric(qe['Earnings'], errors='coerce')/float(so)).replace([np.inf,-np.inf],np.nan).dropna()
-                if not eps_series.empty:
-                    if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0:
-                        EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
-                    try:
-                        if isinstance(eps_series.index, pd.DatetimeIndex):
-                            g_eps = eps_series.groupby(eps_series.index.year)
-                            ann_eps, cnt_eps = g_eps.sum(), g_eps.count()
-                            ann_eps = ann_eps[cnt_eps >= 4]
-                            if len(ann_eps) >= 2:
-                                eps_yoy = ann_eps.pct_change().dropna()
-                                if not eps_yoy.empty:
-                                    EPS_YOY = float(eps_yoy.iloc[-1])
-                    except Exception:
-                        pass
-            except Exception as e:
-                # 型バグを見逃さないため、ここだけは原因を一行で可視化
-                print(f"[WARN][{t}] growth-derivatives skipped: {type(e).__name__}: {e}")
-            df.loc[t,'REV_Q_YOY'], df.loc[t,'EPS_Q_YOY'] = REV_Q_YOY, EPS_Q_YOY
-            df.loc[t,'REV_YOY_ACC'], df.loc[t,'REV_YOY_VAR'] = REV_YOY_ACC, REV_YOY_VAR
-            df.loc[t,'REV_YOY'] = REV_YOY
-            df.loc[t,'REV_ANN_STREAK'] = REV_ANNUAL_STREAK
-            df.loc[t,'EPS_YOY'] = EPS_YOY
-
             # --- Rule of 40 や周辺 ---
             total_rev_ttm = d.get('totalRevenue',np.nan)
             FCF_MGN = _safe_div(fcf_val, total_rev_ttm)
@@ -933,6 +887,123 @@ class Scorer:
                         if status!='none_confident': missing_logs.append({'Ticker':t,'Column':col,'Status':status})
                     else:
                         missing_logs.append({'Ticker':t,'Column':col})
+
+        def _pick_series(entry: dict, keys: list[str]):
+            for k in keys:
+                val = entry.get(k) if isinstance(entry, dict) else None
+                if val is None:
+                    continue
+                try:
+                    if hasattr(val, "empty") and getattr(val, "empty"):
+                        continue
+                except Exception:
+                    pass
+                if isinstance(val, (list, tuple)) and len(val) == 0:
+                    continue
+                return val
+            return None
+
+        rev_q_ge5 = 0
+        ttm_yoy_avail = 0
+        wrote_growth = 0
+
+        for t in tickers:
+            try:
+                d = info.get(t, {}) or {}
+
+                r_src = _pick_series(d, ["SEC_REV_Q_SERIES", "rev_q_series_pairs", "rev_q_series"])
+                e_src = _pick_series(d, ["SEC_EPS_Q_SERIES", "eps_q_series_pairs", "eps_q_series"])
+                r_raw = _ensure_series(r_src)
+                e_raw = _ensure_series(e_src)
+                _log("DERIV_SRC", f"{t} rev_raw_len={r_raw.size} eps_raw_len={e_raw.size}")
+
+                r_q = _to_quarterly(r_raw)
+                e_q = _to_quarterly(e_raw)
+                _log("DERIV_Q", f"{t} rev_q_len={r_q.size} eps_q_len={e_q.size}")
+                if r_q.size >= 5:
+                    rev_q_ge5 += 1
+
+                r_yoy_ttm = _ttm_yoy_from_quarterly(r_q)
+                e_yoy_ttm = _ttm_yoy_from_quarterly(e_q)
+                has_ttm = int(not r_yoy_ttm.dropna().empty)
+                ttm_yoy_avail += has_ttm
+                _log("DERIV_TTM", f"{t} rev_ttm_yoy_len={r_yoy_ttm.dropna().size} eps_ttm_yoy_len={e_yoy_ttm.dropna().size}")
+
+                def _q_yoy(qs):
+                    return np.nan if qs is None or len(qs) < 5 else float(qs.iloc[-1] / qs.iloc[-5] - 1.0)
+
+                rev_q_yoy = _q_yoy(r_q)
+                eps_q_yoy = _q_yoy(e_q)
+
+                def _annual_from(qs: pd.Series, yoy_ttm: pd.Series):
+                    if isinstance(qs.index, pd.DatetimeIndex) and len(qs) >= 8:
+                        ann = qs.groupby(qs.index.year).last().pct_change()
+                        ann_dn = ann.dropna()
+                        if not ann_dn.empty:
+                            y = float(ann_dn.iloc[-1])
+                            acc = float(ann_dn.tail(3).mean()) if ann_dn.size >= 3 else np.nan
+                            var = float(ann_dn.tail(4).var()) if ann_dn.size >= 4 else np.nan
+                            return y, acc, var
+                    yoy_dn = yoy_ttm.dropna()
+                    if yoy_dn.empty:
+                        return np.nan, np.nan, np.nan
+                    return (
+                        float(yoy_dn.iloc[-1]),
+                        float(yoy_dn.tail(3).mean() if yoy_dn.size >= 3 else np.nan),
+                        float(yoy_dn.tail(4).var() if yoy_dn.size >= 4 else np.nan),
+                    )
+
+                rev_yoy, rev_acc, rev_var = _annual_from(r_q, r_yoy_ttm)
+                eps_yoy, _, _ = _annual_from(e_q, e_yoy_ttm)
+
+                def _pos_streak(s: pd.Series):
+                    s = s.dropna()
+                    if s.empty:
+                        return np.nan
+                    b = (s > 0).astype(int).to_numpy()[::-1]
+                    k = 0
+                    for v in b:
+                        if v == 1:
+                            k += 1
+                        else:
+                            break
+                    return float(k)
+
+                rev_ann_streak = _pos_streak(r_yoy_ttm)
+
+                df.loc[t, "REV_Q_YOY"] = rev_q_yoy
+                df.loc[t, "EPS_Q_YOY"] = eps_q_yoy
+                df.loc[t, "REV_YOY"] = rev_yoy
+                df.loc[t, "EPS_YOY"] = eps_yoy
+                df.loc[t, "REV_YOY_ACC"] = rev_acc
+                df.loc[t, "REV_YOY_VAR"] = rev_var
+                df.loc[t, "REV_ANN_STREAK"] = rev_ann_streak
+
+                wrote_growth += 1
+                _log(
+                    "DERIV_WRITE",
+                    f"{t} wrote: Q_YOY(rev={rev_q_yoy}, eps={eps_q_yoy}) ANN(rev_yoy={rev_yoy}, acc={rev_acc}, var={rev_var}) streak={rev_ann_streak}",
+                )
+
+            except Exception as e:
+                _log("DERIV_WARN", f"{t} {type(e).__name__}: {e}")
+
+        _log("DERIV_SUMMARY", f"rev_q_len>=5: {rev_q_ge5}/{len(tickers)}  ttm_yoy_available: {ttm_yoy_avail}  wrote_growth_for: {wrote_growth}")
+
+        try:
+            cols = [
+                "REV_Q_YOY",
+                "EPS_Q_YOY",
+                "REV_YOY",
+                "EPS_YOY",
+                "REV_YOY_ACC",
+                "REV_YOY_VAR",
+                "REV_ANN_STREAK",
+            ]
+            cnt = {c: int(df[c].count()) for c in cols if c in df.columns}
+            _log("DERIV_NONNAN_COUNTS", str(cnt))
+        except Exception as e:
+            _log("DERIV_NONNAN_COUNTS", f"error: {e}")
 
         def _trend_template_pass(row, rs_alpha_thresh=0.10):
             c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)

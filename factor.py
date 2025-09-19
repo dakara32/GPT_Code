@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.stats import zscore  # used via scorer
-from scorer import Scorer, ttm_div_yield_portfolio
+from scorer import Scorer, ttm_div_yield_portfolio, _log
 import config
 
 # その他
@@ -686,6 +686,43 @@ class Input:
                         info[t]["SEC_EPS_Q_SERIES"] = s
                     else:
                         info[t]["SEC_EPS_Q_SERIES"] = sec_map[t].get("eps_q_series") or []
+            def _brief_len(s):
+                try:
+                    return int(getattr(s.dropna(), "size", 0))
+                except Exception:
+                    return 0
+
+            rev_lens = []
+            eps_lens = []
+            samples = []
+
+            for t in tickers:
+                r = info.get(t, {}).get("SEC_REV_Q_SERIES", None)
+                e = info.get(t, {}).get("SEC_EPS_Q_SERIES", None)
+                lr = _brief_len(r)
+                le = _brief_len(e)
+                rev_lens.append(lr)
+                eps_lens.append(le)
+                if len(samples) < 8:
+                    try:
+                        rd = getattr(r, "index", [])[-1] if lr > 0 else None
+                        rv = float(r.iloc[-1]) if lr > 0 else None
+                        ed = getattr(e, "index", [])[-1] if le > 0 else None
+                        ev = float(e.iloc[-1]) if le > 0 else None
+                        samples.append((t, lr, str(rd) if rd is not None else "-", rv, le, str(ed) if ed is not None else "-", ev))
+                    except Exception:
+                        samples.append((t, lr, "-", None, le, "-", None))
+
+            if rev_lens:
+                rev_lens_sorted = sorted(rev_lens)
+                eps_lens_sorted = sorted(eps_lens)
+                _log(
+                    "SEC_SERIES",
+                    f"rev_len min/med/max={rev_lens_sorted[0]}/{rev_lens_sorted[len(rev_lens)//2]}/{rev_lens_sorted[-1]} "
+                    f"eps_len min/med/max={eps_lens_sorted[0]}/{eps_lens_sorted[len(eps_lens)//2]}/{eps_lens_sorted[-1]}",
+                )
+            for (t, lr, rd, rv, le, ed, ev) in samples:
+                _log("SEC_SERIES_SMP", f"{t}  rev_len={lr} last=({rd},{rv})  eps_len={le} last=({ed},{ev})")
         except Exception:
             sec_map = None
         eps_df = self._build_eps_df(tickers, tickers_bulk, info, sec_map=sec_map)
