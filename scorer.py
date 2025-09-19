@@ -86,14 +86,15 @@ def robust_z_keepnan(s: pd.Series) -> pd.Series:
     return pd.Series(z, index=v.index, dtype=float)
 
 
-def _fetch_revenue_quarterly_via_finnhub(symbol: str):
+def _fetch_revenue_quarterly_via_finnhub(symbol: str, api_key: str | None = None):
     """
     Finnhub 'Financials As Reported' から四半期売上を Series で返す。
     スキーマ揺れに対応: income statement(ic)配下の複数キー候補を順探索。
     返却: pandas.Series(index="YYYYQn", name="Revenue") or None
     """
 
-    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+    if api_key is None:
+        api_key = os.getenv("FINNHUB_API_KEY", "").strip()
     if not api_key:
         return None
 
@@ -169,6 +170,38 @@ def _fetch_revenue_quarterly_via_finnhub(symbol: str):
         return s
     except Exception:
         return None
+
+
+def _alt_symbols_for_finnhub(symbol: str) -> list[str]:
+    """Return alternative ticker formats for Finnhub (e.g. BRK-B <-> BRK.B)."""
+    alts: set[str] = set()
+    if "-" in symbol:
+        alts.add(symbol.replace("-", "."))
+    if "." in symbol:
+        alts.add(symbol.replace(".", "-"))
+    alts.discard(symbol)
+    return list(alts)
+
+
+def _fetch_rev_quarterly_with_retry(symbol: str, api_key: str, debug: bool = False):
+    """Fetch quarterly revenue with a single retry for hyphen/dot symbol variants."""
+
+    symbols = [symbol] + _alt_symbols_for_finnhub(symbol)
+    for current in symbols:
+        series = _fetch_revenue_quarterly_via_finnhub(current, api_key=api_key)
+        count = int(series.dropna().shape[0]) if isinstance(series, pd.Series) else 0
+        if debug:
+            if current == symbol:
+                base = f"[REV Fallback] {symbol}"
+            else:
+                base = f"[REV Fallback] {symbol} -> {current}"
+            if count > 0:
+                logger.info("%s: hit=%d", base, count)
+            else:
+                logger.info("%s: miss", base)
+        if count > 0 and isinstance(series, pd.Series):
+            return series
+    return None
 
 
 def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
@@ -453,6 +486,14 @@ class Scorer:
         px, spx, tickers = ib.px, ib.spx, ib.tickers
         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
 
+        debug_mode = bool(getattr(cfg, "debug_mode", False))
+        raw_key = os.environ.get("FINNHUB_API_KEY")
+        finnhub_api_key = raw_key.strip() if isinstance(raw_key, str) else ""
+        if debug_mode and not getattr(self, "_rev_fallback_key_logged", False):
+            if not finnhub_api_key:
+                logger.info("[REV Fallback] FINNHUB_API_KEY missing -> fallback不実行")
+            self._rev_fallback_key_logged = True
+
         df, missing_logs = pd.DataFrame(index=tickers), []
         for t in tickers:
             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
@@ -573,10 +614,13 @@ class Scorer:
                             rev_series = rev_series.sort_index()
                         except Exception:
                             pass
-                    if rev_series is None or getattr(
-                        rev_series, "dropna", lambda: pd.Series(dtype=float)
-                    )().empty:
-                        rev_series = _fetch_revenue_quarterly_via_finnhub(t)
+                    if (
+                        rev_series is None
+                        or getattr(rev_series, "dropna", lambda: pd.Series(dtype=float))().empty
+                    ) and finnhub_api_key:
+                        rev_series = _fetch_rev_quarterly_with_retry(
+                            t, finnhub_api_key, debug=debug_mode
+                        )
 
                 if rev_series is not None and rev_series.dropna().shape[0] >= 2:
                     r = rev_series.dropna().astype(float)
@@ -699,6 +743,22 @@ class Scorer:
                     else:
                         missing_logs.append({'Ticker':t,'Column':col})
 
+        if debug_mode:
+            rev_cols = [c for c in df.columns if c.startswith("REV_")]
+            if rev_cols:
+                total = len(df.index)
+                if total:
+                    parts = []
+                    for col in sorted(rev_cols):
+                        series = pd.to_numeric(df[col], errors="coerce")
+                        valid = int(series.notna().sum())
+                        nan_cnt = total - valid
+                        nan_ratio = nan_cnt / total if total else float("nan")
+                        parts.append(
+                            f"{col}:ok={valid} nan={nan_cnt} nan%={nan_ratio:.2f}"
+                        )
+                    logger.info("[REV Summary] n=%d %s", total, " ".join(parts))
+
         def _trend_template_pass(row, rs_alpha_thresh=0.10):
             c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
             c2 = (row.get('MA150_OVER_200', np.nan) > 0)
@@ -775,6 +835,18 @@ class Scorer:
         df_z['TREND_SLOPE_REV_YR'] = slope_rev_yr_combo.clip(-3.0, 3.0)
         df_z['TREND_SLOPE_EPS_YR_RAW'] = slope_eps_yr
         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
+
+        if debug_mode:
+            slope_cols = [c for c in df_z.columns if c.startswith("TREND_SLOPE_")]
+            if slope_cols:
+                total = len(df_z.index)
+                parts = []
+                for col in sorted(slope_cols):
+                    series = pd.to_numeric(df_z[col], errors="coerce")
+                    nan_cnt = int(series.isna().sum())
+                    zero_cnt = int((series == 0).sum())
+                    parts.append(f"{col}:0={zero_cnt} nan={nan_cnt}")
+                logger.info("[SLOPE Summary] n=%d %s", total, " ".join(parts))
 
         # ===== 新GRW合成式（SEPA寄りシフト） =====
         _nz = lambda name: df_z.get(name, pd.Series(0.0, index=df_z.index)).fillna(0.0)
