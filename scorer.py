@@ -476,21 +476,27 @@ class Scorer:
             EPS_YOY = np.nan
             try:
                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
-                if qe is not None and not qe.empty:
-                    if 'Revenue' in qe.columns:
-                        rev = qe['Revenue'].dropna().astype(float)
-                        if len(rev)>=5: REV_Q_YOY = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5])
-                        if len(rev)>=6:
-                            yoy_now = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5]); yoy_prev = _safe_div(rev.iloc[-2]-rev.iloc[-6], rev.iloc[-6])
-                            if pd.notna(yoy_now) and pd.notna(yoy_prev): REV_YOY_ACC = yoy_now - yoy_prev
-                        yoy_list=[]
-                        for k in range(1,5):
-                            if len(rev)>=4+k:
-                                y = _safe_div(rev.iloc[-k]-rev.iloc[-(k+4)], rev.iloc[-(k+4)])
-                                if pd.notna(y): yoy_list.append(y)
-                        if len(yoy_list)>=2: REV_YOY_VAR = float(np.std(yoy_list, ddof=1))
-                        # NEW: 年次の持続性（直近から遡って前年比プラスが何年連続か、四半期4本揃う完全年のみ）
-                        try:
+                sec_rev_series = (d.get('SEC_REV_Q_SERIES') or [])
+                if sec_rev_series:
+                    rev = pd.Series(sec_rev_series, dtype=float).dropna()
+                elif qe is not None and not qe.empty and 'Revenue' in qe.columns:
+                    rev = qe['Revenue'].dropna().astype(float)
+                else:
+                    rev = pd.Series([], dtype=float)
+                if not rev.empty:
+                    if len(rev)>=5: REV_Q_YOY = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5])
+                    if len(rev)>=6:
+                        yoy_now = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5]); yoy_prev = _safe_div(rev.iloc[-2]-rev.iloc[-6], rev.iloc[-6])
+                        if pd.notna(yoy_now) and pd.notna(yoy_prev): REV_YOY_ACC = yoy_now - yoy_prev
+                    yoy_list=[]
+                    for k in range(1,5):
+                        if len(rev)>=4+k:
+                            y = _safe_div(rev.iloc[-k]-rev.iloc[-(k+4)], rev.iloc[-(k+4)])
+                            if pd.notna(y): yoy_list.append(y)
+                    if len(yoy_list)>=2: REV_YOY_VAR = float(np.std(yoy_list, ddof=1))
+                    # NEW: 年次の持続性（直近から遡って前年比プラスが何年連続か、四半期4本揃う完全年のみ）
+                    try:
+                        if isinstance(rev.index, pd.DatetimeIndex):
                             g = rev.groupby(rev.index.year)
                             ann_sum, cnt = g.sum(), g.count()
                             ann_sum = ann_sum[cnt >= 4]
@@ -504,13 +510,20 @@ class Scorer:
                                         break
                                     streak += 1
                                 REV_ANNUAL_STREAK = float(streak)
-                        except Exception:
-                            pass
-                    if 'Earnings' in qe.columns and so:
-                        eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
-                        if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0:
-                            EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
-                        try:
+                    except Exception:
+                        pass
+                sec_eps_series = (d.get('SEC_EPS_Q_SERIES') or [])
+                if sec_eps_series:
+                    eps_series = pd.Series(sec_eps_series, dtype=float).replace([np.inf,-np.inf],np.nan)
+                elif qe is not None and not qe.empty and 'Earnings' in qe.columns and so:
+                    eps_series = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
+                else:
+                    eps_series = pd.Series([], dtype=float)
+                if not eps_series.empty:
+                    if len(eps_series)>=5 and pd.notna(eps_series.iloc[-5]) and eps_series.iloc[-5]!=0:
+                        EPS_Q_YOY = _safe_div(eps_series.iloc[-1]-eps_series.iloc[-5], eps_series.iloc[-5])
+                    try:
+                        if isinstance(eps_series.index, pd.DatetimeIndex):
                             g_eps = eps_series.groupby(eps_series.index.year)
                             ann_eps, cnt_eps = g_eps.sum(), g_eps.count()
                             ann_eps = ann_eps[cnt_eps >= 4]
@@ -518,8 +531,8 @@ class Scorer:
                                 eps_yoy = ann_eps.pct_change().dropna()
                                 if not eps_yoy.empty:
                                     EPS_YOY = float(eps_yoy.iloc[-1])
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
             except Exception: pass
             df.loc[t,'REV_Q_YOY'], df.loc[t,'EPS_Q_YOY'] = REV_Q_YOY, EPS_Q_YOY
             df.loc[t,'REV_YOY_ACC'], df.loc[t,'REV_YOY_VAR'] = REV_YOY_ACC, REV_YOY_VAR
