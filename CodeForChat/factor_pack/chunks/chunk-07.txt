@@ -1,5 +1,62 @@
 ```text
-85         need_eps, need_fcf = {"EPS_TTM","EPS_Q_LastQ"},{"FCF_TTM"}
+L128
+L129         logger.info("===== DF_Z DUMP START =====")
+L130         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
+L131         logger.info("===== DF_Z DUMP END =====")
+L132     except Exception as exc:
+L133         logger.warning("df_z dump failed: %s", exc)
+L134
+L135 def _safe_div(a, b):
+L136     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
+L137     except Exception: return np.nan
+L138
+L139 def _safe_last(series: pd.Series, default=np.nan):
+L140     try: return float(series.iloc[-1])
+L141     except Exception: return default
+L142
+L143 D_WEIGHTS_EFF = None  # 出力表示互換のため
+L144
+L145
+L146 def _scalar(v):
+L147     """単一セル代入用に値をスカラーへ正規化する。
+L148
+L149     - pandas Series -> .iloc[-1]（最後を採用）
+L150     - list/tuple/ndarray -> 最後の要素
+L151     - それ以外          -> そのまま
+L152     取得失敗時は np.nan を返す。
+L153     """
+L154     import numpy as _np
+L155     import pandas as _pd
+L156     try:
+L157         if isinstance(v, _pd.Series):
+L158             return v.iloc[-1] if len(v) else _np.nan
+L159         if isinstance(v, (list, tuple, _np.ndarray)):
+L160             return v[-1] if len(v) else _np.nan
+L161         return v
+L162     except Exception:
+L163         return _np.nan
+L164
+L165
+L166 # ---- Scorer 本体 -------------------------------------------------------------
+L167 class Scorer:
+L168     """
+L169     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
+L170     - cfg は必須（factor.PipelineConfig を渡す）。
+L171     - 旧カラム名を自動リネームして新スキーマに吸収します。
+L172     """
+L173
+L174     # === 先頭で旧→新カラム名マップ（移行用） ===
+L175     EPS_RENAME = {"eps_ttm":"EPS_TTM", "eps_q_recent":"EPS_Q_LastQ"}
+L176     FCF_RENAME = {"fcf_ttm":"FCF_TTM"}
+L177
+L178     # === スキーマ簡易チェック（最低限） ===
+L179     @staticmethod
+L180     def _validate_ib_for_scorer(ib: Any):
+L181         miss = [a for a in ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"] if not hasattr(ib,a) or getattr(ib,a) is None]
+L182         if miss: raise ValueError(f"InputBundle is missing required attributes for Scorer: {miss}")
+L183         if any(c in ib.eps_df.columns for c in Scorer.EPS_RENAME): ib.eps_df.rename(columns=Scorer.EPS_RENAME, inplace=True)
+L184         if any(c in ib.fcf_df.columns for c in Scorer.FCF_RENAME): ib.fcf_df.rename(columns=Scorer.FCF_RENAME, inplace=True)
+L185         need_eps, need_fcf = {"EPS_TTM","EPS_Q_LastQ"},{"FCF_TTM"}
 L186         if not need_eps.issubset(ib.eps_df.columns): raise ValueError(f"eps_df must contain columns {need_eps} (accepts old names via auto-rename). Got: {list(ib.eps_df.columns)}")
 L187         if not need_fcf.issubset(ib.fcf_df.columns): raise ValueError(f"fcf_df must contain columns {need_fcf} (accepts old names via auto-rename). Got: {list(ib.fcf_df.columns)}")
 L188
@@ -186,45 +243,5 @@ L368         lo252 = px.rolling(252).min()
 L369         hi252 = px.rolling(252).max()
 L370         tt &= (px.divide(lo252).sub(1.0) >= 0.30)   # P_OVER_LOW52 >= 0.30
 L371         tt &= (px >= (0.75 * hi252))                # NEAR_52W_HIGH >= -0.25
-L372
-L373         r12  = px.divide(px.shift(252)).sub(1.0)
-L374         br12 = spx.divide(spx.shift(252)).sub(1.0)
-L375         r1   = px.divide(px.shift(22)).sub(1.0)
-L376         br1  = spx.divide(spx.shift(22)).sub(1.0)
-L377         rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
-L378         tt &= (rs >= 0.10)
-L379
-L380         return tt.fillna(False).sum(axis=1).astype(int)
-L381
-L382     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
-L383     def aggregate_scores(self, ib: Any, cfg):
-L384         if cfg is None:
-L385             raise ValueError("cfg is required; pass factor.PipelineConfig")
-L386         self._validate_ib_for_scorer(ib)
-L387
-L388         px, spx, tickers = ib.px, ib.spx, ib.tickers
-L389         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
-L390
-L391         df, missing_logs = pd.DataFrame(index=tickers), []
-L392         for t in tickers:
-L393             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
-L394             # --- 基本特徴 ---
-L395             df.loc[t,'TR']   = self.trend(s)
-L396             df.loc[t,'EPS']  = _scalar(eps_df.loc[t,'EPS_TTM']) if t in eps_df.index else np.nan
-L397             df.loc[t,'EPS_Q'] = _scalar(eps_df.loc[t,'EPS_Q_LastQ']) if t in eps_df.index else np.nan
-L398             df.loc[t,'REV_TTM'] = _scalar(eps_df.loc[t,'REV_TTM']) if t in eps_df.index else np.nan
-L399             df.loc[t,'REV_Q']   = _scalar(eps_df.loc[t,'REV_Q_LastQ']) if t in eps_df.index else np.nan
-L400             df.loc[t,'REV']  = d.get('revenueGrowth',np.nan)
-L401             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
-L402             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
-L403
-L404             # --- 配当（欠損補完含む） ---
-L405             div = d.get('dividendYield') if d.get('dividendYield') is not None else d.get('trailingAnnualDividendYield')
-L406             if div is None or pd.isna(div):
-L407                 try:
-L408                     divs = yf.Ticker(t).dividends
-L409                     if divs is not None and not divs.empty:
-L410                         last_close = s.iloc[-1]; div_1y = divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum()
-L411                         if last_close and last_close>0: div = float(div_1y/last_close)
-L412  
+
 ```
