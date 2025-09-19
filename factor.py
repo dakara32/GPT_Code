@@ -248,17 +248,52 @@ class Input:
         return Input._sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
 
     @staticmethod
-    def _pick_usd_facts(fact_obj: dict, tag: str):
-        if not fact_obj:
+    def _units_for_tags(facts: dict, namespaces: list[str], tags: list[str]) -> list[dict]:
+        """facts から namespace/tag を横断して units 配列を収集（存在順に連結）。"""
+        out: list[dict] = []
+        facts = facts or {}
+        for ns in namespaces:
+            try:
+                node = facts.get("facts", {}).get(ns, {})
+            except Exception:
+                node = {}
+            for tg in tags:
+                try:
+                    units = node[tg]["units"]
+                except Exception:
+                    continue
+                picks: list[dict] = []
+                if "USD/shares" in units:
+                    picks.extend(list(units["USD/shares"]))
+                if "USD" in units:
+                    picks.extend(list(units["USD"]))
+                if not picks:
+                    for arr in units.values():
+                        picks.extend(list(arr))
+                out.extend(picks)
+        return out
+
+    @staticmethod
+    def _only_quarterly(arr: list[dict]) -> list[dict]:
+        """companyfactsの混在配列から『四半期』だけを抽出。
+
+        - frame に "Q" を含む（例: CY2024Q2I）
+        - fp が Q1/Q2/Q3/Q4
+        - form が 10-Q/10-Q/A/6-K
+        """
+        if not arr:
             return []
-        try:
-            units = fact_obj["facts"]["us-gaap"][tag]["units"]
-            for k in ("USD", "USD/shares"):
-                if k in units:
-                    return units[k]
-        except Exception:
-            return []
-        return []
+        q_forms = {"10-Q", "10-Q/A", "6-K"}
+
+        def is_q(x: dict) -> bool:
+            frame = (x.get("frame") or "").upper()
+            fp = (x.get("fp") or "").upper()
+            form = (x.get("form") or "").upper()
+            return ("Q" in frame) or (fp in {"Q1", "Q2", "Q3", "Q4"}) or (form in q_forms)
+
+        out = [x for x in arr if is_q(x)]
+        out.sort(key=lambda x: (x.get("end") or ""), reverse=True)
+        return out
 
     @staticmethod
     def _series_from_facts(arr, key="val", normalize=float):
@@ -281,14 +316,27 @@ class Input:
                 continue
             try:
                 j = self._sec_companyfacts(cik)
-                rev_arr = self._pick_usd_facts(j, "Revenues") or self._pick_usd_facts(j, "SalesRevenueNet")
-                eps_arr = self._pick_usd_facts(j, "EarningsPerShareDiluted") or self._pick_usd_facts(j, "EarningsPerShareBasic")
-                if rev_arr:
-                    rev_arr = sorted(rev_arr, key=lambda x: x.get("end", ""), reverse=True)
-                if eps_arr:
-                    eps_arr = sorted(eps_arr, key=lambda x: x.get("end", ""), reverse=True)
-                rev_vals = self._series_from_facts(rev_arr)
-                eps_vals = self._series_from_facts(eps_arr)
+                facts = j or {}
+                rev_tags = [
+                    "Revenues",
+                    "RevenueFromContractWithCustomerExcludingAssessedTax",
+                    "SalesRevenueNet",
+                    "SalesRevenueGoodsNet",
+                    "SalesRevenueServicesNet",
+                    "Revenue",
+                ]
+                eps_tags = [
+                    "EarningsPerShareDiluted",
+                    "EarningsPerShareBasicAndDiluted",
+                    "EarningsPerShare",
+                    "EarningsPerShareBasic",
+                ]
+                rev_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], rev_tags)
+                eps_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], eps_tags)
+                rev_q_items = self._only_quarterly(rev_arr)
+                eps_q_items = self._only_quarterly(eps_arr)
+                rev_vals = self._series_from_facts(rev_q_items)
+                eps_vals = self._series_from_facts(eps_q_items)
                 rev_q = float(rev_vals[0]) if rev_vals else float("nan")
                 eps_q = float(eps_vals[0]) if eps_vals else float("nan")
                 rev_ttm = float(sum([v for v in rev_vals[:4] if v == v])) if rev_vals else float("nan")
