@@ -1,5 +1,47 @@
 ```text
-9
+','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']
+L668         for col in grw_cols:
+L669             if col in df.columns:
+L670                 raw = pd.to_numeric(df[col], errors="coerce")
+L671                 df_z[col] = robust_z_keepnan(raw)
+L672                 df_z[f'{col}_RAW'] = raw
+L673         for k in ("TREND_SLOPE_EPS", "TREND_SLOPE_REV"):
+L674             if k in df.columns and k not in df_z.columns:
+L675                 raw = pd.to_numeric(df[k], errors="coerce")
+L676                 df_z[k] = robust_z_keepnan(raw)
+L677                 df_z[f'{k}_RAW'] = raw
+L678         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
+L679
+L680         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
+L681         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
+L682         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
+L683
+L684         # EPSが赤字でもFCFが黒字なら実質黒字とみなす
+L685         eps_pos_mask = (df['EPS'] > 0) | (df['FCF_MGN'] > 0)
+L686         df_z['EPS_POS'] = df_z['EPS'].where(eps_pos_mask, 0.0)
+L687
+L688         # ===== トレンドスロープ算出 =====
+L689         def zpos(x):
+L690             arr = robust_z(x)
+L691             idx = getattr(x, 'index', df_z.index)
+L692             return pd.Series(arr, index=idx).fillna(0.0)
+L693
+L694         def relu(x):
+L695             ser = x if isinstance(x, pd.Series) else pd.Series(x, index=df_z.index)
+L696             return ser.clip(lower=0).fillna(0.0)
+L697
+L698         # 売上トレンドスロープ（四半期）
+L699         slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
+L700         noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
+L701         slope_rev_combo = slope_rev - 0.25*noise_rev
+L702         df_z['TREND_SLOPE_REV_RAW'] = slope_rev_combo
+L703         df_z['TREND_SLOPE_REV'] = slope_rev_combo.clip(-3.0, 3.0)
+L704
+L705         # EPSトレンドスロープ（四半期）
+L706         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
+L707         df_z['TREND_SLOPE_EPS_RAW'] = slope_eps
+L708         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
+L709
 L710         # 年次トレンド（サブ）
 L711         slope_rev_yr = zpos(df_z['REV_YOY'])
 L712         slope_eps_yr = zpos(df_z.get('EPS_YOY', pd.Series(0.0, index=df.index)))
@@ -195,51 +237,5 @@ L901             try:
 L902                 g_universe = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
 L903             except Exception:
 L904                 g_universe = list(feature_df.index)
-L905         if not g_universe:
-L906             return feature_df
-L907
-L908         # 指標
-L909         px = px.ffill(limit=2)
-L910         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
-L911         ma50  = px[g_universe].rolling(50).mean()
-L912         ma150 = px[g_universe].rolling(150).mean()
-L913         ma200 = px[g_universe].rolling(200).mean()
-L914         atr20 = (hi[g_universe] - lo[g_universe]).rolling(20).mean()
-L915         vol20 = vol[g_universe].rolling(20).mean()
-L916         vol50 = vol[g_universe].rolling(50).mean()
-L917
-L918         # トレンドテンプレート合格
-L919         trend_template_ok = (px[g_universe] > ma50) & (px[g_universe] > ma150) & (px[g_universe] > ma200) \
-L920                             & (ma150 > ma200) & (ma200.diff() > 0)
-L921
-L922         # 汎用ピボット：直近65営業日の高値（当日除外）
-L923         pivot_price = hi[g_universe].rolling(65).max().shift(1)
-L924
-L925         # 相対力：年内高値更新
-L926         bench_aligned = bench.reindex(px.index).ffill()
-L927         rs = px[g_universe].div(bench_aligned, axis=0)
-L928         rs_high = rs.rolling(252).max().shift(1)
-L929
-L930         # ブレイクアウト「発生日」：条件立ち上がり
-L931         breakout_today = trend_template_ok & (px[g_universe] > pivot_price) \
-L932                          & (vol[g_universe] >= 1.5 * vol50) & (rs > rs_high)
-L933         breakout_event = breakout_today & ~breakout_today.shift(1).fillna(False)
-L934
-L935         # 押し目反発「発生日」：EMA21帯×出来高ドライアップ×前日高値越え×終値EMA21上
-L936         near_ema21_band = px[g_universe].between(ema21 - atr20, ema21 + atr20)
-L937         volume_dryup = (vol20 / vol50) <= 1.0
-L938         pullback_bounce_confirmed = (px[g_universe] > hi[g_universe].shift(1)) & (px[g_universe] > ema21)
-L939         pullback_today = trend_template_ok & near_ema21_band & volume_dryup & pullback_bounce_confirmed
-L940         pullback_event = pullback_today & ~pullback_today.shift(1).fillna(False)
-L941
-L942         # 直近N営業日内の発火 / 最終発生日
-L943         rows = []
-L944         for t in g_universe:
-L945             def _recent_and_date(s, win):
-L946                 sw = s[t].iloc[-win:]
-L947                 if sw.any():
-L948                     d = sw[sw].index[-1]
-L949                     return True, d.strftime("%Y-%m-%d")
-L950                 return False, ""
-L951             br_recent, br_date = _recent_and_da
+L905       
 ```

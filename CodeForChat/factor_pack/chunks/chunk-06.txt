@@ -1,5 +1,62 @@
 ```text
-cipy.stats import zscore
+ init_G=top_G, init_D=top_D)
+L1126
+L1127     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
+L1128     try:
+L1129         _low_df = (pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
+L1130               .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
+L1131               .sort_values("G_plus_D")
+L1132               .head(10)
+L1133               .round(3))
+L1134         low_msg = "Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string(index=True, index_names=False)
+L1135         _post_slack({"text": f"```{low_msg}```"})
+L1136     except Exception as _e:
+L1137         _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
+L1138
+L1139     return sb
+L1140
+L1141 if __name__ == "__main__":
+L1142     run_pipeline()
+```
+
+## <scorer.py>
+```text
+L1 # scorer.py
+L2 # kawatest
+L3 # =============================================================================
+L4 # Scorer: ファクター/指標の生成と合成スコア算出を担う純粋層
+L5 #
+L6 # 【このファイルだけ読めば分かるポイント】
+L7 # - 入力(InputBundle)は「価格/出来高/ベンチ/基本情報/EPS/FCF/リターン」を含むDTO
+L8 # - 出力(FeatureBundle)は「raw特徴量 df」「標準化 df_z」「G/D スコア」「欠損ログ」
+L9 # - 重み等のコンフィグ(PipelineConfig)は factor から渡す（cfg 必須）
+L10 # - 旧カラム名は Scorer 内で自動リネームして受け入れ（後方互換）
+L11 #   例) eps_ttm -> EPS_TTM, eps_q_recent -> EPS_Q_LastQ, fcf_ttm -> FCF_TTM
+L12 #
+L13 # 【I/O契約（Scorerが参照するInputBundleフィールド）】
+L14 #   - cand: List[str]    … 候補銘柄（単体実行では未使用）
+L15 #   - tickers: List[str] … 対象銘柄リスト
+L16 #   - bench: str         … ベンチマークティッカー（例 '^GSPC'）
+L17 #   - data: pd.DataFrame … yfinance download結果 ('Close','Volume' 等の階層列)
+L18 #   - px: pd.DataFrame   … data['Close'] 相当（終値）
+L19 #   - spx: pd.Series     … ベンチマークの終値
+L20 #   - tickers_bulk: object         … yfinance.Tickers
+L21 #   - info: Dict[str, dict]        … yfinance info per ticker
+L22 #   - eps_df: pd.DataFrame         … 必須列: EPS_TTM, EPS_Q_LastQ（旧名も可）
+L23 #   - fcf_df: pd.DataFrame         … 必須列: FCF_TTM（旧名も可）
+L24 #   - returns: pd.DataFrame        … px[tickers].pct_change() 相当
+L25 #
+L26 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
+L27 # =============================================================================
+L28
+L29 import logging
+L30 import os, sys, warnings
+L31 import requests
+L32 import numpy as np
+L33 import pandas as pd
+L34 import yfinance as yf
+L35 from typing import Any, TYPE_CHECKING
+L36 from scipy.stats import zscore
 L37
 L38 if TYPE_CHECKING:
 L39     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
@@ -207,46 +264,5 @@ L240             bs = tk.quarterly_balance_sheet
 L241             if bs is not None and not bs.empty:
 L242                 c = bs.columns[0]
 L243                 for k in ("Total Debt","Long Term Debt","Short Long Term Debt"):
-L244                     if k in bs.index: debt = float(bs.loc[k,c]); break
-L245                 for k in ("Cash And Cash Equivalents","Cash And Cash Equivalents And Short Term Investments","Cash"):
-L246                     if k in bs.index: cash = float(bs.loc[k,c]); break
-L247         except Exception: pass
-L248         if pd.notna(mc): return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
-L249         return np.nan
-L250
-L251     @staticmethod
-L252     def dividend_status(ticker: str) -> str:
-L253         t = yf.Ticker(ticker)
-L254         try:
-L255             if not t.dividends.empty: return "has"
-L256         except Exception: return "unknown"
-L257         try:
-L258             a = t.actions
-L259             if (a is not None and not a.empty and "Stock Splits" in a.columns and a["Stock Splits"].abs().sum()>0): return "none_confident"
-L260         except Exception: pass
-L261         try:
-L262             fi = t.fast_info
-L263             if any(getattr(fi,k,None) for k in ("last_dividend_date","dividend_rate","dividend_yield")): return "maybe_missing"
-L264         except Exception: pass
-L265         return "unknown"
-L266
-L267     @staticmethod
-L268     def div_streak(t):
-L269         try:
-L270             divs = yf.Ticker(t).dividends.dropna(); ann = divs.groupby(divs.index.year).sum(); ann = ann[ann.index<pd.Timestamp.today().year]
-L271             years, streak = sorted(ann.index), 0
-L272             for i in range(len(years)-1,0,-1):
-L273                 if ann[years[i]] > ann[years[i-1]]: streak += 1
-L274                 else: break
-L275             return streak
-L276         except Exception: return 0
-L277
-L278     @staticmethod
-L279     def fetch_finnhub_metrics(symbol):
-L280         api_key = os.environ.get("FINNHUB_API_KEY")
-L281         if not api_key: return {}
-L282         url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":api_key}
-L283         try:
-L284             r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
-L285             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('fr
+L244                     if k in bs.index: debt =
 ```

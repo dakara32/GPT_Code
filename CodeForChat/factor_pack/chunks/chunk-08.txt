@@ -1,5 +1,44 @@
 ```text
-)
+     except Exception: pass
+L473             df.loc[t,'DIV_TTM_PS'], df.loc[t,'DIV_VAR5'], df.loc[t,'DIV_YOY'], df.loc[t,'DIV_FCF_COVER'] = DIV_TTM_PS, DIV_VAR5, DIV_YOY, DIV_FCF_COVER
+L474
+L475             # --- 財務安定性 ---
+L476             df.loc[t,'DEBT2EQ'], df.loc[t,'CURR_RATIO'] = d.get('debtToEquity',np.nan), d.get('currentRatio',np.nan)
+L477
+L478             # --- EPS 変動 ---
+L479             EPS_VAR_8Q = np.nan
+L480             try:
+L481                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
+L482                 if qe is not None and not qe.empty and so:
+L483                     eps_q = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
+L484                     if len(eps_q)>=4: EPS_VAR_8Q = float(eps_q.iloc[-min(8,len(eps_q)):].std(ddof=1))
+L485             except Exception: pass
+L486             df.loc[t,'EPS_VAR_8Q'] = EPS_VAR_8Q
+L487
+L488             # --- サイズ/流動性 ---
+L489             df.loc[t,'MARKET_CAP'] = d.get('marketCap',np.nan); adv60 = np.nan
+L490             try:
+L491                 vol_series = ib.data['Volume'][t].dropna()
+L492                 if len(vol_series)>=5 and len(s)==len(vol_series):
+L493                     dv = (vol_series*s).rolling(60).mean(); adv60 = float(dv.iloc[-1])
+L494             except Exception: pass
+L495             df.loc[t,'ADV60_USD'] = adv60
+L496
+L497             # --- 売上/利益の加速度等 ---
+L498             REV_Q_YOY=EPS_Q_YOY=REV_YOY_ACC=REV_YOY_VAR=np.nan
+L499             REV_ANNUAL_STREAK = REV_YOY = np.nan
+L500             EPS_YOY = np.nan
+L501             try:
+L502                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
+L503                 sec_rev_series = (d.get('SEC_REV_Q_SERIES') or [])
+L504                 if sec_rev_series:
+L505                     rev = pd.Series(sec_rev_series, dtype=float).dropna()
+L506                 elif qe is not None and not qe.empty and 'Revenue' in qe.columns:
+L507                     rev = qe['Revenue'].dropna().astype(float)
+L508                 else:
+L509                     rev = pd.Series([], dtype=float)
+L510                 if not rev.empty:
+L511                     if len(rev)>=5: REV_Q_YOY = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5])
 L512                     if len(rev)>=6:
 L513                         yoy_now = _safe_div(rev.iloc[-1]-rev.iloc[-5], rev.iloc[-5]); yoy_prev = _safe_div(rev.iloc[-2]-rev.iloc[-6], rev.iloc[-6])
 L514                         if pd.notna(yoy_now) and pd.notna(yoy_prev): REV_YOY_ACC = yoy_now - yoy_prev
@@ -155,47 +194,5 @@ L663         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robus
 L664         for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
 L665
 L666         # === Growth深掘り系（欠損保持z + RAW併載） ===
-L667         grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']
-L668         for col in grw_cols:
-L669             if col in df.columns:
-L670                 raw = pd.to_numeric(df[col], errors="coerce")
-L671                 df_z[col] = robust_z_keepnan(raw)
-L672                 df_z[f'{col}_RAW'] = raw
-L673         for k in ("TREND_SLOPE_EPS", "TREND_SLOPE_REV"):
-L674             if k in df.columns and k not in df_z.columns:
-L675                 raw = pd.to_numeric(df[k], errors="coerce")
-L676                 df_z[k] = robust_z_keepnan(raw)
-L677                 df_z[f'{k}_RAW'] = raw
-L678         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
-L679
-L680         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
-L681         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
-L682         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
-L683
-L684         # EPSが赤字でもFCFが黒字なら実質黒字とみなす
-L685         eps_pos_mask = (df['EPS'] > 0) | (df['FCF_MGN'] > 0)
-L686         df_z['EPS_POS'] = df_z['EPS'].where(eps_pos_mask, 0.0)
-L687
-L688         # ===== トレンドスロープ算出 =====
-L689         def zpos(x):
-L690             arr = robust_z(x)
-L691             idx = getattr(x, 'index', df_z.index)
-L692             return pd.Series(arr, index=idx).fillna(0.0)
-L693
-L694         def relu(x):
-L695             ser = x if isinstance(x, pd.Series) else pd.Series(x, index=df_z.index)
-L696             return ser.clip(lower=0).fillna(0.0)
-L697
-L698         # 売上トレンドスロープ（四半期）
-L699         slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
-L700         noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
-L701         slope_rev_combo = slope_rev - 0.25*noise_rev
-L702         df_z['TREND_SLOPE_REV_RAW'] = slope_rev_combo
-L703         df_z['TREND_SLOPE_REV'] = slope_rev_combo.clip(-3.0, 3.0)
-L704
-L705         # EPSトレンドスロープ（四半期）
-L706         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
-L707         df_z['TREND_SLOPE_EPS_RAW'] = slope_eps
-L708         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
-L70
+L667         grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC
 ```
