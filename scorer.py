@@ -37,6 +37,10 @@ from typing import Any, TYPE_CHECKING
 from scipy.stats import zscore
 from datetime import datetime as _dt
 
+DEBUG_SCOPE_STRICT = (
+    os.getenv("DEBUG_SCOPE_STRICT", "false").strip().lower() == "true"
+)
+
 FACTOR_COLUMNS = {
     "GRW": [
         "GROWTH_F",
@@ -68,29 +72,65 @@ def _log(stage, msg):
         print(f"[DBG][{stage}] {msg}")
 
 
-def _collect_relevant_cols(df, df_z, *, weight_dict=None):
-    use: set[str] = set()
-    if weight_dict:
-        try:
-            items = weight_dict.items() if hasattr(weight_dict, "items") else []
-        except Exception:
-            items = []
-        for col, w in items:
-            try:
-                weight = float(w or 0)
-            except Exception:
-                weight = 0.0
-            if abs(weight) > 0 and col in getattr(df_z, "columns", []):
-                use.add(col)
-    for fac in ("GRW",):
-        for c in FACTOR_COLUMNS.get(fac, []):
-            if c in getattr(df, "columns", []) or c in getattr(df_z, "columns", []):
-                use.add(c)
-    for fac in ["MOM", "VOL", "QUAL", "VAL"]:
-        for c in FACTOR_COLUMNS.get(fac, []):
-            if c in getattr(df, "columns", []) or c in getattr(df_z, "columns", []):
-                use.add(c)
-    return sorted(use)
+def _detect_used_cols(df, df_z):
+    used = set()
+
+    try:
+        import factor as _f
+
+        for k in getattr(_f, "g_weights", {}).keys():
+            if k in df_z.columns:
+                used.add(k)
+    except Exception:
+        pass
+
+    try:
+        import scorer as _sc
+
+        for k in getattr(_sc, "D_WEIGHTS_EFF", {}).keys():
+            if k in df_z.columns:
+                used.add(k)
+    except Exception:
+        pass
+
+    for k in [
+        "GROWTH_F",
+        "MOM",
+        "TRD",
+        "VOL",
+        "D_QAL",
+        "D_YLD",
+        "D_VOL_RAW",
+        "D_TRD",
+    ]:
+        if k in df_z.columns:
+            used.add(k)
+
+    grw_cols = [
+        "GRW_PATH",
+        "GRW_FLEX_SCORE",
+        "GROWTH_F",
+        "GRW_REV_YOY_Q",
+        "GRW_REV_ACC_Q",
+        "GRW_REV_QOQ",
+        "GRW_REV_TTM2",
+        "GRW_REV_YOY_Y",
+        "GRW_PRICE_PROXY",
+    ]
+    for k in grw_cols:
+        if (k in df.columns) or (k in df_z.columns):
+            used.add(k)
+
+    for c in df_z.columns:
+        if isinstance(c, str) and c.startswith("D_"):
+            used.add(c)
+
+    num = df_z.select_dtypes(include=["number"])
+    if not num.empty:
+        var_top = num.var().sort_values(ascending=False).head(20).index.tolist()
+        used.update(var_top)
+
+    return sorted(used)
 
 
 def _reorder_for_debug(df, df_z, factor_cols=FACTOR_COLUMNS):
@@ -108,24 +148,52 @@ def _reorder_for_debug(df, df_z, factor_cols=FACTOR_COLUMNS):
     return ordered
 
 
-def dump_dfz_scoped(df, df_z, *, weight_dict=None, topk=20, logger=None):
-    import pandas as pd, logging
+def dump_dfz_scoped(df, df_z, *, topk=20, logger=None):
+    import numpy as np, pandas as pd, logging
 
-    logger = logger or logging.getLogger(__name__)
-    rel = _collect_relevant_cols(df, df_z, weight_dict=weight_dict)
-    rel_df = [c for c in rel if c in getattr(df_z, "columns", [])]
-    dfz = df_z[rel_df].copy() if rel_df else df_z.copy()
-    logger.info("DEBUG scope: %d relevant cols (of %d total).", dfz.shape[1], df_z.shape[1])
+    lg = logger or logging.getLogger(__name__)
+
+    if not DEBUG_SCOPE_STRICT:
+        dfz = df_z.copy()
+        lg.info("DEBUG scope: disabled (showing ALL %d columns).", dfz.shape[1])
+    else:
+        rel = _detect_used_cols(df, df_z)
+        dfz = df_z[[c for c in rel if c in df_z.columns]].copy()
+        if dfz.shape[1] < 15:
+            num = df_z.select_dtypes(include=["number"])
+            add = []
+            if not num.empty:
+                add = [
+                    c
+                    for c in num.var().sort_values(ascending=False).head(30).index
+                    if c not in dfz.columns
+                ]
+                if dfz.shape[1] < 15:
+                    add = add[: 15 - dfz.shape[1]]
+                else:
+                    add = []
+            dfz = pd.concat([dfz, df_z[add]], axis=1)
+            lg.info("DEBUG scope too small → fallback add %d cols", len(add))
+        excluded = [c for c in df_z.columns if c not in dfz.columns]
+        lg.info(
+            "DEBUG scope: %d relevant cols kept, %d excluded.",
+            dfz.shape[1],
+            len(excluded),
+        )
+
     nan_top = dfz.isna().sum().sort_values(ascending=False).head(topk)
-    logger.info("scorer:NaN columns (top%d):", topk)
+    lg.info("scorer:NaN columns (top%d):", topk)
     for c, n in nan_top.items():
-        logger.info("%s\t%d", c, int(n))
+        lg.info("%s\t%d", c, int(n))
+
     num_dfz = dfz.select_dtypes(include=["number"])
     if not num_dfz.empty:
         ztop = (num_dfz == 0).mean().sort_values(ascending=False).head(topk)
-        logger.info("scorer:Zero-dominated columns (top%d):", topk)
+        lg.info("scorer:Zero-dominated columns (top%d):", topk)
         for c, r in ztop.items():
-            logger.info("%s\t%.2f%%", c, 100.0 * float(r))
+            lg.info("%s\t%.2f%%", c, 100.0 * float(r))
+
+    return dfz
 
 
 def save_factor_debug_csv(df, df_z, path="out/factor_debug_latest.csv"):
@@ -275,21 +343,19 @@ def _dump_dfz(
     debug_mode: bool,
     max_rows: int = 400,
     ndigits: int = 3,
-    *,
-    weight_dict=None,
 ) -> None:
     """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
 
     if not debug_mode:
         return
     try:
-        rel = _collect_relevant_cols(df, df_z, weight_dict=weight_dict)
+        dfz_scoped = dump_dfz_scoped(df, df_z, topk=20, logger=logger)
         ordered = _reorder_for_debug(df, df_z)
-        rel_set = set(rel)
-        view_cols = [c for c in ordered if c in rel_set and c in df_z.columns]
+        rel_set = set(dfz_scoped.columns)
+        view_cols = [c for c in ordered if c in rel_set]
         if not view_cols:
-            view_cols = list(df_z.columns)
-        view = df_z[view_cols].copy()
+            view_cols = list(dfz_scoped.columns)
+        view = dfz_scoped[view_cols].copy()
         view = view.apply(
             lambda s: s.round(ndigits)
             if getattr(getattr(s, "dtype", None), "kind", "") in ("f", "i")
@@ -297,8 +363,6 @@ def _dump_dfz(
         )
         if len(view) > max_rows:
             view = view.iloc[:max_rows]
-
-        dump_dfz_scoped(df, df_z, weight_dict=weight_dict, topk=20, logger=logger)
 
         logger.info("===== DF_Z DUMP START =====")
         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
@@ -1361,7 +1425,6 @@ class Scorer:
             df=df,
             df_z=df_z,
             debug_mode=getattr(cfg, "debug_mode", False),
-            weight_dict=getattr(getattr(cfg, "weights", None), "g", None),
         )
         if getattr(cfg, "debug_mode", False):
             log_grw_stats(df, df_z, logger)
