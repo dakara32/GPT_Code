@@ -1142,26 +1142,24 @@ class Scorer:
         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
 
-        # シンプル版（全明細）：df_zをページングでログ出力
+        # シンプル版（全明細）：df_zをページングでログ出力（loggerのみ）
         if getattr(cfg, "debug_mode", False):
             pd.set_option("display.max_columns", None)
             pd.set_option("display.max_colwidth", None)
             pd.set_option("display.width", None)
-            page = int(getattr(cfg, "debug_dfz_page", 200))  # 1ページの行数（必要に応じて調整）
+            page = int(getattr(cfg, "debug_dfz_page", 200))  # 1ページ行数
             n = len(df_z)
             logger.info("=== df_z FULL DUMP start === rows=%d cols=%d page=%d", n, df_z.shape[1], page)
             for i in range(0, n, page):
                 j = min(i + page, n)
-                print(f"--- df_z rows {i}..{j-1} ---")
-                # print() はActionsの折り返しに強い。列数多くても素で出す
                 try:
-                    print(df_z.iloc[i:j].to_string())
+                    chunk_str = df_z.iloc[i:j].to_string()
                 except Exception:
-                    # 巨大列やdtype問題へのフォールバック
-                    print(df_z.iloc[i:j].astype(str).to_string())
+                    chunk_str = df_z.iloc[i:j].astype(str).to_string()
+                logger.info("--- df_z rows %d..%d ---\n%s", i, j-1, chunk_str)
             logger.info("=== df_z FULL DUMP end ===")
 
-            # （任意）CSVにも保存：後でArtifactsからDL
+            # （任意）CSV保存
             try:
                 import os
                 os.makedirs("out", exist_ok=True)
