@@ -1,213 +1,213 @@
 ```text
-     df.loc[t,'MA200_UP_STREAK_D'] = float(up)
-L636             except Exception:
-L637                 pass
-L638             df.loc[t,'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52<=0 or pd.isna(p)) else (p/(lo52*1.25)-1)
-L639             hi52 = s[-252:].max() if len(s)>=252 else s.max(); df.loc[t,'NEAR_52W_HIGH'] = np.nan
-L640             if hi52 and hi52>0 and pd.notna(p):
-L641                 d_hi = (p/hi52)-1.0; df.loc[t,'NEAR_52W_HIGH'] = -abs(min(0.0, d_hi))
-L642             df.loc[t,'RS_SLOPE_6W'] = self.rs_line_slope(s, ib.spx, 30)
-L643             df.loc[t,'RS_SLOPE_13W'] = self.rs_line_slope(s, ib.spx, 65)
-L644
-L645             df.loc[t,'DIV_STREAK'] = self.div_streak(t)
-L646
-L647             # --- 欠損メモ ---
-L648             fin_cols = ['REV','ROE','BETA','DIV','FCF']
-L649             need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t,col])]
-L650             if need_finnhub:
-L651                 fin_data = self.fetch_finnhub_metrics(t)
-L652                 for col in need_finnhub:
-L653                     val = fin_data.get(col)
-L654                     if val is not None and not pd.isna(val): df.loc[t,col] = val
-L655             for col in fin_cols + ['EPS','RS','TR_str','DIV_STREAK']:
-L656                 if pd.isna(df.loc[t,col]):
-L657                     if col=='DIV':
-L658                         status = self.dividend_status(t)
-L659                         if status!='none_confident': missing_logs.append({'Ticker':t,'Column':col,'Status':status})
-L660                     else:
-L661                         missing_logs.append({'Ticker':t,'Column':col})
-L662
-L663         def _trend_template_pass(row, rs_alpha_thresh=0.10):
-L664             c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
-L665             c2 = (row.get('MA150_OVER_200', np.nan) > 0)
-L666             c3 = (row.get('MA200_SLOPE_1M', np.nan) > 0)
-L667             c4 = (row.get('MA50_OVER_150', np.nan) > 0) and (row.get('MA50_OVER_200', np.nan) > 0)
-L668             c5 = (row.get('TR_str', np.nan) > 0)
-L669             c6 = (row.get('P_OVER_LOW52', np.nan) >= 0.30)
-L670             c7 = (row.get('NEAR_52W_HIGH', np.nan) >= -0.25)
-L671             c8 = (row.get('RS', np.nan) >= 0.10)
-L672             return bool(c1 and c2 and c3 and c4 and c5 and c6 and c7 and c8)
-L673
-L674         if 'trend_template' not in df.columns: df['trend_template'] = df.apply(_trend_template_pass, axis=1).fillna(False)
-L675         assert 'trend_template' in df.columns
-L676
-L677         # === Z化と合成 ===
-L678         for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
-L679
-L680         df_z = pd.DataFrame(index=df.index)
-L681         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
-L682         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
-L683         for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
-L684
-L685         # === Growth深掘り系（欠損保持z + RAW併載） ===
-L686         grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']
-L687         for col in grw_cols:
-L688             if col in df.columns:
-L689                 raw = pd.to_numeric(df[col], errors="coerce")
-L690                 df_z[col] = robust_z_keepnan(raw)
-L691                 df_z[f'{col}_RAW'] = raw
-L692         for k in ("TREND_SLOPE_EPS", "TREND_SLOPE_REV"):
-L693             if k in df.columns and k not in df_z.columns:
-L694                 raw = pd.to_numeric(df[k], errors="coerce")
-L695                 df_z[k] = robust_z_keepnan(raw)
-L696                 df_z[f'{k}_RAW'] = raw
-L697         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
-L698
-L699         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
-L700         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
-L701         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
-L702
-L703         # EPSが赤字でもFCFが黒字なら実質黒字とみなす
-L704         eps_pos_mask = (df['EPS'] > 0) | (df['FCF_MGN'] > 0)
-L705         df_z['EPS_POS'] = df_z['EPS'].where(eps_pos_mask, 0.0)
-L706
-L707         # ===== トレンドスロープ算出 =====
-L708         def zpos(x):
-L709             arr = robust_z(x)
-L710             idx = getattr(x, 'index', df_z.index)
-L711             return pd.Series(arr, index=idx).fillna(0.0)
+.loc[t,'MA50_OVER_200'] = _safe_last(sma50)/_safe_last(sma200)-1 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
+L659             df.loc[t,'MA200_SLOPE_5M'] = np.nan
+L660             if len(sma200.dropna())>=105:
+L661                 cur200, old200 = _safe_last(sma200), float(sma200.iloc[-105])
+L662                 if old200 and old200!=0: df.loc[t,'MA200_SLOPE_5M'] = cur200/old200 - 1
+L663             # NEW: 200日線が連続で上向きの「日数」
+L664             df.loc[t,'MA200_UP_STREAK_D'] = np.nan
+L665             try:
+L666                 s200 = sma200.dropna()
+L667                 if len(s200) >= 2:
+L668                     diff200 = s200.diff()
+L669                     up = 0
+L670                     for v in diff200.iloc[::-1]:
+L671                         if pd.isna(v) or v <= 0:
+L672                             break
+L673                         up += 1
+L674                     df.loc[t,'MA200_UP_STREAK_D'] = float(up)
+L675             except Exception:
+L676                 pass
+L677             df.loc[t,'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52<=0 or pd.isna(p)) else (p/(lo52*1.25)-1)
+L678             hi52 = s[-252:].max() if len(s)>=252 else s.max(); df.loc[t,'NEAR_52W_HIGH'] = np.nan
+L679             if hi52 and hi52>0 and pd.notna(p):
+L680                 d_hi = (p/hi52)-1.0; df.loc[t,'NEAR_52W_HIGH'] = -abs(min(0.0, d_hi))
+L681             df.loc[t,'RS_SLOPE_6W'] = self.rs_line_slope(s, ib.spx, 30)
+L682             df.loc[t,'RS_SLOPE_13W'] = self.rs_line_slope(s, ib.spx, 65)
+L683
+L684             df.loc[t,'DIV_STREAK'] = self.div_streak(t)
+L685
+L686             # --- 欠損メモ ---
+L687             fin_cols = ['REV','ROE','BETA','DIV','FCF']
+L688             need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t,col])]
+L689             if need_finnhub:
+L690                 fin_data = self.fetch_finnhub_metrics(t)
+L691                 for col in need_finnhub:
+L692                     val = fin_data.get(col)
+L693                     if val is not None and not pd.isna(val): df.loc[t,col] = val
+L694             for col in fin_cols + ['EPS','RS','TR_str','DIV_STREAK']:
+L695                 if pd.isna(df.loc[t,col]):
+L696                     if col=='DIV':
+L697                         status = self.dividend_status(t)
+L698                         if status!='none_confident': missing_logs.append({'Ticker':t,'Column':col,'Status':status})
+L699                     else:
+L700                         missing_logs.append({'Ticker':t,'Column':col})
+L701
+L702         def _trend_template_pass(row, rs_alpha_thresh=0.10):
+L703             c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
+L704             c2 = (row.get('MA150_OVER_200', np.nan) > 0)
+L705             c3 = (row.get('MA200_SLOPE_1M', np.nan) > 0)
+L706             c4 = (row.get('MA50_OVER_150', np.nan) > 0) and (row.get('MA50_OVER_200', np.nan) > 0)
+L707             c5 = (row.get('TR_str', np.nan) > 0)
+L708             c6 = (row.get('P_OVER_LOW52', np.nan) >= 0.30)
+L709             c7 = (row.get('NEAR_52W_HIGH', np.nan) >= -0.25)
+L710             c8 = (row.get('RS', np.nan) >= 0.10)
+L711             return bool(c1 and c2 and c3 and c4 and c5 and c6 and c7 and c8)
 L712
-L713         def relu(x):
-L714             ser = x if isinstance(x, pd.Series) else pd.Series(x, index=df_z.index)
-L715             return ser.clip(lower=0).fillna(0.0)
-L716
-L717         # 売上トレンドスロープ（四半期）
-L718         slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
-L719         noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
-L720         slope_rev_combo = slope_rev - 0.25*noise_rev
-L721         df_z['TREND_SLOPE_REV_RAW'] = slope_rev_combo
-L722         df_z['TREND_SLOPE_REV'] = slope_rev_combo.clip(-3.0, 3.0)
+L713         if 'trend_template' not in df.columns: df['trend_template'] = df.apply(_trend_template_pass, axis=1).fillna(False)
+L714         assert 'trend_template' in df.columns
+L715
+L716         # === Z化と合成 ===
+L717         for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
+L718
+L719         df_z = pd.DataFrame(index=df.index)
+L720         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
+L721         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
+L722         for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
 L723
-L724         # EPSトレンドスロープ（四半期）
-L725         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
-L726         df_z['TREND_SLOPE_EPS_RAW'] = slope_eps
-L727         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
-L728
-L729         # 年次トレンド（サブ）
-L730         slope_rev_yr = zpos(df_z['REV_YOY'])
-L731         slope_eps_yr = zpos(df_z.get('EPS_YOY', pd.Series(0.0, index=df.index)))
-L732         streak_base = df['REV_ANN_STREAK'].clip(lower=0).fillna(0)
-L733         streak_yr = streak_base / (streak_base.abs() + 1.0)
-L734         slope_rev_yr_combo = 0.7*slope_rev_yr + 0.3*streak_yr
-L735         df_z['TREND_SLOPE_REV_YR_RAW'] = slope_rev_yr_combo
-L736         df_z['TREND_SLOPE_REV_YR'] = slope_rev_yr_combo.clip(-3.0, 3.0)
-L737         df_z['TREND_SLOPE_EPS_YR_RAW'] = slope_eps_yr
-L738         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
-L739
-L740         # ===== 新GRW合成式（SEPA寄りシフト） =====
-L741         _nz = lambda name: df_z.get(name, pd.Series(0.0, index=df_z.index)).fillna(0.0)
-L742         grw_combo = (
-L743               0.20*_nz('REV_Q_YOY')
-L744             + 0.10*_nz('REV_YOY_ACC')
-L745             + 0.10*_nz('REV_ANN_STREAK')
-L746             - 0.05*_nz('REV_YOY_VAR')
-L747             + 0.10*_nz('TREND_SLOPE_REV')
-L748             + 0.15*_nz('EPS_Q_YOY')
-L749             + 0.05*_nz('EPS_POS')
-L750             + 0.20*_nz('TREND_SLOPE_EPS')
-L751             + 0.05*_nz('TREND_SLOPE_REV_YR')
-L752             + 0.03*_nz('TREND_SLOPE_EPS_YR')
-L753             + 0.10*_nz('FCF_MGN')
-L754             + 0.05*_nz('RULE40')
-L755         )
-L756         df_z['GROWTH_F_RAW'] = grw_combo
-L757         df_z['GROWTH_F'] = robust_z(grw_combo).clip(-3.0, 3.0)
-L758
-L759         # Debug dump for GRW composition (console OFF by default; enable only with env)
-L760         if bool(os.getenv("GRW_CONSOLE_DEBUG")):
-L761             try:
-L762                 i = df_z[['GROWTH_F', 'GROWTH_F_RAW']].copy()
-L763                 i.sort_values('GROWTH_F', ascending=False, inplace=True)
-L764                 limit = max(0, min(40, len(i)))
-L765                 print("[DEBUG: GRW]")
-L766                 for t in i.index[:limit]:
-L767                     row = i.loc[t]
-L768                     parts = [f"GROWTH_F={row['GROWTH_F']:.3f}"]
-L769                     if pd.notna(row.get('GROWTH_F_RAW')):
-L770                         parts.append(f"GROWTH_F_RAW={row['GROWTH_F_RAW']:.3f}")
-L771                     print(f"Ticker: {t} | " + " ".join(parts))
-L772                 print()
-L773             except Exception as exc:
-L774                 print(f"[ERR] GRW debug dump failed: {exc}")
-L775
-L776         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
-L777             + 0.15*df_z['TR_str']
-L778             + 0.15*df_z['RS_SLOPE_6W']
-L779             + 0.15*df_z['RS_SLOPE_13W']
-L780             + 0.10*df_z['MA200_SLOPE_5M']
-L781             + 0.10*df_z['MA200_UP_STREAK_D']).clip(-3.0,3.0)
-L782         df_z['VOL'] = robust_z(df['BETA'])
-L783         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
-L784         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
-L785
-L786         _dump_dfz(df_z=df_z, debug_mode=getattr(cfg, "debug_mode", False))
-L787
-L788         # === begin: BIO LOSS PENALTY =====================================
-L789         try:
-L790             penalty_z = float(os.getenv("BIO_LOSS_PENALTY_Z", "0.8"))
-L791         except Exception:
-L792             penalty_z = 0.8
-L793
-L794         def _is_bio_like(t: str) -> bool:
-L795             inf = info.get(t, {}) if isinstance(info, dict) else {}
-L796             sec = str(inf.get("sector", "")).lower()
-L797             ind = str(inf.get("industry", "")).lower()
-L798             if "health" not in sec:
-L799                 return False
-L800             keys = ("biotech", "biopharma", "pharma")
-L801             return any(k in ind for k in keys)
-L802
-L803         tickers_s = pd.Index(df_z.index)
-L804         is_bio = pd.Series({t: _is_bio_like(t) for t in tickers_s})
-L805         is_loss = pd.Series({t: (pd.notna(df.loc[t,"EPS"]) and df.loc[t,"EPS"] <= 0) for t in tickers_s})
-L806         mask_bio_loss = (is_bio & is_loss).reindex(df_z.index).fillna(False)
-L807
-L808         if bool(mask_bio_loss.any()) and penalty_z > 0:
-L809             df_z.loc[mask_bio_loss, "GROWTH_F"] = df_z.loc[mask_bio_loss, "GROWTH_F"] - penalty_z
-L810             df_z["GROWTH_F"] = df_z["GROWTH_F"].clip(-3.0, 3.0)
-L811         # === end: BIO LOSS PENALTY =======================================
-L812
-L813         df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
-L814         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
-L815
-L816         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
-L817         df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
-L818         df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
-L819         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
-L820
-L821         # --- 重みは cfg を優先（外部があればそれを使用） ---
-L822         # ① 全銘柄で G/D スコアを算出（unmasked）
-L823         g_score_all = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
+L724         # === Growth深掘り系（欠損保持z + RAW併載） ===
+L725         grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']
+L726         for col in grw_cols:
+L727             if col in df.columns:
+L728                 raw = pd.to_numeric(df[col], errors="coerce")
+L729                 df_z[col] = robust_z_keepnan(raw)
+L730                 df_z[f'{col}_RAW'] = raw
+L731         for k in ("TREND_SLOPE_EPS", "TREND_SLOPE_REV"):
+L732             if k in df.columns and k not in df_z.columns:
+L733                 raw = pd.to_numeric(df[k], errors="coerce")
+L734                 df_z[k] = robust_z_keepnan(raw)
+L735                 df_z[f'{k}_RAW'] = raw
+L736         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
+L737
+L738         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
+L739         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
+L740         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
+L741
+L742         # EPSが赤字でもFCFが黒字なら実質黒字とみなす
+L743         eps_pos_mask = (df['EPS'] > 0) | (df['FCF_MGN'] > 0)
+L744         df_z['EPS_POS'] = df_z['EPS'].where(eps_pos_mask, 0.0)
+L745
+L746         # ===== トレンドスロープ算出 =====
+L747         def zpos(x):
+L748             arr = robust_z(x)
+L749             idx = getattr(x, 'index', df_z.index)
+L750             return pd.Series(arr, index=idx).fillna(0.0)
+L751
+L752         def relu(x):
+L753             ser = x if isinstance(x, pd.Series) else pd.Series(x, index=df_z.index)
+L754             return ser.clip(lower=0).fillna(0.0)
+L755
+L756         # 売上トレンドスロープ（四半期）
+L757         slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
+L758         noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
+L759         slope_rev_combo = slope_rev - 0.25*noise_rev
+L760         df_z['TREND_SLOPE_REV_RAW'] = slope_rev_combo
+L761         df_z['TREND_SLOPE_REV'] = slope_rev_combo.clip(-3.0, 3.0)
+L762
+L763         # EPSトレンドスロープ（四半期）
+L764         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
+L765         df_z['TREND_SLOPE_EPS_RAW'] = slope_eps
+L766         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
+L767
+L768         # 年次トレンド（サブ）
+L769         slope_rev_yr = zpos(df_z['REV_YOY'])
+L770         slope_eps_yr = zpos(df_z.get('EPS_YOY', pd.Series(0.0, index=df.index)))
+L771         streak_base = df['REV_ANN_STREAK'].clip(lower=0).fillna(0)
+L772         streak_yr = streak_base / (streak_base.abs() + 1.0)
+L773         slope_rev_yr_combo = 0.7*slope_rev_yr + 0.3*streak_yr
+L774         df_z['TREND_SLOPE_REV_YR_RAW'] = slope_rev_yr_combo
+L775         df_z['TREND_SLOPE_REV_YR'] = slope_rev_yr_combo.clip(-3.0, 3.0)
+L776         df_z['TREND_SLOPE_EPS_YR_RAW'] = slope_eps_yr
+L777         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
+L778
+L779         # ===== 新GRW合成式（SEPA寄りシフト） =====
+L780         _nz = lambda name: df_z.get(name, pd.Series(0.0, index=df_z.index)).fillna(0.0)
+L781         grw_combo = (
+L782               0.20*_nz('REV_Q_YOY')
+L783             + 0.10*_nz('REV_YOY_ACC')
+L784             + 0.10*_nz('REV_ANN_STREAK')
+L785             - 0.05*_nz('REV_YOY_VAR')
+L786             + 0.10*_nz('TREND_SLOPE_REV')
+L787             + 0.15*_nz('EPS_Q_YOY')
+L788             + 0.05*_nz('EPS_POS')
+L789             + 0.20*_nz('TREND_SLOPE_EPS')
+L790             + 0.05*_nz('TREND_SLOPE_REV_YR')
+L791             + 0.03*_nz('TREND_SLOPE_EPS_YR')
+L792             + 0.10*_nz('FCF_MGN')
+L793             + 0.05*_nz('RULE40')
+L794         )
+L795         df_z['GROWTH_F_RAW'] = grw_combo
+L796         df_z['GROWTH_F'] = robust_z(grw_combo).clip(-3.0, 3.0)
+L797
+L798         # Debug dump for GRW composition (console OFF by default; enable only with env)
+L799         if bool(os.getenv("GRW_CONSOLE_DEBUG")):
+L800             try:
+L801                 i = df_z[['GROWTH_F', 'GROWTH_F_RAW']].copy()
+L802                 i.sort_values('GROWTH_F', ascending=False, inplace=True)
+L803                 limit = max(0, min(40, len(i)))
+L804                 print("[DEBUG: GRW]")
+L805                 for t in i.index[:limit]:
+L806                     row = i.loc[t]
+L807                     parts = [f"GROWTH_F={row['GROWTH_F']:.3f}"]
+L808                     if pd.notna(row.get('GROWTH_F_RAW')):
+L809                         parts.append(f"GROWTH_F_RAW={row['GROWTH_F_RAW']:.3f}")
+L810                     print(f"Ticker: {t} | " + " ".join(parts))
+L811                 print()
+L812             except Exception as exc:
+L813                 print(f"[ERR] GRW debug dump failed: {exc}")
+L814
+L815         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
+L816             + 0.15*df_z['TR_str']
+L817             + 0.15*df_z['RS_SLOPE_6W']
+L818             + 0.15*df_z['RS_SLOPE_13W']
+L819             + 0.10*df_z['MA200_SLOPE_5M']
+L820             + 0.10*df_z['MA200_UP_STREAK_D']).clip(-3.0,3.0)
+L821         df_z['VOL'] = robust_z(df['BETA'])
+L822         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
+L823         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
 L824
-L825         d_comp = pd.concat({
-L826             'QAL': df_z['D_QAL'],
-L827             'YLD': df_z['D_YLD'],
-L828             'VOL': df_z['D_VOL_RAW'],
-L829             'TRD': df_z['D_TRD']
-L830         }, axis=1)
-L831         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
-L832         globals()['D_WEIGHTS_EFF'] = dw.copy()
-L833         d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
-L834
-L835         # ② テンプレ判定（既存ロジックそのまま）
-L836         mask = df['trend_template']
-L837         if not bool(mask.any()):
-L838             mask = ((df.get('P_OVER_LOW52', np.nan) >= 0.25) &
-L839                 (df.get('NEAR_52W_HIGH', np.nan) >= -0.30) &
-L840                 (df.get('RS', np.nan) >= 0.08) &
-L841                 (df.get('MA200_SLOPE_1M', np.nan) > 0) &
-L842                 (df.get('P_OVER_150', np.nan) > 0) & (df.get('P_OVER_200', np.nan) > 0) &
-L843                 (df.get('MA150_OVER_200', np.nan) > 0) &
-L844                 (df.get('MA50_OVER_150', np.nan) > 0) & (df.get('MA50_OVER_200', np.nan) > 0) &
-L845                 (df.get('TR_st
+L825         _dump_dfz(df_z=df_z, debug_mode=getattr(cfg, "debug_mode", False))
+L826
+L827         # === begin: BIO LOSS PENALTY =====================================
+L828         try:
+L829             penalty_z = float(os.getenv("BIO_LOSS_PENALTY_Z", "0.8"))
+L830         except Exception:
+L831             penalty_z = 0.8
+L832
+L833         def _is_bio_like(t: str) -> bool:
+L834             inf = info.get(t, {}) if isinstance(info, dict) else {}
+L835             sec = str(inf.get("sector", "")).lower()
+L836             ind = str(inf.get("industry", "")).lower()
+L837             if "health" not in sec:
+L838                 return False
+L839             keys = ("biotech", "biopharma", "pharma")
+L840             return any(k in ind for k in keys)
+L841
+L842         tickers_s = pd.Index(df_z.index)
+L843         is_bio = pd.Series({t: _is_bio_like(t) for t in tickers_s})
+L844         is_loss = pd.Series({t: (pd.notna(df.loc[t,"EPS"]) and df.loc[t,"EPS"] <= 0) for t in tickers_s})
+L845         mask_bio_loss = (is_bio & is_loss).reindex(df_z.index).fillna(False)
+L846
+L847         if bool(mask_bio_loss.any()) and penalty_z > 0:
+L848             df_z.loc[mask_bio_loss, "GROWTH_F"] = df_z.loc[mask_bio_loss, "GROWTH_F"] - penalty_z
+L849             df_z["GROWTH_F"] = df_z["GROWTH_F"].clip(-3.0, 3.0)
+L850         # === end: BIO LOSS PENALTY =======================================
+L851
+L852         df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
+L853         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
+L854
+L855         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
+L856         df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
+L857         df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
+L858         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
+L859
+L860         # --- 重みは cfg を優先（外部があればそれを使用） ---
+L861         # ① 全銘柄で G/D スコアを算出（unmasked）
+L862         g_score_all = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
+L863
+L864         d_comp = pd.concat({
+L865             'QAL': df_z['D_QAL'],
+L866             'YLD': df_z['D_YLD'],
+L867             'VOL': df_z['D_VOL_RAW'],
+L868        
 ```

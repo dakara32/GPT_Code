@@ -105,184 +105,197 @@ L26 # ※入出力の形式・例外文言は既存実装を変えません（�
 L27 # =============================================================================
 L28
 L29 import logging
-L30 import os, sys, warnings
-L31 import requests
-L32 import numpy as np
-L33 import pandas as pd
-L34 import yfinance as yf
-L35 from typing import Any, TYPE_CHECKING
-L36 from scipy.stats import zscore
-L37
-L38 if TYPE_CHECKING:
-L39     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
-L40
-L41 logger = logging.getLogger(__name__)
-L42
-L43 # ---- Dividend Helpers -------------------------------------------------------
-L44 def _last_close(t, price_map=None):
-L45     if price_map and (c := price_map.get(t)) is not None: return float(c)
-L46     try:
-L47         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
-L48         return float(h.iloc[-1]) if len(h) else np.nan
-L49     except Exception:
-L50         return np.nan
-L51
-L52 def _ttm_div_sum(t, lookback_days=400):
-L53     try:
-L54         div = yf.Ticker(t).dividends
-L55         if div is None or len(div) == 0: return 0.0
-L56         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
-L57         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
-L58         return ttm if ttm > 0 else float(div.tail(4).sum())
-L59     except Exception:
-L60         return 0.0
-L61
-L62 def ttm_div_yield_portfolio(tickers, price_map=None):
-L63     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
-L64     return float(np.mean(ys)) if ys else 0.0
-L65
-L66 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
-L67 def winsorize_s(s: pd.Series, p=0.02):
-L68     if s is None or s.dropna().empty: return s
-L69     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
-L70
-L71 def robust_z(s: pd.Series, p=0.02):
-L72     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
-L73
-L74 def robust_z_keepnan(s: pd.Series) -> pd.Series:
-L75     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
-L76     if s is None:
-L77         return pd.Series(dtype=float)
-L78     v = pd.to_numeric(s, errors="coerce")
-L79     m = np.nanmedian(v)
-L80     mad = np.nanmedian(np.abs(v - m))
-L81     z = (v - m) / (1.4826 * mad + 1e-9)
-L82     if np.nanstd(z) < 1e-9:
-L83         r = v.rank(method="average", na_option="keep")
-L84         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
-L85     return pd.Series(z, index=v.index, dtype=float)
-L86
+L30 import math
+L31 import os, sys, warnings
+L32 import requests
+L33 import numpy as np
+L34 import pandas as pd
+L35 import yfinance as yf
+L36 from typing import Any, TYPE_CHECKING
+L37 from scipy.stats import zscore
+L38
+L39 if TYPE_CHECKING:
+L40     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
+L41
+L42 logger = logging.getLogger(__name__)
+L43
+L44 # ---- Dividend Helpers -------------------------------------------------------
+L45 def _last_close(t, price_map=None):
+L46     if price_map and (c := price_map.get(t)) is not None: return float(c)
+L47     try:
+L48         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
+L49         return float(h.iloc[-1]) if len(h) else np.nan
+L50     except Exception:
+L51         return np.nan
+L52
+L53 def _ttm_div_sum(t, lookback_days=400):
+L54     try:
+L55         div = yf.Ticker(t).dividends
+L56         if div is None or len(div) == 0: return 0.0
+L57         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
+L58         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
+L59         return ttm if ttm > 0 else float(div.tail(4).sum())
+L60     except Exception:
+L61         return 0.0
+L62
+L63 def ttm_div_yield_portfolio(tickers, price_map=None):
+L64     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
+L65     return float(np.mean(ys)) if ys else 0.0
+L66
+L67 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
+L68 def winsorize_s(s: pd.Series, p=0.02):
+L69     if s is None or s.dropna().empty: return s
+L70     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L71
+L72 def robust_z(s: pd.Series, p=0.02):
+L73     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L74
+L75 def robust_z_keepnan(s: pd.Series) -> pd.Series:
+L76     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
+L77     if s is None:
+L78         return pd.Series(dtype=float)
+L79     v = pd.to_numeric(s, errors="coerce")
+L80     m = np.nanmedian(v)
+L81     mad = np.nanmedian(np.abs(v - m))
+L82     z = (v - m) / (1.4826 * mad + 1e-9)
+L83     if np.nanstd(z) < 1e-9:
+L84         r = v.rank(method="average", na_option="keep")
+L85         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
+L86     return pd.Series(z, index=v.index, dtype=float)
 L87
-L88 def _fetch_revenue_quarterly_via_finnhub(symbol: str):
-L89     """Fetch quarterly revenue via Finnhub when yfinance data is unavailable.
-L90
-L91     Returns a pandas.Series indexed by "YYYYQn" (ascending) or ``None`` when
-L92     an API token is missing, data is not found, or any error occurs. No
-L93     exception is propagated to keep behaviour identical without a token.
+L88
+L89 def _fetch_revenue_quarterly_via_finnhub(symbol: str):
+L90     """
+L91     Finnhub 'Financials As Reported' から四半期売上を Series で返す。
+L92     スキーマ揺れに対応: income statement(ic)配下の複数キー候補を順探索。
+L93     返却: pandas.Series(index="YYYYQn", name="Revenue") or None
 L94     """
-L95     api_key = os.getenv("FINNHUB_API_KEY", "").strip()
-L96     if not api_key:
-L97         return None
-L98     try:
-L99         url = "https://finnhub.io/api/v1/stock/financials-reported"
-L100         params = {"symbol": symbol, "token": api_key}
-L101         r = requests.get(url, params=params, timeout=10)
-L102         r.raise_for_status()
-L103         payload = r.json() or {}
-L104         rows = []
-L105         for item in payload.get("data", []) or []:
-L106             rep = (item or {}).get("report", {})
-L107             ic = rep.get("ic", {}) if isinstance(rep, dict) else {}
-L108             rev_val = None
-L109             if isinstance(ic, dict):
-L110                 revenue_node = ic.get("revenue")
-L111                 if isinstance(revenue_node, dict):
-L112                     rev_val = revenue_node.get("value")
-L113                 if rev_val is None:
-L114                     total_node = ic.get("totalRevenue")
-L115                     if isinstance(total_node, dict):
-L116                         rev_val = total_node.get("value")
-L117             if rev_val is None:
-L118                 continue
-L119             year = item.get("year")
-L120             quarter = item.get("quarter")
-L121             if year is None or quarter is None:
-L122                 continue
-L123             try:
-L124                 rows.append((int(year), int(quarter), float(rev_val)))
-L125             except Exception:
-L126                 continue
-L127         if not rows:
-L128             return None
-L129         rows.sort(key=lambda x: (x[0], x[1]))
-L130         idx = [f"{y}Q{q}" for y, q, _ in rows]
-L131         vals = [v for _, _, v in rows]
-L132         return pd.Series(vals, index=idx, name="Revenue")
-L133     except Exception:
-L134         return None
+L95
+L96     api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+L97     if not api_key:
+L98         return None
+L99
+L100     try:
+L101         url = "https://finnhub.io/api/v1/stock/financials-reported"
+L102         r = requests.get(url, params={"symbol": symbol, "token": api_key}, timeout=10)
+L103         r.raise_for_status()
+L104         payload = r.json() or {}
+L105         data = payload.get("data", []) or []
+L106
+L107         CAND_KEYS = [
+L108             "revenue",
+L109             "totalRevenue",
+L110             "netSales",
+L111             "salesRevenueNet",
+L112             "operatingRevenue",
+L113             "totalOperatingRevenue",
+L114             "totalRevenueFromOperations",
+L115             "turnover",
+L116         ]
+L117
+L118         def _first_number(v):
+L119             try:
+L120                 if isinstance(v, dict):
+L121                     v = v.get("value")
+L122                 if v is None:
+L123                     return None
+L124                 x = float(v)
+L125                 if math.isfinite(x):
+L126                     return x
+L127             except Exception:
+L128                 return None
+L129             return None
+L130
+L131         rows = []
+L132         for item in data:
+L133             rep = (item or {}).get("report", {})
+L134             ic = rep.get("ic", {}) if isinstance(rep, dict) else {}
 L135
-L136
-L137 def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
-L138     """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
-L139     if not debug_mode:
-L140         return
-L141     try:
-L142         view = df_z.copy()
-L143         view = view.apply(
-L144             lambda s: s.round(ndigits)
-L145             if getattr(getattr(s, "dtype", None), "kind", "") in ("f", "i")
-L146             else s
-L147         )
-L148         if len(view) > max_rows:
-L149             view = view.iloc[:max_rows]
-L150
-L151         # === NaNサマリ（列ごとの欠損件数 上位20） ===
-L152         try:
-L153             nan_counts = df_z.isna().sum().sort_values(ascending=False)
-L154             top_nan = nan_counts[nan_counts > 0].head(20)
-L155             if len(top_nan) > 0:
-L156                 logger.info("NaN columns (top20):\n%s", top_nan.to_string())
-L157             else:
-L158                 logger.info("NaN columns: none")
-L159         except Exception as exc:
-L160             logger.warning("nan summary failed: %s", exc)
-L161
-L162         # === Zeroサマリ（列ごとのゼロ比率 上位20） ===
-L163         try:
-L164             zero_counts = ((df_z == 0) & (~df_z.isna())).sum()
-L165             nonnull_counts = (~df_z.isna()).sum()
-L166             zero_ratio = (zero_counts / nonnull_counts).sort_values(ascending=False)
-L167             top_zero = zero_ratio[zero_ratio > 0].head(20)
-L168             if len(top_zero) > 0:
-L169                 logger.info(
-L170                     "Zero-dominated columns (top20):\n%s",
-L171                     top_zero.to_string(float_format=lambda x: f"{x:.2%}"),
-L172                 )
-L173             else:
-L174                 logger.info("Zero-dominated columns: none")
-L175         except Exception as exc:
-L176             logger.warning("zero summary failed: %s", exc)
-L177
-L178         logger.info("===== DF_Z DUMP START =====")
-L179         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
-L180         logger.info("===== DF_Z DUMP END =====")
-L181     except Exception as exc:
-L182         logger.warning("df_z dump failed: %s", exc)
-L183
-L184 def _safe_div(a, b):
-L185     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
-L186     except Exception: return np.nan
+L136             if isinstance(ic, list):
+L137                 ic_dict = {}
+L138                 for entry in ic:
+L139                     if isinstance(entry, dict) and "concept" in entry:
+L140                         ic_dict[entry["concept"]] = {"value": entry.get("value")}
+L141                 ic = ic_dict
+L142
+L143             rev_val = None
+L144             if isinstance(ic, dict):
+L145                 for key in CAND_KEYS:
+L146                     if key in ic:
+L147                         rev_val = _first_number(ic.get(key))
+L148                         if rev_val is not None:
+L149                             break
+L150             if rev_val is None:
+L151                 continue
+L152
+L153             year = item.get("year")
+L154             quarter = item.get("quarter")
+L155             if year is None or quarter is None:
+L156                 continue
+L157
+L158             rows.append((int(year), int(quarter), rev_val))
+L159
+L160         if not rows:
+L161             return None
+L162
+L163         rows.sort(key=lambda x: (x[0], x[1]))
+L164         idx = [f"{y}Q{q}" for y, q, _ in rows]
+L165         vals = [v for _, _, v in rows]
+L166         s = pd.Series(vals, index=idx, name="Revenue")
+L167         if s.dropna().empty:
+L168             return None
+L169         return s
+L170     except Exception:
+L171         return None
+L172
+L173
+L174 def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
+L175     """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
+L176     if not debug_mode:
+L177         return
+L178     try:
+L179         view = df_z.copy()
+L180         view = view.apply(
+L181             lambda s: s.round(ndigits)
+L182             if getattr(getattr(s, "dtype", None), "kind", "") in ("f", "i")
+L183             else s
+L184         )
+L185         if len(view) > max_rows:
+L186             view = view.iloc[:max_rows]
 L187
-L188 def _safe_last(series: pd.Series, default=np.nan):
-L189     try: return float(series.iloc[-1])
-L190     except Exception: return default
-L191
-L192 D_WEIGHTS_EFF = None  # 出力表示互換のため
-L193
-L194 # ---- Scorer 本体 -------------------------------------------------------------
-L195 class Scorer:
-L196     """
-L197     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
-L198     - cfg は必須（factor.PipelineConfig を渡す）。
-L199     - 旧カラム名を自動リネームして新スキーマに吸収します。
-L200     """
-L201
-L202     # === 先頭で旧→新カラム名マップ（移行用） ===
-L203     EPS_RENAME = {"eps_ttm":"EPS_TTM", "eps_q_recent":"EPS_Q_LastQ"}
-L204     FCF_RENAME = {"fcf_ttm":"FCF_TTM"}
-L205
-L206     # === スキーマ簡易チェック（最低限） ===
-L207     @staticmethod
-L208     def _validate_ib_for_scorer(ib: Any):
-L2
+L188         # === NaNサマリ（列ごとの欠損件数 上位20） ===
+L189         try:
+L190             nan_counts = df_z.isna().sum().sort_values(ascending=False)
+L191             top_nan = nan_counts[nan_counts > 0].head(20)
+L192             if len(top_nan) > 0:
+L193                 logger.info("NaN columns (top20):\n%s", top_nan.to_string())
+L194             else:
+L195                 logger.info("NaN columns: none")
+L196         except Exception as exc:
+L197             logger.warning("nan summary failed: %s", exc)
+L198
+L199         # === Zeroサマリ（列ごとのゼロ比率 上位20） ===
+L200         try:
+L201             zero_counts = ((df_z == 0) & (~df_z.isna())).sum()
+L202             nonnull_counts = (~df_z.isna()).sum()
+L203             zero_ratio = (zero_counts / nonnull_counts).sort_values(ascending=False)
+L204             top_zero = zero_ratio[zero_ratio > 0].head(20)
+L205             if len(top_zero) > 0:
+L206                 logger.info(
+L207                     "Zero-dominated columns (top20):\n%s",
+L208                     top_zero.to_string(float_format=lambda x: f"{x:.2%}"),
+L209                 )
+L210             else:
+L211                 logger.info("Zero-dominated columns: none")
+L212         except Exception as exc:
+L213             logger.warning("zero summary failed: %s", exc)
+L214
+L215         logger.info("===== DF_Z DUMP START =====")
+L216         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
+L217         logger.info("===== DF_Z DUMP END =====")
+L218     except Exception as exc:
+L219         logger.warning("df_z dump failed: %s", exc)
+L220
+L221 def _safe_div(a, b):
+L222     try: return np.nan if (b is None or float(b
 ```
