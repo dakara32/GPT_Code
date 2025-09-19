@@ -462,7 +462,8 @@ class Input:
             except Exception as e: print(f"{t}: price fetch failed ({e})"); cand_prices[t] = np.inf
         cand_f = [t for t,p in cand_prices.items() if p<=self.price_max]
         T.log("price cap filter done (CAND_PRICE_MAX)")
-        tickers = sorted(set(self.exist + cand_f))
+        # 入力ティッカーの重複を除去し、現行→候補の順序を維持
+        tickers = list(dict.fromkeys(self.exist + cand_f))
         T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
         data = yf.download(tickers + [self.bench], period="600d",
                            auto_adjust=True, progress=False, threads=False)
@@ -492,6 +493,9 @@ class Input:
         except Exception:
             sec_map = None
         eps_df = self._build_eps_df(tickers, tickers_bulk, info, sec_map=sec_map)
+        # index 重複があると .loc[t, col] が Series になり代入時に ValueError を誘発する
+        if not eps_df.index.is_unique:
+            eps_df = eps_df[~eps_df.index.duplicated(keep="last")]
         eps_df = eps_df.assign(
             EPS_TTM=eps_df["eps_ttm"],
             EPS_Q_LastQ=eps_df["eps_q_recent"],

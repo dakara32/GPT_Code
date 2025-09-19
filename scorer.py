@@ -142,6 +142,27 @@ def _safe_last(series: pd.Series, default=np.nan):
 
 D_WEIGHTS_EFF = None  # 出力表示互換のため
 
+
+def _scalar(v):
+    """単一セル代入用に値をスカラーへ正規化する。
+
+    - pandas Series -> .iloc[-1]（最後を採用）
+    - list/tuple/ndarray -> 最後の要素
+    - それ以外          -> そのまま
+    取得失敗時は np.nan を返す。
+    """
+    import numpy as _np
+    import pandas as _pd
+    try:
+        if isinstance(v, _pd.Series):
+            return v.iloc[-1] if len(v) else _np.nan
+        if isinstance(v, (list, tuple, _np.ndarray)):
+            return v[-1] if len(v) else _np.nan
+        return v
+    except Exception:
+        return _np.nan
+
+
 # ---- Scorer 本体 -------------------------------------------------------------
 class Scorer:
     """
@@ -372,7 +393,10 @@ class Scorer:
             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
             # --- 基本特徴 ---
             df.loc[t,'TR']   = self.trend(s)
-            df.loc[t,'EPS']  = eps_df.loc[t,'EPS_TTM'] if t in eps_df.index else np.nan
+            df.loc[t,'EPS']  = _scalar(eps_df.loc[t,'EPS_TTM']) if t in eps_df.index else np.nan
+            df.loc[t,'EPS_Q'] = _scalar(eps_df.loc[t,'EPS_Q_LastQ']) if t in eps_df.index else np.nan
+            df.loc[t,'REV_TTM'] = _scalar(eps_df.loc[t,'REV_TTM']) if t in eps_df.index else np.nan
+            df.loc[t,'REV_Q']   = _scalar(eps_df.loc[t,'REV_Q_LastQ']) if t in eps_df.index else np.nan
             df.loc[t,'REV']  = d.get('revenueGrowth',np.nan)
             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
