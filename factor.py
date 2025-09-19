@@ -212,6 +212,100 @@ class Input:
 
     # ---- （Input専用）EPS補完・FCF算出系 ----
     @staticmethod
+    def _sec_headers():
+        mail = (os.getenv("SEC_CONTACT_EMAIL") or "yasonba55@gmail.com").strip()
+        app = (os.getenv("SEC_APP_NAME") or "FactorBot/1.0").strip()
+        return {
+            "User-Agent": f"{app} ({mail})",
+            "From": mail,
+            "Accept": "application/json",
+        }
+
+    @staticmethod
+    def _sec_get(url: str, retries: int = 3, backoff: float = 0.5):
+        for i in range(retries):
+            r = requests.get(url, headers=Input._sec_headers(), timeout=20)
+            if r.status_code in (429, 503):
+                time.sleep(min(2 ** i * backoff, 4.0))
+                continue
+            r.raise_for_status()
+            return r.json()
+        r.raise_for_status()
+
+    @staticmethod
+    def _sec_ticker_map():
+        j = Input._sec_get("https://data.sec.gov/api/xbrl/company_tickers.json")
+        mp = {}
+        for _, v in (j or {}).items():
+            try:
+                mp[str(v["ticker"]).upper()] = f"{int(v['cik_str']):010d}"
+            except Exception:
+                pass
+        return mp
+
+    @staticmethod
+    def _sec_companyfacts(cik: str):
+        return Input._sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
+
+    @staticmethod
+    def _pick_usd_facts(fact_obj: dict, tag: str):
+        if not fact_obj:
+            return []
+        try:
+            units = fact_obj["facts"]["us-gaap"][tag]["units"]
+            for k in ("USD", "USD/shares"):
+                if k in units:
+                    return units[k]
+        except Exception:
+            return []
+        return []
+
+    @staticmethod
+    def _series_from_facts(arr, key="val", normalize=float):
+        out = []
+        for x in (arr or []):
+            try:
+                v = x.get(key)
+                out.append(normalize(v) if v is not None else float("nan"))
+            except Exception:
+                out.append(float("nan"))
+        return out
+
+    def fetch_eps_rev_from_sec(self, tickers: list[str]) -> dict:
+        out = {}
+        t2cik = self._sec_ticker_map()
+        for t in tickers:
+            cik = t2cik.get(t.upper())
+            if not cik:
+                out[t] = {}
+                continue
+            try:
+                j = self._sec_companyfacts(cik)
+                rev_arr = self._pick_usd_facts(j, "Revenues") or self._pick_usd_facts(j, "SalesRevenueNet")
+                eps_arr = self._pick_usd_facts(j, "EarningsPerShareDiluted") or self._pick_usd_facts(j, "EarningsPerShareBasic")
+                if rev_arr:
+                    rev_arr = sorted(rev_arr, key=lambda x: x.get("end", ""), reverse=True)
+                if eps_arr:
+                    eps_arr = sorted(eps_arr, key=lambda x: x.get("end", ""), reverse=True)
+                rev_vals = self._series_from_facts(rev_arr)
+                eps_vals = self._series_from_facts(eps_arr)
+                rev_q = float(rev_vals[0]) if rev_vals else float("nan")
+                eps_q = float(eps_vals[0]) if eps_vals else float("nan")
+                rev_ttm = float(sum([v for v in rev_vals[:4] if v == v])) if rev_vals else float("nan")
+                eps_ttm = float(sum([v for v in eps_vals[:4] if v == v])) if eps_vals else float("nan")
+                out[t] = {
+                    "eps_q_recent": eps_q,
+                    "eps_ttm": eps_ttm,
+                    "rev_q_recent": rev_q,
+                    "rev_ttm": rev_ttm,
+                    "eps_q_series": eps_vals[:8],
+                    "rev_q_series": rev_vals[:8],
+                }
+            except Exception:
+                out[t] = {}
+            time.sleep(0.12)
+        return out
+    @staticmethod
     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
         out_col = out_col or ttm_col; df = df.copy(); df["eps_imputed"] = False
         cand = df[q_col]*4; ok = df[ttm_col].isna() & cand.replace([np.inf,-np.inf], np.nan).notna()
@@ -340,18 +434,24 @@ class Input:
         cols = ["cfo_ttm_yf","capex_ttm_yf","cfo_ttm_fh","capex_ttm_fh","cfo_ttm","capex_ttm","fcf_ttm","fcf_ttm_yf_direct","cfo_source","capex_source","fcf_imputed"]
         return df[cols].sort_index()
 
-    def _build_eps_df(self, tickers, tickers_bulk, info):
+    def _build_eps_df(self, tickers, tickers_bulk, info, sec_map: dict | None = None):
         eps_rows=[]
         for t in tickers:
-            info_t, eps_ttm, eps_q = info[t], info[t].get("trailingEps", np.nan), np.nan
+            info_t = info[t]
+            sec_t = (sec_map or {}).get(t, {})
+            eps_ttm = sec_t.get("eps_ttm", info_t.get("trailingEps", np.nan))
+            eps_q = sec_t.get("eps_q_recent", np.nan)
             try:
                 qearn, so = tickers_bulk.tickers[t].quarterly_earnings, info_t.get("sharesOutstanding")
                 if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
                     eps_ttm_q = qearn["Earnings"].head(4).sum()/so
                     if pd.notna(eps_ttm_q) and (pd.isna(eps_ttm) or (abs(eps_ttm)>0 and abs(eps_ttm/eps_ttm_q)>3)): eps_ttm = eps_ttm_q
-                    eps_q = qearn["Earnings"].iloc[-1]/so
+                    if pd.isna(eps_q):
+                        eps_q = qearn["Earnings"].iloc[-1]/so
             except Exception: pass
-            eps_rows.append({"ticker":t,"eps_ttm":eps_ttm,"eps_q_recent":eps_q})
+            rev_ttm = sec_t.get("rev_ttm", np.nan)
+            rev_q = sec_t.get("rev_q_recent", np.nan)
+            eps_rows.append({"ticker":t,"eps_ttm":eps_ttm,"eps_q_recent":eps_q,"rev_ttm":rev_ttm,"rev_q_recent":rev_q})
         return self.impute_eps_ttm(pd.DataFrame(eps_rows).set_index("ticker"))
 
     def prepare_data(self):
@@ -383,7 +483,21 @@ class Input:
             except Exception as e:
                 logger.info("[warn] %s: info fetch failed (%s)", t, e)
                 info[t] = {}
-        eps_df = self._build_eps_df(tickers, tickers_bulk, info)
+        try:
+            sec_map = self.fetch_eps_rev_from_sec(tickers)
+            for t in tickers:
+                if t in info and sec_map.get(t):
+                    info[t]["SEC_REV_Q_SERIES"] = sec_map[t].get("rev_q_series") or []
+                    info[t]["SEC_EPS_Q_SERIES"] = sec_map[t].get("eps_q_series") or []
+        except Exception:
+            sec_map = None
+        eps_df = self._build_eps_df(tickers, tickers_bulk, info, sec_map=sec_map)
+        eps_df = eps_df.assign(
+            EPS_TTM=eps_df["eps_ttm"],
+            EPS_Q_LastQ=eps_df["eps_q_recent"],
+            REV_TTM=eps_df["rev_ttm"],
+            REV_Q_LastQ=eps_df["rev_q_recent"],
+        )
         fcf_df = self.compute_fcf_with_fallback(tickers, finnhub_api_key=self.api_key)
         T.log("eps/fcf prep done")
         returns = px[tickers].pct_change()
