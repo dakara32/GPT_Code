@@ -1142,12 +1142,12 @@ class Scorer:
         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
 
-        # シンプル版（全明細）：df_zをページングでログ出力（loggerのみ）
+        # df_z 全明細をページングしてログ出力（最小版）
         if getattr(cfg, "debug_mode", False):
             pd.set_option("display.max_columns", None)
             pd.set_option("display.max_colwidth", None)
             pd.set_option("display.width", None)
-            page = int(getattr(cfg, "debug_dfz_page", 200))  # 1ページ行数
+            page = int(getattr(cfg, "debug_dfz_page", 50))  # デフォルト50行単位
             n = len(df_z)
             logger.info("=== df_z FULL DUMP start === rows=%d cols=%d page=%d", n, df_z.shape[1], page)
             for i in range(0, n, page):
@@ -1158,16 +1158,6 @@ class Scorer:
                     chunk_str = df_z.iloc[i:j].astype(str).to_string()
                 logger.info("--- df_z rows %d..%d ---\n%s", i, j-1, chunk_str)
             logger.info("=== df_z FULL DUMP end ===")
-
-            # （任意）CSV保存
-            try:
-                import os
-                os.makedirs("out", exist_ok=True)
-                csv_path = "out/df_z_latest.csv"
-                df_z.to_csv(csv_path)
-                logger.info("df_z CSV saved: %s (rows=%d cols=%d)", csv_path, n, df_z.shape[1])
-            except Exception as e:
-                logger.warning("df_z CSV save failed: %s", e)
 
         # === begin: BIO LOSS PENALTY =====================================
         try:
