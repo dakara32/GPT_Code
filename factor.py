@@ -7,7 +7,7 @@ import os, time, requests
 import logging
 from time import perf_counter
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
@@ -324,14 +324,20 @@ class Input:
         return out
 
     @staticmethod
-    def _series_from_facts(arr, key="val", normalize=float):
-        out = []
+    def _series_from_facts_with_dates(arr, key_val="val", key_dt="end", normalize=float):
+        """companyfactsアイテム配列から (date,value) を返す。dateはYYYY-MM-DDを想定。"""
+        out: List[Tuple[str, float]] = []
         for x in (arr or []):
             try:
-                v = x.get(key)
-                out.append(normalize(v) if v is not None else float("nan"))
+                v = x.get(key_val)
+                d = x.get(key_dt)
+                if d is None:
+                    continue
+                out.append((str(d), normalize(v) if v is not None else float("nan")))
             except Exception:
-                out.append(float("nan"))
+                continue
+        # end(=日付)の降順にソート（最新→古い）
+        out.sort(key=lambda t: t[0], reverse=True)
         return out
 
     def fetch_eps_rev_from_sec(self, tickers: list[str]) -> dict:
@@ -381,8 +387,11 @@ class Input:
                 eps_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], eps_tags)
                 rev_q_items = self._only_quarterly(rev_arr)
                 eps_q_items = self._only_quarterly(eps_arr)
-                rev_vals = self._series_from_facts(rev_q_items)
-                eps_vals = self._series_from_facts(eps_q_items)
+                # (date,value) で取得
+                rev_pairs = self._series_from_facts_with_dates(rev_q_items)
+                eps_pairs = self._series_from_facts_with_dates(eps_q_items)
+                rev_vals = [v for (_d, v) in rev_pairs]
+                eps_vals = [v for (_d, v) in eps_pairs]
                 rev_q = float(rev_vals[0]) if rev_vals else float("nan")
                 eps_q = float(eps_vals[0]) if eps_vals else float("nan")
                 rev_ttm = float(sum([v for v in rev_vals[:4] if v == v])) if rev_vals else float("nan")
@@ -392,8 +401,11 @@ class Input:
                     "eps_ttm": eps_ttm,
                     "rev_q_recent": rev_q,
                     "rev_ttm": rev_ttm,
-                    "eps_q_series": eps_vals[:8],
-                    "rev_q_series": rev_vals[:8],
+                    # 後段でDatetimeIndex化できるよう (date,value) を保持。値だけの互換キーも残す。
+                    "eps_q_series_pairs": eps_pairs[:16],
+                    "rev_q_series_pairs": rev_pairs[:16],
+                    "eps_q_series": eps_vals[:16],
+                    "rev_q_series": rev_vals[:16],
                 }
                 n_map += 1
                 if rev_vals:
@@ -408,6 +420,14 @@ class Input:
         try:
             total = len(tickers)
             print(f"[SEC] map={n_map}/{total}  rev_q_hit={n_rev}  eps_q_hit={n_eps}")
+            # デバッグ: 取得本数の分布（先頭のみ）
+            try:
+                lens = [len((out.get(t, {}) or {}).get("rev_q_series", [])) for t in tickers]
+                print(f"[SEC] rev_q_series length: min={min(lens) if lens else 0} "
+                      f"p25={np.percentile(lens,25) if lens else 0} median={np.median(lens) if lens else 0} "
+                      f"p75={np.percentile(lens,75) if lens else 0} max={max(lens) if lens else 0}")
+            except Exception:
+                pass
             if miss_map:
                 print(f"[SEC] no CIK map: {len(miss_map)} (サンプル例) {miss_map[:20]}")
             if miss_facts:
@@ -649,8 +669,23 @@ class Input:
             sec_map = self.fetch_eps_rev_from_sec(tickers)
             for t in tickers:
                 if t in info and sec_map.get(t):
-                    info[t]["SEC_REV_Q_SERIES"] = sec_map[t].get("rev_q_series") or []
-                    info[t]["SEC_EPS_Q_SERIES"] = sec_map[t].get("eps_q_series") or []
+                    # (date,value) を優先採用。なければ従来の値だけ配列。
+                    pairs_r = sec_map[t].get("rev_q_series_pairs") or []
+                    pairs_e = sec_map[t].get("eps_q_series_pairs") or []
+                    if pairs_r:
+                        idx = pd.to_datetime([d for (d, _v) in pairs_r], errors="coerce")
+                        val = pd.to_numeric([v for (_d, v) in pairs_r], errors="coerce")
+                        s = pd.Series(val, index=idx).sort_index()  # 古い→新しい（YoY等の直感に合わせる）
+                        info[t]["SEC_REV_Q_SERIES"] = s
+                    else:
+                        info[t]["SEC_REV_Q_SERIES"] = sec_map[t].get("rev_q_series") or []
+                    if pairs_e:
+                        idx = pd.to_datetime([d for (d, _v) in pairs_e], errors="coerce")
+                        val = pd.to_numeric([v for (_d, v) in pairs_e], errors="coerce")
+                        s = pd.Series(val, index=idx).sort_index()
+                        info[t]["SEC_EPS_Q_SERIES"] = s
+                    else:
+                        info[t]["SEC_EPS_Q_SERIES"] = sec_map[t].get("eps_q_series") or []
         except Exception:
             sec_map = None
         eps_df = self._build_eps_df(tickers, tickers_bulk, info, sec_map=sec_map)
