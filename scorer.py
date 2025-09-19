@@ -86,15 +86,10 @@ def robust_z_keepnan(s: pd.Series) -> pd.Series:
     return pd.Series(z, index=v.index, dtype=float)
 
 
-def _fetch_revenue_quarterly_via_finnhub(symbol: str, api_key: str | None = None):
-    """
-    Finnhub 'Financials As Reported' から四半期売上を Series で返す。
-    スキーマ揺れに対応: income statement(ic)配下の複数キー候補を順探索。
-    返却: pandas.Series(index="YYYYQn", name="Revenue") or None
-    """
+def _fetch_revenue_quarterly_via_finnhub(symbol: str):
+    """Finnhub financials-reported endpoint から四半期売上を取得する."""
 
-    if api_key is None:
-        api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+    api_key = os.getenv("FINNHUB_API_KEY", "").strip()
     if not api_key:
         return None
 
@@ -102,10 +97,9 @@ def _fetch_revenue_quarterly_via_finnhub(symbol: str, api_key: str | None = None
         url = "https://finnhub.io/api/v1/stock/financials-reported"
         r = requests.get(url, params={"symbol": symbol, "token": api_key}, timeout=10)
         r.raise_for_status()
-        payload = r.json() or {}
-        data = payload.get("data", []) or []
+        data = (r.json() or {}).get("data", []) or []
 
-        CAND_KEYS = [
+        cand_keys = [
             "revenue",
             "totalRevenue",
             "netSales",
@@ -116,47 +110,45 @@ def _fetch_revenue_quarterly_via_finnhub(symbol: str, api_key: str | None = None
             "turnover",
         ]
 
-        def _first_number(v):
+        def _num(v):
             try:
                 if isinstance(v, dict):
                     v = v.get("value")
                 if v is None:
                     return None
                 x = float(v)
-                if math.isfinite(x):
-                    return x
+                return x if math.isfinite(x) else None
             except Exception:
                 return None
-            return None
 
         rows = []
         for item in data:
             rep = (item or {}).get("report", {})
             ic = rep.get("ic", {}) if isinstance(rep, dict) else {}
-
             if isinstance(ic, list):
-                ic_dict = {}
-                for entry in ic:
-                    if isinstance(entry, dict) and "concept" in entry:
-                        ic_dict[entry["concept"]] = {"value": entry.get("value")}
-                ic = ic_dict
+                ic = {
+                    u.get("concept"): {"value": u.get("value")}
+                    for u in ic
+                    if isinstance(u, dict) and "concept" in u
+                }
 
-            rev_val = None
+            val = None
             if isinstance(ic, dict):
-                for key in CAND_KEYS:
+                for key in cand_keys:
                     if key in ic:
-                        rev_val = _first_number(ic.get(key))
-                        if rev_val is not None:
+                        val = _num(ic.get(key))
+                        if val is not None:
                             break
-            if rev_val is None:
-                continue
 
             year = item.get("year")
             quarter = item.get("quarter")
-            if year is None or quarter is None:
+            if val is None or year is None or quarter is None:
                 continue
 
-            rows.append((int(year), int(quarter), rev_val))
+            try:
+                rows.append((int(year), int(quarter), float(val)))
+            except Exception:
+                continue
 
         if not rows:
             return None
@@ -165,43 +157,9 @@ def _fetch_revenue_quarterly_via_finnhub(symbol: str, api_key: str | None = None
         idx = [f"{y}Q{q}" for y, q, _ in rows]
         vals = [v for _, _, v in rows]
         s = pd.Series(vals, index=idx, name="Revenue")
-        if s.dropna().empty:
-            return None
-        return s
+        return None if s.dropna().empty else s
     except Exception:
         return None
-
-
-def _alt_symbols_for_finnhub(symbol: str) -> list[str]:
-    """Return alternative ticker formats for Finnhub (e.g. BRK-B <-> BRK.B)."""
-    alts: set[str] = set()
-    if "-" in symbol:
-        alts.add(symbol.replace("-", "."))
-    if "." in symbol:
-        alts.add(symbol.replace(".", "-"))
-    alts.discard(symbol)
-    return list(alts)
-
-
-def _fetch_rev_quarterly_with_retry(symbol: str, api_key: str, debug: bool = False):
-    """Fetch quarterly revenue with a single retry for hyphen/dot symbol variants."""
-
-    symbols = [symbol] + _alt_symbols_for_finnhub(symbol)
-    for current in symbols:
-        series = _fetch_revenue_quarterly_via_finnhub(current, api_key=api_key)
-        count = int(series.dropna().shape[0]) if isinstance(series, pd.Series) else 0
-        if debug:
-            if current == symbol:
-                base = f"[REV Fallback] {symbol}"
-            else:
-                base = f"[REV Fallback] {symbol} -> {current}"
-            if count > 0:
-                logger.info("%s: hit=%d", base, count)
-            else:
-                logger.info("%s: miss", base)
-        if count > 0 and isinstance(series, pd.Series):
-            return series
-    return None
 
 
 def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
@@ -487,12 +445,6 @@ class Scorer:
         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
 
         debug_mode = bool(getattr(cfg, "debug_mode", False))
-        raw_key = os.environ.get("FINNHUB_API_KEY")
-        finnhub_api_key = raw_key.strip() if isinstance(raw_key, str) else ""
-        if debug_mode and not getattr(self, "_rev_fallback_key_logged", False):
-            if not finnhub_api_key:
-                logger.info("[REV Fallback] FINNHUB_API_KEY missing -> fallback不実行")
-            self._rev_fallback_key_logged = True
 
         df, missing_logs = pd.DataFrame(index=tickers), []
         for t in tickers:
@@ -614,13 +566,13 @@ class Scorer:
                             rev_series = rev_series.sort_index()
                         except Exception:
                             pass
-                    if (
-                        rev_series is None
-                        or getattr(rev_series, "dropna", lambda: pd.Series(dtype=float))().empty
-                    ) and finnhub_api_key:
-                        rev_series = _fetch_rev_quarterly_with_retry(
-                            t, finnhub_api_key, debug=debug_mode
-                        )
+                    needs_fallback = True
+                    if isinstance(rev_series, pd.Series):
+                        needs_fallback = rev_series.dropna().empty
+                    if needs_fallback:
+                        fallback = _fetch_revenue_quarterly_via_finnhub(t)
+                        if isinstance(fallback, pd.Series) and not fallback.dropna().empty:
+                            rev_series = fallback
 
                 if rev_series is not None and rev_series.dropna().shape[0] >= 2:
                     r = rev_series.dropna().astype(float)
