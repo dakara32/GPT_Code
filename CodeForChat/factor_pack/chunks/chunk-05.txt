@@ -163,105 +163,126 @@ L84         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
 L85     return pd.Series(z, index=v.index, dtype=float)
 L86
 L87
-L88 def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
-L89     """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
-L90     if not debug_mode:
-L91         return
-L92     try:
-L93         view = df_z.copy()
-L94         view = view.apply(
-L95             lambda s: s.round(ndigits)
-L96             if getattr(getattr(s, "dtype", None), "kind", "") in ("f", "i")
-L97             else s
-L98         )
-L99         if len(view) > max_rows:
-L100             view = view.iloc[:max_rows]
-L101
-L102         # === NaNサマリ（列ごとの欠損件数 上位20） ===
-L103         try:
-L104             nan_counts = df_z.isna().sum().sort_values(ascending=False)
-L105             top_nan = nan_counts[nan_counts > 0].head(20)
-L106             if len(top_nan) > 0:
-L107                 logger.info("NaN columns (top20):\n%s", top_nan.to_string())
-L108             else:
-L109                 logger.info("NaN columns: none")
-L110         except Exception as exc:
-L111             logger.warning("nan summary failed: %s", exc)
-L112
-L113         # === Zeroサマリ（列ごとのゼロ比率 上位20） ===
-L114         try:
-L115             zero_counts = ((df_z == 0) & (~df_z.isna())).sum()
-L116             nonnull_counts = (~df_z.isna()).sum()
-L117             zero_ratio = (zero_counts / nonnull_counts).sort_values(ascending=False)
-L118             top_zero = zero_ratio[zero_ratio > 0].head(20)
-L119             if len(top_zero) > 0:
-L120                 logger.info(
-L121                     "Zero-dominated columns (top20):\n%s",
-L122                     top_zero.to_string(float_format=lambda x: f"{x:.2%}"),
-L123                 )
-L124             else:
-L125                 logger.info("Zero-dominated columns: none")
-L126         except Exception as exc:
-L127             logger.warning("zero summary failed: %s", exc)
-L128
-L129         logger.info("===== DF_Z DUMP START =====")
-L130         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
-L131         logger.info("===== DF_Z DUMP END =====")
-L132     except Exception as exc:
-L133         logger.warning("df_z dump failed: %s", exc)
-L134
-L135 def _safe_div(a, b):
-L136     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
-L137     except Exception: return np.nan
-L138
-L139 def _safe_last(series: pd.Series, default=np.nan):
-L140     try: return float(series.iloc[-1])
-L141     except Exception: return default
-L142
-L143 D_WEIGHTS_EFF = None  # 出力表示互換のため
-L144
-L145 # ---- Scorer 本体 -------------------------------------------------------------
-L146 class Scorer:
-L147     """
-L148     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
-L149     - cfg は必須（factor.PipelineConfig を渡す）。
-L150     - 旧カラム名を自動リネームして新スキーマに吸収します。
-L151     """
-L152
-L153     # === 先頭で旧→新カラム名マップ（移行用） ===
-L154     EPS_RENAME = {"eps_ttm":"EPS_TTM", "eps_q_recent":"EPS_Q_LastQ"}
-L155     FCF_RENAME = {"fcf_ttm":"FCF_TTM"}
-L156
-L157     # === スキーマ簡易チェック（最低限） ===
-L158     @staticmethod
-L159     def _validate_ib_for_scorer(ib: Any):
-L160         miss = [a for a in ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"] if not hasattr(ib,a) or getattr(ib,a) is None]
-L161         if miss: raise ValueError(f"InputBundle is missing required attributes for Scorer: {miss}")
-L162         if any(c in ib.eps_df.columns for c in Scorer.EPS_RENAME): ib.eps_df.rename(columns=Scorer.EPS_RENAME, inplace=True)
-L163         if any(c in ib.fcf_df.columns for c in Scorer.FCF_RENAME): ib.fcf_df.rename(columns=Scorer.FCF_RENAME, inplace=True)
-L164         need_eps, need_fcf = {"EPS_TTM","EPS_Q_LastQ"},{"FCF_TTM"}
-L165         if not need_eps.issubset(ib.eps_df.columns): raise ValueError(f"eps_df must contain columns {need_eps} (accepts old names via auto-rename). Got: {list(ib.eps_df.columns)}")
-L166         if not need_fcf.issubset(ib.fcf_df.columns): raise ValueError(f"fcf_df must contain columns {need_fcf} (accepts old names via auto-rename). Got: {list(ib.fcf_df.columns)}")
-L167
-L168     # ----（Scorer専用）テクニカル・指標系 ----
-L169     @staticmethod
-L170     def trend(s: pd.Series):
-L171         if len(s)<200: return np.nan
-L172         sma50, sma150, sma200 = s.rolling(50).mean().iloc[-1], s.rolling(150).mean().iloc[-1], s.rolling(200).mean().iloc[-1]
-L173         prev200, p = s.rolling(200).mean().iloc[-21], s.iloc[-1]
-L174         lo_52 = s[-252:].min() if len(s)>=252 else s.min(); hi_52 = s[-252:].max() if len(s)>=252 else s.max()
-L175         rng = (hi_52 - lo_52) if hi_52>lo_52 else np.nan
-L176         clip = lambda x,lo,hi: (np.nan if pd.isna(x) else max(lo,min(hi,x)))
-L177         a = clip(p/(s.rolling(50).mean().iloc[-1]) - 1, -0.5, 0.5)
-L178         b = clip(sma50/sma150 - 1, -0.5, 0.5)
-L179         c = clip(sma150/sma200 - 1, -0.5, 0.5)
-L180         d = clip(sma200/prev200 - 1, -0.2, 0.2)
-L181         e = clip((p - lo_52) / (rng if rng and rng>0 else np.nan) - 0.5, -0.5, 0.5)
-L182         parts = [0.0 if pd.isna(x) else x for x in (a,b,c,d,e)]
-L183         return 0.30*parts[0] + 0.20*parts[1] + 0.15*parts[2] + 0.15*parts[3] + 0.20*parts[4]
-L184
-L185     @staticmethod
-L186     def rs(s, b):
-L187         n, nb = len(s), len(b)
-L188         if n<60 or nb<60: return np
+L88 def _fetch_revenue_quarterly_via_finnhub(symbol: str):
+L89     """Fetch quarterly revenue via Finnhub when yfinance data is unavailable.
+L90
+L91     Returns a pandas.Series indexed by "YYYYQn" (ascending) or ``None`` when
+L92     an API token is missing, data is not found, or any error occurs. No
+L93     exception is propagated to keep behaviour identical without a token.
+L94     """
+L95     api_key = os.getenv("FINNHUB_API_KEY", "").strip()
+L96     if not api_key:
+L97         return None
+L98     try:
+L99         url = "https://finnhub.io/api/v1/stock/financials-reported"
+L100         params = {"symbol": symbol, "token": api_key}
+L101         r = requests.get(url, params=params, timeout=10)
+L102         r.raise_for_status()
+L103         payload = r.json() or {}
+L104         rows = []
+L105         for item in payload.get("data", []) or []:
+L106             rep = (item or {}).get("report", {})
+L107             ic = rep.get("ic", {}) if isinstance(rep, dict) else {}
+L108             rev_val = None
+L109             if isinstance(ic, dict):
+L110                 revenue_node = ic.get("revenue")
+L111                 if isinstance(revenue_node, dict):
+L112                     rev_val = revenue_node.get("value")
+L113                 if rev_val is None:
+L114                     total_node = ic.get("totalRevenue")
+L115                     if isinstance(total_node, dict):
+L116                         rev_val = total_node.get("value")
+L117             if rev_val is None:
+L118                 continue
+L119             year = item.get("year")
+L120             quarter = item.get("quarter")
+L121             if year is None or quarter is None:
+L122                 continue
+L123             try:
+L124                 rows.append((int(year), int(quarter), float(rev_val)))
+L125             except Exception:
+L126                 continue
+L127         if not rows:
+L128             return None
+L129         rows.sort(key=lambda x: (x[0], x[1]))
+L130         idx = [f"{y}Q{q}" for y, q, _ in rows]
+L131         vals = [v for _, _, v in rows]
+L132         return pd.Series(vals, index=idx, name="Revenue")
+L133     except Exception:
+L134         return None
+L135
+L136
+L137 def _dump_dfz(df_z: pd.DataFrame, debug_mode: bool, max_rows: int = 400, ndigits: int = 3) -> None:
+L138     """df_z を System log(INFO) へダンプする簡潔なユーティリティ."""
+L139     if not debug_mode:
+L140         return
+L141     try:
+L142         view = df_z.copy()
+L143         view = view.apply(
+L144             lambda s: s.round(ndigits)
+L145             if getattr(getattr(s, "dtype", None), "kind", "") in ("f", "i")
+L146             else s
+L147         )
+L148         if len(view) > max_rows:
+L149             view = view.iloc[:max_rows]
+L150
+L151         # === NaNサマリ（列ごとの欠損件数 上位20） ===
+L152         try:
+L153             nan_counts = df_z.isna().sum().sort_values(ascending=False)
+L154             top_nan = nan_counts[nan_counts > 0].head(20)
+L155             if len(top_nan) > 0:
+L156                 logger.info("NaN columns (top20):\n%s", top_nan.to_string())
+L157             else:
+L158                 logger.info("NaN columns: none")
+L159         except Exception as exc:
+L160             logger.warning("nan summary failed: %s", exc)
+L161
+L162         # === Zeroサマリ（列ごとのゼロ比率 上位20） ===
+L163         try:
+L164             zero_counts = ((df_z == 0) & (~df_z.isna())).sum()
+L165             nonnull_counts = (~df_z.isna()).sum()
+L166             zero_ratio = (zero_counts / nonnull_counts).sort_values(ascending=False)
+L167             top_zero = zero_ratio[zero_ratio > 0].head(20)
+L168             if len(top_zero) > 0:
+L169                 logger.info(
+L170                     "Zero-dominated columns (top20):\n%s",
+L171                     top_zero.to_string(float_format=lambda x: f"{x:.2%}"),
+L172                 )
+L173             else:
+L174                 logger.info("Zero-dominated columns: none")
+L175         except Exception as exc:
+L176             logger.warning("zero summary failed: %s", exc)
+L177
+L178         logger.info("===== DF_Z DUMP START =====")
+L179         logger.info("\n%s", view.to_string(max_rows=None, max_cols=None))
+L180         logger.info("===== DF_Z DUMP END =====")
+L181     except Exception as exc:
+L182         logger.warning("df_z dump failed: %s", exc)
+L183
+L184 def _safe_div(a, b):
+L185     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
+L186     except Exception: return np.nan
+L187
+L188 def _safe_last(series: pd.Series, default=np.nan):
+L189     try: return float(series.iloc[-1])
+L190     except Exception: return default
+L191
+L192 D_WEIGHTS_EFF = None  # 出力表示互換のため
+L193
+L194 # ---- Scorer 本体 -------------------------------------------------------------
+L195 class Scorer:
+L196     """
+L197     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
+L198     - cfg は必須（factor.PipelineConfig を渡す）。
+L199     - 旧カラム名を自動リネームして新スキーマに吸収します。
+L200     """
+L201
+L202     # === 先頭で旧→新カラム名マップ（移行用） ===
+L203     EPS_RENAME = {"eps_ttm":"EPS_TTM", "eps_q_recent":"EPS_Q_LastQ"}
+L204     FCF_RENAME = {"fcf_ttm":"FCF_TTM"}
+L205
+L206     # === スキーマ簡易チェック（最低限） ===
+L207     @staticmethod
+L208     def _validate_ib_for_scorer(ib: Any):
+L2
 ```
