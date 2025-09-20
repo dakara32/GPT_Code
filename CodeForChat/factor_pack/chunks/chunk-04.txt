@@ -1,223 +1,225 @@
 ```text
-L728         else:
-L729             logger.info("[T] price window clip skipped; rows=%d", len(px))
-L730         tickers_bulk, info = yf.Tickers(" ".join(tickers)), {}
-L731         for t in tickers:
-L732             try:
-L733                 info[t] = tickers_bulk.tickers[t].info
-L734             except Exception as e:
-L735                 logger.info("[warn] %s: info fetch failed (%s)", t, e)
-L736                 info[t] = {}
-L737         try:
-L738             sec_map = self.fetch_eps_rev_from_sec(tickers)
-L739         except Exception as e:
-L740             logger.warning("[SEC] fetch_eps_rev_from_sec failed: %s", e)
-L741             sec_map = {}
-L742
-L743         def _brief_len(s):
-L744             try:
-L745                 if isinstance(s, pd.Series):
-L746                     return int(s.dropna().size)
-L747                 if isinstance(s, (list, tuple)):
-L748                     return len([v for v in s if pd.notna(v)])
-L749                 if isinstance(s, np.ndarray):
-L750                     return int(np.count_nonzero(~pd.isna(s)))
-L751                 return int(bool(s))
-L752             except Exception:
-L753                 return 0
-L754
-L755         def _has_entries(val) -> bool:
-L756             try:
-L757                 if isinstance(val, pd.Series):
-L758                     return not val.dropna().empty
-L759                 if isinstance(val, (list, tuple)):
-L760                     return any(pd.notna(v) for v in val)
-L761                 return bool(val)
-L762             except Exception:
-L763                 return False
-L764
-L765         have_rev = 0
-L766         have_eps = 0
-L767         rev_lens: list[int] = []
-L768         eps_lens: list[int] = []
-L769         rev_y_lens: list[int] = []
-L770         samples: list[tuple[str, int, str, float | None, int, str, float | None]] = []
-L771
-L772         for t in tickers:
-L773             entry = info.get(t, {})
-L774             m = (sec_map or {}).get(t) or {}
-L775             if entry is None or not isinstance(entry, dict):
-L776                 entry = {}
-L777                 info[t] = entry
-L778
-L779             if m:
-L780                 pairs_r = m.get("rev_q_series_pairs") or []
-L781                 pairs_e = m.get("eps_q_series_pairs") or []
-L782                 if pairs_r:
-L783                     idx = pd.to_datetime([d for (d, _v) in pairs_r], errors="coerce")
-L784                     val = pd.to_numeric([v for (_d, v) in pairs_r], errors="coerce")
-L785                     s = pd.Series(val, index=idx).sort_index()
-L786                     entry["SEC_REV_Q_SERIES"] = s
-L787                 else:
-L788                     entry["SEC_REV_Q_SERIES"] = m.get("rev_q_series") or []
-L789                 if pairs_e:
-L790                     idx = pd.to_datetime([d for (d, _v) in pairs_e], errors="coerce")
-L791                     val = pd.to_numeric([v for (_d, v) in pairs_e], errors="coerce")
-L792                     s = pd.Series(val, index=idx).sort_index()
-L793                     entry["SEC_EPS_Q_SERIES"] = s
-L794                 else:
-L795                     entry["SEC_EPS_Q_SERIES"] = m.get("eps_q_series") or []
-L796
-L797             r = entry.get("SEC_REV_Q_SERIES")
-L798             e = entry.get("SEC_EPS_Q_SERIES")
-L799             # 年次は直近3件（約3年）だけ保持。重み分岐の nY 判定は従来通り。
-L800             try:
-L801                 if hasattr(r, "index") and isinstance(r.index, pd.DatetimeIndex):
-L802                     y = r.resample("Y").sum().dropna()
-L803                     entry["SEC_REV_Y_SERIES"] = y.tail(3)
-L804                 else:
-L805                     entry["SEC_REV_Y_SERIES"] = []
-L806             except Exception:
-L807                 entry["SEC_REV_Y_SERIES"] = []
-L808             ry = entry.get("SEC_REV_Y_SERIES")
-L809             if _has_entries(r):
-L810                 have_rev += 1
-L811             if _has_entries(e):
-L812                 have_eps += 1
-L813             lr = _brief_len(r)
-L814             le = _brief_len(e)
-L815             rev_lens.append(lr)
-L816             eps_lens.append(le)
-L817             rev_y_lens.append(_brief_len(ry))
-L818             if len(samples) < 8:
-L819                 try:
-L820                     rd = getattr(r, "index", [])[-1] if lr > 0 else None
-L821                     rv = float(r.iloc[-1]) if lr > 0 else None
-L822                     ed = getattr(e, "index", [])[-1] if le > 0 else None
-L823                     ev = float(e.iloc[-1]) if le > 0 else None
-L824                     samples.append((t, lr, str(rd) if rd is not None else "-", rv, le, str(ed) if ed is not None else "-", ev))
-L825                 except Exception:
-L826                     samples.append((t, lr, "-", None, le, "-", None))
-L827
-L828         logger.info("[SEC] series attach: rev_q=%d/%d, eps_q=%d/%d", have_rev, len(tickers), have_eps, len(tickers))
-L829         logger.info(
-L830             "[SEC_SERIES] rev_q=%d (<=12), eps_q=%d (<=12), rev_y=%d (<=3)",
-L831             max(rev_lens) if rev_lens else 0,
-L832             max(eps_lens) if eps_lens else 0,
-L833             max(rev_y_lens) if rev_y_lens else 0,
-L834         )
-L835
-L836         if rev_lens:
-L837             rev_lens_sorted = sorted(rev_lens)
-L838             eps_lens_sorted = sorted(eps_lens)
-L839             _log(
-L840                 "SEC_SERIES",
-L841                 f"rev_len min/med/max={rev_lens_sorted[0]}/{rev_lens_sorted[len(rev_lens)//2]}/{rev_lens_sorted[-1]} "
-L842                 f"eps_len min/med/max={eps_lens_sorted[0]}/{eps_lens_sorted[len(eps_lens)//2]}/{eps_lens_sorted[-1]}",
-L843             )
-L844         for (t, lr, rd, rv, le, ed, ev) in samples:
-L845             _log("SEC_SERIES_SMP", f"{t}  rev_len={lr} last=({rd},{rv})  eps_len={le} last=({ed},{ev})")
-L846         eps_df = self._build_eps_df(tickers, tickers_bulk, info, sec_map=sec_map)
-L847         # index 重複があると .loc[t, col] が Series になり代入時に ValueError を誘発する
-L848         if not eps_df.index.is_unique:
-L849             eps_df = eps_df[~eps_df.index.duplicated(keep="last")]
-L850         eps_df = eps_df.assign(
-L851             EPS_TTM=eps_df["eps_ttm"],
-L852             EPS_Q_LastQ=eps_df["eps_q_recent"],
-L853             REV_TTM=eps_df["rev_ttm"],
-L854             REV_Q_LastQ=eps_df["rev_q_recent"],
-L855         )
-L856         # ここで非NaN件数をサマリ表示（欠損状況の即時把握用）
-L857         try:
-L858             n = len(eps_df)
-L859             c_eps = int(eps_df["EPS_TTM"].notna().sum())
-L860             c_rev = int(eps_df["REV_TTM"].notna().sum())
-L861             print(f"[SEC] eps_ttm non-NaN: {c_eps}/{n}  rev_ttm non-NaN: {c_rev}/{n}")
-L862         except Exception:
-L863             pass
-L864         fcf_df = self.compute_fcf_with_fallback(tickers, finnhub_api_key=self.api_key)
-L865         T.log("eps/fcf prep done")
-L866         returns = px[tickers].pct_change()
-L867         T.log("price prep/returns done")
-L868         return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
-L869
-L870 # === Selector：相関低減・選定（スコア＆リターンだけ読む） ===
-L871 class Selector:
-L872     # ---- DRRS helpers（Selector専用） ----
-L873     @staticmethod
-L874     def _z_np(X: np.ndarray) -> np.ndarray:
-L875         X = np.asarray(X, dtype=np.float32); m = np.nanmean(X, axis=0, keepdims=True); s = np.nanstd(X, axis=0, keepdims=True)+1e-9
-L876         return (np.nan_to_num(X)-m)/s
-L877
-L878     @classmethod
-L879     def residual_corr(cls, R: np.ndarray, n_pc: int=3, shrink: float=0.1) -> np.ndarray:
-L880         Z = cls._z_np(R); U,S,_ = np.linalg.svd(Z, full_matrices=False); F = U[:,:n_pc]*S[:n_pc]; B = np.linalg.lstsq(F, Z, rcond=None)[0]
-L881         E = Z - F@B; C = np.corrcoef(E, rowvar=False)
-L882         off = C - np.diag(np.diag(C)); iu = np.triu_indices_from(off,1); avg_abs = np.nanmean(np.abs(off[iu])) if iu[0].size else 0.0
-L883         shrink_eff = float(np.clip(shrink + 0.5*avg_abs, 0.1, 0.6)); N = C.shape[0]
-L884         return (1.0 - shrink_eff)*C + shrink_eff*np.eye(N, dtype=C.dtype)
-L885
-L886     @classmethod
-L887     def rrqr_like_det(cls, R: np.ndarray, score: np.ndarray, k: int, gamma: float=1.0):
-L888         Z, w = cls._z_np(R), (score-score.min())/(np.ptp(score)+1e-12); X = Z*(1.0 + gamma*w)
-L889         N, k = X.shape[1], max(0, min(k, X.shape[1]))
-L890         if k==0: return []
-L891         S, selected, Rres = [], np.zeros(N, dtype=bool), X.copy()
-L892         for _ in range(k):
-L893             norms = (Rres*Rres).sum(axis=0); cand = np.where(~selected)[0]
-L894             j = sorted(cand, key=lambda c:(-norms[c], -w[c], c))[0]
-L895             S.append(j); selected[j]=True; u = X[:,j:j+1]; u/=(np.linalg.norm(u)+1e-12); Rres = Rres - u @ (u.T @ Rres)
-L896         return sorted(S)
-L897
-L898     @staticmethod
-L899     def _obj(corrM: np.ndarray, score: np.ndarray, idx, lam: float) -> float:
-L900         idx = list(idx); P = corrM[np.ix_(idx, idx)]; s = (score-score.mean())/(score.std()+1e-9)
-L901         return float(s[idx].sum() - lam*((P.sum()-np.trace(P))/2.0))
-L902
-L903     @classmethod
-L904     def swap_local_det(cls, corrM: np.ndarray, score: np.ndarray, idx, lam: float=0.6, max_pass: int=15):
-L905         S, best, improved, passes = sorted(idx), cls._obj(corrM, score, idx, lam), True, 0
-L906         while improved and passes<max_pass:
-L907             improved, passes = False, passes+1
-L908             for i,out in enumerate(list(S)):
-L909                 for inn in range(len(score)):
-L910                     if inn in S: continue
-L911                     cand = sorted(S[:i]+[inn]+S[i+1:]); v = cls._obj(corrM, score, cand, lam)
-L912                     if v>best+1e-10: S, best, improved = cand, v, True; break
-L913                 if improved: break
-L914         return S, best
-L915
-L916     @staticmethod
-L917     def _obj_with_cross(C_within: np.ndarray, C_cross: np.ndarray|None, score: np.ndarray, idx, lam: float, mu: float) -> float:
-L918         idx = list(idx); P = C_within[np.ix_(idx, idx)]; s = (score-score.mean())/(score.std()+1e-9)
-L919         within = (P.sum()-np.trace(P))/2.0; cross = 0.0
-L920         if C_cross is not None and C_cross.size>0: cross = C_cross[idx,:].sum()
-L921         return float(s[idx].sum() - lam*within - mu*cross)
-L922
-L923     @classmethod
-L924     def swap_local_det_cross(cls, C_within: np.ndarray, C_cross: np.ndarray|None, score: np.ndarray, idx, lam: float=0.6, mu: float=0.3, max_pass: int=15):
-L925         S, best, improved, passes, N = sorted(idx), cls._obj_with_cross(C_within,C_cross,score,idx,lam,mu), True, 0, len(score)
-L926         while improved and passes<max_pass:
-L927             improved, passes = False, passes+1
-L928             for i,out in enumerate(list(S)):
-L929                 for inn in range(N):
-L930                     if inn in S: continue
-L931                     cand = sorted(S[:i]+[inn]+S[i+1:]); v = cls._obj_with_cross(C_within,C_cross,score,cand,lam,mu)
-L932                     if v>best+1e-10: S, best, improved = cand, v, True; break
-L933                 if improved: break
-L934         return S, best
-L935
-L936     @staticmethod
-L937     def avg_corr(C: np.ndarray, idx) -> float:
-L938         k = len(idx); P = C[np.ix_(idx, idx)]
-L939         return float((P.sum()-np.trace(P))/(k*(k-1)+1e-12))
-L940
-L941     @classmethod
-L942     def select_bucket_drrs(cls, returns_df: pd.DataFrame, score_ser: pd.Series, pool_tickers: list[str], k: int, *, n_pc: int, gamma: float, lam: float, lookback: int, shrink: float=0.10, g_fixed_tickers: list[str]|None=None, mu: float=0.0):
-L943         g_fixed = [t for t in (g_fixed_tickers or []) if t in returns_df.columns]
-L944         union = [t for t in pool_tickers if t in returns_df.columns]
-L945         for t in g_fixed:
-L946             if t not in union: union.append(t)
-L947         Rdf_all = returns_df[union]; Rdf_all = Rdf_all.iloc[-lookback:] if len(Rdf_all)>=lookback else Rdf_all; Rdf_all = Rdf_all.dropna()
-L948         pool_eff, g_eff = [t for t in pool_tickers if t in Rdf_all.co
+and_info.tickers[t].fast_info.get("lastPrice", np.inf)
+L736             except Exception as e:
+L737                 print(f"{t}: price fetch failed ({e})")
+L738                 return np.inf
+L739
+L740         cand_prices = {t: _price(t) for t in self.cand}
+L741         cand_f = [t for t, p in cand_prices.items() if p <= self.price_max]
+L742         T.log("price cap filter done (CAND_PRICE_MAX)")
+L743         # 入力ティッカーの重複を除去し、現行→候補の順序を維持
+L744         tickers = list(dict.fromkeys(self.exist + cand_f))
+L745         T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
+L746         data = yf.download(tickers + [self.bench], period="600d",
+L747                            auto_adjust=True, progress=False, threads=False)
+L748         T.log("yf.download done")
+L749         px = data["Close"].dropna(how="all", axis=1).ffill(limit=2)
+L750         spx = data["Close"][self.bench].reindex(px.index).ffill()
+L751         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
+L752         if clip_days > 0:
+L753             px, spx = px.tail(clip_days + 1), spx.tail(clip_days + 1)
+L754             logger.info("[T] price window clipped by env: %d rows (PRICE_CLIP_DAYS=%d)", len(px), clip_days)
+L755         else:
+L756             logger.info("[T] price window clip skipped; rows=%d", len(px))
+L757         tickers_bulk, info = yf.Tickers(" ".join(tickers)), {}
+L758         for t in tickers:
+L759             try:
+L760                 info[t] = tickers_bulk.tickers[t].info
+L761             except Exception as e:
+L762                 logger.info("[warn] %s: info fetch failed (%s)", t, e)
+L763                 info[t] = {}
+L764         try:
+L765             sec_map = self.fetch_eps_rev_from_sec(tickers)
+L766         except Exception as e:
+L767             logger.warning("[SEC] fetch_eps_rev_from_sec failed: %s", e)
+L768             sec_map = {}
+L769
+L770         def _brief_len(s):
+L771             try:
+L772                 if isinstance(s, pd.Series):
+L773                     return int(s.dropna().size)
+L774                 if isinstance(s, (list, tuple)):
+L775                     return len([v for v in s if pd.notna(v)])
+L776                 if isinstance(s, np.ndarray):
+L777                     return int(np.count_nonzero(~pd.isna(s)))
+L778                 return int(bool(s))
+L779             except Exception:
+L780                 return 0
+L781
+L782         def _has_entries(val) -> bool:
+L783             try:
+L784                 if isinstance(val, pd.Series):
+L785                     return not val.dropna().empty
+L786                 if isinstance(val, (list, tuple)):
+L787                     return any(pd.notna(v) for v in val)
+L788                 return bool(val)
+L789             except Exception:
+L790                 return False
+L791
+L792         have_rev = 0
+L793         have_eps = 0
+L794         rev_lens: list[int] = []
+L795         eps_lens: list[int] = []
+L796         rev_y_lens: list[int] = []
+L797         samples: list[tuple[str, int, str, float | None, int, str, float | None]] = []
+L798
+L799         for t in tickers:
+L800             entry = info.get(t, {})
+L801             m = (sec_map or {}).get(t) or {}
+L802             if entry is None or not isinstance(entry, dict):
+L803                 entry = {}
+L804                 info[t] = entry
+L805
+L806             if m:
+L807                 pairs_r = m.get("rev_q_series_pairs") or []
+L808                 pairs_e = m.get("eps_q_series_pairs") or []
+L809                 if pairs_r:
+L810                     idx = pd.to_datetime([d for (d, _v) in pairs_r], errors="coerce")
+L811                     val = pd.to_numeric([v for (_d, v) in pairs_r], errors="coerce")
+L812                     s = pd.Series(val, index=idx).sort_index()
+L813                     entry["SEC_REV_Q_SERIES"] = s
+L814                 else:
+L815                     entry["SEC_REV_Q_SERIES"] = m.get("rev_q_series") or []
+L816                 if pairs_e:
+L817                     idx = pd.to_datetime([d for (d, _v) in pairs_e], errors="coerce")
+L818                     val = pd.to_numeric([v for (_d, v) in pairs_e], errors="coerce")
+L819                     s = pd.Series(val, index=idx).sort_index()
+L820                     entry["SEC_EPS_Q_SERIES"] = s
+L821                 else:
+L822                     entry["SEC_EPS_Q_SERIES"] = m.get("eps_q_series") or []
+L823
+L824             r = entry.get("SEC_REV_Q_SERIES")
+L825             e = entry.get("SEC_EPS_Q_SERIES")
+L826             # 年次は直近3件（約3年）だけ保持。重み分岐の nY 判定は従来通り。
+L827             try:
+L828                 if hasattr(r, "index") and isinstance(r.index, pd.DatetimeIndex):
+L829                     y = r.resample("Y").sum().dropna()
+L830                     entry["SEC_REV_Y_SERIES"] = y.tail(3)
+L831                 else:
+L832                     entry["SEC_REV_Y_SERIES"] = []
+L833             except Exception:
+L834                 entry["SEC_REV_Y_SERIES"] = []
+L835             ry = entry.get("SEC_REV_Y_SERIES")
+L836             if _has_entries(r):
+L837                 have_rev += 1
+L838             if _has_entries(e):
+L839                 have_eps += 1
+L840             lr = _brief_len(r)
+L841             le = _brief_len(e)
+L842             rev_lens.append(lr)
+L843             eps_lens.append(le)
+L844             rev_y_lens.append(_brief_len(ry))
+L845             if len(samples) < 8:
+L846                 try:
+L847                     rd = getattr(r, "index", [])[-1] if lr > 0 else None
+L848                     rv = float(r.iloc[-1]) if lr > 0 else None
+L849                     ed = getattr(e, "index", [])[-1] if le > 0 else None
+L850                     ev = float(e.iloc[-1]) if le > 0 else None
+L851                     samples.append((t, lr, str(rd) if rd is not None else "-", rv, le, str(ed) if ed is not None else "-", ev))
+L852                 except Exception:
+L853                     samples.append((t, lr, "-", None, le, "-", None))
+L854
+L855         logger.info("[SEC] series attach: rev_q=%d/%d, eps_q=%d/%d", have_rev, len(tickers), have_eps, len(tickers))
+L856         logger.info(
+L857             "[SEC_SERIES] rev_q=%d (<=12), eps_q=%d (<=12), rev_y=%d (<=3)",
+L858             max(rev_lens) if rev_lens else 0,
+L859             max(eps_lens) if eps_lens else 0,
+L860             max(rev_y_lens) if rev_y_lens else 0,
+L861         )
+L862
+L863         if rev_lens:
+L864             rev_lens_sorted = sorted(rev_lens)
+L865             eps_lens_sorted = sorted(eps_lens)
+L866             _log(
+L867                 "SEC_SERIES",
+L868                 f"rev_len min/med/max={rev_lens_sorted[0]}/{rev_lens_sorted[len(rev_lens)//2]}/{rev_lens_sorted[-1]} "
+L869                 f"eps_len min/med/max={eps_lens_sorted[0]}/{eps_lens_sorted[len(eps_lens)//2]}/{eps_lens_sorted[-1]}",
+L870             )
+L871         for (t, lr, rd, rv, le, ed, ev) in samples:
+L872             _log("SEC_SERIES_SMP", f"{t}  rev_len={lr} last=({rd},{rv})  eps_len={le} last=({ed},{ev})")
+L873         eps_df = self._build_eps_df(tickers, tickers_bulk, info, sec_map=sec_map)
+L874         # index 重複があると .loc[t, col] が Series になり代入時に ValueError を誘発する
+L875         if not eps_df.index.is_unique:
+L876             eps_df = eps_df[~eps_df.index.duplicated(keep="last")]
+L877         eps_df = eps_df.assign(
+L878             EPS_TTM=eps_df["eps_ttm"],
+L879             EPS_Q_LastQ=eps_df["eps_q_recent"],
+L880             REV_TTM=eps_df["rev_ttm"],
+L881             REV_Q_LastQ=eps_df["rev_q_recent"],
+L882         )
+L883         # ここで非NaN件数をサマリ表示（欠損状況の即時把握用）
+L884         try:
+L885             n = len(eps_df)
+L886             c_eps = int(eps_df["EPS_TTM"].notna().sum())
+L887             c_rev = int(eps_df["REV_TTM"].notna().sum())
+L888             print(f"[SEC] eps_ttm non-NaN: {c_eps}/{n}  rev_ttm non-NaN: {c_rev}/{n}")
+L889         except Exception:
+L890             pass
+L891         fcf_df = self.compute_fcf_with_fallback(tickers, finnhub_api_key=self.api_key)
+L892         T.log("eps/fcf prep done")
+L893         returns = px[tickers].pct_change()
+L894         T.log("price prep/returns done")
+L895         return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
+L896
+L897 # === Selector：相関低減・選定（スコア＆リターンだけ読む） ===
+L898 class Selector:
+L899     # ---- DRRS helpers（Selector専用） ----
+L900     @staticmethod
+L901     def _z_np(X: np.ndarray) -> np.ndarray:
+L902         X = np.asarray(X, dtype=np.float32); m = np.nanmean(X, axis=0, keepdims=True); s = np.nanstd(X, axis=0, keepdims=True)+1e-9
+L903         return (np.nan_to_num(X)-m)/s
+L904
+L905     @classmethod
+L906     def residual_corr(cls, R: np.ndarray, n_pc: int=3, shrink: float=0.1) -> np.ndarray:
+L907         Z = cls._z_np(R); U,S,_ = np.linalg.svd(Z, full_matrices=False); F = U[:,:n_pc]*S[:n_pc]; B = np.linalg.lstsq(F, Z, rcond=None)[0]
+L908         E = Z - F@B; C = np.corrcoef(E, rowvar=False)
+L909         off = C - np.diag(np.diag(C)); iu = np.triu_indices_from(off,1); avg_abs = np.nanmean(np.abs(off[iu])) if iu[0].size else 0.0
+L910         shrink_eff = float(np.clip(shrink + 0.5*avg_abs, 0.1, 0.6)); N = C.shape[0]
+L911         return (1.0 - shrink_eff)*C + shrink_eff*np.eye(N, dtype=C.dtype)
+L912
+L913     @classmethod
+L914     def rrqr_like_det(cls, R: np.ndarray, score: np.ndarray, k: int, gamma: float=1.0):
+L915         Z, w = cls._z_np(R), (score-score.min())/(np.ptp(score)+1e-12); X = Z*(1.0 + gamma*w)
+L916         N, k = X.shape[1], max(0, min(k, X.shape[1]))
+L917         if k==0: return []
+L918         S, selected, Rres = [], np.zeros(N, dtype=bool), X.copy()
+L919         for _ in range(k):
+L920             norms = (Rres*Rres).sum(axis=0); cand = np.where(~selected)[0]
+L921             j = sorted(cand, key=lambda c:(-norms[c], -w[c], c))[0]
+L922             S.append(j); selected[j]=True; u = X[:,j:j+1]; u/=(np.linalg.norm(u)+1e-12); Rres = Rres - u @ (u.T @ Rres)
+L923         return sorted(S)
+L924
+L925     @staticmethod
+L926     def _obj(corrM: np.ndarray, score: np.ndarray, idx, lam: float) -> float:
+L927         idx = list(idx); P = corrM[np.ix_(idx, idx)]; s = (score-score.mean())/(score.std()+1e-9)
+L928         return float(s[idx].sum() - lam*((P.sum()-np.trace(P))/2.0))
+L929
+L930     @classmethod
+L931     def swap_local_det(cls, corrM: np.ndarray, score: np.ndarray, idx, lam: float=0.6, max_pass: int=15):
+L932         S, best, improved, passes = sorted(idx), cls._obj(corrM, score, idx, lam), True, 0
+L933         while improved and passes<max_pass:
+L934             improved, passes = False, passes+1
+L935             for i,out in enumerate(list(S)):
+L936                 for inn in range(len(score)):
+L937                     if inn in S: continue
+L938                     cand = sorted(S[:i]+[inn]+S[i+1:]); v = cls._obj(corrM, score, cand, lam)
+L939                     if v>best+1e-10: S, best, improved = cand, v, True; break
+L940                 if improved: break
+L941         return S, best
+L942
+L943     @staticmethod
+L944     def _obj_with_cross(C_within: np.ndarray, C_cross: np.ndarray|None, score: np.ndarray, idx, lam: float, mu: float) -> float:
+L945         idx = list(idx); P = C_within[np.ix_(idx, idx)]; s = (score-score.mean())/(score.std()+1e-9)
+L946         within = (P.sum()-np.trace(P))/2.0; cross = 0.0
+L947         if C_cross is not None and C_cross.size>0: cross = C_cross[idx,:].sum()
+L948         return float(s[idx].sum() - lam*within - mu*cross)
+L949
+L950     @classmethod
+L951     def swap_local_det_cross(cls, C_within: np.ndarray, C_cross: np.ndarray|None, score: np.ndarray, idx, lam: float=0.6, mu: float=0.3, max_pass: int=15):
+L952         S, best, improved, passes, N = sorted(idx), cls._obj_with_cross(C_within,C_cross,score,idx,lam,mu), True, 0, len(score)
+L953         while improved and passes<max_pass:
+L954             improved, passes = False, passes+1
+L955             for i,out in enumerate(list(S)):
+L956                 for inn in range(N):
+L957                     if in
 ```
