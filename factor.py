@@ -309,13 +309,40 @@ class Input:
 
     @staticmethod
     def _sec_ticker_map():
-        j = Input._sec_get("https://data.sec.gov/api/xbrl/company_tickers.json")
+        import requests
+
+        url_primary = "https://data.sec.gov/api/xbrl/company_tickers.json"
+        url_fallback = "https://www.sec.gov/files/company_tickers.json"
         mp = {}
-        for _, v in (j or {}).items():
-            try:
-                mp[str(v["ticker"]).upper()] = f"{int(v['cik_str']):010d}"
-            except Exception:
-                continue
+        try:
+            j = Input._sec_get(url_primary)  # 既存の堅牢GET（リトライ・バックオフ）
+        except Exception:
+            r = requests.get(url_fallback, headers=Input._sec_headers(), timeout=20)
+            r.raise_for_status()
+            j = r.json()
+        # 形状A: {"0": {"ticker":..., "cik_str":...}, ...}
+        if isinstance(j, dict) and "0" in j:
+            for _, v in (j or {}).items():
+                try:
+                    mp[str(v["ticker"]).upper()] = f"{int(v['cik_str']):010d}"
+                except Exception:
+                    pass
+        # 形状B: [{"ticker":..., "cik_str":...}, ...]
+        elif isinstance(j, list):
+            for v in j:
+                try:
+                    mp[str(v.get("ticker")).upper()] = f"{int(v.get('cik_str')):010d}"
+                except Exception:
+                    pass
+        # 形状C: {"data":[[idx,ticker,title,cik_str],...]}
+        elif isinstance(j, dict) and "data" in j:
+            for row in j.get("data") or []:
+                try:
+                    t = str(row[1]).upper()
+                    c = int(row[3])
+                    mp[t] = f"{c:010d}"
+                except Exception:
+                    pass
         return mp
 
     # --- 追加: ADR/OTC向けの簡易正規化（末尾Y/F, ドット等） ---
