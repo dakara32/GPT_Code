@@ -874,19 +874,6 @@ class Scorer:
             except Exception:
                 return 0
 
-        cnt_rev_series = sum(1 for _t, d in info.items() if _has_sec_series(d.get("SEC_REV_Q_SERIES")))
-        cnt_eps_series = sum(1 for _t, d in info.items() if _has_sec_series(d.get("SEC_EPS_Q_SERIES")))
-        logger.info(
-            "[DERIV] SEC series presence: REV_Q=%d, EPS_Q=%d (universe=%d)",
-            cnt_rev_series,
-            cnt_eps_series,
-            len(info),
-        )
-
-        rev_q_ge5 = 0
-        ttm_yoy_avail = 0
-        wrote_growth = 0
-
         for t in tickers:
             try:
                 d = info.get(t, {}) or {}
@@ -898,31 +885,17 @@ class Scorer:
                     fallback_qearn = bool(qe is not None and not getattr(qe, "empty", True))
                 except Exception:
                     qe = None
-                logger.debug(
-                    "[DERIV] %s: rev_q_len=%s eps_q_len=%s fallback_qearn=%s",
-                    t,
-                    _series_len(rev_series),
-                    _series_len(eps_series),
-                    fallback_qearn,
-                )
 
                 r_src = _pick_series(d, ["SEC_REV_Q_SERIES", "rev_q_series_pairs", "rev_q_series"])
                 e_src = _pick_series(d, ["SEC_EPS_Q_SERIES", "eps_q_series_pairs", "eps_q_series"])
                 r_raw = _ensure_series(r_src)
                 e_raw = _ensure_series(e_src)
-                _log("DERIV_SRC", f"{t} rev_raw_len={r_raw.size} eps_raw_len={e_raw.size}")
 
                 r_q = _to_quarterly(r_raw)
                 e_q = _to_quarterly(e_raw)
-                _log("DERIV_Q", f"{t} rev_q_len={r_q.size} eps_q_len={e_q.size}")
-                if r_q.size >= 5:
-                    rev_q_ge5 += 1
 
                 r_yoy_ttm = _ttm_yoy_from_quarterly(r_q)
                 e_yoy_ttm = _ttm_yoy_from_quarterly(e_q)
-                has_ttm = int(not r_yoy_ttm.dropna().empty)
-                ttm_yoy_avail += has_ttm
-                _log("DERIV_TTM", f"{t} rev_ttm_yoy_len={r_yoy_ttm.dropna().size} eps_ttm_yoy_len={e_yoy_ttm.dropna().size}")
 
                 def _q_yoy(qs):
                     return np.nan if qs is None or len(qs) < 5 else float(qs.iloc[-1] / qs.iloc[-5] - 1.0)
@@ -974,32 +947,8 @@ class Scorer:
                 df.loc[t, "REV_YOY_VAR"] = rev_var
                 df.loc[t, "REV_ANN_STREAK"] = rev_ann_streak
 
-                wrote_growth += 1
-                _log(
-                    "DERIV_WRITE",
-                    f"{t} wrote: Q_YOY(rev={rev_q_yoy}, eps={eps_q_yoy}) ANN(rev_yoy={rev_yoy}, acc={rev_acc}, var={rev_var}) streak={rev_ann_streak}",
-                )
-
             except Exception as e:
-                logger.warning("[DERIV_WARN] %s growth-derivatives failed: %s", t, e)
-                _log("DERIV_WARN", f"{t} {type(e).__name__}: {e}")
-
-        _log("DERIV_SUMMARY", f"rev_q_len>=5: {rev_q_ge5}/{len(tickers)}  ttm_yoy_available: {ttm_yoy_avail}  wrote_growth_for: {wrote_growth}")
-
-        try:
-            cols = [
-                "REV_Q_YOY",
-                "EPS_Q_YOY",
-                "REV_YOY",
-                "EPS_YOY",
-                "REV_YOY_ACC",
-                "REV_YOY_VAR",
-                "REV_ANN_STREAK",
-            ]
-            cnt = {c: int(df[c].count()) for c in cols if c in df.columns}
-            _log("DERIV_NONNAN_COUNTS", str(cnt))
-        except Exception as e:
-            _log("DERIV_NONNAN_COUNTS", f"error: {e}")
+                logger.warning("growth-derivatives failed: %s: %s", t, e)
 
         def _trend_template_pass(row, rs_alpha_thresh=0.10):
             c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
