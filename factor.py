@@ -17,6 +17,84 @@ from scipy.stats import zscore  # used via scorer
 from scorer import Scorer, ttm_div_yield_portfolio, _log
 import config
 
+import warnings, atexit, threading
+from collections import Counter, defaultdict
+
+# ---------- 重複警告の集約ロジック ----------
+_warn_lock = threading.Lock()
+_warn_seen = set()                     # 初回表示済みキー
+_warn_count = Counter()                # (category, message, module) → 件数
+_warn_first_ctx = {}                   # 初回の (filename, lineno)
+
+def _warn_key(message, category, filename, lineno, *_args, **_kwargs):
+    # "同じ警告" を定義: カテゴリ + 正規化メッセージ + モジュールパス(先頭数階層)
+    mod = filename.split("/site-packages/")[-1] if "/site-packages/" in filename else filename
+    mod = mod.rsplit("/", 3)[-1]  # 長すぎ抑制（末尾3階層まで）
+    msg = str(message).strip()
+    return (category.__name__, msg, mod)
+
+_orig_showwarning = warnings.showwarning
+
+def _compact_showwarning(message, category, filename, lineno, file=None, line=None):
+    key = _warn_key(message, category, filename, lineno)
+    with _warn_lock:
+        _warn_count[key] += 1
+        if key not in _warn_seen:
+            # 初回だけ1行で出す（カテゴリ | モジュール | メッセージ）
+            _warn_seen.add(key)
+            _warn_first_ctx[key] = (filename, lineno)
+            # 1行フォーマット（行数節約）
+            txt = f"[WARN][{category.__name__}] {message} | {filename}:{lineno}"
+            print(txt)
+        # 2回目以降は出さない（集約）
+
+warnings.showwarning = _compact_showwarning
+
+# ベースポリシー: 通常は警告を出す（default）→ ただし同一メッセージは集約
+warnings.resetwarnings()
+warnings.simplefilter("default")
+
+# 2) ピンポイント間引き: yfinance 'Ticker.earnings' は "once"（初回のみ可視化）
+warnings.filterwarnings(
+    "once",
+    message="'Ticker.earnings' is deprecated",
+    category=DeprecationWarning,
+    module="yfinance"
+)
+
+# 3) 最終サマリ: 同一警告が何回出たかを最後に1行で
+@atexit.register
+def _print_warning_summary():
+    suppressed = []
+    for key, cnt in _warn_count.items():
+        if cnt > 1:
+            (cat, msg, mod) = key
+            filename, lineno = _warn_first_ctx.get(key, ("", 0))
+            suppressed.append((cnt, cat, msg, mod, filename, lineno))
+    if suppressed:
+        suppressed.sort(reverse=True)  # 件数降順
+        # 最多上位だけ出す（必要なら上限制御：ここでは上位10件）
+        top = suppressed[:10]
+        print(f"[WARN-SUMMARY] duplicated warning groups: {len(suppressed)}")
+        for cnt, cat, msg, mod, filename, lineno in top:
+            print(f"[WARN-SUMMARY] {cnt-1} more | [{cat}] {msg} | {mod} ({filename}:{lineno})")
+        if len(suppressed) > len(top):
+            print(f"[WARN-SUMMARY] ... and {len(suppressed)-len(top)} more groups suppressed")
+
+# 4) 追加（任意）: 1ジョブあたりの総警告上限を設定したい場合
+#    例: 上限1000を超えたら以降は完全サイレント
+_WARN_HARD_LIMIT = int(os.getenv("WARN_HARD_LIMIT", "0") or "0")  # 0なら無効
+if _WARN_HARD_LIMIT > 0:
+    _orig_warn_func = warnings.warn
+    def _limited_warn(*a, **k):
+        total = sum(_warn_count.values())
+        if total < _WARN_HARD_LIMIT:
+            return _orig_warn_func(*a, **k)
+        # 超過後は捨てる（最後にsummaryだけ残る）
+    warnings.warn = _limited_warn
+
+# ---------- ここまでで警告の“可視性は維持”しつつ“重複で行数爆発”を抑止 ----------
+
 # その他
 debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
 
