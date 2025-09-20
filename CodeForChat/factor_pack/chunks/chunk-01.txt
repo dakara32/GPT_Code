@@ -2,7 +2,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, factor.py, scorer.py, .github/workflows/weekly-report.yml, documents/README.md, documents/factor_design.md
-# 作成日時: 2025-09-20 08:12:11 (JST)
+# 作成日時: 2025-09-20 14:38:36 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -57,265 +57,265 @@ L16
 L17 from scorer import Scorer, ttm_div_yield_portfolio, _log
 L18 import config
 L19
-L20 # その他
-L21 debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
+L20 import warnings, atexit, threading
+L21 from collections import Counter, defaultdict
 L22
-L23 logger = logging.getLogger(__name__)
-L24 logging.basicConfig(level=(logging.INFO if debug_mode else logging.WARNING), force=True)
-L25
-L26 class T:
-L27     t = perf_counter()
+L23 # ---------- 重複警告の集約ロジック ----------
+L24 _warn_lock = threading.Lock()
+L25 _warn_seen = set()                     # 初回表示済みキー
+L26 _warn_count = Counter()                # (category, message, module) → 件数
+L27 _warn_first_ctx = {}                   # 初回の (filename, lineno)
 L28
-L29     @staticmethod
-L30     def log(tag):
-L31         now = perf_counter()
-L32         print(f"[T] {tag}: {now - T.t:.2f}s")
-L33         T.t = now
-L34
-L35 T.log("start")
-L36
-L37 # === ユニバースと定数（冒頭に固定） ===
-L38 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
-L39 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
-L40 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
-L41 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
-L42 g_weights = {'GROWTH_F':0.35,'MOM':0.55,'VOL':-0.10}
-L43 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
-L44 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
-L45 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
-L46 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
-L47
-L48 # DRRS 初期プール・各種パラメータ
-L49 corrM = 45
-L50 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
-L51 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
+L29 def _warn_key(message, category, filename, lineno, *_args, **_kwargs):
+L30     # "同じ警告" を定義: カテゴリ + 正規化メッセージ + モジュールパス(先頭数階層)
+L31     mod = filename.split("/site-packages/")[-1] if "/site-packages/" in filename else filename
+L32     mod = mod.rsplit("/", 3)[-1]  # 長すぎ抑制（末尾3階層まで）
+L33     msg = str(message).strip()
+L34     return (category.__name__, msg, mod)
+L35
+L36 _orig_showwarning = warnings.showwarning
+L37
+L38 def _compact_showwarning(message, category, filename, lineno, file=None, line=None):
+L39     key = _warn_key(message, category, filename, lineno)
+L40     with _warn_lock:
+L41         _warn_count[key] += 1
+L42         if key not in _warn_seen:
+L43             # 初回だけ1行で出す（カテゴリ | モジュール | メッセージ）
+L44             _warn_seen.add(key)
+L45             _warn_first_ctx[key] = (filename, lineno)
+L46             # 1行フォーマット（行数節約）
+L47             txt = f"[WARN][{category.__name__}] {message} | {filename}:{lineno}"
+L48             print(txt)
+L49         # 2回目以降は出さない（集約）
+L50
+L51 warnings.showwarning = _compact_showwarning
 L52
-L53 # クロス相関ペナルティ（未定義なら設定）
-L54 try: CROSS_MU_GD
-L55 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+L53 # ベースポリシー: 通常は警告を出す（default）→ ただし同一メッセージは集約
+L54 warnings.resetwarnings()
+L55 warnings.simplefilter("default")
 L56
-L57 # 出力関連
-L58 RESULTS_DIR = "results"
-L59 os.makedirs(RESULTS_DIR, exist_ok=True)
-L60
-L61 # === 共有DTO（クラス間I/O契約）＋ Config ===
-L62 @dataclass(frozen=True)
-L63 class InputBundle:
-L64     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
-L65     cand: List[str]
-L66     tickers: List[str]
-L67     bench: str
-L68     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
-L69     px: pd.DataFrame                # data['Close']
-L70     spx: pd.Series                  # data['Close'][bench]
-L71     tickers_bulk: object            # yfinance.Tickers
-L72     info: Dict[str, dict]           # yfinance info per ticker
-L73     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
-L74     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
-L75     returns: pd.DataFrame           # px[tickers].pct_change()
-L76
-L77 @dataclass(frozen=True)
-L78 class FeatureBundle:
-L79     df: pd.DataFrame
-L80     df_z: pd.DataFrame
-L81     g_score: pd.Series
-L82     d_score_all: pd.Series
-L83     missing_logs: pd.DataFrame
-L84     df_full: pd.DataFrame | None = None
-L85     df_full_z: pd.DataFrame | None = None
-L86     scaler: Any | None = None
-L87
-L88 @dataclass(frozen=True)
-L89 class SelectionBundle:
-L90     resG: dict
-L91     resD: dict
-L92     top_G: List[str]
-L93     top_D: List[str]
-L94     init_G: List[str]
-L95     init_D: List[str]
-L96
-L97 @dataclass(frozen=True)
-L98 class WeightsConfig:
-L99     g: Dict[str,float]
-L100     d: Dict[str,float]
-L101
-L102 @dataclass(frozen=True)
-L103 class DRRSParams:
-L104     corrM: int
-L105     shrink: float
-L106     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
-L107     D: Dict[str,float]
-L108     cross_mu_gd: float
-L109
-L110 @dataclass(frozen=True)
-L111 class PipelineConfig:
-L112     weights: WeightsConfig
-L113     drrs: DRRSParams
-L114     price_max: float
-L115     debug_mode: bool = False
-L116
-L117 # === 共通ユーティリティ（複数クラスで使用） ===
-L118 # (unused local utils removed – use scorer.py versions if needed)
-L119
-L120 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
-L121
-L122 def _post_slack(payload: dict):
-L123     url = os.getenv("SLACK_WEBHOOK_URL")
-L124     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-L125     try:
-L126         requests.post(url, json=payload).raise_for_status()
-L127     except Exception as e:
-L128         print(f"⚠️ Slack通知エラー: {e}")
-L129
-L130 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
-L131     """Slackへテキストを分割送信（コードブロック形式）。"""
-L132
-L133     def _post_text(payload: str) -> None:
-L134         try:
-L135             resp = requests.post(url, json={"text": payload})
-L136             print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
-L137             if resp is not None:
-L138                 resp.raise_for_status()
-L139         except Exception as e:
-L140             print(f"[ERR] debug_post_failed: {e}")
-L141
-L142     body = (text or "").strip()
-L143     if not body:
-L144         print("[DBG] skip debug send: empty body")
-L145         return
-L146
-L147     block, block_len = [], 0
-L148
-L149     def _flush():
-L150         nonlocal block, block_len
-L151         if block:
-L152             _post_text("```" + "\n".join(block) + "```")
-L153             block, block_len = [], 0
+L57 # 2) ピンポイント間引き: yfinance 'Ticker.earnings' は "once"（初回のみ可視化）
+L58 warnings.filterwarnings(
+L59     "once",
+L60     message="'Ticker.earnings' is deprecated",
+L61     category=DeprecationWarning,
+L62     module="yfinance"
+L63 )
+L64
+L65 # 3) 最終サマリ: 同一警告が何回出たかを最後に1行で
+L66 @atexit.register
+L67 def _print_warning_summary():
+L68     suppressed = []
+L69     for key, cnt in _warn_count.items():
+L70         if cnt > 1:
+L71             (cat, msg, mod) = key
+L72             filename, lineno = _warn_first_ctx.get(key, ("", 0))
+L73             suppressed.append((cnt, cat, msg, mod, filename, lineno))
+L74     if suppressed:
+L75         suppressed.sort(reverse=True)  # 件数降順
+L76         # 最多上位だけ出す（必要なら上限制御：ここでは上位10件）
+L77         top = suppressed[:10]
+L78         print(f"[WARN-SUMMARY] duplicated warning groups: {len(suppressed)}")
+L79         for cnt, cat, msg, mod, filename, lineno in top:
+L80             print(f"[WARN-SUMMARY] {cnt-1} more | [{cat}] {msg} | {mod} ({filename}:{lineno})")
+L81         if len(suppressed) > len(top):
+L82             print(f"[WARN-SUMMARY] ... and {len(suppressed)-len(top)} more groups suppressed")
+L83
+L84 # 4) 追加（任意）: 1ジョブあたりの総警告上限を設定したい場合
+L85 #    例: 上限1000を超えたら以降は完全サイレント
+L86 _WARN_HARD_LIMIT = int(os.getenv("WARN_HARD_LIMIT", "0") or "0")  # 0なら無効
+L87 if _WARN_HARD_LIMIT > 0:
+L88     _orig_warn_func = warnings.warn
+L89     def _limited_warn(*a, **k):
+L90         total = sum(_warn_count.values())
+L91         if total < _WARN_HARD_LIMIT:
+L92             return _orig_warn_func(*a, **k)
+L93         # 超過後は捨てる（最後にsummaryだけ残る）
+L94     warnings.warn = _limited_warn
+L95
+L96 # ---------- ここまでで警告の“可視性は維持”しつつ“重複で行数爆発”を抑止 ----------
+L97
+L98 # その他
+L99 debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
+L100
+L101 logger = logging.getLogger(__name__)
+L102 logging.basicConfig(level=(logging.INFO if debug_mode else logging.WARNING), force=True)
+L103
+L104 class T:
+L105     t = perf_counter()
+L106
+L107     @staticmethod
+L108     def log(tag):
+L109         now = perf_counter()
+L110         print(f"[T] {tag}: {now - T.t:.2f}s")
+L111         T.t = now
+L112
+L113 T.log("start")
+L114
+L115 # === ユニバースと定数（冒頭に固定） ===
+L116 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
+L117 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
+L118 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
+L119 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
+L120 g_weights = {'GROWTH_F':0.35,'MOM':0.55,'VOL':-0.10}
+L121 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
+L122 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
+L123 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
+L124 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
+L125
+L126 # DRRS 初期プール・各種パラメータ
+L127 corrM = 45
+L128 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
+L129 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
+L130
+L131 # クロス相関ペナルティ（未定義なら設定）
+L132 try: CROSS_MU_GD
+L133 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+L134
+L135 # 出力関連
+L136 RESULTS_DIR = "results"
+L137 os.makedirs(RESULTS_DIR, exist_ok=True)
+L138
+L139 # === 共有DTO（クラス間I/O契約）＋ Config ===
+L140 @dataclass(frozen=True)
+L141 class InputBundle:
+L142     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
+L143     cand: List[str]
+L144     tickers: List[str]
+L145     bench: str
+L146     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
+L147     px: pd.DataFrame                # data['Close']
+L148     spx: pd.Series                  # data['Close'][bench]
+L149     tickers_bulk: object            # yfinance.Tickers
+L150     info: Dict[str, dict]           # yfinance info per ticker
+L151     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
+L152     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
+L153     returns: pd.DataFrame           # px[tickers].pct_change()
 L154
-L155     for raw in body.splitlines():
-L156         line = raw or ""
-L157         while len(line) > chunk:
-L158             head, line = line[:chunk], line[chunk:]
-L159             _flush()
-L160             _post_text("```" + head + "```")
-L161         add_len = len(line) if not block else len(line) + 1
-L162         if block and block_len + add_len > chunk:
-L163             _flush(); add_len = len(line)
-L164         block.append(line)
-L165         block_len += add_len
-L166     _flush()
-L167
-L168 def _disjoint_keepG(top_G, top_D, poolD):
-L169     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
-L170     used, D, i = set(top_G), list(top_D), 0
-L171     for j, t in enumerate(D):
-L172         if t not in used:
-L173             continue
-L174         while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
-L175             i += 1
-L176         if i < len(poolD):
-L177             D[j] = poolD[i]; used.add(D[j]); i += 1
-L178     return top_G, D
+L155 @dataclass(frozen=True)
+L156 class FeatureBundle:
+L157     df: pd.DataFrame
+L158     df_z: pd.DataFrame
+L159     g_score: pd.Series
+L160     d_score_all: pd.Series
+L161     missing_logs: pd.DataFrame
+L162     df_full: pd.DataFrame | None = None
+L163     df_full_z: pd.DataFrame | None = None
+L164     scaler: Any | None = None
+L165
+L166 @dataclass(frozen=True)
+L167 class SelectionBundle:
+L168     resG: dict
+L169     resD: dict
+L170     top_G: List[str]
+L171     top_D: List[str]
+L172     init_G: List[str]
+L173     init_D: List[str]
+L174
+L175 @dataclass(frozen=True)
+L176 class WeightsConfig:
+L177     g: Dict[str,float]
+L178     d: Dict[str,float]
 L179
-L180
-L181 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
-L182                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
-L183     import pandas as pd, numpy as np
-L184     sel = list(pick)
-L185     if not sel: return sel
-L186     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
-L187     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
-L188     std = agg.std()
-L189     sigma = float(std) if pd.notna(std) else 0.0
-L190     thresh = kth - delta_z * sigma
-L191     ranked_all = agg.sort_values(ascending=False)
-L192     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
-L193     for t in cand:
-L194         within_score = pd.notna(agg[t]) and agg[t] >= thresh
-L195         within_rank = t in ranked_all.index and ranked_all.index.get_loc(t) < n_target + keep_buffer
-L196         if not (within_score or within_rank):
-L197             continue
-L198         non_inc = [x for x in sel if x not in incumbents]
-L199         if not non_inc:
-L200             break
-L201         weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
-L202         if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
-L203             sel.remove(weakest); sel.append(t)
-L204     if len(sel) > n_target:
-L205         sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
-L206     return sel
+L180 @dataclass(frozen=True)
+L181 class DRRSParams:
+L182     corrM: int
+L183     shrink: float
+L184     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
+L185     D: Dict[str,float]
+L186     cross_mu_gd: float
+L187
+L188 @dataclass(frozen=True)
+L189 class PipelineConfig:
+L190     weights: WeightsConfig
+L191     drrs: DRRSParams
+L192     price_max: float
+L193     debug_mode: bool = False
+L194
+L195 # === 共通ユーティリティ（複数クラスで使用） ===
+L196 # (unused local utils removed – use scorer.py versions if needed)
+L197
+L198 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
+L199
+L200 def _post_slack(payload: dict):
+L201     url = os.getenv("SLACK_WEBHOOK_URL")
+L202     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+L203     try:
+L204         requests.post(url, json=payload).raise_for_status()
+L205     except Exception as e:
+L206         print(f"⚠️ Slack通知エラー: {e}")
 L207
-L208
-L209 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
-L210 class Input:
-L211     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
-L212         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
-L213         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
-L214
-L215     # ---- （Input専用）EPS補完・FCF算出系 ----
-L216     @staticmethod
-L217     def _sec_headers():
-L218         mail = (os.getenv("SEC_CONTACT_EMAIL") or "yasonba55@gmail.com").strip()
-L219         app = (os.getenv("SEC_APP_NAME") or "FactorBot/1.0").strip()
-L220         return {"User-Agent": f"{app} ({mail})", "From": mail, "Accept": "application/json"}
-L221
-L222     @staticmethod
-L223     def _sec_get(url: str, retries: int = 3, backoff: float = 0.5):
-L224         for i in range(retries):
-L225             r = requests.get(url, headers=Input._sec_headers(), timeout=20)
-L226             if r.status_code in (429, 503, 403):
-L227                 time.sleep(min(2 ** i * backoff, 8.0))
-L228                 continue
-L229             r.raise_for_status(); return r.json()
-L230         r.raise_for_status()
-L231
-L232     @staticmethod
-L233     def _sec_ticker_map():
-L234         j = Input._sec_get("https://data.sec.gov/api/xbrl/company_tickers.json")
-L235         mp = {}
-L236         for _, v in (j or {}).items():
-L237             try:
-L238                 mp[str(v["ticker"]).upper()] = f"{int(v['cik_str']):010d}"
-L239             except Exception:
-L240                 continue
-L241         return mp
-L242
-L243     # --- 追加: ADR/OTC向けの簡易正規化（末尾Y/F, ドット等） ---
-L244     @staticmethod
-L245     def _normalize_ticker(sym: str) -> list[str]:
-L246         s = (sym or "").upper().strip()
-L247         # 追加: 先頭の$や全角の記号を除去
-L248         s = s.lstrip("$").replace("＄", "").replace("．", ".").replace("－", "-")
-L249         cand: list[str] = []
-L250
-L251         def add(x: str) -> None:
-L252             if x and x not in cand:
-L253                 cand.append(x)
-L254
-L255         # 1) 原文を最優先（SECは BRK.B, BF.B など . を正式採用）
-L256         add(s)
-L257         # 2) Yahoo系バリアント（. と - の揺れを相互に）
-L258         if "." in s:
-L259             add(s.replace(".", "-"))
-L260             add(s.replace(".", ""))
-L261         if "-" in s:
-L262             add(s.replace("-", "."))
-L263             add(s.replace("-", ""))
-L264         # 3) ドット・ハイフン・ピリオド無し版（最後の保険）
-L265         add(s.replace("-", "").replace(".", ""))
-L266         # 4) ADR簡易：末尾Y/Fの除去（SECマップは本体ティッカーを持つことがある）
-L267         if len(s) >= 2 and s[-1] in {"Y", "F"}:
-L268             add(s[:-1])
-L269         return cand
-L270
-L271     @staticmethod
-L272     def _sec_companyfacts(cik: str):
-L273         return Input._sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
-L274
-L275     @staticmethod
-L276     def _units_for_tags(facts: dict, namespaces: list[str], tags: list[str]) -> list[dict]:
-L277         """facts から namespace/tag を横断して units 配列を収集（存在順に連結）。"""
-L278         out: list[dict] = []
-L279         facts = (facts or {}).get("facts", {})
-L280         for ns in namespaces
+L208 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
+L209     """Slackへテキストを分割送信（コードブロック形式）。"""
+L210
+L211     def _post_text(payload: str) -> None:
+L212         try:
+L213             resp = requests.post(url, json={"text": payload})
+L214             print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
+L215             if resp is not None:
+L216                 resp.raise_for_status()
+L217         except Exception as e:
+L218             print(f"[ERR] debug_post_failed: {e}")
+L219
+L220     body = (text or "").strip()
+L221     if not body:
+L222         print("[DBG] skip debug send: empty body")
+L223         return
+L224
+L225     block, block_len = [], 0
+L226
+L227     def _flush():
+L228         nonlocal block, block_len
+L229         if block:
+L230             _post_text("```" + "\n".join(block) + "```")
+L231             block, block_len = [], 0
+L232
+L233     for raw in body.splitlines():
+L234         line = raw or ""
+L235         while len(line) > chunk:
+L236             head, line = line[:chunk], line[chunk:]
+L237             _flush()
+L238             _post_text("```" + head + "```")
+L239         add_len = len(line) if not block else len(line) + 1
+L240         if block and block_len + add_len > chunk:
+L241             _flush(); add_len = len(line)
+L242         block.append(line)
+L243         block_len += add_len
+L244     _flush()
+L245
+L246 def _disjoint_keepG(top_G, top_D, poolD):
+L247     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
+L248     used, D, i = set(top_G), list(top_D), 0
+L249     for j, t in enumerate(D):
+L250         if t not in used:
+L251             continue
+L252         while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
+L253             i += 1
+L254         if i < len(poolD):
+L255             D[j] = poolD[i]; used.add(D[j]); i += 1
+L256     return top_G, D
+L257
+L258
+L259 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
+L260                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
+L261     import pandas as pd, numpy as np
+L262     sel = list(pick)
+L263     if not sel: return sel
+L264     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
+L265     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
+L266     std = agg.std()
+L267     sigma = float(std) if pd.notna(std) else 0.0
+L268     thresh = kth - delta_z * sigma
+L269     ranked_all = agg.sort_values(ascending=False)
+L270     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
+L271     for t in cand:
+L272         within_score = pd.notna(agg[t]) and agg[t] >= thresh
+L273         within_rank = t in ranked_all.index and ranked_all.index.get_loc(t) < n_target + keep_buffer
+L274         if not (within_score or within_rank):
+L275             continue
+L276         non_inc = [x for x in sel if x not in incumbents]
+L277         if not non_inc:
+L278             break
+L279         weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
+L280         if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np
 ```

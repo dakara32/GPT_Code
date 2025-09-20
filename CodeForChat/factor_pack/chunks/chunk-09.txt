@@ -1,5 +1,83 @@
 ```text
-   df, missing_logs = pd.DataFrame(index=tickers), []
+み。
+L563         """
+L564         s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
+L565         cnt, pen = {}, {}
+L566         for t in order:
+L567             sec = sectors.get(t, "U"); cnt[sec] = cnt.get(sec,0) + 1; pen[t] = alpha*max(0, cnt[sec]-cap)
+L568         return (s - pd.Series(pen)).sort_values(ascending=False)
+L569
+L570     @staticmethod
+L571     def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08, hard: int|None=5) -> list[str]:
+L572         """
+L573         soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
+L574         """
+L575         eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
+L576         if not hard:
+L577             return list(eff.head(N).index)
+L578         pick, used = [], {}
+L579         for t in eff.index:
+L580             s = sectors.get(t, "U")
+L581             if used.get(s,0) < hard:
+L582                 pick.append(t); used[s] = used.get(s,0) + 1
+L583             if len(pick) == N: break
+L584         return pick
+L585
+L586     @staticmethod
+L587     def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
+L588         """
+L589         各営業日の trend_template 合格本数（合格“本数”=C）を返す。
+L590         - px: 列=ticker（ベンチは含めない）
+L591         - spx: ベンチマーク Series（px.index に整列）
+L592         - win_days: 末尾の計算対象営業日数（None→全体、既定600は呼び出し側指定）
+L593         ベクトル化＆rollingのみで軽量。欠損は False 扱い。
+L594         """
+L595         import numpy as np, pandas as pd
+L596         if px is None or px.empty:
+L597             return pd.Series(dtype=int)
+L598         px = px.dropna(how="all", axis=1)
+L599         if win_days and win_days > 0:
+L600             px = px.tail(win_days)
+L601         if px.empty:
+L602             return pd.Series(dtype=int)
+L603         spx = spx.reindex(px.index).ffill()
+L604
+L605         ma50  = px.rolling(50).mean()
+L606         ma150 = px.rolling(150).mean()
+L607         ma200 = px.rolling(200).mean()
+L608
+L609         tt = (px > ma150)
+L610         tt &= (px > ma200)
+L611         tt &= (ma150 > ma200)
+L612         tt &= (ma200 - ma200.shift(21) > 0)
+L613         tt &= (ma50  > ma150)
+L614         tt &= (ma50  > ma200)
+L615         tt &= (px    > ma50)
+L616
+L617         lo252 = px.rolling(252).min()
+L618         hi252 = px.rolling(252).max()
+L619         tt &= (px.divide(lo252).sub(1.0) >= 0.30)   # P_OVER_LOW52 >= 0.30
+L620         tt &= (px >= (0.75 * hi252))                # NEAR_52W_HIGH >= -0.25
+L621
+L622         r12  = px.divide(px.shift(252)).sub(1.0)
+L623         br12 = spx.divide(spx.shift(252)).sub(1.0)
+L624         r1   = px.divide(px.shift(22)).sub(1.0)
+L625         br1  = spx.divide(spx.shift(22)).sub(1.0)
+L626         rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
+L627         tt &= (rs >= 0.10)
+L628
+L629         return tt.fillna(False).sum(axis=1).astype(int)
+L630
+L631     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
+L632     def aggregate_scores(self, ib: Any, cfg):
+L633         if cfg is None:
+L634             raise ValueError("cfg is required; pass factor.PipelineConfig")
+L635         self._validate_ib_for_scorer(ib)
+L636
+L637         px, spx, tickers = ib.px, ib.spx, ib.tickers
+L638         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
+L639
+L640         df, missing_logs = pd.DataFrame(index=tickers), []
 L641         for t in tickers:
 L642             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
 L643             try:
@@ -149,63 +227,5 @@ L786             lo52 = s[-252:].min() if len(s)>=252 else s.min()
 L787             df.loc[t,'P_OVER_LOW52'] = (p/lo52 - 1) if (lo52 and lo52>0 and pd.notna(p)) else np.nan
 L788
 L789             df.loc[t,'MA200_SLOPE_1M'] = np.nan
-L790             if len(sma200.dropna()) >= 21:
-L791                 cur200 = _safe_last(sma200)
-L792                 old2001 = float(sma200.iloc[-21])
-L793                 if old2001:
-L794                     df.loc[t,'MA200_SLOPE_1M'] = cur200/old2001 - 1
-L795
-L796             df.loc[t,'P_OVER_150'] = p/_safe_last(sma150)-1 if pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan
-L797             df.loc[t,'P_OVER_200'] = p/_safe_last(sma200)-1 if pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
-L798             df.loc[t,'MA50_OVER_200'] = _safe_last(sma50)/_safe_last(sma200)-1 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
-L799             df.loc[t,'MA200_SLOPE_5M'] = np.nan
-L800             if len(sma200.dropna())>=105:
-L801                 cur200, old200 = _safe_last(sma200), float(sma200.iloc[-105])
-L802                 if old200 and old200!=0: df.loc[t,'MA200_SLOPE_5M'] = cur200/old200 - 1
-L803             # NEW: 200日線が連続で上向きの「日数」
-L804             df.loc[t,'MA200_UP_STREAK_D'] = np.nan
-L805             try:
-L806                 s200 = sma200.dropna()
-L807                 if len(s200) >= 2:
-L808                     diff200 = s200.diff()
-L809                     up = 0
-L810                     for v in diff200.iloc[::-1]:
-L811                         if pd.isna(v) or v <= 0:
-L812                             break
-L813                         up += 1
-L814                     df.loc[t,'MA200_UP_STREAK_D'] = float(up)
-L815             except Exception:
-L816                 pass
-L817             df.loc[t,'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52<=0 or pd.isna(p)) else (p/(lo52*1.25)-1)
-L818             hi52 = s[-252:].max() if len(s)>=252 else s.max(); df.loc[t,'NEAR_52W_HIGH'] = np.nan
-L819             if hi52 and hi52>0 and pd.notna(p):
-L820                 d_hi = (p/hi52)-1.0; df.loc[t,'NEAR_52W_HIGH'] = -abs(min(0.0, d_hi))
-L821             df.loc[t,'RS_SLOPE_6W'] = self.rs_line_slope(s, ib.spx, 30)
-L822             df.loc[t,'RS_SLOPE_13W'] = self.rs_line_slope(s, ib.spx, 65)
-L823
-L824             df.loc[t,'DIV_STREAK'] = self.div_streak(t)
-L825
-L826             # --- 欠損メモ ---
-L827             fin_cols = ['REV','ROE','BETA','DIV','FCF']
-L828             need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t,col])]
-L829             if need_finnhub:
-L830                 fin_data = self.fetch_finnhub_metrics(t)
-L831                 for col in need_finnhub:
-L832                     val = fin_data.get(col)
-L833                     if val is not None and not pd.isna(val): df.loc[t,col] = val
-L834             for col in fin_cols + ['EPS','RS','TR_str','DIV_STREAK']:
-L835                 if pd.isna(df.loc[t,col]):
-L836                     if col=='DIV':
-L837                         status = self.dividend_status(t)
-L838                         if status!='none_confident': missing_logs.append({'Ticker':t,'Column':col,'Status':status})
-L839                     else:
-L840                         missing_logs.append({'Ticker':t,'Column':col})
-L841
-L842         def _pick_series(entry: dict, keys: list[str]):
-L843             for k in keys:
-L844                 val = entry.get(k) if isinstance(entry, dict) else None
-L845                 if val is None:
-L846                     continue
-L847                 try:
-L848                
+L790             if len(sma200.
 ```

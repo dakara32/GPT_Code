@@ -1,5 +1,63 @@
 ```text
-eric(df.get('GRW_FLEX_SCORE'), errors="coerce")
+LOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
+L1025
+L1026         # === Growth深掘り系（欠損保持z + RAW併載） ===
+L1027         grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']
+L1028         for col in grw_cols:
+L1029             if col in df.columns:
+L1030                 raw = pd.to_numeric(df[col], errors="coerce")
+L1031                 df_z[col] = robust_z_keepnan(raw)
+L1032                 df_z[f'{col}_RAW'] = raw
+L1033         for k in ("TREND_SLOPE_EPS", "TREND_SLOPE_REV"):
+L1034             if k in df.columns and k not in df_z.columns:
+L1035                 raw = pd.to_numeric(df[k], errors="coerce")
+L1036                 df_z[k] = robust_z_keepnan(raw)
+L1037                 df_z[f'{k}_RAW'] = raw
+L1038         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
+L1039
+L1040         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
+L1041         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
+L1042         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
+L1043
+L1044         # EPSが赤字でもFCFが黒字なら実質黒字とみなす
+L1045         eps_pos_mask = (df['EPS'] > 0) | (df['FCF_MGN'] > 0)
+L1046         df_z['EPS_POS'] = df_z['EPS'].where(eps_pos_mask, 0.0)
+L1047
+L1048         # ===== トレンドスロープ算出 =====
+L1049         def zpos(x):
+L1050             arr = robust_z(x)
+L1051             idx = getattr(x, 'index', df_z.index)
+L1052             return pd.Series(arr, index=idx).fillna(0.0)
+L1053
+L1054         def relu(x):
+L1055             ser = x if isinstance(x, pd.Series) else pd.Series(x, index=df_z.index)
+L1056             return ser.clip(lower=0).fillna(0.0)
+L1057
+L1058         # 売上トレンドスロープ（四半期）
+L1059         slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
+L1060         noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
+L1061         slope_rev_combo = slope_rev - 0.25*noise_rev
+L1062         df_z['TREND_SLOPE_REV_RAW'] = slope_rev_combo
+L1063         df_z['TREND_SLOPE_REV'] = slope_rev_combo.clip(-3.0, 3.0)
+L1064
+L1065         # EPSトレンドスロープ（四半期）
+L1066         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
+L1067         df_z['TREND_SLOPE_EPS_RAW'] = slope_eps
+L1068         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
+L1069
+L1070         # 年次トレンド（サブ）
+L1071         slope_rev_yr = zpos(df_z['REV_YOY'])
+L1072         slope_eps_yr = zpos(df_z.get('EPS_YOY', pd.Series(0.0, index=df.index)))
+L1073         streak_base = df['REV_ANN_STREAK'].clip(lower=0).fillna(0)
+L1074         streak_yr = streak_base / (streak_base.abs() + 1.0)
+L1075         slope_rev_yr_combo = 0.7*slope_rev_yr + 0.3*streak_yr
+L1076         df_z['TREND_SLOPE_REV_YR_RAW'] = slope_rev_yr_combo
+L1077         df_z['TREND_SLOPE_REV_YR'] = slope_rev_yr_combo.clip(-3.0, 3.0)
+L1078         df_z['TREND_SLOPE_EPS_YR_RAW'] = slope_eps_yr
+L1079         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
+L1080
+L1081         # ===== GRW flexible score (variable data paths) =====
+L1082         grw_raw = pd.to_numeric(df.get('GRW_FLEX_SCORE'), errors="coerce")
 L1083         df_z['GRW_FLEX_SCORE_RAW'] = grw_raw
 L1084         df_z['GROWTH_F_RAW'] = grw_raw
 L1085         df_z['GROWTH_F'] = robust_z_keepnan(grw_raw).clip(-3.0, 3.0)
@@ -152,82 +210,5 @@ L1231                   .str.upper()
 L1232                   .tolist())
 L1233         except FileNotFoundError:
 L1234             warnings.warn("current_tickers.csv not found — bonus skipped")
-L1235             current = []
-L1236
-L1237         mask_bonus = g_score.index.isin(current)
-L1238         if mask_bonus.any():
-L1239             # 1) factor.BONUS_COEFF から k を決め、無ければ 0.4
-L1240             k = float(getattr(sys.modules.get("factor"), "BONUS_COEFF", 0.4))
-L1241             # 2) g 側の σ を取り、NaN なら 0 に丸める
-L1242             sigma_g = g_score.std()
-L1243             if pd.isna(sigma_g):
-L1244                 sigma_g = 0.0
-L1245             bonus_g = round(k * sigma_g, 3)
-L1246             g_score.loc[mask_bonus] += bonus_g
-L1247             Scorer.g_score = g_score
-L1248             # 3) D 側も同様に σ の NaN をケア
-L1249             sigma_d = d_score_all.std()
-L1250             if pd.isna(sigma_d):
-L1251                 sigma_d = 0.0
-L1252             bonus_d = round(k * sigma_d, 3)
-L1253             d_score_all.loc[d_score_all.index.isin(current)] += bonus_d
-L1254
-L1255         try:
-L1256             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
-L1257         except Exception:
-L1258             pass
-L1259
-L1260         df_full = df.copy()
-L1261         df_full_z = df_z.copy()
-L1262
-L1263         from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
-L1264         return FeatureBundle(df=df,
-L1265             df_z=df_z,
-L1266             g_score=g_score,
-L1267             d_score_all=d_score_all,
-L1268             missing_logs=pd.DataFrame(missing_logs),
-L1269             df_full=df_full,
-L1270             df_full_z=df_full_z,
-L1271             scaler=None)
-L1272
-L1273 def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_pullback=5):
-L1274     """
-L1275     G枠ユニバースに対し、ブレイクアウト確定/押し目反発の「直近N営業日内の発火」を判定し、
-L1276     次の列を feature_df に追加する（index=ticker）。
-L1277       - G_BREAKOUT_recent_5d : bool
-L1278       - G_BREAKOUT_last_date : str "YYYY-MM-DD"
-L1279       - G_PULLBACK_recent_5d : bool
-L1280       - G_PULLBACK_last_date : str "YYYY-MM-DD"
-L1281       - G_PIVOT_price        : float
-L1282     失敗しても例外は握り潰し、既存処理を阻害しない。
-L1283     """
-L1284     try:
-L1285         px   = bundle.px                      # 終値 DataFrame
-L1286         hi   = bundle.data['High']
-L1287         lo   = bundle.data['Low']
-L1288         vol  = bundle.data['Volume']
-L1289         bench= bundle.spx                     # ベンチマーク Series
-L1290
-L1291         # Gユニバース推定：self.g_universe 優先 → feature_df['group']=='G' → 全銘柄
-L1292         g_universe = getattr(self_obj, "g_universe", None)
-L1293         if g_universe is None:
-L1294             try:
-L1295                 g_universe = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
-L1296             except Exception:
-L1297                 g_universe = list(feature_df.index)
-L1298         if not g_universe:
-L1299             return feature_df
-L1300
-L1301         # 指標
-L1302         px = px.ffill(limit=2)
-L1303         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
-L1304         ma50  = px[g_universe].rolling(50).mean()
-L1305         ma150 = px[g_universe].rolling(150).mean()
-L1306         ma200 = px[g_universe].rolling(200).mean()
-L1307         atr20 = (hi[g_universe] - lo[g_universe]).rolling(20).mean()
-L1308         vol20 = vol[g_universe].rolling(20).mean()
-L1309         vol50 = vol[g_universe].rolling(50).mean()
-L1310
-L1311         # トレンドテンプレート合格
-L1312         trend_template_ok = (px[g
+L1235  
 ```
