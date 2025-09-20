@@ -970,7 +970,7 @@ class Scorer:
         df_z = pd.DataFrame(index=df.index)
         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
-        for col in ['P_OVER_150','P_OVER_200','MA50_OVER_200','MA200_SLOPE_5M','LOW52PCT25_EXCESS','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
+        for col in ['P_OVER_150','P_OVER_200','MA200_SLOPE_5M','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
 
         # === Growth深掘り系（欠損保持z + RAW併載） ===
         grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']
@@ -978,13 +978,11 @@ class Scorer:
             if col in df.columns:
                 raw = pd.to_numeric(df[col], errors="coerce")
                 df_z[col] = robust_z_keepnan(raw)
-                df_z[f'{col}_RAW'] = raw
         for k in ("TREND_SLOPE_EPS", "TREND_SLOPE_REV"):
             if k in df.columns and k not in df_z.columns:
                 raw = pd.to_numeric(df[k], errors="coerce")
                 df_z[k] = robust_z_keepnan(raw)
-                df_z[f'{k}_RAW'] = raw
-        for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_TTM_PS','DIV_VAR5','DIV_YOY','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
+        for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_VAR5','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
 
         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
@@ -1008,12 +1006,10 @@ class Scorer:
         slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
         noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
         slope_rev_combo = slope_rev - 0.25*noise_rev
-        df_z['TREND_SLOPE_REV_RAW'] = slope_rev_combo
         df_z['TREND_SLOPE_REV'] = slope_rev_combo.clip(-3.0, 3.0)
 
         # EPSトレンドスロープ（四半期）
         slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
-        df_z['TREND_SLOPE_EPS_RAW'] = slope_eps
         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
 
         # 年次トレンド（サブ）
@@ -1022,24 +1018,18 @@ class Scorer:
         streak_base = df['REV_ANN_STREAK'].clip(lower=0).fillna(0)
         streak_yr = streak_base / (streak_base.abs() + 1.0)
         slope_rev_yr_combo = 0.7*slope_rev_yr + 0.3*streak_yr
-        df_z['TREND_SLOPE_REV_YR_RAW'] = slope_rev_yr_combo
         df_z['TREND_SLOPE_REV_YR'] = slope_rev_yr_combo.clip(-3.0, 3.0)
-        df_z['TREND_SLOPE_EPS_YR_RAW'] = slope_eps_yr
         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
 
         # ===== GRW flexible score (variable data paths) =====
         grw_raw = pd.to_numeric(df.get('GRW_FLEX_SCORE'), errors="coerce")
-        df_z['GRW_FLEX_SCORE_RAW'] = grw_raw
-        df_z['GROWTH_F_RAW'] = grw_raw
         df_z['GROWTH_F'] = robust_z_keepnan(grw_raw).clip(-3.0, 3.0)
         df_z['GRW_FLEX_WEIGHT'] = pd.to_numeric(df.get('GRW_FLEX_WEIGHT'), errors="coerce")
-        df_z['GRW_FLEX_CORE_RAW'] = pd.to_numeric(df.get('GRW_FLEX_CORE'), errors="coerce")
-        df_z['GRW_FLEX_PRICE_RAW'] = pd.to_numeric(df.get('GRW_FLEX_PRICE'), errors="coerce")
 
         # Debug dump for GRW composition (console OFF by default; enable only with env)
         if bool(os.getenv("GRW_CONSOLE_DEBUG")):
             try:
-                cols = ['GROWTH_F', 'GROWTH_F_RAW', 'GRW_FLEX_WEIGHT']
+                cols = ['GROWTH_F', 'GRW_FLEX_WEIGHT']
                 use_cols = [c for c in cols if c in df_z.columns]
                 i = df_z[use_cols].copy() if use_cols else pd.DataFrame(index=df_z.index)
                 i.sort_values('GROWTH_F', ascending=False, inplace=True)
@@ -1050,9 +1040,9 @@ class Scorer:
                     parts = []
                     if pd.notna(row.get('GROWTH_F')):
                         parts.append(f"GROWTH_F={row.get('GROWTH_F'):.3f}")
-                    raw_val = row.get('GROWTH_F_RAW')
+                    raw_val = grw_raw.get(t) if isinstance(grw_raw, pd.Series) else np.nan
                     if pd.notna(raw_val):
-                        parts.append(f"GROWTH_F_RAW={raw_val:.3f}")
+                        parts.append(f"GRW_FLEX_SCORE={raw_val:.3f}")
                     weight_val = row.get('GRW_FLEX_WEIGHT')
                     if pd.notna(weight_val):
                         parts.append(f"w={weight_val:.2f}")
@@ -1132,6 +1122,10 @@ class Scorer:
             df_z.loc[mask_bio_loss, "GROWTH_F"] = df_z.loc[mask_bio_loss, "GROWTH_F"] - penalty_z
             df_z["GROWTH_F"] = df_z["GROWTH_F"].clip(-3.0, 3.0)
         # === end: BIO LOSS PENALTY =======================================
+
+        assert not any(c.endswith("_RAW") for c in df_z.columns)
+        for c in ["DIV_TTM_PS","DIV_YOY","LOW52PCT25_EXCESS","MA50_OVER_200"]:
+            assert c not in df_z.columns
 
         df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
