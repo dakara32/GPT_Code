@@ -465,10 +465,11 @@ class Input:
                     "rev_q_recent": rev_q,
                     "rev_ttm": rev_ttm,
                     # 後段でDatetimeIndex化できるよう (date,value) を保持。値だけの互換キーも残す。
-                    "eps_q_series_pairs": eps_pairs[:16],
-                    "rev_q_series_pairs": rev_pairs[:16],
-                    "eps_q_series": eps_vals[:16],
-                    "rev_q_series": rev_vals[:16],
+                    # 3年運用に合わせて四半期は直近12本のみ保持（約3年=12Q）
+                    "eps_q_series_pairs": eps_pairs[:12],
+                    "rev_q_series_pairs": rev_pairs[:12],
+                    "eps_q_series": eps_vals[:12],
+                    "rev_q_series": rev_vals[:12],
                 }
                 n_map += 1
                 if rev_vals:
@@ -765,6 +766,7 @@ class Input:
         have_eps = 0
         rev_lens: list[int] = []
         eps_lens: list[int] = []
+        rev_y_lens: list[int] = []
         samples: list[tuple[str, int, str, float | None, int, str, float | None]] = []
 
         for t in tickers:
@@ -794,6 +796,16 @@ class Input:
 
             r = entry.get("SEC_REV_Q_SERIES")
             e = entry.get("SEC_EPS_Q_SERIES")
+            # 年次は直近3件（約3年）だけ保持。重み分岐の nY 判定は従来通り。
+            try:
+                if hasattr(r, "index") and isinstance(r.index, pd.DatetimeIndex):
+                    y = r.resample("Y").sum().dropna()
+                    entry["SEC_REV_Y_SERIES"] = y.tail(3)
+                else:
+                    entry["SEC_REV_Y_SERIES"] = []
+            except Exception:
+                entry["SEC_REV_Y_SERIES"] = []
+            ry = entry.get("SEC_REV_Y_SERIES")
             if _has_entries(r):
                 have_rev += 1
             if _has_entries(e):
@@ -802,6 +814,7 @@ class Input:
             le = _brief_len(e)
             rev_lens.append(lr)
             eps_lens.append(le)
+            rev_y_lens.append(_brief_len(ry))
             if len(samples) < 8:
                 try:
                     rd = getattr(r, "index", [])[-1] if lr > 0 else None
@@ -813,6 +826,12 @@ class Input:
                     samples.append((t, lr, "-", None, le, "-", None))
 
         logger.info("[SEC] series attach: rev_q=%d/%d, eps_q=%d/%d", have_rev, len(tickers), have_eps, len(tickers))
+        logger.info(
+            "[SEC_SERIES] rev_q=%d (<=12), eps_q=%d (<=12), rev_y=%d (<=3)",
+            max(rev_lens) if rev_lens else 0,
+            max(eps_lens) if eps_lens else 0,
+            max(rev_y_lens) if rev_y_lens else 0,
+        )
 
         if rev_lens:
             rev_lens_sorted = sorted(rev_lens)
