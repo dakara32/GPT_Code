@@ -343,6 +343,7 @@ class Scorer:
         soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
         """
         eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
+        eff = eff.dropna()
         if not hard:
             return list(eff.head(N).index)
         pick, used = [], {}
@@ -1004,9 +1005,25 @@ class Scorer:
 
         # --- 重みは cfg を優先（外部があればそれを使用） ---
         # ① 全銘柄で G/D スコアを算出（unmasked）
+        g_weights = pd.Series(cfg.weights.g, dtype=float)
+        need_g_candidates = ["GROWTH_F", "MOM"]
+        mask_g = pd.Series(True, index=df_z.index, dtype=bool)
+        for c in need_g_candidates:
+            if c in df_z.columns:
+                mask_g &= df_z[c].notna()
+            else:
+                mask_g &= False
+        for c in need_g_candidates:
+            if c in df_z.columns:
+                df_z[f"DBGRW.{c}"] = df_z[c]
+        df_fill_g = df_z.reindex(columns=g_weights.index, fill_value=np.nan).copy()
+        for c in df_fill_g.columns:
+            if c not in need_g_candidates:
+                df_fill_g[c] = df_fill_g[c].fillna(0)
         g_score_all = _as_numeric_series(
-            df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1, skipna=False)
+            df_fill_g.mul(g_weights.reindex(df_fill_g.columns)).sum(axis=1, skipna=False)
         )
+        g_score_all = g_score_all.where(mask_g)
 
         d_comp = pd.concat({
             'QAL': df_z['D_QAL'],
@@ -1016,9 +1033,21 @@ class Scorer:
         }, axis=1)
         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
         globals()['D_WEIGHTS_EFF'] = dw.copy()
+        need_d_candidates = ["VOL", "QAL"]
+        mask_d = pd.Series(True, index=d_comp.index, dtype=bool)
+        for c in need_d_candidates:
+            if c in d_comp.columns:
+                mask_d &= d_comp[c].notna()
+            else:
+                mask_d &= False
+        df_fill_d = d_comp.copy()
+        for c in df_fill_d.columns:
+            if c not in need_d_candidates:
+                df_fill_d[c] = df_fill_d[c].fillna(0)
         d_score_all = _as_numeric_series(
-            d_comp.mul(dw, axis=1).sum(axis=1, skipna=False)
+            df_fill_d.mul(dw, axis=1).sum(axis=1, skipna=False)
         )
+        d_score_all = d_score_all.where(mask_d)
 
         # ② テンプレ判定（既存ロジックそのまま）
         mask = df['trend_template']
