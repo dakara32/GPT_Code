@@ -115,209 +115,210 @@ L46     except Exception:
 L47         print(f"[DBG][{stage}] {msg}")
 L48
 L49
-L50 # ---- Dividend Helpers -------------------------------------------------------
-L51 def _last_close(t, price_map=None):
-L52     if price_map and (c := price_map.get(t)) is not None: return float(c)
-L53     try:
-L54         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
-L55         return float(h.iloc[-1]) if len(h) else np.nan
-L56     except Exception:
-L57         return np.nan
-L58
-L59 def _ttm_div_sum(t, lookback_days=400):
-L60     try:
-L61         div = yf.Ticker(t).dividends
-L62         if div is None or len(div) == 0: return 0.0
-L63         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
-L64         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
-L65         return ttm if ttm > 0 else float(div.tail(4).sum())
-L66     except Exception:
-L67         return 0.0
-L68
-L69 def ttm_div_yield_portfolio(tickers, price_map=None):
-L70     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
-L71     return float(np.mean(ys)) if ys else 0.0
+L50 # ---- Debug helpers ----------------------------------------------------------
+L51 def _flatten_for_debug(d, prefix="DBG_GRW"):
+L52     """
+L53     ネストしたdict/list/tupleを、df_z列に入れやすい一次元dictへ。
+L54     例: {"w":0.68,"path":"P5","core":{"rev_yoy_mean":1.73,"eps_yoy_mean":0.72,"accel":0.45}}
+L55       -> {"DBG_GRW.w":0.68,"DBG_GRW.path":"P5","DBG_GRW.core.rev_yoy_mean":1.73,...}
+L56     """
+L57     out = {}
+L58     if d is None:
+L59         return out
+L60
+L61     def rec(k, v):
+L62         if isinstance(v, dict):
+L63             for kk, vv in v.items():
+L64                 rec(f"{k}.{str(kk)}", vv)
+L65         elif isinstance(v, (list, tuple, np.ndarray)):
+L66             try:
+L67                 out[k] = list(v[:6])
+L68             except Exception:
+L69                 out[k] = list(v)
+L70         else:
+L71             out[k] = v
 L72
-L73 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
-L74 def winsorize_s(s: pd.Series, p=0.02):
-L75     if s is None or s.dropna().empty: return s
-L76     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L73     if isinstance(d, dict):
+L74         for k, v in d.items():
+L75             rec(f"{prefix}.{str(k)}", v)
+L76     return out
 L77
-L78 def robust_z(s: pd.Series, p=0.02):
-L79     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
-L80
-L81 def robust_z_keepnan(s: pd.Series) -> pd.Series:
-L82     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
-L83     if s is None:
-L84         return pd.Series(dtype=float)
-L85     v = pd.to_numeric(s, errors="coerce")
-L86     m = np.nanmedian(v)
-L87     mad = np.nanmedian(np.abs(v - m))
-L88     z = (v - m) / (1.4826 * mad + 1e-9)
-L89     if np.nanstd(z) < 1e-9:
-L90         r = v.rank(method="average", na_option="keep")
-L91         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
-L92     return pd.Series(z, index=v.index, dtype=float)
-L93
-L94
-L95 def _safe_div(a, b):
-L96     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
-L97     except Exception: return np.nan
-L98
-L99 def _safe_last(series: pd.Series, default=np.nan):
-L100     try: return float(series.iloc[-1])
-L101     except Exception: return default
-L102
-L103
-L104 def _ensure_series(x):
-L105     if x is None:
-L106         return pd.Series(dtype=float)
-L107     if isinstance(x, pd.Series):
-L108         return x.dropna()
-L109     if isinstance(x, (list, tuple)):
-L110         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
-L111             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
-L112             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
-L113             return pd.Series(v, index=dt).dropna()
-L114         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
-L115     try:
-L116         return pd.Series(x).dropna()
-L117     except Exception:
-L118         return pd.Series(dtype=float)
-L119
-L120
-L121 def _to_quarterly(s: pd.Series) -> pd.Series:
-L122     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
-L123         return s
-L124     return s.resample("Q").last().dropna()
-L125
-L126
-L127 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
-L128     if qs is None or qs.empty:
-L129         return pd.Series(dtype=float)
-L130     ttm = qs.rolling(4, min_periods=2).sum()
-L131     yoy = ttm.pct_change(4)
-L132     return yoy
-L133
-L134
-L135 def _nz(x) -> float:
-L136     if x is None:
-L137         return 0.0
-L138     try:
-L139         value = float(x)
-L140     except Exception:
-L141         return 0.0
-L142     if not np.isfinite(value):
-L143         return 0.0
-L144     return value
-L145
-L146
-L147 def _winsor(x, lo=-2.0, hi=2.0) -> float:
-L148     v = _nz(x)
-L149     if v < lo:
-L150         return float(lo)
-L151     if v > hi:
-L152         return float(hi)
-L153     return float(v)
+L78
+L79 # ---- Dividend Helpers -------------------------------------------------------
+L80 def _last_close(t, price_map=None):
+L81     if price_map and (c := price_map.get(t)) is not None: return float(c)
+L82     try:
+L83         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
+L84         return float(h.iloc[-1]) if len(h) else np.nan
+L85     except Exception:
+L86         return np.nan
+L87
+L88 def _ttm_div_sum(t, lookback_days=400):
+L89     try:
+L90         div = yf.Ticker(t).dividends
+L91         if div is None or len(div) == 0: return 0.0
+L92         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
+L93         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
+L94         return ttm if ttm > 0 else float(div.tail(4).sum())
+L95     except Exception:
+L96         return 0.0
+L97
+L98 def ttm_div_yield_portfolio(tickers, price_map=None):
+L99     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
+L100     return float(np.mean(ys)) if ys else 0.0
+L101
+L102 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
+L103 def winsorize_s(s: pd.Series, p=0.02):
+L104     if s is None or s.dropna().empty: return s
+L105     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L106
+L107 def robust_z(s: pd.Series, p=0.02):
+L108     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L109
+L110 def robust_z_keepnan(s: pd.Series) -> pd.Series:
+L111     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
+L112     if s is None:
+L113         return pd.Series(dtype=float)
+L114     v = pd.to_numeric(s, errors="coerce")
+L115     m = np.nanmedian(v)
+L116     mad = np.nanmedian(np.abs(v - m))
+L117     z = (v - m) / (1.4826 * mad + 1e-9)
+L118     if np.nanstd(z) < 1e-9:
+L119         r = v.rank(method="average", na_option="keep")
+L120         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
+L121     return pd.Series(z, index=v.index, dtype=float)
+L122
+L123
+L124 def _safe_div(a, b):
+L125     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
+L126     except Exception: return np.nan
+L127
+L128 def _safe_last(series: pd.Series, default=np.nan):
+L129     try: return float(series.iloc[-1])
+L130     except Exception: return default
+L131
+L132
+L133 def _ensure_series(x):
+L134     if x is None:
+L135         return pd.Series(dtype=float)
+L136     if isinstance(x, pd.Series):
+L137         return x.dropna()
+L138     if isinstance(x, (list, tuple)):
+L139         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
+L140             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
+L141             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
+L142             return pd.Series(v, index=dt).dropna()
+L143         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
+L144     try:
+L145         return pd.Series(x).dropna()
+L146     except Exception:
+L147         return pd.Series(dtype=float)
+L148
+L149
+L150 def _to_quarterly(s: pd.Series) -> pd.Series:
+L151     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
+L152         return s
+L153     return s.resample("Q").last().dropna()
 L154
 L155
-L156 def _round_debug(x, ndigits: int = 4):
-L157     try:
-L158         value = float(x)
-L159     except Exception:
-L160         return None
-L161     if not np.isfinite(value):
-L162         return None
-L163     return round(value, ndigits)
-L164
-L165
-L166 def _calc_grw_flexible(
-L167     ticker: str,
-L168     info_entry: dict | None,
-L169     close_series: pd.Series | None,
-L170     volume_series: pd.Series | None,
-L171 ):
-L172     info_entry = info_entry if isinstance(info_entry, dict) else {}
-L173
-L174     s_rev_q = _ensure_series(info_entry.get("SEC_REV_Q_SERIES"))
-L175     s_eps_q = _ensure_series(info_entry.get("SEC_EPS_Q_SERIES"))
-L176     s_rev_y = _ensure_series(info_entry.get("SEC_REV_Y_SERIES"))
-L177
-L178     nQ = int(getattr(s_rev_q, "size", 0))
-L179     nY = int(getattr(s_rev_y, "size", 0))
-L180
-L181     parts: dict[str, Any] = {"nQ": nQ, "nY": nY}
-L182     path = "NONE"
-L183     w = 0.0
+L156 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
+L157     if qs is None or qs.empty:
+L158         return pd.Series(dtype=float)
+L159     ttm = qs.rolling(4, min_periods=2).sum()
+L160     yoy = ttm.pct_change(4)
+L161     return yoy
+L162
+L163
+L164 def _nz(x) -> float:
+L165     if x is None:
+L166         return 0.0
+L167     try:
+L168         value = float(x)
+L169     except Exception:
+L170         return 0.0
+L171     if not np.isfinite(value):
+L172         return 0.0
+L173     return value
+L174
+L175
+L176 def _winsor(x, lo=-2.0, hi=2.0) -> float:
+L177     v = _nz(x)
+L178     if v < lo:
+L179         return float(lo)
+L180     if v > hi:
+L181         return float(hi)
+L182     return float(v)
+L183
 L184
-L185     def _valid_ratio(a, b):
-L186         try:
-L187             na, nb = float(a), float(b)
-L188         except Exception:
-L189             return None
-L190         if not np.isfinite(na) or not np.isfinite(nb) or nb == 0:
-L191             return None
-L192         return na, nb
+L185 def _round_debug(x, ndigits: int = 4):
+L186     try:
+L187         value = float(x)
+L188     except Exception:
+L189         return None
+L190     if not np.isfinite(value):
+L191         return None
+L192     return round(value, ndigits)
 L193
-L194     def yoy_q(series: pd.Series) -> float | None:
-L195         s = _ensure_series(series)
-L196         if s.empty:
-L197             return None
-L198         s = s.sort_index()
-L199         if isinstance(s.index, pd.DatetimeIndex):
-L200             last_idx = s.index[-1]
-L201             window_start = last_idx - pd.DateOffset(months=15)
-L202             window_end = last_idx - pd.DateOffset(months=9)
-L203             candidates = s.loc[(s.index >= window_start) & (s.index <= window_end)]
-L204             if candidates.empty:
-L205                 candidates = s.loc[s.index <= window_end]
-L206             if candidates.empty:
-L207                 return None
-L208             v1 = candidates.iloc[-1]
-L209             v0 = s.iloc[-1]
-L210         else:
-L211             if s.size < 5:
-L212                 return None
-L213             v0 = s.iloc[-1]
-L214             v1 = s.iloc[-5]
-L215         pair = _valid_ratio(v0, v1)
-L216         if pair is None:
-L217             return None
-L218         a, b = pair
-L219         return float(a / b - 1.0)
-L220
-L221     def qoq(series: pd.Series) -> float | None:
-L222         s = _ensure_series(series)
-L223         if s.size < 2:
-L224             return None
-L225         s = s.sort_index()
-L226         v0, v1 = s.iloc[-1], s.iloc[-2]
-L227         pair = _valid_ratio(v0, v1)
-L228         if pair is None:
-L229             return None
-L230         a, b = pair
-L231         return float(a / b - 1.0)
-L232
-L233     def ttm_delta(series: pd.Series) -> float | None:
-L234         s = _ensure_series(series)
-L235         if s.size < 2:
-L236             return None
-L237         s = s.sort_index()
-L238         k = int(min(4, s.size))
-L239         cur_slice = s.iloc[-k:]
-L240         prev_slice = s.iloc[:-k]
-L241         if prev_slice.empty:
-L242             return None
-L243         prev_k = int(min(k, prev_slice.size))
-L244         cur_sum = float(cur_slice.sum())
-L245         prev_sum = float(prev_slice.iloc[-prev_k:].sum())
-L246         pair = _valid_ratio(cur_sum, prev_sum)
-L247         if pair is None:
-L248             return None
-L249         a, b = pair
-L250         return float(a / b - 1.0)
-L251
-L252     def yoy_y(series: pd.Series) -> float | None:
-L253         s = _ensure_series(series)
-L254
+L194
+L195 def _calc_grw_flexible(
+L196     ticker: str,
+L197     info_entry: dict | None,
+L198     close_series: pd.Series | None,
+L199     volume_series: pd.Series | None,
+L200 ):
+L201     info_entry = info_entry if isinstance(info_entry, dict) else {}
+L202
+L203     s_rev_q = _ensure_series(info_entry.get("SEC_REV_Q_SERIES"))
+L204     s_eps_q = _ensure_series(info_entry.get("SEC_EPS_Q_SERIES"))
+L205     s_rev_y = _ensure_series(info_entry.get("SEC_REV_Y_SERIES"))
+L206
+L207     nQ = int(getattr(s_rev_q, "size", 0))
+L208     nY = int(getattr(s_rev_y, "size", 0))
+L209
+L210     parts: dict[str, Any] = {"nQ": nQ, "nY": nY}
+L211     path = "NONE"
+L212     w = 0.0
+L213
+L214     def _valid_ratio(a, b):
+L215         try:
+L216             na, nb = float(a), float(b)
+L217         except Exception:
+L218             return None
+L219         if not np.isfinite(na) or not np.isfinite(nb) or nb == 0:
+L220             return None
+L221         return na, nb
+L222
+L223     def yoy_q(series: pd.Series) -> float | None:
+L224         s = _ensure_series(series)
+L225         if s.empty:
+L226             return None
+L227         s = s.sort_index()
+L228         if isinstance(s.index, pd.DatetimeIndex):
+L229             last_idx = s.index[-1]
+L230             window_start = last_idx - pd.DateOffset(months=15)
+L231             window_end = last_idx - pd.DateOffset(months=9)
+L232             candidates = s.loc[(s.index >= window_start) & (s.index <= window_end)]
+L233             if candidates.empty:
+L234                 candidates = s.loc[s.index <= window_end]
+L235             if candidates.empty:
+L236                 return None
+L237             v1 = candidates.iloc[-1]
+L238             v0 = s.iloc[-1]
+L239         else:
+L240             if s.size < 5:
+L241                 return None
+L242             v0 = s.iloc[-1]
+L243             v1 = s.iloc[-5]
+L244         pair = _valid_ratio(v0, v1)
+L245         if pair is None:
+L246             return None
+L247         a, b = pair
+L248         return float(a / b - 1.0)
+L249
+L250     def qoq(series: pd.Series) -> float | None:
+L251         s = _ensure_series(series)
+L252         if s.size < 2:
+L253             return None
+L254         s = s.sort_index()
+L2
 ```

@@ -1,228 +1,227 @@
 ```text
-
-L526
-L527     @staticmethod
-L528     def fetch_finnhub_metrics(symbol):
-L529         api_key = os.environ.get("FINNHUB_API_KEY")
-L530         if not api_key: return {}
-L531         url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":api_key}
-L532         try:
-L533             r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
-L534             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.get('enterpriseValue') else None}
-L535         except Exception: return {}
-L536
-L537     @staticmethod
-L538     def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
-L539         r, m = series.pct_change().dropna(), market.pct_change().dropna()
-L540         n = min(len(r), len(m), lookback)
-L541         if n<60: return np.nan
-L542         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
-L543         return np.nan if var==0 else cov/var
-L544
-L545     @staticmethod
-L546     def spx_to_alpha(spx: pd.Series, bands=(0.03,0.10), w=(0.6,0.4),
-L547                      span=5, q=(0.20,0.40), alphas=(0.05,0.08,0.10)) -> float:
-L548         """
-L549         S&P500指数のみから擬似breadthを作り、履歴分位でαを段階決定。
-L550         bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
-L551         """
-L552         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
-L553         b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
-L554         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
-L555         b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
-L556         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
-L557
-L558     @staticmethod
-L559     def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
-L560         """
-L561         同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
-L562         戻り値は降順ソート済み。
-L563         """
-L564         s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
-L565         cnt, pen = {}, {}
-L566         for t in order:
-L567             sec = sectors.get(t, "U"); cnt[sec] = cnt.get(sec,0) + 1; pen[t] = alpha*max(0, cnt[sec]-cap)
-L568         return (s - pd.Series(pen)).sort_values(ascending=False)
-L569
-L570     @staticmethod
-L571     def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08, hard: int|None=5) -> list[str]:
-L572         """
-L573         soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
-L574         """
-L575         eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
-L576         if not hard:
-L577             return list(eff.head(N).index)
-L578         pick, used = [], {}
-L579         for t in eff.index:
-L580             s = sectors.get(t, "U")
-L581             if used.get(s,0) < hard:
-L582                 pick.append(t); used[s] = used.get(s,0) + 1
-L583             if len(pick) == N: break
-L584         return pick
-L585
-L586     @staticmethod
-L587     def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
-L588         """
-L589         各営業日の trend_template 合格本数（合格“本数”=C）を返す。
-L590         - px: 列=ticker（ベンチは含めない）
-L591         - spx: ベンチマーク Series（px.index に整列）
-L592         - win_days: 末尾の計算対象営業日数（None→全体、既定600は呼び出し側指定）
-L593         ベクトル化＆rollingのみで軽量。欠損は False 扱い。
+@staticmethod
+L535     def dividend_status(ticker: str) -> str:
+L536         t = yf.Ticker(ticker)
+L537         try:
+L538             if not t.dividends.empty: return "has"
+L539         except Exception: return "unknown"
+L540         try:
+L541             a = t.actions
+L542             if (a is not None and not a.empty and "Stock Splits" in a.columns and a["Stock Splits"].abs().sum()>0): return "none_confident"
+L543         except Exception: pass
+L544         try:
+L545             fi = t.fast_info
+L546             if any(getattr(fi,k,None) for k in ("last_dividend_date","dividend_rate","dividend_yield")): return "maybe_missing"
+L547         except Exception: pass
+L548         return "unknown"
+L549
+L550     @staticmethod
+L551     def div_streak(t):
+L552         try:
+L553             divs = yf.Ticker(t).dividends.dropna(); ann = divs.groupby(divs.index.year).sum(); ann = ann[ann.index<pd.Timestamp.today().year]
+L554             years, streak = sorted(ann.index), 0
+L555             for i in range(len(years)-1,0,-1):
+L556                 if ann[years[i]] > ann[years[i-1]]: streak += 1
+L557                 else: break
+L558             return streak
+L559         except Exception: return 0
+L560
+L561     @staticmethod
+L562     def fetch_finnhub_metrics(symbol):
+L563         api_key = os.environ.get("FINNHUB_API_KEY")
+L564         if not api_key: return {}
+L565         url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":api_key}
+L566         try:
+L567             r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
+L568             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.get('enterpriseValue') else None}
+L569         except Exception: return {}
+L570
+L571     @staticmethod
+L572     def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
+L573         r, m = series.pct_change().dropna(), market.pct_change().dropna()
+L574         n = min(len(r), len(m), lookback)
+L575         if n<60: return np.nan
+L576         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
+L577         return np.nan if var==0 else cov/var
+L578
+L579     @staticmethod
+L580     def spx_to_alpha(spx: pd.Series, bands=(0.03,0.10), w=(0.6,0.4),
+L581                      span=5, q=(0.20,0.40), alphas=(0.05,0.08,0.10)) -> float:
+L582         """
+L583         S&P500指数のみから擬似breadthを作り、履歴分位でαを段階決定。
+L584         bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
+L585         """
+L586         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
+L587         b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
+L588         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
+L589         b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
+L590         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
+L591
+L592     @staticmethod
+L593     def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
 L594         """
-L595         import numpy as np, pandas as pd
-L596         if px is None or px.empty:
-L597             return pd.Series(dtype=int)
-L598         px = px.dropna(how="all", axis=1)
-L599         if win_days and win_days > 0:
-L600             px = px.tail(win_days)
-L601         if px.empty:
-L602             return pd.Series(dtype=int)
-L603         spx = spx.reindex(px.index).ffill()
-L604
-L605         ma50  = px.rolling(50).mean()
-L606         ma150 = px.rolling(150).mean()
-L607         ma200 = px.rolling(200).mean()
-L608
-L609         tt = (px > ma150)
-L610         tt &= (px > ma200)
-L611         tt &= (ma150 > ma200)
-L612         tt &= (ma200 - ma200.shift(21) > 0)
-L613         tt &= (ma50  > ma150)
-L614         tt &= (ma50  > ma200)
-L615         tt &= (px    > ma50)
-L616
-L617         lo252 = px.rolling(252).min()
-L618         hi252 = px.rolling(252).max()
-L619         tt &= (px.divide(lo252).sub(1.0) >= 0.30)   # P_OVER_LOW52 >= 0.30
-L620         tt &= (px >= (0.75 * hi252))                # NEAR_52W_HIGH >= -0.25
-L621
-L622         r12  = px.divide(px.shift(252)).sub(1.0)
-L623         br12 = spx.divide(spx.shift(252)).sub(1.0)
-L624         r1   = px.divide(px.shift(22)).sub(1.0)
-L625         br1  = spx.divide(spx.shift(22)).sub(1.0)
-L626         rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
-L627         tt &= (rs >= 0.10)
-L628
-L629         return tt.fillna(False).sum(axis=1).astype(int)
-L630
-L631     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
-L632     def aggregate_scores(self, ib: Any, cfg):
-L633         if cfg is None:
-L634             raise ValueError("cfg is required; pass factor.PipelineConfig")
-L635         self._validate_ib_for_scorer(ib)
-L636
-L637         px, spx, tickers = ib.px, ib.spx, ib.tickers
-L638         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
-L639
-L640         df, missing_logs = pd.DataFrame(index=tickers), []
-L641         for t in tickers:
-L642             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
-L643             try:
-L644                 volume_series_full = ib.data['Volume'][t]
-L645             except Exception:
-L646                 volume_series_full = None
-L647
-L648             grw_result = _calc_grw_flexible(t, d, s, volume_series_full)
-L649             df.loc[t,'GRW_FLEX_SCORE'] = grw_result.get('score')
-L650             df.loc[t,'GRW_FLEX_WEIGHT'] = grw_result.get('weight')
-L651             df.loc[t,'GRW_FLEX_CORE'] = grw_result.get('core')
-L652             df.loc[t,'GRW_FLEX_PRICE'] = grw_result.get('price_proxy')
-L653             df.loc[t,'DEBUG_GRW_PATH'] = grw_result.get('path')
-L654             df.loc[t,'DEBUG_GRW_PARTS'] = grw_result.get('parts')
+L595         同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
+L596         戻り値は降順ソート済み。
+L597         """
+L598         s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
+L599         cnt, pen = {}, {}
+L600         for t in order:
+L601             sec = sectors.get(t, "U"); cnt[sec] = cnt.get(sec,0) + 1; pen[t] = alpha*max(0, cnt[sec]-cap)
+L602         return (s - pd.Series(pen)).sort_values(ascending=False)
+L603
+L604     @staticmethod
+L605     def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08, hard: int|None=5) -> list[str]:
+L606         """
+L607         soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
+L608         """
+L609         eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
+L610         if not hard:
+L611             return list(eff.head(N).index)
+L612         pick, used = [], {}
+L613         for t in eff.index:
+L614             s = sectors.get(t, "U")
+L615             if used.get(s,0) < hard:
+L616                 pick.append(t); used[s] = used.get(s,0) + 1
+L617             if len(pick) == N: break
+L618         return pick
+L619
+L620     @staticmethod
+L621     def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
+L622         """
+L623         各営業日の trend_template 合格本数（合格“本数”=C）を返す。
+L624         - px: 列=ticker（ベンチは含めない）
+L625         - spx: ベンチマーク Series（px.index に整列）
+L626         - win_days: 末尾の計算対象営業日数（None→全体、既定600は呼び出し側指定）
+L627         ベクトル化＆rollingのみで軽量。欠損は False 扱い。
+L628         """
+L629         import numpy as np, pandas as pd
+L630         if px is None or px.empty:
+L631             return pd.Series(dtype=int)
+L632         px = px.dropna(how="all", axis=1)
+L633         if win_days and win_days > 0:
+L634             px = px.tail(win_days)
+L635         if px.empty:
+L636             return pd.Series(dtype=int)
+L637         spx = spx.reindex(px.index).ffill()
+L638
+L639         ma50  = px.rolling(50).mean()
+L640         ma150 = px.rolling(150).mean()
+L641         ma200 = px.rolling(200).mean()
+L642
+L643         tt = (px > ma150)
+L644         tt &= (px > ma200)
+L645         tt &= (ma150 > ma200)
+L646         tt &= (ma200 - ma200.shift(21) > 0)
+L647         tt &= (ma50  > ma150)
+L648         tt &= (ma50  > ma200)
+L649         tt &= (px    > ma50)
+L650
+L651         lo252 = px.rolling(252).min()
+L652         hi252 = px.rolling(252).max()
+L653         tt &= (px.divide(lo252).sub(1.0) >= 0.30)   # P_OVER_LOW52 >= 0.30
+L654         tt &= (px >= (0.75 * hi252))                # NEAR_52W_HIGH >= -0.25
 L655
-L656             # --- 基本特徴 ---
-L657             df.loc[t,'TR']   = self.trend(s)
-L658             df.loc[t,'EPS']  = _scalar(eps_df.loc[t,'EPS_TTM']) if t in eps_df.index else np.nan
-L659             df.loc[t,'EPS_Q'] = _scalar(eps_df.loc[t,'EPS_Q_LastQ']) if t in eps_df.index else np.nan
-L660             df.loc[t,'REV_TTM'] = _scalar(eps_df.loc[t,'REV_TTM']) if t in eps_df.index else np.nan
-L661             df.loc[t,'REV_Q']   = _scalar(eps_df.loc[t,'REV_Q_LastQ']) if t in eps_df.index else np.nan
-L662             df.loc[t,'REV']  = d.get('revenueGrowth',np.nan)
-L663             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
-L664             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
-L665
-L666             # --- 配当（欠損補完含む） ---
-L667             div = d.get('dividendYield') if d.get('dividendYield') is not None else d.get('trailingAnnualDividendYield')
-L668             if div is None or pd.isna(div):
-L669                 try:
-L670                     divs = yf.Ticker(t).dividends
-L671                     if divs is not None and not divs.empty:
-L672                         last_close = s.iloc[-1]; div_1y = divs[divs.index >= (divs.index.max() - pd.Timedelta(days=365))].sum()
-L673                         if last_close and last_close>0: div = float(div_1y/last_close)
-L674                 except Exception: pass
-L675             df.loc[t,'DIV'] = 0.0 if (div is None or pd.isna(div)) else float(div)
-L676
-L677             # --- FCF/EV ---
-L678             fcf_val = fcf_df.loc[t,'FCF_TTM'] if t in fcf_df.index else np.nan
-L679             df.loc[t,'FCF'] = (fcf_val/ev) if (pd.notna(fcf_val) and pd.notna(ev) and ev>0) else np.nan
-L680
-L681             # --- モメンタム・ボラ関連 ---
-L682             df.loc[t,'RS'], df.loc[t,'TR_str'] = self.rs(s, spx), self.tr_str(s)
-L683             r, rm = s.pct_change().dropna(), spx.pct_change().dropna()
-L684             n = int(min(len(r), len(rm)))
-L685
-L686             DOWNSIDE_DEV = np.nan
-L687             if n>=60:
-L688                 r6 = r.iloc[-min(len(r),126):]; neg = r6[r6<0]
-L689                 if len(neg)>=10: DOWNSIDE_DEV = float(neg.std(ddof=0)*np.sqrt(252))
-L690             df.loc[t,'DOWNSIDE_DEV'] = DOWNSIDE_DEV
-L691
-L692             MDD_1Y = np.nan
-L693             try:
-L694                 w = s.iloc[-min(len(s),252):].dropna()
-L695                 if len(w)>=30:
-L696                     roll_max = w.cummax(); MDD_1Y = float((w/roll_max - 1.0).min())
-L697             except Exception: pass
-L698             df.loc[t,'MDD_1Y'] = MDD_1Y
-L699
-L700             RESID_VOL = np.nan
-L701             if n>=120:
-L702                 rr, rrm = r.iloc[-n:].align(rm.iloc[-n:], join='inner')
-L703                 if len(rr)==len(rrm) and len(rr)>=120 and rrm.var()>0:
-L704                     beta = float(np.cov(rr, rrm)[0,1]/np.var(rrm)); resid = rr - beta*rrm
-L705                     RESID_VOL = float(resid.std(ddof=0)*np.sqrt(252))
-L706             df.loc[t,'RESID_VOL'] = RESID_VOL
-L707
-L708             DOWN_OUTPERF = np.nan
-L709             if n>=60:
-L710                 m, x = rm.iloc[-n:], r.iloc[-n:]; mask = m<0
-L711                 if mask.sum()>=10:
-L712                     mr, sr = float(m[mask].mean()), float(x[mask].mean())
-L713                     DOWN_OUTPERF = (sr - mr)/abs(mr) if mr!=0 else np.nan
-L714             df.loc[t,'DOWN_OUTPERF'] = DOWN_OUTPERF
-L715
-L716             # --- 長期移動平均/位置 ---
-L717             sma200 = s.rolling(200).mean(); df.loc[t,'EXT_200'] = np.nan
-L718             if pd.notna(sma200.iloc[-1]) and sma200.iloc[-1]!=0: df.loc[t,'EXT_200'] = abs(float(s.iloc[-1]/sma200.iloc[-1]-1.0))
-L719
-L720             # --- 配当の詳細系 ---
-L721             DIV_TTM_PS=DIV_VAR5=DIV_YOY=DIV_FCF_COVER=np.nan
-L722             try:
-L723                 divs = yf.Ticker(t).dividends.dropna()
-L724                 if not divs.empty:
-L725                     last_close = s.iloc[-1]; div_1y = float(divs[divs.index >= (divs.index.max()-pd.Timedelta(days=365))].sum())
-L726                     DIV_TTM_PS = div_1y if div_1y>0 else np.nan
-L727                     ann = divs.groupby(divs.index.year).sum()
-L728                     if len(ann)>=2 and ann.iloc[-2]!=0: DIV_YOY = float(ann.iloc[-1]/ann.iloc[-2]-1.0)
-L729                     tail = ann.iloc[-5:] if len(ann)>=5 else ann
-L730                     if len(tail)>=3 and tail.mean()!=0: DIV_VAR5 = float(tail.std(ddof=1)/abs(tail.mean()))
-L731                 so = d.get('sharesOutstanding',None)
-L732                 if so and pd.notna(DIV_TTM_PS) and pd.notna(fcf_val) and fcf_val!=0:
-L733                     DIV_FCF_COVER = float((fcf_val)/(DIV_TTM_PS*float(so)))
-L734             except Exception: pass
-L735             df.loc[t,'DIV_TTM_PS'], df.loc[t,'DIV_VAR5'], df.loc[t,'DIV_YOY'], df.loc[t,'DIV_FCF_COVER'] = DIV_TTM_PS, DIV_VAR5, DIV_YOY, DIV_FCF_COVER
-L736
-L737             # --- 財務安定性 ---
-L738             df.loc[t,'DEBT2EQ'], df.loc[t,'CURR_RATIO'] = d.get('debtToEquity',np.nan), d.get('currentRatio',np.nan)
-L739
-L740             # --- EPS 変動 ---
-L741             EPS_VAR_8Q = np.nan
-L742             try:
-L743                 qe, so = tickers_bulk.tickers[t].quarterly_earnings, d.get('sharesOutstanding',None)
-L744                 if qe is not None and not qe.empty and so:
-L745                     eps_q = (qe['Earnings'].dropna().astype(float)/float(so)).replace([np.inf,-np.inf],np.nan)
-L746                     if len(eps_q)>=4: EPS_VAR_8Q = float(eps_q.iloc[-min(8,len(eps_q)):].std(ddof=1))
-L747             except Exception: pass
-L748             df.loc[t,'EPS_VAR_8Q'] = EPS_VAR_8Q
-L749
-L7
+L656         r12  = px.divide(px.shift(252)).sub(1.0)
+L657         br12 = spx.divide(spx.shift(252)).sub(1.0)
+L658         r1   = px.divide(px.shift(22)).sub(1.0)
+L659         br1  = spx.divide(spx.shift(22)).sub(1.0)
+L660         rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
+L661         tt &= (rs >= 0.10)
+L662
+L663         return tt.fillna(False).sum(axis=1).astype(int)
+L664
+L665     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
+L666     def aggregate_scores(self, ib: Any, cfg):
+L667         if cfg is None:
+L668             raise ValueError("cfg is required; pass factor.PipelineConfig")
+L669         self._validate_ib_for_scorer(ib)
+L670
+L671         px, spx, tickers = ib.px, ib.spx, ib.tickers
+L672         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
+L673
+L674         df, missing_logs = pd.DataFrame(index=tickers), []
+L675         debug_mode = bool(getattr(cfg, "debug_mode", False))
+L676         for t in tickers:
+L677             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
+L678             try:
+L679                 volume_series_full = ib.data['Volume'][t]
+L680             except Exception:
+L681                 volume_series_full = None
+L682
+L683             grw_result = _calc_grw_flexible(t, d, s, volume_series_full)
+L684             grw_score = grw_result.get('score')
+L685             try:
+L686                 grw_score_val = float(grw_score)
+L687             except Exception:
+L688                 grw_score_val = np.nan
+L689             df.loc[t,'GRW_FLEX_SCORE'] = grw_score
+L690             df.loc[t,'GRW_FLEX_WEIGHT'] = grw_result.get('weight')
+L691             df.loc[t,'GRW_FLEX_CORE'] = grw_result.get('core')
+L692             df.loc[t,'GRW_FLEX_PRICE'] = grw_result.get('price_proxy')
+L693             df.loc[t,'DEBUG_GRW_PATH'] = grw_result.get('path')
+L694             df.loc[t,'DEBUG_GRW_PARTS'] = grw_result.get('parts')
+L695
+L696             if debug_mode:
+L697                 try:
+L698                     parts_dict = grw_result.get('parts_dict')
+L699                     flat = _flatten_for_debug(parts_dict, "DBG_GRW") if parts_dict else {}
+L700                     if grw_result.get('path') is not None:
+L701                         flat.setdefault("DBG_GRW.path", grw_result.get('path'))
+L702                     if grw_result.get('weight') is not None:
+L703                         flat.setdefault("DBG_GRW.w", grw_result.get('weight'))
+L704                     for key, value in flat.items():
+L705                         df.loc[t, key] = value
+L706
+L707                     series_rev_q = _ensure_series(d.get("SEC_REV_Q_SERIES"))
+L708                     series_eps_q = _ensure_series(d.get("SEC_EPS_Q_SERIES"))
+L709                     if isinstance(series_rev_q, pd.Series) and series_rev_q.size >= 8:
+L710                         rev_yoy = (series_rev_q / series_rev_q.shift(4) - 1).dropna()
+L711                         if not rev_yoy.empty:
+L712                             df.loc[t, "DBG_GRW.rev_yoy_last4"] = list(rev_yoy.tail(4).round(4))
+L713                             df.loc[t, "DBG_GRW.rev_yoy_mean"] = float(np.nanmean(rev_yoy)) if len(rev_yoy) > 0 else None
+L714                             df.loc[t, "DBG_GRW.rev_yoy_med"] = float(np.nanmedian(rev_yoy)) if len(rev_yoy) > 0 else None
+L715                     if isinstance(series_eps_q, pd.Series) and series_eps_q.size >= 8:
+L716                         eps_yoy = (series_eps_q / series_eps_q.shift(4) - 1).dropna()
+L717                         if not eps_yoy.empty:
+L718                             df.loc[t, "DBG_GRW.eps_yoy_last4"] = list(eps_yoy.tail(4).round(4))
+L719                             df.loc[t, "DBG_GRW.eps_yoy_mean"] = float(np.nanmean(eps_yoy)) if len(eps_yoy) > 0 else None
+L720                             df.loc[t, "DBG_GRW.eps_yoy_med"] = float(np.nanmedian(eps_yoy)) if len(eps_yoy) > 0 else None
+L721
+L722                     base_pos = []
+L723                     for key in ("DBG_GRW.rev_yoy_mean", "DBG_GRW.eps_yoy_mean", "DBG_GRW.core.ttm_yoy"):
+L724                         if key in df.columns:
+L725                             val = df.at[t, key]
+L726                             if val is not None and not pd.isna(val):
+L727                                 try:
+L728                                     base_pos.append(float(val))
+L729                                 except Exception:
+L730                                     continue
+L731                     if base_pos:
+L732                         median_base = float(np.nanmedian(base_pos))
+L733                         if (
+L734                             np.isfinite(median_base)
+L735                             and median_base > 0.30
+L736                             and np.isfinite(grw_score_val)
+L737                             and grw_score_val < 0
+L738                         ):
+L739                             row_dbg = df.loc[t] if t in df.index else {}
+L740                             path_dbg = row_dbg.get('DBG_GRW.path') if hasattr(row_dbg, 'get') else None
+L741                             weight_dbg = row_dbg.get('DBG_GRW.w') if hasattr(row_dbg, 'get') else None
+L742                             logger.warning(
+L743                                 "[GRW-SANITY] %s: median_base=%.3f but GROWTH_F=%.3f  path=%s w=%s",
+L744                                 t,
+L745                                 median_base,
+L746                                 grw_score_val,
+L747                                 path_dbg,
+L748                                 weight_dbg,
+L749                             )
+L750                 except Exception:
+L751                     pass
+L752
+L753             # --- 基本特徴 ---
+L754             df.loc[t,'TR']   = self.trend(s)
+L755             df.loc[t,'EPS']  = _scalar(eps_df.loc[t,'EPS_TTM']) if t in eps_df.index else np.nan
+L756             df.loc[t,'EPS_Q'] = _scalar(eps_df.loc[t,'EPS_Q_LastQ']) if t in eps_df.index else np.nan
+L757             df.loc[t,'REV_TTM'] = _scalar(eps_df.loc[t,'REV_TTM']) if t in eps_df.index else np.nan
+
 ```
