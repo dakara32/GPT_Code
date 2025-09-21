@@ -198,87 +198,109 @@ L78     v = pd.to_numeric(s, errors="coerce")
 L79     return pd.Series(v.values, index=getattr(s, "index", None), dtype=float, name=getattr(s, "name", None))
 L80
 L81
-L82 def winsorize_s(s: pd.Series, p=0.02):
-L83     if s is None or s.dropna().empty: return s
-L84     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L82 def _scalar(x):
+L83     """
+L84     入力を安全に float スカラへ変換する。
 L85
-L86 def robust_z(s: pd.Series, p=0.02):
-L87     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
-L88
-L89 def robust_z_keepnan(s: pd.Series) -> pd.Series:
-L90     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
-L91     if s is None:
-L92         return pd.Series(dtype=float)
-L93     v = pd.to_numeric(s, errors="coerce")
-L94     m = np.nanmedian(v)
-L95     mad = np.nanmedian(np.abs(v - m))
-L96     z = (v - m) / (1.4826 * mad + 1e-9)
-L97     if np.nanstd(z) < 1e-9:
-L98         r = v.rank(method="average", na_option="keep")
-L99         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
-L100     return pd.Series(z, index=v.index, dtype=float)
+L86     許容する入力パターン:
+L87       - pandas.Series: 非NaNの最後の値を採用
+L88       - numpy スカラ/配列: 最後の要素を採用
+L89       - その他の数値っぽい値: float へ変換
+L90
+L91     変換できない場合は np.nan を返す。
+L92     """
+L93
+L94     if x is None:
+L95         return np.nan
+L96
+L97     # pandas.Series の場合は非NaNの最後の値を採用
+L98     if isinstance(x, pd.Series):
+L99         s = pd.to_numeric(x, errors="coerce").dropna()
+L100         return float(s.iloc[-1]) if not s.empty else np.nan
 L101
-L102
-L103 def _safe_div(a, b):
-L104     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
-L105     except Exception: return np.nan
-L106
-L107 def _safe_last(series: pd.Series, default=np.nan):
-L108     try: return float(series.iloc[-1])
-L109     except Exception: return default
-L110
-L111
-L112 def _ensure_series(x):
-L113     if x is None:
-L114         return pd.Series(dtype=float)
-L115     if isinstance(x, pd.Series):
-L116         return x.dropna()
-L117     if isinstance(x, (list, tuple)):
-L118         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
-L119             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
-L120             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
-L121             return pd.Series(v, index=dt).dropna()
-L122         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
-L123     try:
-L124         return pd.Series(x).dropna()
-L125     except Exception:
-L126         return pd.Series(dtype=float)
-L127
-L128
-L129 def _to_quarterly(s: pd.Series) -> pd.Series:
-L130     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
-L131         return s
-L132     return s.resample("Q").last().dropna()
-L133
-L134
-L135 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
-L136     if qs is None or qs.empty:
-L137         return pd.Series(dtype=float)
-L138     ttm = qs.rolling(4, min_periods=2).sum()
-L139     yoy = ttm.pct_change(4)
-L140     return yoy
-L141
+L102     # numpy スカラ (item() を持つ) ※文字列は除外
+L103     if hasattr(x, "item") and not isinstance(x, (str, bytes)):
+L104         try:
+L105             return float(x.item())
+L106         except Exception:
+L107             pass
+L108
+L109     # 配列様のオブジェクト
+L110     try:
+L111         arr = np.asarray(x, dtype=float).ravel()
+L112         return float(arr[-1]) if arr.size else np.nan
+L113     except Exception:
+L114         pass
+L115
+L116     # 最後に素直に float 変換を試す
+L117     try:
+L118         return float(x)
+L119     except Exception:
+L120         return np.nan
+L121
+L122
+L123 def winsorize_s(s: pd.Series, p=0.02):
+L124     if s is None or s.dropna().empty: return s
+L125     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L126
+L127 def robust_z(s: pd.Series, p=0.02):
+L128     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L129
+L130 def robust_z_keepnan(s: pd.Series) -> pd.Series:
+L131     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
+L132     if s is None:
+L133         return pd.Series(dtype=float)
+L134     v = pd.to_numeric(s, errors="coerce")
+L135     m = np.nanmedian(v)
+L136     mad = np.nanmedian(np.abs(v - m))
+L137     z = (v - m) / (1.4826 * mad + 1e-9)
+L138     if np.nanstd(z) < 1e-9:
+L139         r = v.rank(method="average", na_option="keep")
+L140         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
+L141     return pd.Series(z, index=v.index, dtype=float)
 L142
 L143
-L144
-L145 class Scorer:
-L146     """
-L147     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
-L148     - cfg は必須（factor.PipelineConfig を渡す）。
-L149     - 旧カラム名を自動リネームして新スキーマに吸収します。
-L150     """
+L144 def _safe_div(a, b):
+L145     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
+L146     except Exception: return np.nan
+L147
+L148 def _safe_last(series: pd.Series, default=np.nan):
+L149     try: return float(series.iloc[-1])
+L150     except Exception: return default
 L151
-L152     # === 先頭で旧→新カラム名マップ（移行用） ===
-L153     EPS_RENAME = {"eps_ttm":"EPS_TTM", "eps_q_recent":"EPS_Q_LastQ"}
-L154     FCF_RENAME = {"fcf_ttm":"FCF_TTM"}
-L155
-L156     # === スキーマ簡易チェック（最低限） ===
-L157     @staticmethod
-L158     def _validate_ib_for_scorer(ib: Any):
-L159         miss = [a for a in ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"] if not hasattr(ib,a) or getattr(ib,a) is None]
-L160         if miss: raise ValueError(f"InputBundle is missing required attributes for Scorer: {miss}")
-L161         if any(c in ib.eps_df.columns for c in Scorer.EPS_RENAME): ib.eps_df.rename(columns=Scorer.EPS_RENAME, inplace=True)
-L162         if any(c in ib.fcf_df.columns for c in Scorer.FCF_RENAME): ib.fcf_df.rename(columns=Scorer.FCF_RENAME, inplace=True)
-L163         need_eps, need_fcf = {"EPS_TTM","EPS_Q_LastQ"},{"FCF_TTM"}
-L164         if not need_ep
+L152
+L153 def _ensure_series(x):
+L154     if x is None:
+L155         return pd.Series(dtype=float)
+L156     if isinstance(x, pd.Series):
+L157         return x.dropna()
+L158     if isinstance(x, (list, tuple)):
+L159         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
+L160             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
+L161             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
+L162             return pd.Series(v, index=dt).dropna()
+L163         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
+L164     try:
+L165         return pd.Series(x).dropna()
+L166     except Exception:
+L167         return pd.Series(dtype=float)
+L168
+L169
+L170 def _to_quarterly(s: pd.Series) -> pd.Series:
+L171     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
+L172         return s
+L173     return s.resample("Q").last().dropna()
+L174
+L175
+L176 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
+L177     if qs is None or qs.empty:
+L178         return pd.Series(dtype=float)
+L179     ttm = qs.rolling(4, min_periods=2).sum()
+L180     yoy = ttm.pct_change(4)
+L181     return yoy
+L182
+L183
+L184
+L185
+L186 class
 ```
