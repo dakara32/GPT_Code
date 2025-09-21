@@ -1,5 +1,108 @@
 ```text
-L**: 0.60×`FCF_W` + 0.40×`ROE_W`で作成。
+グ | FCF/EVや配当カバレッジ |
+L58 | `returns` | `px.pct_change()`のリターン表 | 相関行列・DRRS計算 |
+L59
+L60 ### FeatureBundle（Scorer → Selector）
+L61 | 変数 | 内容 | 主な用途 |
+L62 | --- | --- | --- |
+L63 | `df` | 計算済み指標の生値テーブル | デバッグ・出力表示 |
+L64 | `df_z` | ウィンザー後Zスコア化した指標表 | 因子スコア合成、選定基準 |
+L65 | `g_score` | Gバケット総合スコア | G選定、IN/OUT比較 |
+L66 | `d_score_all` | Dバケット総合スコア（全銘柄） | D選定、低スコアランキング |
+L67 | `missing_logs` | 欠損指標と補完状況のログ | データ品質チェック |
+L68
+L69 ### SelectionBundle（Selector → Output）
+L70 | 変数 | 内容 | 主な用途 |
+L71 | --- | --- | --- |
+L72 | `resG` | G選定結果の詳細dict（`tickers`、目的値等） | 結果保存・平均相関などの指標表示 |
+L73 | `resD` | D選定結果の詳細dict | 同上 |
+L74 | `top_G` | 最終採用Gティッカー | 新ポートフォリオ構築 |
+L75 | `top_D` | 最終採用Dティッカー | 同上 |
+L76 | `init_G` | DRRS前のG初期候補 | 惜しくも外れた銘柄表示 |
+L77 | `init_D` | DRRS前のD初期候補 | 同上 |
+L78
+L79 ### WeightsConfig
+L80 | 変数 | 内容 | 主な用途 |
+L81 | --- | --- | --- |
+L82 | `g` | G因子（GRW/MOM/VOL）の重みdict | `g_score`合成 |
+L83 | `d` | D因子（D_QAL/D_YLD/D_VOL_RAW/D_TRD）の重みdict | `d_score_all`合成 |
+L84
+L85 ### DRRSParams
+L86 | 変数 | 内容 | 主な用途 |
+L87 | --- | --- | --- |
+L88 | `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
+L89 | `shrink` | 残差相関のシュリンク率 | `residual_corr`の対角強調 |
+L90 | `G` | Gバケット用パラメータdict（`lookback`等） | `select_bucket_drrs`設定 |
+L91 | `D` | Dバケット用パラメータdict | 同上 |
+L92 | `cross_mu_gd` | G-Dクロス相関ペナルティ係数μ | `select_buckets`の目的関数 |
+L93
+L94 ### PipelineConfig
+L95 | 変数 | 内容 | 主な用途 |
+L96 | --- | --- | --- |
+L97 | `weights` | `WeightsConfig`のインスタンス | スコア合成の重み参照 |
+L98 | `drrs` | `DRRSParams`のインスタンス | 選定ステップの設定値 |
+L99 | `price_max` | 候補銘柄の許容価格上限 | Input段階でのフィルタ |
+L100
+L101 ## 共通ユーティリティ
+L102 - `winsorize_s` / `robust_z` : 外れ値処理とZスコア化。
+L103 - `_safe_div` / `_safe_last` : 例外を潰した分割・末尾取得。
+L104 - `_load_prev` / `_save_sel` : 選定結果の読み書き。
+L105
+L106 ## クラス設計
+L107 ### Step1: Input
+L108 `current_tickers.csv`の現行銘柄と`candidate_tickers.csv`の検討中銘柄を起点にデータを集約する。外部I/Oと前処理を担当し、`prepare_data`で`InputBundle`を生成。価格・財務データの取得は**yfinanceを優先し、欠損がある指標のみFinnhub APIで補完**する。
+L109 主なメソッド:
+L110 - `impute_eps_ttm` : 四半期EPS×4でTTMを推定し欠損時のみ差し替え。
+L111 - `fetch_cfo_capex_ttm_yf` : yfinanceの四半期/年次キャッシュフローからCFO・CapEx・FCF TTMを算出。
+L112 - `fetch_cfo_capex_ttm_finnhub` : yfinanceで欠けた銘柄のみFinnhub APIで補完。
+L113 - `compute_fcf_with_fallback` : yfinance値を基準にFinnhub値で穴埋めし、CFO/CapEx/FCFと情報源フラグを返す。
+L114 - `_build_eps_df` : `info`や`quarterly_earnings`からEPS TTMと直近EPSを計算し、`impute_eps_ttm`で補完。
+L115 - `prepare_data` :
+L116     0. CSVから現行銘柄と候補銘柄のティッカー一覧を読み込む。
+L117     1. 候補銘柄の現在値を取得し価格上限でフィルタ。
+L118     2. 既存+候補から対象ティッカーを決定し、価格・出来高を一括ダウンロード（yfinance）。
+L119     3. yfinance値を基にEPS/FCFテーブルやベンチマーク系列、リターンを構築し、欠損セルはFinnhub呼び出しで穴埋め。
+L120     4. 上記を`InputBundle`に格納して返す。
+L121
+L122 ### Step2: Score Calculation (Scorer)
+L123 特徴量計算とスコア合成を担当し、`FeatureBundle`を返す。
+L124
+L125 #### 補助関数
+L126 - `trend(s)` : 50/150/200日移動平均や52週レンジから-0.5〜0.5で構成されたトレンド指標。
+L127 - `rs(s,b)` / `tr_str(s)` / `rs_line_slope(s,b,win)` : 相対強さや短期トレンド、RS回帰傾きを算出。
+L128 - `ev_fallback` : `enterpriseValue`欠損時に負債・現金からEVを推定。
+L129 - `dividend_status` / `div_streak` : 配当未設定状況の判定と増配年数カウント。
+L130 - `fetch_finnhub_metrics` : Finnhub APIからEPS成長・ROE・βなど不足指標を取得。
+L131 - `calc_beta` : ベンチマークとの共分散からβを算出。
+L132 - `spx_to_alpha` : S&P500の位置情報からDRRSで用いるαを推定。
+L133 - `soft_cap_effective_scores` / `pick_top_softcap` : セクターソフトキャップ付きスコア調整と上位抽出。
+L134
+L135 **補助関数と生成指標**
+L136
+L137 | 補助関数 | 生成指標 | 略称 |
+L138 | --- | --- | --- |
+L139 | `trend` | トレンド総合値 | `TR` |
+L140 | `rs` | 相対強さ | `RS` |
+L141 | `tr_str` | 価格と50日線の乖離 | `TR_str` |
+L142 | `rs_line_slope` | RS線の回帰傾き | `RS_SLOPE_*` |
+L143 | `calc_beta` | β | `BETA` |
+L144 | `div_streak` | 連続増配年数 | `DIV_STREAK` |
+L145
+L146 #### `aggregate_scores` 詳細
+L147 1. 各銘柄の価格系列や`info`を基に以下を算出。
+L148    - **トレンド/モメンタム**: `TR`、`RS`、`TR_str`、多様な移動平均比、`RS_SLOPE_*`など。
+L149    - **リスク**: `BETA`、`DOWNSIDE_DEV`、`MDD_1Y`、`RESID_VOL`、`DOWN_OUTPERF`、`EXT_200`等。
+L150    - **配当**: `DIV`、`DIV_TTM_PS`、`DIV_VAR5`、`DIV_YOY`、`DIV_FCF_COVER`、`DIV_STREAK`。
+L151    - **財務・成長**: `EPS`、`REV`、`ROE`、`FCF/EV`、`REV_Q_YOY`、`EPS_Q_YOY`、`REV_YOY_ACC`、`REV_YOY_VAR`、`REV_ANN_STREAK`、`RULE40`、`FCF_MGN` 等。
+L152    - **安定性/サイズ**: `DEBT2EQ`、`CURR_RATIO`、`MARKET_CAP`、`ADV60_USD`、`EPS_VAR_8Q`など。
+L153 2. 指標欠損はFinnhub API等で補完し、未取得項目を`missing_logs`に記録。
+L154 3. `winsorize_s`→`robust_z`で標準化し`df_z`へ保存。サイズ・流動性は対数変換。
+L155 4. 正規化済指標から因子スコアを合成。
+L156    - 各因子の構成と重みは以下の通り。
+L157      - **GRW**: 0.30×`REV` + 0.20×`EPS_Q_YOY` + 0.15×`REV_Q_YOY` + 0.15×`REV_YOY_ACC` + 0.10×`RULE40` + 0.10×`FCF_MGN` + 0.10×`REV_ANN_STREAK` − 0.05×`REV_YOY_VAR`。
+L158      - **MOM**: 0.40×`RS` + 0.15×`TR_str` + 0.15×`RS_SLOPE_6W` + 0.15×`RS_SLOPE_13W` + 0.10×`MA200_SLOPE_5M` + 0.10×`MA200_UP_STREAK_D`。
+L159      - **VOL**: `BETA`単体を使用。
+L160      - **QAL**: 0.60×`FCF_W` + 0.40×`ROE_W`で作成。
 L161      - **YLD**: 0.30×`DIV` + 0.70×`DIV_STREAK`。
 L162      - **D_QAL**: 0.35×`QAL` + 0.20×`FCF` + 0.15×`CURR_RATIO` − 0.15×`DEBT2EQ` − 0.15×`EPS_VAR_8Q`。
 L163      - **D_YLD**: 0.45×`DIV` + 0.25×`DIV_STREAK` + 0.20×`DIV_FCF_COVER` − 0.10×`DIV_VAR5`。

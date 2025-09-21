@@ -2,7 +2,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, factor.py, scorer.py, .github/workflows/weekly-report.yml, documents/README.md, documents/factor_design.md
-# 作成日時: 2025-09-21 23:06:38 (JST)
+# 作成日時: 2025-09-21 23:43:13 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -191,131 +191,142 @@ L150     info: Dict[str, dict]           # yfinance info per ticker
 L151     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
 L152     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
 L153     returns: pd.DataFrame           # px[tickers].pct_change()
-L154
-L155 @dataclass(frozen=True)
-L156 class FeatureBundle:
-L157     df: pd.DataFrame
-L158     df_z: pd.DataFrame
-L159     g_score: pd.Series
-L160     d_score_all: pd.Series
-L161     missing_logs: pd.DataFrame
-L162     df_full: pd.DataFrame | None = None
-L163     df_full_z: pd.DataFrame | None = None
-L164     scaler: Any | None = None
-L165
-L166 @dataclass(frozen=True)
-L167 class SelectionBundle:
-L168     resG: dict
-L169     resD: dict
-L170     top_G: List[str]
-L171     top_D: List[str]
-L172     init_G: List[str]
-L173     init_D: List[str]
-L174
-L175 @dataclass(frozen=True)
-L176 class WeightsConfig:
-L177     g: Dict[str,float]
-L178     d: Dict[str,float]
-L179
-L180 @dataclass(frozen=True)
-L181 class DRRSParams:
-L182     corrM: int
-L183     shrink: float
-L184     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
-L185     D: Dict[str,float]
-L186     cross_mu_gd: float
-L187
-L188 @dataclass(frozen=True)
-L189 class PipelineConfig:
-L190     weights: WeightsConfig
-L191     drrs: DRRSParams
-L192     price_max: float
-L193     debug_mode: bool = False
-L194
-L195 # === 共通ユーティリティ（複数クラスで使用） ===
-L196 # (unused local utils removed – use scorer.py versions if needed)
-L197
-L198 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
-L199
-L200 def _post_slack(payload: dict):
-L201     url = os.getenv("SLACK_WEBHOOK_URL")
-L202     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-L203     try:
-L204         requests.post(url, json=payload).raise_for_status()
-L205     except Exception as e:
-L206         print(f"⚠️ Slack通知エラー: {e}")
-L207
-L208 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
-L209     """Slackへテキストを分割送信（コードブロック形式）。"""
-L210
-L211     def _post_text(payload: str) -> None:
-L212         try:
-L213             resp = requests.post(url, json={"text": payload})
-L214             print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
-L215             if resp is not None:
-L216                 resp.raise_for_status()
-L217         except Exception as e:
-L218             print(f"[ERR] debug_post_failed: {e}")
-L219
-L220     body = (text or "").strip()
-L221     if not body:
-L222         print("[DBG] skip debug send: empty body")
-L223         return
-L224
-L225     block, block_len = [], 0
-L226
-L227     def _flush():
-L228         nonlocal block, block_len
-L229         if block:
-L230             _post_text("```" + "\n".join(block) + "```")
-L231             block, block_len = [], 0
-L232
-L233     for raw in body.splitlines():
-L234         line = raw or ""
-L235         while len(line) > chunk:
-L236             head, line = line[:chunk], line[chunk:]
-L237             _flush()
-L238             _post_text("```" + head + "```")
-L239         add_len = len(line) if not block else len(line) + 1
-L240         if block and block_len + add_len > chunk:
-L241             _flush(); add_len = len(line)
-L242         block.append(line)
-L243         block_len += add_len
-L244     _flush()
-L245
-L246 def _disjoint_keepG(top_G, top_D, poolD):
-L247     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
-L248     used, D, i = set(top_G), list(top_D), 0
-L249     for j, t in enumerate(D):
-L250         if t not in used:
-L251             continue
-L252         while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
-L253             i += 1
-L254         if i < len(poolD):
-L255             D[j] = poolD[i]; used.add(D[j]); i += 1
-L256     return top_G, D
-L257
-L258
-L259 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
-L260                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
-L261     import pandas as pd, numpy as np
-L262     sel = list(pick)
-L263     if not sel: return sel
-L264     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
-L265     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
-L266     std = agg.std()
-L267     sigma = float(std) if pd.notna(std) else 0.0
-L268     thresh = kth - delta_z * sigma
-L269     ranked_all = agg.sort_values(ascending=False)
-L270     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
-L271     for t in cand:
-L272         within_score = pd.notna(agg[t]) and agg[t] >= thresh
-L273         within_rank = t in ranked_all.index and ranked_all.index.get_loc(t) < n_target + keep_buffer
-L274         if not (within_score or within_rank):
-L275             continue
-L276         non_inc = [x for x in sel if x not in incumbents]
-L277         if not non_inc:
-L278             break
-L279         weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
-L280         if weakest in sel and agg.get(t, -np.inf) >= 
+L154     missing_logs: pd.DataFrame
+L155
+L156 @dataclass(frozen=True)
+L157 class FeatureBundle:
+L158     df: pd.DataFrame
+L159     df_z: pd.DataFrame
+L160     g_score: pd.Series
+L161     d_score_all: pd.Series
+L162     missing_logs: pd.DataFrame
+L163     df_full: pd.DataFrame | None = None
+L164     df_full_z: pd.DataFrame | None = None
+L165     scaler: Any | None = None
+L166
+L167 @dataclass(frozen=True)
+L168 class SelectionBundle:
+L169     resG: dict
+L170     resD: dict
+L171     top_G: List[str]
+L172     top_D: List[str]
+L173     init_G: List[str]
+L174     init_D: List[str]
+L175
+L176 @dataclass(frozen=True)
+L177 class WeightsConfig:
+L178     g: Dict[str,float]
+L179     d: Dict[str,float]
+L180
+L181 @dataclass(frozen=True)
+L182 class DRRSParams:
+L183     corrM: int
+L184     shrink: float
+L185     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
+L186     D: Dict[str,float]
+L187     cross_mu_gd: float
+L188
+L189 @dataclass(frozen=True)
+L190 class PipelineConfig:
+L191     weights: WeightsConfig
+L192     drrs: DRRSParams
+L193     price_max: float
+L194     debug_mode: bool = False
+L195
+L196 # === 共通ユーティリティ（複数クラスで使用） ===
+L197 # (unused local utils removed – use scorer.py versions if needed)
+L198
+L199 def _build_missing_logs_after_impute(eps_df: pd.DataFrame) -> pd.DataFrame:
+L200     df = eps_df.copy()
+L201     required_cols = [
+L202         "EPS_TTM",
+L203         "EPS_Q_LastQ",
+L204         "EPS_A_LATEST",
+L205         "REV_TTM",
+L206         "REV_Q_LastQ",
+L207         "REV_A_LATEST",
+L208     ]
+L209     for col in required_cols:
+L210         if col not in df.columns:
+L211             df[col] = np.nan
+L212
+L213     miss_eps = df["EPS_TTM"].isna() & df["EPS_Q_LastQ"].isna() & df["EPS_A_LATEST"].isna()
+L214     miss_rev = df["REV_TTM"].isna() & df["REV_Q_LastQ"].isna() & df["REV_A_LATEST"].isna()
+L215
+L216     rows: list[dict] = []
+L217     for ticker, row in df.iterrows():
+L218         eps_missing = bool(miss_eps.loc[ticker])
+L219         rev_missing = bool(miss_rev.loc[ticker])
+L220         if not (eps_missing or rev_missing):
+L221             continue
+L222         rows.append({
+L223             "ticker": ticker,
+L224             "EPS_missing": eps_missing,
+L225             "REV_missing": rev_missing,
+L226             "eps_imputed": bool(row.get("eps_imputed", False)),
+L227             "EPS_TTM": row.get("EPS_TTM"),
+L228             "EPS_Q_LastQ": row.get("EPS_Q_LastQ"),
+L229             "EPS_A_LATEST": row.get("EPS_A_LATEST"),
+L230             "REV_TTM": row.get("REV_TTM"),
+L231             "REV_Q_LastQ": row.get("REV_Q_LastQ"),
+L232             "REV_A_LATEST": row.get("REV_A_LATEST"),
+L233         })
+L234
+L235     if not rows:
+L236         return pd.DataFrame(
+L237             columns=[
+L238                 "ticker",
+L239                 "EPS_missing",
+L240                 "REV_missing",
+L241                 "eps_imputed",
+L242                 "EPS_TTM",
+L243                 "EPS_Q_LastQ",
+L244                 "EPS_A_LATEST",
+L245                 "REV_TTM",
+L246                 "REV_Q_LastQ",
+L247                 "REV_A_LATEST",
+L248             ]
+L249         )
+L250
+L251     return pd.DataFrame(rows)
+L252
+L253 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
+L254
+L255 def _post_slack(payload: dict):
+L256     url = os.getenv("SLACK_WEBHOOK_URL")
+L257     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+L258     try:
+L259         requests.post(url, json=payload).raise_for_status()
+L260     except Exception as e:
+L261         print(f"⚠️ Slack通知エラー: {e}")
+L262
+L263 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
+L264     """Slackへテキストを分割送信（コードブロック形式）。"""
+L265
+L266     def _post_text(payload: str) -> None:
+L267         try:
+L268             resp = requests.post(url, json={"text": payload})
+L269             print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
+L270             if resp is not None:
+L271                 resp.raise_for_status()
+L272         except Exception as e:
+L273             print(f"[ERR] debug_post_failed: {e}")
+L274
+L275     body = (text or "").strip()
+L276     if not body:
+L277         print("[DBG] skip debug send: empty body")
+L278         return
+L279
+L280     block, block_len = [], 0
+L281
+L282     def _flush():
+L283         nonlocal block, block_len
+L284         if block:
+L285             _post_text("```" + "\n".join(block) + "```")
+L286             block, block_len = [], 0
+L287
+L288     for raw in body.splitlines():
+L289         line = raw or ""
+L290         while len(line) > chunk:
+L291             head, line = line
 ```
