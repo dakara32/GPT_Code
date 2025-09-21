@@ -151,6 +151,7 @@ class InputBundle:
     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
     returns: pd.DataFrame           # px[tickers].pct_change()
+    missing_logs: pd.DataFrame
 
 @dataclass(frozen=True)
 class FeatureBundle:
@@ -194,6 +195,60 @@ class PipelineConfig:
 
 # === 共通ユーティリティ（複数クラスで使用） ===
 # (unused local utils removed – use scorer.py versions if needed)
+
+def _build_missing_logs_after_impute(eps_df: pd.DataFrame) -> pd.DataFrame:
+    df = eps_df.copy()
+    required_cols = [
+        "EPS_TTM",
+        "EPS_Q_LastQ",
+        "EPS_A_LATEST",
+        "REV_TTM",
+        "REV_Q_LastQ",
+        "REV_A_LATEST",
+    ]
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    miss_eps = df["EPS_TTM"].isna() & df["EPS_Q_LastQ"].isna() & df["EPS_A_LATEST"].isna()
+    miss_rev = df["REV_TTM"].isna() & df["REV_Q_LastQ"].isna() & df["REV_A_LATEST"].isna()
+
+    rows: list[dict] = []
+    for ticker, row in df.iterrows():
+        eps_missing = bool(miss_eps.loc[ticker])
+        rev_missing = bool(miss_rev.loc[ticker])
+        if not (eps_missing or rev_missing):
+            continue
+        rows.append({
+            "ticker": ticker,
+            "EPS_missing": eps_missing,
+            "REV_missing": rev_missing,
+            "eps_imputed": bool(row.get("eps_imputed", False)),
+            "EPS_TTM": row.get("EPS_TTM"),
+            "EPS_Q_LastQ": row.get("EPS_Q_LastQ"),
+            "EPS_A_LATEST": row.get("EPS_A_LATEST"),
+            "REV_TTM": row.get("REV_TTM"),
+            "REV_Q_LastQ": row.get("REV_Q_LastQ"),
+            "REV_A_LATEST": row.get("REV_A_LATEST"),
+        })
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "ticker",
+                "EPS_missing",
+                "REV_missing",
+                "eps_imputed",
+                "EPS_TTM",
+                "EPS_Q_LastQ",
+                "EPS_A_LATEST",
+                "REV_TTM",
+                "REV_Q_LastQ",
+                "REV_A_LATEST",
+            ]
+        )
+
+    return pd.DataFrame(rows)
 
 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
 
@@ -1075,6 +1130,7 @@ class Input:
             EPS_A_CAGR3=eps_df.get("eps_cagr3", np.nan),
             REV_A_CAGR3=eps_df.get("rev_cagr3", np.nan),
         )
+        missing_logs = _build_missing_logs_after_impute(eps_df)
         # ここで非NaN件数をサマリ表示（欠損状況の即時把握用）
         try:
             n = len(eps_df)
@@ -1087,7 +1143,7 @@ class Input:
         T.log("eps/fcf prep done")
         returns = px[tickers].pct_change()
         T.log("price prep/returns done")
-        return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns)
+        return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns, missing_logs=missing_logs)
 
 # === Selector：相関低減・選定（スコア＆リターンだけ読む） ===
 class Selector:
@@ -1199,6 +1255,45 @@ class Output:
         self.low10_table = None
         self.debug_text = ""   # デバッグ用本文はここに一本化
         self._debug_logged = False
+        self._miss_disp_info: Tuple[pd.DataFrame, bool, int] | None = None
+
+    @staticmethod
+    def _prepare_missing_display(df: pd.DataFrame | None) -> Tuple[pd.DataFrame, bool, int]:
+        if df is None or df.empty:
+            return pd.DataFrame(), False, 0
+        work = df.copy()
+        if 'ticker' not in work.columns:
+            work = work.reset_index()
+            if 'ticker' not in work.columns and 'index' in work.columns:
+                work = work.rename(columns={'index': 'ticker'})
+        bool_cols = [c for c in ['EPS_missing', 'REV_missing'] if c in work.columns]
+        if bool_cols:
+            work = work.loc[work[bool_cols].any(axis=1)]
+        if work.empty:
+            return pd.DataFrame(columns=work.columns), False, 0
+        cols_order = [
+            col for col in [
+                'ticker',
+                'EPS_missing',
+                'REV_missing',
+                'eps_imputed',
+                'EPS_TTM',
+                'EPS_Q_LastQ',
+                'EPS_A_LATEST',
+                'REV_TTM',
+                'REV_Q_LastQ',
+                'REV_A_LATEST',
+            ]
+            if col in work.columns
+        ]
+        if cols_order:
+            work = work.loc[:, cols_order]
+        total = len(work)
+        truncated = False
+        if total > 50:
+            work = work.head(20)
+            truncated = True
+        return work, truncated, total
 
     # --- 表示（元 display_results のロジックそのまま） ---
     def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
@@ -1206,9 +1301,13 @@ class Output:
         logger.info("📌 reached display_results")
         pd.set_option('display.float_format','{:.3f}'.format)
         print("📈 ファクター分散最適化の結果")
-        if self.miss_df is not None and not self.miss_df.empty:
+        miss_df, truncated, total = self._prepare_missing_display(self.miss_df)
+        self._miss_disp_info = (miss_df, truncated, total)
+        if not miss_df.empty:
             print("Missing Data:")
-            print(self.miss_df.to_string(index=False))
+            print(miss_df.to_string(index=False))
+            if truncated:
+                print(f"...省略 ({total}件中 上位20件のみ表示)")
 
         # ---- 表示用：Changes/Near-Miss のスコア源を“最終集計”に統一するプロキシ ----
         try:
@@ -1374,8 +1473,11 @@ class Output:
             return f"{title}\n```{tbl.to_string(formatters=fmt)}```\n"
 
         message = "📈 ファクター分散最適化の結果\n"
-        if self.miss_df is not None and not self.miss_df.empty:
-            message += "Missing Data\n```" + self.miss_df.to_string(index=False) + "```\n"
+        miss_df, truncated, total = self._miss_disp_info or self._prepare_missing_display(self.miss_df)
+        if not miss_df.empty:
+            message += "Missing Data\n```" + miss_df.to_string(index=False) + "```\n"
+            if truncated:
+                message += f"...省略 ({total}件中 上位20件のみ表示)\n"
         message += _blk(_inject_filter_suffix(self.g_title, "G"), self.g_table, self.g_formatters, drop=("TRD",))
         message += _blk(_inject_filter_suffix(self.d_title, "D"), self.d_table, self.d_formatters)
         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table, 'empty', False) else f"```{self.io_table.to_string(index=False)}```\n")
@@ -1430,7 +1532,7 @@ def io_build_input_bundle() -> InputBundle:
     処理内容・列名・丸め・例外・ログ文言は現行どおり（変更禁止）。
     """
     state = Input(cand=cand, exist=exist, bench=bench, price_max=CAND_PRICE_MAX, finnhub_api_key=FINNHUB_API_KEY).prepare_data()
-    return InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench, data=state["data"], px=state["px"], spx=state["spx"], tickers_bulk=state["tickers_bulk"], info=state["info"], eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"])
+    return InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench, data=state["data"], px=state["px"], spx=state["spx"], tickers_bulk=state["tickers_bulk"], info=state["info"], eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"], missing_logs=state["missing_logs"])
 
 def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
               n_target: int) -> tuple[list, float, float, float]:
@@ -1579,8 +1681,10 @@ def run_pipeline() -> SelectionBundle:
 
     out = Output()
     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
-    try: out._sc = sc
-    except Exception: pass
+    try:
+        out._sc = sc
+    except Exception:
+        pass
     if hasattr(sc, "_feat"):
         try:
             fb = sc._feat
@@ -1599,6 +1703,13 @@ def run_pipeline() -> SelectionBundle:
                 prev_G=getattr(sc, "_prev_G", exist),
                 prev_D=getattr(sc, "_prev_D", exist),
             )
+            try:
+                DBG_COLS = ["GSC", "GROWTH_F", "MOM", "VOL", "DBGRW.GROWTH_F", "DBGRW.MOM", "DBGRW.VOL"]
+                cols = [c for c in DBG_COLS if c in fb.df_z.columns]
+                idx = [t for t in top_G if t in fb.df_z.index]
+                out.debug_table = fb.df_z.loc[idx, cols].round(2) if idx and cols else None
+            except Exception:
+                out.debug_table = None
         except Exception:
             pass
     out.notify_slack()
