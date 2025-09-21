@@ -680,6 +680,7 @@ class Scorer:
         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
 
         df, missing_logs = pd.DataFrame(index=tickers), []
+        df['EPS_SERIES'] = pd.Series([None] * len(df), index=df.index, dtype=object)
         debug_mode = bool(getattr(cfg, "debug_mode", False))
         for t in tickers:
             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
@@ -999,6 +1000,8 @@ class Scorer:
                 r_q = _to_quarterly(r_raw)
                 e_q = _to_quarterly(e_raw)
 
+                df.at[t, "EPS_SERIES"] = e_q
+
                 r_yoy_ttm = _ttm_yoy_from_quarterly(r_q)
                 e_yoy_ttm = _ttm_yoy_from_quarterly(e_q)
 
@@ -1069,6 +1072,36 @@ class Scorer:
         if 'trend_template' not in df.columns: df['trend_template'] = df.apply(_trend_template_pass, axis=1).fillna(False)
         assert 'trend_template' in df.columns
 
+        def _calc_eps_abs_slope(eps_series, n=12):
+            try:
+                if isinstance(eps_series, pd.Series):
+                    series = pd.to_numeric(eps_series, errors="coerce").dropna()
+                elif isinstance(eps_series, (list, tuple, np.ndarray)):
+                    series = pd.Series(eps_series, dtype=float).dropna()
+                else:
+                    return 0.0
+            except Exception:
+                return 0.0
+
+            if series.empty:
+                return 0.0
+
+            tail = series.tail(n).to_numpy(dtype=float)
+            if tail.size < 2:
+                return 0.0
+
+            x = np.arange(tail.size, dtype=float)
+            x = x - x.mean()
+            y = tail - tail.mean()
+            denom = np.dot(x, x)
+            if denom == 0:
+                return 0.0
+            slope = float(np.dot(x, y) / denom)
+            return slope
+
+        df['EPS_ABS_SLOPE'] = df['EPS_SERIES'].apply(_calc_eps_abs_slope).astype(float)
+        df.drop(columns=['EPS_SERIES'], inplace=True)
+
         # === Z化と合成 ===
         for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
 
@@ -1076,6 +1109,8 @@ class Scorer:
         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
         for col in ['P_OVER_150','P_OVER_200','MA200_SLOPE_5M','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
+
+        df_z['EPS_ABS_SLOPE'] = robust_z(df['EPS_ABS_SLOPE']).clip(-3.0, 3.0)
 
         # === Growth深掘り系（欠損保持z + RAW併載） ===
         grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']
@@ -1114,7 +1149,11 @@ class Scorer:
         df_z['TREND_SLOPE_REV'] = slope_rev_combo.clip(-3.0, 3.0)
 
         # EPSトレンドスロープ（四半期）
-        slope_eps = 0.60*zpos(df_z['EPS_Q_YOY']) + 0.40*zpos(df_z['EPS_POS'])
+        slope_eps = (
+            0.40*zpos(df_z['EPS_Q_YOY']) +
+            0.20*zpos(df_z['EPS_POS']) +
+            0.40*zpos(df_z['EPS_ABS_SLOPE'])
+        )
         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
 
         # 年次トレンド（サブ）
