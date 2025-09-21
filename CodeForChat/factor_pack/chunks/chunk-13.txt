@@ -1,5 +1,47 @@
 ```text
-       df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
+1051                 (df.get('RS', np.nan) >= 0.08) &
+L1052                 (df.get('MA200_SLOPE_1M', np.nan) > 0) &
+L1053                 (df.get('P_OVER_150', np.nan) > 0) & (df.get('P_OVER_200', np.nan) > 0) &
+L1054                 (df.get('MA150_OVER_200', np.nan) > 0) &
+L1055                 (df.get('MA50_OVER_150', np.nan) > 0) & (df.get('MA50_OVER_200', np.nan) > 0) &
+L1056                 (df.get('TR_str', np.nan) > 0)).fillna(False)
+L1057             df['trend_template'] = mask
+L1058
+L1059         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
+L1060         g_score = _as_numeric_series(g_score_all.loc[mask])
+L1061         Scorer.g_score = g_score
+L1062         df_z['GSC'] = g_score_all
+L1063         df_z['DSC'] = d_score_all
+L1064
+L1065         try:
+L1066             current = (pd.read_csv("current_tickers.csv")
+L1067                   .iloc[:, 0]
+L1068                   .str.upper()
+L1069                   .tolist())
+L1070         except FileNotFoundError:
+L1071             warnings.warn("current_tickers.csv not found — bonus skipped")
+L1072             current = []
+L1073
+L1074         mask_bonus = g_score.index.isin(current)
+L1075         if mask_bonus.any():
+L1076             # 1) factor.BONUS_COEFF から k を決め、無ければ 0.4
+L1077             k = float(getattr(sys.modules.get("factor"), "BONUS_COEFF", 0.4))
+L1078             # 2) g 側の σ を取り、NaN なら 0 に丸める
+L1079             sigma_g = g_score.std()
+L1080             if pd.isna(sigma_g):
+L1081                 sigma_g = 0.0
+L1082             bonus_g = round(k * sigma_g, 3)
+L1083             g_score.loc[mask_bonus] += bonus_g
+L1084             Scorer.g_score = g_score
+L1085             # 3) D 側も同様に σ の NaN をケア
+L1086             sigma_d = d_score_all.std()
+L1087             if pd.isna(sigma_d):
+L1088                 sigma_d = 0.0
+L1089             bonus_d = round(k * sigma_d, 3)
+L1090             d_score_all.loc[d_score_all.index.isin(current)] += bonus_d
+L1091
+L1092         try:
+L1093             df = _apply_growth_entry_flags(df, ib, self, win_breakout=5, win_pullback=5)
 L1094         except Exception:
 L1095             pass
 L1096
@@ -271,50 +313,5 @@ L8   - 新旧ポートフォリオの比較表
 L9   - 検討中銘柄の低スコアランキング（整理用）
 L10
 L11 ## 全体フロー
-L12 1. **Input** – `current_tickers.csv`と`candidate_tickers.csv`を読み込み、yfinanceやFinnhubのAPIから価格・財務データを収集して`InputBundle`を整備。
-L13 2. **Score Calculation** – Scorerが特徴量を計算し因子スコアを合成して`FeatureBundle`を生成。
-L14 3. **Correlation Reduction & Selection** – SelectorがDRRSロジックで相関を抑えつつG/D銘柄を選定し`SelectionBundle`を得る。
-L15 4. **Output** – 採用結果と周辺情報を表・Slack通知として出力。
-L16
-L17 ```mermaid
-L18 flowchart LR
-L19   A[Input\nAPI & 前処理] --> B[Score Calculation\n特徴量・因子合成]
-L20   B --> C[Correlation Reduction\nDRRS選定]
-L21   C --> D[Output\nSlack通知]
-L22 ```
-L23
-L24 ## 定数・設定
-L25 | 変数 | 内容 | 主な用途 |
-L26 | --- | --- | --- |
-L27 | `exist` / `cand` | 現行ポートフォリオと検討中銘柄のティッカーリスト | スコア対象ユニバースの構成、候補整理 |
-L28 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
-L29 | `CAND_PRICE_MAX` | 候補銘柄の許容価格上限 | 高額銘柄の事前除外 |
-L30 | `N_G` / `N_D` | G/D採用枠の件数（**既定: 12 / 8**） | 最終的に選ぶ銘柄数の制約 |
-L31 | `g_weights` / `D_weights` | 各因子の重みdict | G/Dスコア合成 |
-L32 | `D_BETA_MAX` | Dバケットの許容β上限 | 高β銘柄の除外フィルタ |
-L33 | `FILTER_SPEC` | G/Dごとの前処理フィルタ | トレンドマスクやβ上限設定 |
-L34 | `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
-L35 | `DRRS_G` / `DRRS_D` | DRRSパラメータdict | バケット別の相関低減設定 |
-L36 | `DRRS_SHRINK` | 残差相関の対角シュリンク率 | `residual_corr`の安定化 |
-L37 | `CROSS_MU_GD` | G-D間クロス相関ペナルティμ | 2バケット同時最適化で相関抑制 |
-L38 | `RESULTS_DIR` | 選定結果保存ディレクトリ | `_save_sel`/`_load_prev`の入出力 |
-L39
-L40 選定結果は`results/`配下にJSONとして保存し、次回実行時に`_load_prev`で読み込んで選定条件に反映。
-L41
-L42 ## DTO/Config
-L43 各ステップ間で受け渡すデータ構造と設定値。変数の意味合いと利用箇所を以下に示す。
-L44
-L45 ### InputBundle（Input → Scorer）
-L46 | 変数 | 内容 | 主な用途 |
-L47 | --- | --- | --- |
-L48 | `cand` | 候補銘柄ティッカーのリスト | OUTテーブルや低スコアランキング対象の母集団 |
-L49 | `tickers` | 現行+候補を合わせたティッカー一覧 | 価格・出来高ダウンロード、リターン計算 |
-L50 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
-L51 | `data` | yfinanceのダウンロード結果（階層列） | `px`/`spx`/リターン等の基礎データ |
-L52 | `px` | `data['Close']`だけを抜き出した価格系列 | 指標計算・リターン生成 |
-L53 | `spx` | `data['Close'][bench]` のSeries | `rs`や`calc_beta`の基準指数 |
-L54 | `tickers_bulk` | `yf.Tickers`オブジェクト | `info`等の一括取得 |
-L55 | `info` | ティッカー別のyfinance情報dict | セクター判定やEPS補完 |
-L56 | `eps_df` | EPS TTM/直近EPS等をまとめた表 | 成長指標の算出 |
-L57 | `fcf_df` | CFO・CapEx・FCF TTMと情報源フラ
+L12 1. **Input** – `current_tickers.csv`と`candidate_tickers.csv`を読み込み、yfinanceやFinnhubのAPIから価格・財務データを収集して`Inp
 ```

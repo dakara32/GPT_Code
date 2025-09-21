@@ -1,5 +1,52 @@
 ```text
-te_ib_for_scorer(ib)
+L360         """
+L361         各営業日の trend_template 合格本数（合格“本数”=C）を返す。
+L362         - px: 列=ticker（ベンチは含めない）
+L363         - spx: ベンチマーク Series（px.index に整列）
+L364         - win_days: 末尾の計算対象営業日数（None→全体、既定600は呼び出し側指定）
+L365         ベクトル化＆rollingのみで軽量。欠損は False 扱い。
+L366         """
+L367         import numpy as np, pandas as pd
+L368         if px is None or px.empty:
+L369             return pd.Series(dtype=int)
+L370         px = px.dropna(how="all", axis=1)
+L371         if win_days and win_days > 0:
+L372             px = px.tail(win_days)
+L373         if px.empty:
+L374             return pd.Series(dtype=int)
+L375         spx = spx.reindex(px.index).ffill()
+L376
+L377         ma50  = px.rolling(50).mean()
+L378         ma150 = px.rolling(150).mean()
+L379         ma200 = px.rolling(200).mean()
+L380
+L381         tt = (px > ma150)
+L382         tt &= (px > ma200)
+L383         tt &= (ma150 > ma200)
+L384         tt &= (ma200 - ma200.shift(21) > 0)
+L385         tt &= (ma50  > ma150)
+L386         tt &= (ma50  > ma200)
+L387         tt &= (px    > ma50)
+L388
+L389         lo252 = px.rolling(252).min()
+L390         hi252 = px.rolling(252).max()
+L391         tt &= (px.divide(lo252).sub(1.0) >= 0.30)   # P_OVER_LOW52 >= 0.30
+L392         tt &= (px >= (0.75 * hi252))                # NEAR_52W_HIGH >= -0.25
+L393
+L394         r12  = px.divide(px.shift(252)).sub(1.0)
+L395         br12 = spx.divide(spx.shift(252)).sub(1.0)
+L396         r1   = px.divide(px.shift(22)).sub(1.0)
+L397         br1  = spx.divide(spx.shift(22)).sub(1.0)
+L398         rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
+L399         tt &= (rs >= 0.10)
+L400
+L401         return tt.fillna(False).sum(axis=1).astype(int)
+L402
+L403     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
+L404     def aggregate_scores(self, ib: Any, cfg):
+L405         if cfg is None:
+L406             raise ValueError("cfg is required; pass factor.PipelineConfig")
+L407         self._validate_ib_for_scorer(ib)
 L408
 L409         px, spx, tickers = ib.px, ib.spx, ib.tickers
 L410         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
@@ -176,41 +223,5 @@ L580                     df.loc[t,'MA200_SLOPE_1M'] = cur200/old2001 - 1
 L581
 L582             df.loc[t,'P_OVER_150'] = p/_safe_last(sma150)-1 if pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan
 L583             df.loc[t,'P_OVER_200'] = p/_safe_last(sma200)-1 if pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
-L584             df.loc[t,'MA50_OVER_200'] = _safe_last(sma50)/_safe_last(sma200)-1 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
-L585             df.loc[t,'MA200_SLOPE_5M'] = np.nan
-L586             if len(sma200.dropna())>=105:
-L587                 cur200, old200 = _safe_last(sma200), float(sma200.iloc[-105])
-L588                 if old200 and old200!=0: df.loc[t,'MA200_SLOPE_5M'] = cur200/old200 - 1
-L589             # NEW: 200日線が連続で上向きの「日数」
-L590             df.loc[t,'MA200_UP_STREAK_D'] = np.nan
-L591             try:
-L592                 s200 = sma200.dropna()
-L593                 if len(s200) >= 2:
-L594                     diff200 = s200.diff()
-L595                     up = 0
-L596                     for v in diff200.iloc[::-1]:
-L597                         if pd.isna(v) or v <= 0:
-L598                             break
-L599                         up += 1
-L600                     df.loc[t,'MA200_UP_STREAK_D'] = float(up)
-L601             except Exception:
-L602                 pass
-L603             df.loc[t,'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52<=0 or pd.isna(p)) else (p/(lo52*1.25)-1)
-L604             hi52 = s[-252:].max() if len(s)>=252 else s.max(); df.loc[t,'NEAR_52W_HIGH'] = np.nan
-L605             if hi52 and hi52>0 and pd.notna(p):
-L606                 d_hi = (p/hi52)-1.0; df.loc[t,'NEAR_52W_HIGH'] = -abs(min(0.0, d_hi))
-L607             df.loc[t,'RS_SLOPE_6W'] = self.rs_line_slope(s, ib.spx, 30)
-L608             df.loc[t,'RS_SLOPE_13W'] = self.rs_line_slope(s, ib.spx, 65)
-L609
-L610             df.loc[t,'DIV_STREAK'] = self.div_streak(t)
-L611
-L612             # --- 欠損メモ ---
-L613             fin_cols = ['REV','ROE','BETA','DIV','FCF']
-L614             need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t,col])]
-L615             if need_finnhub:
-L616                 fin_data = self.fetch_finnhub_metrics(t)
-L617                 for col in need_finnhub:
-L618                     val = fin_data.get(col)
-L619                     if val is not None and not pd.isna(val): df.loc[t,col] = val
-L620             # 欠損ログは fac
+L584             df.loc[t,'MA50_OVER_200'] = _safe_last(sma50)/_safe_last(sma200)-1 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else n
 ```

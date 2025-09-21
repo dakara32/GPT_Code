@@ -2,7 +2,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, factor.py, scorer.py, .github/workflows/weekly-report.yml, documents/README.md, documents/factor_design.md
-# 作成日時: 2025-09-21 23:43:13 (JST)
+# 作成日時: 2025-09-22 00:36:37 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -157,7 +157,7 @@ L116 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_t
 L117 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
 L118 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
 L119 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
-L120 g_weights = {'GROWTH_F':0.35,'MOM':0.55,'VOL':-0.10}
+L120 g_weights = {'GROWTH_F':0.30,'MOM':0.60,'VOL':-0.10}
 L121 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
 L122 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
 L123 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
@@ -233,100 +233,104 @@ L192     drrs: DRRSParams
 L193     price_max: float
 L194     debug_mode: bool = False
 L195
-L196 # === 共通ユーティリティ（複数クラスで使用） ===
-L197 # (unused local utils removed – use scorer.py versions if needed)
-L198
-L199 def _build_missing_logs_after_impute(eps_df: pd.DataFrame) -> pd.DataFrame:
-L200     df = eps_df.copy()
-L201     required_cols = [
-L202         "EPS_TTM",
-L203         "EPS_Q_LastQ",
-L204         "EPS_A_LATEST",
-L205         "REV_TTM",
-L206         "REV_Q_LastQ",
-L207         "REV_A_LATEST",
-L208     ]
-L209     for col in required_cols:
-L210         if col not in df.columns:
-L211             df[col] = np.nan
-L212
-L213     miss_eps = df["EPS_TTM"].isna() & df["EPS_Q_LastQ"].isna() & df["EPS_A_LATEST"].isna()
-L214     miss_rev = df["REV_TTM"].isna() & df["REV_Q_LastQ"].isna() & df["REV_A_LATEST"].isna()
+L196 # === Utilities ===
+L197 def aggregate_warnings(rows, key="message", max_items=10):
+L198     """
+L199     同一内容の警告を '×N' 表記でまとめる。機能変更なし（位置のみ移動）。
+L200     rows: List[Dict] または List[str]
+L201     """
+L202     from collections import Counter
+L203
+L204     if not rows:
+L205         return []
+L206
+L207     if isinstance(rows[0], dict):
+L208         msgs = [str(r.get(key, "")) for r in rows if r.get(key)]
+L209     else:
+L210         msgs = [str(r) for r in rows if r]
+L211
+L212     cnt = Counter(msgs)
+L213     out = [f"{m} ×{n}" if n > 1 else m for m, n in cnt.most_common()]
+L214     return out[:max_items]
 L215
-L216     rows: list[dict] = []
-L217     for ticker, row in df.iterrows():
-L218         eps_missing = bool(miss_eps.loc[ticker])
-L219         rev_missing = bool(miss_rev.loc[ticker])
-L220         if not (eps_missing or rev_missing):
-L221             continue
-L222         rows.append({
-L223             "ticker": ticker,
-L224             "EPS_missing": eps_missing,
-L225             "REV_missing": rev_missing,
-L226             "eps_imputed": bool(row.get("eps_imputed", False)),
-L227             "EPS_TTM": row.get("EPS_TTM"),
-L228             "EPS_Q_LastQ": row.get("EPS_Q_LastQ"),
-L229             "EPS_A_LATEST": row.get("EPS_A_LATEST"),
-L230             "REV_TTM": row.get("REV_TTM"),
-L231             "REV_Q_LastQ": row.get("REV_Q_LastQ"),
-L232             "REV_A_LATEST": row.get("REV_A_LATEST"),
-L233         })
-L234
-L235     if not rows:
-L236         return pd.DataFrame(
-L237             columns=[
-L238                 "ticker",
-L239                 "EPS_missing",
-L240                 "REV_missing",
-L241                 "eps_imputed",
-L242                 "EPS_TTM",
-L243                 "EPS_Q_LastQ",
-L244                 "EPS_A_LATEST",
-L245                 "REV_TTM",
-L246                 "REV_Q_LastQ",
-L247                 "REV_A_LATEST",
-L248             ]
-L249         )
-L250
-L251     return pd.DataFrame(rows)
-L252
-L253 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
-L254
-L255 def _post_slack(payload: dict):
-L256     url = os.getenv("SLACK_WEBHOOK_URL")
-L257     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-L258     try:
-L259         requests.post(url, json=payload).raise_for_status()
-L260     except Exception as e:
-L261         print(f"⚠️ Slack通知エラー: {e}")
-L262
-L263 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
-L264     """Slackへテキストを分割送信（コードブロック形式）。"""
-L265
-L266     def _post_text(payload: str) -> None:
-L267         try:
-L268             resp = requests.post(url, json={"text": payload})
-L269             print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
-L270             if resp is not None:
-L271                 resp.raise_for_status()
-L272         except Exception as e:
-L273             print(f"[ERR] debug_post_failed: {e}")
-L274
-L275     body = (text or "").strip()
-L276     if not body:
-L277         print("[DBG] skip debug send: empty body")
-L278         return
-L279
-L280     block, block_len = [], 0
-L281
-L282     def _flush():
-L283         nonlocal block, block_len
-L284         if block:
-L285             _post_text("```" + "\n".join(block) + "```")
-L286             block, block_len = [], 0
-L287
-L288     for raw in body.splitlines():
-L289         line = raw or ""
-L290         while len(line) > chunk:
-L291             head, line = line
+L216
+L217 def compact_missing_lines(missing_df, limit=300):
+L218     if missing_df is None or getattr(missing_df, "empty", True):
+L219         return []
+L220
+L221     df = missing_df.copy()
+L222     if "ticker" not in df.columns:
+L223         df = df.reset_index().rename(columns={"index": "ticker"})
+L224
+L225     out: list[str] = []
+L226     for _, r in df.iterrows():
+L227         tags: list[str] = []
+L228         if bool(r.get("EPS_missing", False)):
+L229             tags.append("eps")
+L230         if bool(r.get("REV_missing", False)):
+L231             tags.append("rev")
+L232         if tags:
+L233             ticker = r.get("ticker")
+L234             if pd.isna(ticker) or ticker is None:
+L235                 ticker = "(unknown)"
+L236             else:
+L237                 ticker = str(ticker)
+L238             out.append(f"{ticker} : {', '.join(tags)}")
+L239         if len(out) >= limit:
+L240             out.append("...")
+L241             break
+L242
+L243     return out
+L244
+L245 # === 共通ユーティリティ（複数クラスで使用） ===
+L246 # (unused local utils removed – use scorer.py versions if needed)
+L247
+L248 def _build_missing_logs_after_impute(eps_df: pd.DataFrame) -> pd.DataFrame:
+L249     df = eps_df.copy()
+L250     required_cols = [
+L251         "EPS_TTM",
+L252         "EPS_Q_LastQ",
+L253         "EPS_A_LATEST",
+L254         "REV_TTM",
+L255         "REV_Q_LastQ",
+L256         "REV_A_LATEST",
+L257     ]
+L258     for col in required_cols:
+L259         if col not in df.columns:
+L260             df[col] = np.nan
+L261
+L262     miss_eps = df["EPS_TTM"].isna() & df["EPS_Q_LastQ"].isna() & df["EPS_A_LATEST"].isna()
+L263     miss_rev = df["REV_TTM"].isna() & df["REV_Q_LastQ"].isna() & df["REV_A_LATEST"].isna()
+L264
+L265     rows: list[dict] = []
+L266     for ticker, row in df.iterrows():
+L267         eps_missing = bool(miss_eps.loc[ticker])
+L268         rev_missing = bool(miss_rev.loc[ticker])
+L269         if not (eps_missing or rev_missing):
+L270             continue
+L271         rows.append({
+L272             "ticker": ticker,
+L273             "EPS_missing": eps_missing,
+L274             "REV_missing": rev_missing,
+L275             "eps_imputed": bool(row.get("eps_imputed", False)),
+L276             "EPS_TTM": row.get("EPS_TTM"),
+L277             "EPS_Q_LastQ": row.get("EPS_Q_LastQ"),
+L278             "EPS_A_LATEST": row.get("EPS_A_LATEST"),
+L279             "REV_TTM": row.get("REV_TTM"),
+L280             "REV_Q_LastQ": row.get("REV_Q_LastQ"),
+L281             "REV_A_LATEST": row.get("REV_A_LATEST"),
+L282         })
+L283
+L284     if not rows:
+L285         return pd.DataFrame(
+L286             columns=[
+L287                 "ticker",
+L288                 "EPS_missing",
+L289                 "REV_missing",
+L290                 "eps_imputed",
+L291                 "EPS_TTM",
+L292                 "EPS_Q_LastQ",
+L293                 "EPS_A_LATEST",
+L294                 "REV_TTM",
+L295                 "R
 ```
