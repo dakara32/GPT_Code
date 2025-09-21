@@ -1167,6 +1167,14 @@ class Scorer:
 
         # ===== GRW flexible score (variable data paths) =====
         grw_raw = pd.to_numeric(df.get('GRW_FLEX_SCORE'), errors="coerce")
+
+        # EPSトレンドスロープをGRWに加算
+        if 'TREND_SLOPE_EPS' in df_z.columns:
+            try:
+                grw_raw = grw_raw + 0.2 * df_z['TREND_SLOPE_EPS']
+            except Exception as e:
+                print("[WARN] failed to add TREND_SLOPE_EPS to GRW_FLEX_SCORE:", e)
+
         df_z['GROWTH_F'] = robust_z_keepnan(grw_raw).clip(-3.0, 3.0)
         df_z['GRW_FLEX_WEIGHT'] = pd.to_numeric(df.get('GRW_FLEX_WEIGHT'), errors="coerce")
         if debug_mode:
