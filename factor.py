@@ -117,7 +117,7 @@ exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_ticker
 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
-g_weights = {'GROWTH_F':0.35,'MOM':0.55,'VOL':-0.10}
+g_weights = {'GROWTH_F':0.30,'MOM':0.60,'VOL':-0.10}
 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
@@ -192,6 +192,55 @@ class PipelineConfig:
     drrs: DRRSParams
     price_max: float
     debug_mode: bool = False
+
+# === Utilities ===
+def aggregate_warnings(rows, key="message", max_items=10):
+    """
+    同一内容の警告を '×N' 表記でまとめる。機能変更なし（位置のみ移動）。
+    rows: List[Dict] または List[str]
+    """
+    from collections import Counter
+
+    if not rows:
+        return []
+
+    if isinstance(rows[0], dict):
+        msgs = [str(r.get(key, "")) for r in rows if r.get(key)]
+    else:
+        msgs = [str(r) for r in rows if r]
+
+    cnt = Counter(msgs)
+    out = [f"{m} ×{n}" if n > 1 else m for m, n in cnt.most_common()]
+    return out[:max_items]
+
+
+def compact_missing_lines(missing_df, limit=300):
+    if missing_df is None or getattr(missing_df, "empty", True):
+        return []
+
+    df = missing_df.copy()
+    if "ticker" not in df.columns:
+        df = df.reset_index().rename(columns={"index": "ticker"})
+
+    out: list[str] = []
+    for _, r in df.iterrows():
+        tags: list[str] = []
+        if bool(r.get("EPS_missing", False)):
+            tags.append("eps")
+        if bool(r.get("REV_missing", False)):
+            tags.append("rev")
+        if tags:
+            ticker = r.get("ticker")
+            if pd.isna(ticker) or ticker is None:
+                ticker = "(unknown)"
+            else:
+                ticker = str(ticker)
+            out.append(f"{ticker} : {', '.join(tags)}")
+        if len(out) >= limit:
+            out.append("...")
+            break
+
+    return out
 
 # === 共通ユーティリティ（複数クラスで使用） ===
 # (unused local utils removed – use scorer.py versions if needed)
@@ -1474,10 +1523,16 @@ class Output:
 
         message = "📈 ファクター分散最適化の結果\n"
         miss_df, truncated, total = self._miss_disp_info or self._prepare_missing_display(self.miss_df)
-        if not miss_df.empty:
-            message += "Missing Data\n```" + miss_df.to_string(index=False) + "```\n"
+        lines = compact_missing_lines(miss_df, limit=300)
+        if lines:
+            missing_txt = "Missing Data\n" + "\n".join(lines)
+            message += missing_txt + "\n"
             if truncated:
-                message += f"...省略 ({total}件中 上位20件のみ表示)\n"
+                trunc_note = f"...省略 ({total}件中 上位20件のみ表示)"
+                message += trunc_note + "\n"
+                missing_txt += f"\n{trunc_note}"
+            if SLACK_WEBHOOK_URL:
+                _slack_send_text_chunks(SLACK_WEBHOOK_URL, missing_txt)
         message += _blk(_inject_filter_suffix(self.g_title, "G"), self.g_table, self.g_formatters, drop=("TRD",))
         message += _blk(_inject_filter_suffix(self.d_title, "D"), self.d_table, self.d_formatters)
         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table, 'empty', False) else f"```{self.io_table.to_string(index=False)}```\n")
