@@ -899,8 +899,14 @@ class Selector:
     # ---- DRRS helpers（Selector専用） ----
     @staticmethod
     def _z_np(X: np.ndarray) -> np.ndarray:
-        X = np.asarray(X, dtype=np.float32); m = np.nanmean(X, axis=0, keepdims=True); s = np.nanstd(X, axis=0, keepdims=True)+1e-9
-        return (np.nan_to_num(X)-m)/s
+        X = np.asarray(X, dtype=np.float32)
+        m = np.nanmean(X, axis=0, keepdims=True)
+        s = np.nanstd(X, axis=0, keepdims=True)
+        # 分母0/全NaN列の安全化：std==0 を 1 に置換（z=0に収束）
+        s = np.where(np.isfinite(s) & (s > 0), s, 1.0).astype(np.float32)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            Z = (np.nan_to_num(X) - np.nan_to_num(m)) / s
+        return np.nan_to_num(Z)
 
     @classmethod
     def residual_corr(cls, R: np.ndarray, n_pc: int=3, shrink: float=0.1) -> np.ndarray:
