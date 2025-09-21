@@ -100,6 +100,14 @@ def ttm_div_yield_portfolio(tickers, price_map=None):
     return float(np.mean(ys)) if ys else 0.0
 
 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
+def _as_numeric_series(s: pd.Series) -> pd.Series:
+    """Series を float dtype に強制変換し、index を保持する。"""
+    if s is None:
+        return pd.Series(dtype=float)
+    v = pd.to_numeric(s, errors="coerce")
+    return pd.Series(v.values, index=getattr(s, "index", None), dtype=float, name=getattr(s, "name", None))
+
+
 def winsorize_s(s: pd.Series, p=0.02):
     if s is None or s.dropna().empty: return s
     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
@@ -1238,7 +1246,7 @@ class Scorer:
 
         # --- 重みは cfg を優先（外部があればそれを使用） ---
         # ① 全銘柄で G/D スコアを算出（unmasked）
-        g_score_all = df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1)
+        g_score_all = _as_numeric_series(df_z.mul(pd.Series(cfg.weights.g)).sum(axis=1))
 
         d_comp = pd.concat({
             'QAL': df_z['D_QAL'],
@@ -1248,7 +1256,7 @@ class Scorer:
         }, axis=1)
         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
         globals()['D_WEIGHTS_EFF'] = dw.copy()
-        d_score_all = d_comp.mul(dw, axis=1).sum(axis=1)
+        d_score_all = _as_numeric_series(d_comp.mul(dw, axis=1).sum(axis=1))
 
         # ② テンプレ判定（既存ロジックそのまま）
         mask = df['trend_template']
@@ -1264,7 +1272,7 @@ class Scorer:
             df['trend_template'] = mask
 
         # ③ 採用用は mask、表示/分析用は列で全銘柄保存
-        g_score = g_score_all.loc[mask]
+        g_score = _as_numeric_series(g_score_all.loc[mask])
         Scorer.g_score = g_score
         df_z['GSC'] = g_score_all
         df_z['DSC'] = d_score_all

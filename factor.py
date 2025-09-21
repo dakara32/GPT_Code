@@ -14,7 +14,7 @@ import pandas as pd
 import yfinance as yf
 from scipy.stats import zscore  # used via scorer
 
-from scorer import Scorer, ttm_div_yield_portfolio, _log
+from scorer import Scorer, ttm_div_yield_portfolio, _log, _as_numeric_series
 import config
 
 import warnings, atexit, threading
@@ -691,7 +691,13 @@ class Input:
             eps_ttm = sec_t.get("eps_ttm", info_t.get("trailingEps", np.nan))
             eps_q = sec_t.get("eps_q_recent", np.nan)
             try:
-                qearn, so = tickers_bulk.tickers[t].quarterly_earnings, info_t.get("sharesOutstanding")
+                tk = tickers_bulk.tickers.get(t)
+                if tk is None:
+                    sym = info_t.get("_yf_symbol") if isinstance(info_t, dict) else None
+                    if sym:
+                        tk = tickers_bulk.tickers.get(sym)
+                qearn = tk.quarterly_earnings if tk is not None else None
+                so = info_t.get("sharesOutstanding")
                 if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
                     eps_ttm_q = qearn["Earnings"].head(4).sum()/so
                     if pd.notna(eps_ttm_q) and (pd.isna(eps_ttm) or (abs(eps_ttm)>0 and abs(eps_ttm/eps_ttm_q)>3)): eps_ttm = eps_ttm_q
@@ -702,7 +708,11 @@ class Input:
             rev_q = sec_t.get("rev_q_recent", np.nan)
             if (not sec_t) or pd.isna(rev_ttm):
                 try:
-                    tk = tickers_bulk.tickers[t]
+                    tk = tickers_bulk.tickers.get(t)
+                    if tk is None and isinstance(info_t, dict):
+                        sym = info_t.get("_yf_symbol")
+                        if sym:
+                            tk = tickers_bulk.tickers.get(sym)
                     qfin = getattr(tk, "quarterly_financials", None)
                     if qfin is not None and not qfin.empty:
                         idx_lower = {str(i).lower(): i for i in qfin.index}
@@ -728,25 +738,45 @@ class Input:
     def prepare_data(self):
         """Fetch price and fundamental data for all tickers."""
         self.sec_dryrun_sample()
-        cand_info = yf.Tickers(" ".join(self.cand))
+        # --- yfinance 用にティッカーを正規化（"$"剥がし、"."→"-"） ---
+        def _to_yf(sym: str) -> str:
+            s = (sym or "").strip().lstrip("$").replace("＄", "")
+            # BRK.B / PBR.A などは Yahoo では '-' を使用
+            yf_sym = s.replace("．", ".").replace(".", "-")
+            return yf_sym or (sym or "")
 
-        def _price(t: str) -> float:
+        cand_y = [_to_yf(t) for t in self.cand]
+        cand_info = yf.Tickers(" ".join(cand_y))
+
+        def _price(orig: str, ysym: str) -> float:
             try:
-                return cand_info.tickers[t].fast_info.get("lastPrice", np.inf)
+                return cand_info.tickers[ysym].fast_info.get("lastPrice", np.inf)
             except Exception as e:
-                print(f"{t}: price fetch failed ({e})")
+                print(f"{orig}: price fetch failed ({e})")
                 return np.inf
 
-        cand_prices = {t: _price(t) for t in self.cand}
+        cand_prices = {orig: _price(orig, ysym) for orig, ysym in zip(self.cand, cand_y)}
         cand_f = [t for t, p in cand_prices.items() if p <= self.price_max]
         T.log("price cap filter done (CAND_PRICE_MAX)")
         # 入力ティッカーの重複を除去し、現行→候補の順序を維持
+        # ユニバース確定（元ティッカー保持）。yfinance には後で変換して渡す
         tickers = list(dict.fromkeys(self.exist + cand_f))
+        yf_map = {t: _to_yf(t) for t in tickers}
+        yf_list = list(dict.fromkeys([yf_map[t] for t in tickers]))
         T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
-        data = yf.download(tickers + [self.bench], period="600d",
+        data = yf.download(yf_list + [self.bench], period="600d",
                            auto_adjust=True, progress=False, threads=False)
         T.log("yf.download done")
+        inv = {v: k for k, v in yf_map.items()}
         px = data["Close"].dropna(how="all", axis=1).ffill(limit=2)
+        px = px.rename(columns=inv)
+        try:
+            if isinstance(data.columns, pd.MultiIndex):
+                data = data.rename(columns=inv, level=1)
+            else:
+                data = data.rename(columns=inv)
+        except Exception:
+            pass
         spx = data["Close"][self.bench].reindex(px.index).ffill()
         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
         if clip_days > 0:
@@ -754,10 +784,18 @@ class Input:
             logger.info("[T] price window clipped by env: %d rows (PRICE_CLIP_DAYS=%d)", len(px), clip_days)
         else:
             logger.info("[T] price window clip skipped; rows=%d", len(px))
-        tickers_bulk, info = yf.Tickers(" ".join(tickers)), {}
+        tickers_bulk, info = yf.Tickers(" ".join(yf_list)), {}
+        for orig, ysym in yf_map.items():
+            if ysym in tickers_bulk.tickers:
+                tickers_bulk.tickers[orig] = tickers_bulk.tickers[ysym]
         for t in tickers:
             try:
-                info[t] = tickers_bulk.tickers[t].info
+                tk = tickers_bulk.tickers.get(t) or tickers_bulk.tickers.get(yf_map[t])
+                info_entry = tk.info if tk is not None else {}
+                if not isinstance(info_entry, dict):
+                    info_entry = {}
+                info_entry.setdefault("_yf_symbol", getattr(tk, "ticker", yf_map.get(t)))
+                info[t] = info_entry
             except Exception as e:
                 logger.info("[warn] %s: info fetch failed (%s)", t, e)
                 info[t] = {}
@@ -1264,6 +1302,9 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
 
     if hasattr(sc, "filter_candidates"):
         agg = agg[sc.filter_candidates(inb, agg, group, cfg)]
+
+    if isinstance(agg, pd.Series):
+        agg = _as_numeric_series(agg)
 
     selector = Selector()
     if hasattr(sc, "select_diversified"):
