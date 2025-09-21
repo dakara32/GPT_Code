@@ -1,73 +1,118 @@
 ```text
-== "True")]
-L1360     except Exception: fire_recent = []
-L1361
-L1362     lines = [
-L1363         "【G枠レポート｜週次モニタ（直近5営業日）】",
-L1364         "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
-L1365         f"選定{N_G}: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else f"選定{N_G}: なし",
-L1366         f"次点10: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点10: なし",]
-L1367
-L1368     if fire_recent:
-L1369         fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
-L1370         lines.append(f"過去5営業日の検知: {fire_list}")
-L1371     else:
-L1372         lines.append("過去5営業日の検知: なし")
-L1373
-L1374     try:
-L1375         webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
-L1376         if webhook:
-L1377             requests.post(webhook, json={"text": "\n".join([s for s in lines if s != ""])}, timeout=10)
-L1378     except Exception:
-L1379         pass
-L1380
-L1381     out = Output()
-L1382     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
-L1383     try: out._sc = sc
-L1384     except Exception: pass
-L1385     if hasattr(sc, "_feat"):
-L1386         try:
-L1387             fb = sc._feat
-L1388             out.miss_df = fb.missing_logs
-L1389             out.display_results(
-L1390                 exist=exist,
-L1391                 bench=bench,
-L1392                 df_z=fb.df_z,
-L1393                 g_score=fb.g_score,
-L1394                 d_score_all=fb.d_score_all,
-L1395                 init_G=top_G,
-L1396                 init_D=top_D,
-L1397                 top_G=top_G,
-L1398                 top_D=top_D,
-L1399                 df_full_z=getattr(fb, "df_full_z", None),
-L1400                 prev_G=getattr(sc, "_prev_G", exist),
-L1401                 prev_D=getattr(sc, "_prev_D", exist),
-L1402             )
-L1403         except Exception:
-L1404             pass
-L1405     out.notify_slack()
-L1406     sb = SelectionBundle(resG={"tickers": top_G, "avg_res_corr": avgG,
-L1407               "sum_score": sumG, "objective": objG},
-L1408         resD={"tickers": top_D, "avg_res_corr": avgD,
-L1409               "sum_score": sumD, "objective": objD},
-L1410         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
-L1411
-L1412     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
-L1413     try:
-L1414         _low_df = (pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
-L1415               .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
-L1416               .sort_values("G_plus_D")
-L1417               .head(10)
-L1418               .round(3))
-L1419         low_msg = "Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string(index=True, index_names=False)
-L1420         _post_slack({"text": f"```{low_msg}```"})
-L1421     except Exception as _e:
-L1422         _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
-L1423
-L1424     return sb
-L1425
-L1426 if __name__ == "__main__":
-L1427     run_pipeline()
+"D":
+L1356         T.log("save done")
+L1357     if group == "G":
+L1358         sc._top_G = pick
+L1359     return pick, avg_r, sum_sc, obj
+L1360
+L1361 def run_pipeline() -> SelectionBundle:
+L1362     """
+L1363     G/D共通フローの入口。I/Oはここだけで実施し、計算はScorerに委譲。
+L1364     Slack文言・丸め・順序は既存の Output を用いて変更しない。
+L1365     """
+L1366     inb = io_build_input_bundle()
+L1367     cfg = PipelineConfig(
+L1368         weights=WeightsConfig(g=g_weights, d=D_weights),
+L1369         drrs=DRRSParams(
+L1370             corrM=corrM, shrink=DRRS_SHRINK,
+L1371             G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD
+L1372         ),
+L1373         price_max=CAND_PRICE_MAX,
+L1374         debug_mode=debug_mode
+L1375     )
+L1376     sc = Scorer()
+L1377     top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G)
+L1378     poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False).index)
+L1379     alpha = Scorer.spx_to_alpha(inb.spx)
+L1380     sectors = {t:(inb.info.get(t,{}).get("sector") or "U") for t in poolG}; scores = {t:Scorer.g_score.get(t,0.0) for t in poolG}
+L1381     top_G = Scorer.pick_top_softcap(scores, sectors, N=N_G, cap=2, alpha=alpha, hard=5)
+L1382     sc._top_G = top_G
+L1383     try:
+L1384         aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False)
+L1385         sc._near_G = [t for t in aggG.index if t not in set(top_G)][:10]
+L1386     except Exception:
+L1387         pass
+L1388     base = sum(Scorer.g_score.get(t,0.0) for t in poolG[:N_G])
+L1389     effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
+L1390     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
+L1391     top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D)
+L1392     fb = getattr(sc, "_feat", None)
+L1393     near_G = getattr(sc, "_near_G", [])
+L1394     selected12 = list(top_G)
+L1395     df = fb.df if fb is not None else pd.DataFrame()
+L1396     guni = _infer_g_universe(df, selected12, near_G)
+L1397     try:
+L1398         fire_recent = [t for t in guni
+L1399                        if (str(df.at[t, "G_BREAKOUT_recent_5d"]) == "True") or
+L1400                           (str(df.at[t, "G_PULLBACK_recent_5d"]) == "True")]
+L1401     except Exception: fire_recent = []
+L1402
+L1403     lines = [
+L1404         "【G枠レポート｜週次モニタ（直近5営業日）】",
+L1405         "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
+L1406         f"選定{N_G}: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else f"選定{N_G}: なし",
+L1407         f"次点10: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点10: なし",]
+L1408
+L1409     if fire_recent:
+L1410         fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
+L1411         lines.append(f"過去5営業日の検知: {fire_list}")
+L1412     else:
+L1413         lines.append("過去5営業日の検知: なし")
+L1414
+L1415     try:
+L1416         webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+L1417         if webhook:
+L1418             requests.post(webhook, json={"text": "\n".join([s for s in lines if s != ""])}, timeout=10)
+L1419     except Exception:
+L1420         pass
+L1421
+L1422     out = Output()
+L1423     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
+L1424     try: out._sc = sc
+L1425     except Exception: pass
+L1426     if hasattr(sc, "_feat"):
+L1427         try:
+L1428             fb = sc._feat
+L1429             out.miss_df = fb.missing_logs
+L1430             out.display_results(
+L1431                 exist=exist,
+L1432                 bench=bench,
+L1433                 df_z=fb.df_z,
+L1434                 g_score=fb.g_score,
+L1435                 d_score_all=fb.d_score_all,
+L1436                 init_G=top_G,
+L1437                 init_D=top_D,
+L1438                 top_G=top_G,
+L1439                 top_D=top_D,
+L1440                 df_full_z=getattr(fb, "df_full_z", None),
+L1441                 prev_G=getattr(sc, "_prev_G", exist),
+L1442                 prev_D=getattr(sc, "_prev_D", exist),
+L1443             )
+L1444         except Exception:
+L1445             pass
+L1446     out.notify_slack()
+L1447     sb = SelectionBundle(resG={"tickers": top_G, "avg_res_corr": avgG,
+L1448               "sum_score": sumG, "objective": objG},
+L1449         resD={"tickers": top_D, "avg_res_corr": avgD,
+L1450               "sum_score": sumD, "objective": objD},
+L1451         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
+L1452
+L1453     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
+L1454     try:
+L1455         _low_df = (pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
+L1456               .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
+L1457               .sort_values("G_plus_D")
+L1458               .head(10)
+L1459               .round(3))
+L1460         low_msg = "Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string(index=True, index_names=False)
+L1461         _post_slack({"text": f"```{low_msg}```"})
+L1462     except Exception as _e:
+L1463         _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
+L1464
+L1465     return sb
+L1466
+L1467 if __name__ == "__main__":
+L1468     run_pipeline()
 ```
 
 ## <scorer.py>
@@ -174,148 +219,78 @@ L99     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(
 L100     return float(np.mean(ys)) if ys else 0.0
 L101
 L102 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
-L103 def winsorize_s(s: pd.Series, p=0.02):
-L104     if s is None or s.dropna().empty: return s
-L105     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
-L106
-L107 def robust_z(s: pd.Series, p=0.02):
-L108     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L103 def _as_numeric_series(s: pd.Series) -> pd.Series:
+L104     """Series を float dtype に強制変換し、index を保持する。"""
+L105     if s is None:
+L106         return pd.Series(dtype=float)
+L107     v = pd.to_numeric(s, errors="coerce")
+L108     return pd.Series(v.values, index=getattr(s, "index", None), dtype=float, name=getattr(s, "name", None))
 L109
-L110 def robust_z_keepnan(s: pd.Series) -> pd.Series:
-L111     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
-L112     if s is None:
-L113         return pd.Series(dtype=float)
-L114     v = pd.to_numeric(s, errors="coerce")
-L115     m = np.nanmedian(v)
-L116     mad = np.nanmedian(np.abs(v - m))
-L117     z = (v - m) / (1.4826 * mad + 1e-9)
-L118     if np.nanstd(z) < 1e-9:
-L119         r = v.rank(method="average", na_option="keep")
-L120         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
-L121     return pd.Series(z, index=v.index, dtype=float)
-L122
-L123
-L124 def _safe_div(a, b):
-L125     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
-L126     except Exception: return np.nan
-L127
-L128 def _safe_last(series: pd.Series, default=np.nan):
-L129     try: return float(series.iloc[-1])
-L130     except Exception: return default
+L110
+L111 def winsorize_s(s: pd.Series, p=0.02):
+L112     if s is None or s.dropna().empty: return s
+L113     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L114
+L115 def robust_z(s: pd.Series, p=0.02):
+L116     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L117
+L118 def robust_z_keepnan(s: pd.Series) -> pd.Series:
+L119     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
+L120     if s is None:
+L121         return pd.Series(dtype=float)
+L122     v = pd.to_numeric(s, errors="coerce")
+L123     m = np.nanmedian(v)
+L124     mad = np.nanmedian(np.abs(v - m))
+L125     z = (v - m) / (1.4826 * mad + 1e-9)
+L126     if np.nanstd(z) < 1e-9:
+L127         r = v.rank(method="average", na_option="keep")
+L128         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
+L129     return pd.Series(z, index=v.index, dtype=float)
+L130
 L131
-L132
-L133 def _ensure_series(x):
-L134     if x is None:
-L135         return pd.Series(dtype=float)
-L136     if isinstance(x, pd.Series):
-L137         return x.dropna()
-L138     if isinstance(x, (list, tuple)):
-L139         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
-L140             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
-L141             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
-L142             return pd.Series(v, index=dt).dropna()
-L143         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
-L144     try:
-L145         return pd.Series(x).dropna()
-L146     except Exception:
-L147         return pd.Series(dtype=float)
-L148
-L149
-L150 def _to_quarterly(s: pd.Series) -> pd.Series:
-L151     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
-L152         return s
-L153     return s.resample("Q").last().dropna()
-L154
-L155
-L156 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
-L157     if qs is None or qs.empty:
-L158         return pd.Series(dtype=float)
-L159     ttm = qs.rolling(4, min_periods=2).sum()
-L160     yoy = ttm.pct_change(4)
-L161     return yoy
+L132 def _safe_div(a, b):
+L133     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
+L134     except Exception: return np.nan
+L135
+L136 def _safe_last(series: pd.Series, default=np.nan):
+L137     try: return float(series.iloc[-1])
+L138     except Exception: return default
+L139
+L140
+L141 def _ensure_series(x):
+L142     if x is None:
+L143         return pd.Series(dtype=float)
+L144     if isinstance(x, pd.Series):
+L145         return x.dropna()
+L146     if isinstance(x, (list, tuple)):
+L147         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
+L148             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
+L149             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
+L150             return pd.Series(v, index=dt).dropna()
+L151         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
+L152     try:
+L153         return pd.Series(x).dropna()
+L154     except Exception:
+L155         return pd.Series(dtype=float)
+L156
+L157
+L158 def _to_quarterly(s: pd.Series) -> pd.Series:
+L159     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
+L160         return s
+L161     return s.resample("Q").last().dropna()
 L162
 L163
-L164 def _nz(x) -> float:
-L165     if x is None:
-L166         return 0.0
-L167     try:
-L168         value = float(x)
-L169     except Exception:
-L170         return 0.0
-L171     if not np.isfinite(value):
-L172         return 0.0
-L173     return value
-L174
-L175
-L176 def _winsor(x, lo=-2.0, hi=2.0) -> float:
-L177     v = _nz(x)
-L178     if v < lo:
-L179         return float(lo)
-L180     if v > hi:
-L181         return float(hi)
-L182     return float(v)
-L183
-L184
-L185 def _round_debug(x, ndigits: int = 4):
-L186     try:
-L187         value = float(x)
-L188     except Exception:
-L189         return None
-L190     if not np.isfinite(value):
-L191         return None
-L192     return round(value, ndigits)
-L193
-L194
-L195 def _calc_grw_flexible(
-L196     ticker: str,
-L197     info_entry: dict | None,
-L198     close_series: pd.Series | None,
-L199     volume_series: pd.Series | None,
-L200 ):
-L201     info_entry = info_entry if isinstance(info_entry, dict) else {}
-L202
-L203     s_rev_q = _ensure_series(info_entry.get("SEC_REV_Q_SERIES"))
-L204     s_eps_q = _ensure_series(info_entry.get("SEC_EPS_Q_SERIES"))
-L205     s_rev_y = _ensure_series(info_entry.get("SEC_REV_Y_SERIES"))
-L206
-L207     nQ = int(getattr(s_rev_q, "size", 0))
-L208     nY = int(getattr(s_rev_y, "size", 0))
-L209
-L210     parts: dict[str, Any] = {"nQ": nQ, "nY": nY}
-L211     path = "NONE"
-L212     w = 0.0
-L213
-L214     def _valid_ratio(a, b):
-L215         try:
-L216             na, nb = float(a), float(b)
-L217         except Exception:
-L218             return None
-L219         if not np.isfinite(na) or not np.isfinite(nb) or nb == 0:
-L220             return None
-L221         return na, nb
-L222
-L223     def yoy_q(series: pd.Series) -> float | None:
-L224         s = _ensure_series(series)
-L225         if s.empty:
-L226             return None
-L227         s = s.sort_index()
-L228         if isinstance(s.index, pd.DatetimeIndex):
-L229             last_idx = s.index[-1]
-L230             window_start = last_idx - pd.DateOffset(months=15)
-L231             window_end = last_idx - pd.DateOffset(months=9)
-L232             candidates = s.loc[(s.index >= window_start) & (s.index <= window_end)]
-L233             if candidates.empty:
-L234                 candidates = s.loc[s.index <= window_end]
-L235             if candidates.empty:
-L236                 return None
-L237             v1 = candidates.iloc[-1]
-L238             v0 = s.iloc[-1]
-L239         else:
-L240             if s.size < 5:
-L241                 return None
-L242             v0 = s.iloc[-1]
-L243             v1 = s.iloc[-5]
-L244         pair = _valid_ratio(v0, v1)
-L245         if pair is None:
-L24
+L164 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
+L165     if qs is None or qs.empty:
+L166         return pd.Series(dtype=float)
+L167     ttm = qs.rolling(4, min_periods=2).sum()
+L168     yoy = ttm.pct_change(4)
+L169     return yoy
+L170
+L171
+L172 def _nz(x) -> float:
+L173     if x is None:
+L174         return 0.0
+L175     try:
+L176
 ```
