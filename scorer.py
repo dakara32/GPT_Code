@@ -47,6 +47,35 @@ def _log(stage, msg):
         print(f"[DBG][{stage}] {msg}")
 
 
+# ---- Debug helpers ----------------------------------------------------------
+def _flatten_for_debug(d, prefix="DBG_GRW"):
+    """
+    ネストしたdict/list/tupleを、df_z列に入れやすい一次元dictへ。
+    例: {"w":0.68,"path":"P5","core":{"rev_yoy_mean":1.73,"eps_yoy_mean":0.72,"accel":0.45}}
+      -> {"DBG_GRW.w":0.68,"DBG_GRW.path":"P5","DBG_GRW.core.rev_yoy_mean":1.73,...}
+    """
+    out = {}
+    if d is None:
+        return out
+
+    def rec(k, v):
+        if isinstance(v, dict):
+            for kk, vv in v.items():
+                rec(f"{k}.{str(kk)}", vv)
+        elif isinstance(v, (list, tuple, np.ndarray)):
+            try:
+                out[k] = list(v[:6])
+            except Exception:
+                out[k] = list(v)
+        else:
+            out[k] = v
+
+    if isinstance(d, dict):
+        for k, v in d.items():
+            rec(f"{prefix}.{str(k)}", v)
+    return out
+
+
 # ---- Dividend Helpers -------------------------------------------------------
 def _last_close(t, price_map=None):
     if price_map and (c := price_map.get(t)) is not None: return float(c)
@@ -372,8 +401,12 @@ def _calc_grw_flexible(
         rounded = _round_debug(value)
         parts_out[key] = rounded
 
+    parts_out["path"] = path
+    parts_out["w"] = _round_debug(w)
+
     info_entry["DEBUG_GRW_PATH"] = path
     info_entry["DEBUG_GRW_PARTS"] = json.dumps(parts_out, ensure_ascii=False, sort_keys=True)
+    info_entry["DEBUG_GRW_PARTS_DICT"] = dict(parts_out)
     info_entry["GRW_SCORE"] = grw
     info_entry["GRW_WEIGHT"] = w
     info_entry["GRW_CORE"] = core
@@ -383,6 +416,7 @@ def _calc_grw_flexible(
         "score": grw,
         "path": path,
         "parts": info_entry["DEBUG_GRW_PARTS"],
+        "parts_dict": dict(parts_out),
         "weight": w,
         "core": core,
         "price_proxy": price_alt,
@@ -638,6 +672,7 @@ class Scorer:
         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
 
         df, missing_logs = pd.DataFrame(index=tickers), []
+        debug_mode = bool(getattr(cfg, "debug_mode", False))
         for t in tickers:
             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
             try:
@@ -646,12 +681,74 @@ class Scorer:
                 volume_series_full = None
 
             grw_result = _calc_grw_flexible(t, d, s, volume_series_full)
-            df.loc[t,'GRW_FLEX_SCORE'] = grw_result.get('score')
+            grw_score = grw_result.get('score')
+            try:
+                grw_score_val = float(grw_score)
+            except Exception:
+                grw_score_val = np.nan
+            df.loc[t,'GRW_FLEX_SCORE'] = grw_score
             df.loc[t,'GRW_FLEX_WEIGHT'] = grw_result.get('weight')
             df.loc[t,'GRW_FLEX_CORE'] = grw_result.get('core')
             df.loc[t,'GRW_FLEX_PRICE'] = grw_result.get('price_proxy')
             df.loc[t,'DEBUG_GRW_PATH'] = grw_result.get('path')
             df.loc[t,'DEBUG_GRW_PARTS'] = grw_result.get('parts')
+
+            if debug_mode:
+                try:
+                    parts_dict = grw_result.get('parts_dict')
+                    flat = _flatten_for_debug(parts_dict, "DBG_GRW") if parts_dict else {}
+                    if grw_result.get('path') is not None:
+                        flat.setdefault("DBG_GRW.path", grw_result.get('path'))
+                    if grw_result.get('weight') is not None:
+                        flat.setdefault("DBG_GRW.w", grw_result.get('weight'))
+                    for key, value in flat.items():
+                        df.loc[t, key] = value
+
+                    series_rev_q = _ensure_series(d.get("SEC_REV_Q_SERIES"))
+                    series_eps_q = _ensure_series(d.get("SEC_EPS_Q_SERIES"))
+                    if isinstance(series_rev_q, pd.Series) and series_rev_q.size >= 8:
+                        rev_yoy = (series_rev_q / series_rev_q.shift(4) - 1).dropna()
+                        if not rev_yoy.empty:
+                            df.loc[t, "DBG_GRW.rev_yoy_last4"] = list(rev_yoy.tail(4).round(4))
+                            df.loc[t, "DBG_GRW.rev_yoy_mean"] = float(np.nanmean(rev_yoy)) if len(rev_yoy) > 0 else None
+                            df.loc[t, "DBG_GRW.rev_yoy_med"] = float(np.nanmedian(rev_yoy)) if len(rev_yoy) > 0 else None
+                    if isinstance(series_eps_q, pd.Series) and series_eps_q.size >= 8:
+                        eps_yoy = (series_eps_q / series_eps_q.shift(4) - 1).dropna()
+                        if not eps_yoy.empty:
+                            df.loc[t, "DBG_GRW.eps_yoy_last4"] = list(eps_yoy.tail(4).round(4))
+                            df.loc[t, "DBG_GRW.eps_yoy_mean"] = float(np.nanmean(eps_yoy)) if len(eps_yoy) > 0 else None
+                            df.loc[t, "DBG_GRW.eps_yoy_med"] = float(np.nanmedian(eps_yoy)) if len(eps_yoy) > 0 else None
+
+                    base_pos = []
+                    for key in ("DBG_GRW.rev_yoy_mean", "DBG_GRW.eps_yoy_mean", "DBG_GRW.core.ttm_yoy"):
+                        if key in df.columns:
+                            val = df.at[t, key]
+                            if val is not None and not pd.isna(val):
+                                try:
+                                    base_pos.append(float(val))
+                                except Exception:
+                                    continue
+                    if base_pos:
+                        median_base = float(np.nanmedian(base_pos))
+                        if (
+                            np.isfinite(median_base)
+                            and median_base > 0.30
+                            and np.isfinite(grw_score_val)
+                            and grw_score_val < 0
+                        ):
+                            row_dbg = df.loc[t] if t in df.index else {}
+                            path_dbg = row_dbg.get('DBG_GRW.path') if hasattr(row_dbg, 'get') else None
+                            weight_dbg = row_dbg.get('DBG_GRW.w') if hasattr(row_dbg, 'get') else None
+                            logger.warning(
+                                "[GRW-SANITY] %s: median_base=%.3f but GROWTH_F=%.3f  path=%s w=%s",
+                                t,
+                                median_base,
+                                grw_score_val,
+                                path_dbg,
+                                weight_dbg,
+                            )
+                except Exception:
+                    pass
 
             # --- 基本特徴 ---
             df.loc[t,'TR']   = self.trend(s)
@@ -1025,6 +1122,10 @@ class Scorer:
         grw_raw = pd.to_numeric(df.get('GRW_FLEX_SCORE'), errors="coerce")
         df_z['GROWTH_F'] = robust_z_keepnan(grw_raw).clip(-3.0, 3.0)
         df_z['GRW_FLEX_WEIGHT'] = pd.to_numeric(df.get('GRW_FLEX_WEIGHT'), errors="coerce")
+        if debug_mode:
+            dbg_cols = [c for c in df.columns if isinstance(c, str) and c.startswith("DBG_GRW.")]
+            for col in dbg_cols:
+                df_z[col] = df[col]
 
         # Debug dump for GRW composition (console OFF by default; enable only with env)
         if bool(os.getenv("GRW_CONSOLE_DEBUG")):
