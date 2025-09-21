@@ -809,21 +809,24 @@ class Scorer:
         grw_core = grw_core.clip(-2.5, 2.5)
         df_z['GROWTH_F'] = robust_z_keepnan(grw_core).clip(-3.0, 3.0)
 
-        df_z['GRW_FLEX_WEIGHT'] = 1.0
+        df_z['GRW_FLEX_WEIGHT'] = 1.0  # 現状は固定（SECの可用性に依らず）
 
         if debug_mode:
-            df_z['DBG_GRW.REV_YOY']       = rev_yoy
-            df_z['DBG_GRW.REV_ACC']       = rev_acc
-            df_z['DBG_GRW.REV_BLOCK']     = rev_block
-            df_z['DBG_GRW.EPS_Q_YOY']     = eps_qyoy
-            df_z['DBG_GRW.EPS_POS']       = eps_pos
-            df_z['DBG_GRW.EPS_ABS_SLOPE'] = eps_slope
-            df_z['DBG_GRW.EPS_BLOCK']     = eps_block
-            df_z['DBG_GRW.RULE40']        = rule40
-            df_z['DBG_GRW.EPS_VAR_8Q']    = eps_var
-            df_z['DBG_GRW.BONUS']         = bonus
-            df_z['DBG_GRW.PENALTY']       = penalty
-            df_z['DBG_GRW.CORE_BEFORE_Z'] = grw_core
+            # ---- Growth debug columns (可視化用) ----
+            df_z['DBG_GRW.REV_YOY']        = rev_yoy
+            df_z['DBG_GRW.REV_ACC']        = rev_acc
+            df_z['DBG_GRW.REV_VAR']        = rev_var
+            df_z['DBG_GRW.REV_BLOCK']      = rev_block
+            df_z['DBG_GRW.EPS_Q_YOY']      = eps_qyoy
+            df_z['DBG_GRW.EPS_POS']        = eps_pos
+            df_z['DBG_GRW.EPS_ABS_SLOPE']  = eps_slope
+            df_z['DBG_GRW.EPS_VAR_8Q']     = eps_var
+            df_z['DBG_GRW.EPS_BLOCK']      = eps_block
+            df_z['DBG_GRW.RULE40']         = rule40
+            df_z['DBG_GRW.BONUS']          = bonus
+            df_z['DBG_GRW.PENALTY']        = penalty
+            df_z['DBG_GRW.CORE_RAW']       = grw_core
+            df_z['DBG_GRW.GROWTH_F']       = df_z['GROWTH_F']
 
         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
             + 0.15*df_z['TR_str']
