@@ -410,6 +410,7 @@ class Scorer:
         df, missing_logs = pd.DataFrame(index=tickers), []
         df['EPS_SERIES'] = pd.Series([None] * len(df), index=df.index, dtype=object)
         debug_mode = bool(getattr(cfg, "debug_mode", False))
+        eps_cols = set(getattr(eps_df, "columns", []))
         for t in tickers:
             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
             try:
@@ -419,10 +420,29 @@ class Scorer:
 
             # --- 基本特徴 ---
             df.loc[t,'TR']   = self.trend(s)
-            df.loc[t,'EPS']  = _scalar(eps_df.loc[t,'EPS_TTM']) if t in eps_df.index else np.nan
-            df.loc[t,'EPS_Q'] = _scalar(eps_df.loc[t,'EPS_Q_LastQ']) if t in eps_df.index else np.nan
-            df.loc[t,'REV_TTM'] = _scalar(eps_df.loc[t,'REV_TTM']) if t in eps_df.index else np.nan
-            df.loc[t,'REV_Q']   = _scalar(eps_df.loc[t,'REV_Q_LastQ']) if t in eps_df.index else np.nan
+
+            def _eps_value(col: str) -> float:
+                if col not in eps_cols:
+                    return np.nan
+                try:
+                    return _scalar(eps_df[col].get(t, np.nan))
+                except Exception:
+                    return np.nan
+
+            df.loc[t,'EPS']  = _eps_value('EPS_TTM')
+            df.loc[t,'EPS_Q'] = _eps_value('EPS_Q_LastQ')
+            df.loc[t,'REV_TTM'] = _eps_value('REV_TTM')
+            df.loc[t,'REV_Q']   = _eps_value('REV_Q_LastQ')
+            df.loc[t,'EPS_TTM_PREV'] = _eps_value('EPS_TTM_PREV')
+            df.loc[t,'REV_TTM_PREV'] = _eps_value('REV_TTM_PREV')
+            df.loc[t,'EPS_Q_PREV'] = _eps_value('EPS_Q_Prev')
+            df.loc[t,'REV_Q_PREV'] = _eps_value('REV_Q_Prev')
+            df.loc[t,'EPS_A_LATEST'] = _eps_value('EPS_A_LATEST')
+            df.loc[t,'EPS_A_PREV'] = _eps_value('EPS_A_PREV')
+            df.loc[t,'REV_A_LATEST'] = _eps_value('REV_A_LATEST')
+            df.loc[t,'REV_A_PREV'] = _eps_value('REV_A_PREV')
+            df.loc[t,'EPS_A_CAGR3'] = _eps_value('EPS_A_CAGR3')
+            df.loc[t,'REV_A_CAGR3'] = _eps_value('REV_A_CAGR3')
             df.loc[t,'REV']  = d.get('revenueGrowth',np.nan)
             df.loc[t,'ROE']  = d.get('returnOnEquity',np.nan)
             df.loc[t,'BETA'] = self.calc_beta(s, spx, lookback=252)
@@ -716,6 +736,45 @@ class Scorer:
             except Exception as e:
                 logger.warning("growth-derivatives failed: %s: %s", t, e)
 
+        def _pct_change(new, old):
+            try:
+                if np.isfinite(new) and np.isfinite(old) and float(old) != 0:
+                    return float((new - old) / abs(old))
+            except Exception:
+                pass
+            return np.nan
+
+        def _pct_series(a: pd.Series, b: pd.Series) -> list[float]:
+            a_vals = pd.to_numeric(a, errors="coerce") if a is not None else pd.Series(np.nan, index=df.index)
+            b_vals = pd.to_numeric(b, errors="coerce") if b is not None else pd.Series(np.nan, index=df.index)
+            return [_pct_change(x, y) for x, y in zip(a_vals.reindex(df.index), b_vals.reindex(df.index))]
+
+        def _mean_valid(vals: list[float]) -> float:
+            arr = [float(v) for v in vals if np.isfinite(v)]
+            return float(np.mean(arr)) if arr else np.nan
+
+        grw_q_eps_last = _pct_series(df['EPS_Q'], df.get('EPS_Q_PREV', pd.Series(np.nan, index=df.index)))
+        grw_q_rev_last = _pct_series(df['REV_Q'], df.get('REV_Q_PREV', pd.Series(np.nan, index=df.index)))
+        grw_q_eps_ttm = _pct_series(df['EPS'], df.get('EPS_TTM_PREV', pd.Series(np.nan, index=df.index)))
+        grw_q_rev_ttm = _pct_series(df['REV_TTM'], df.get('REV_TTM_PREV', pd.Series(np.nan, index=df.index)))
+
+        grw_a_eps_yoy = _pct_series(df.get('EPS_A_LATEST', pd.Series(np.nan, index=df.index)), df.get('EPS_A_PREV', pd.Series(np.nan, index=df.index)))
+        grw_a_rev_yoy = _pct_series(df.get('REV_A_LATEST', pd.Series(np.nan, index=df.index)), df.get('REV_A_PREV', pd.Series(np.nan, index=df.index)))
+        grw_a_eps_cagr = pd.to_numeric(df.get('EPS_A_CAGR3', pd.Series(np.nan, index=df.index)), errors="coerce").reindex(df.index).tolist()
+        grw_a_rev_cagr = pd.to_numeric(df.get('REV_A_CAGR3', pd.Series(np.nan, index=df.index)), errors="coerce").reindex(df.index).tolist()
+
+        grw_q_combined = [
+            _mean_valid([a, b, c, d])
+            for a, b, c, d in zip(grw_q_eps_last, grw_q_rev_last, grw_q_eps_ttm, grw_q_rev_ttm)
+        ]
+        grw_a_combined = [
+            _mean_valid([a, b, c, d])
+            for a, b, c, d in zip(grw_a_eps_yoy, grw_a_rev_yoy, grw_a_eps_cagr, grw_a_rev_cagr)
+        ]
+
+        df['GRW_Q_RAW'] = pd.Series(grw_q_combined, index=df.index, dtype=float)
+        df['GRW_A_RAW'] = pd.Series(grw_a_combined, index=df.index, dtype=float)
+
         def _trend_template_pass(row, rs_alpha_thresh=0.10):
             c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
             c2 = (row.get('MA150_OVER_200', np.nan) > 0)
@@ -823,51 +882,55 @@ class Scorer:
         df_z['TREND_SLOPE_REV_YR'] = slope_rev_yr_combo.clip(-3.0, 3.0)
         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
 
-        # ===== GRW 固定レシピ =====
-        def _z(name):
-            ser = df_z.get(name)
-            if isinstance(ser, pd.Series):
-                return pd.to_numeric(ser, errors="coerce").fillna(0.0)
-            return pd.Series(0.0, index=df_z.index)
+        grw_q_z = robust_z_keepnan(df['GRW_Q_RAW']).clip(-3.0, 3.0)
+        grw_a_z = robust_z_keepnan(df['GRW_A_RAW']).clip(-3.0, 3.0)
+        df_z['GRW_Q'] = grw_q_z
+        df_z['GRW_A'] = grw_a_z
 
-        rev_yoy   = _z('REV_Q_YOY')
-        rev_acc   = _z('REV_YOY_ACC')
-        rev_var   = _z('REV_YOY_VAR')
-        rev_block = (0.70*rev_yoy + 0.30*rev_acc) - 0.20*rev_var.clip(lower=0)
-        rev_block = rev_block.clip(-3.0, 3.0)
+        try:
+            mix = float(os.environ.get("GRW_Q_ANNUAL_MIX", "0.7"))
+        except Exception:
+            mix = 0.7
+        if not np.isfinite(mix):
+            mix = 0.7
+        mix = float(np.clip(mix, 0.0, 1.0))
 
-        eps_qyoy  = _z('EPS_Q_YOY')
-        eps_pos   = _z('EPS_POS')
-        eps_slope = _z('EPS_ABS_SLOPE')
-        eps_block = (0.40*eps_qyoy + 0.20*eps_pos + 0.40*eps_slope).clip(-3.0, 3.0)
+        weights_q: list[float] = []
+        weights_a: list[float] = []
+        grw_mix: list[float] = []
+        for idx in df.index:
+            q_val = grw_q_z.get(idx, np.nan)
+            a_val = grw_a_z.get(idx, np.nan)
+            q_ok = np.isfinite(q_val)
+            a_ok = np.isfinite(a_val)
+            if q_ok and a_ok:
+                wq, wa = mix, 1.0 - mix
+            elif q_ok:
+                wq, wa = 1.0, 0.0
+            elif a_ok:
+                wq, wa = 0.0, 1.0
+            else:
+                wq = wa = np.nan
+                grw_mix.append(np.nan)
+                weights_q.append(wq)
+                weights_a.append(wa)
+                continue
+            weights_q.append(wq)
+            weights_a.append(wa)
+            grw_mix.append(q_val * wq + a_val * wa)
 
-        rule40  = _z('RULE40')
-        eps_var = _z('EPS_VAR_8Q')
-        bonus   = 0.10*rule40
-        penalty = 0.10*eps_var.clip(lower=0)
+        wq_series = pd.Series(weights_q, index=df.index, dtype=float)
+        wa_series = pd.Series(weights_a, index=df.index, dtype=float)
+        grw_series = pd.Series(grw_mix, index=df.index, dtype=float).clip(-3.0, 3.0)
 
-        grw_core = (0.65*rev_block + 0.35*eps_block + bonus - penalty)
-        grw_core = grw_core.clip(-2.5, 2.5)
-        df_z['GROWTH_F'] = robust_z_keepnan(grw_core).clip(-3.0, 3.0)
-
+        df_z['GROWTH_F'] = grw_series
         df_z['GRW_FLEX_WEIGHT'] = 1.0  # 現状は固定（SECの可用性に依らず）
 
-        if debug_mode:
-            # ---- Growth debug columns (可視化用) ----
-            df_z['DBG_GRW.REV_YOY']        = rev_yoy
-            df_z['DBG_GRW.REV_ACC']        = rev_acc
-            df_z['DBG_GRW.REV_VAR']        = rev_var
-            df_z['DBG_GRW.REV_BLOCK']      = rev_block
-            df_z['DBG_GRW.EPS_Q_YOY']      = eps_qyoy
-            df_z['DBG_GRW.EPS_POS']        = eps_pos
-            df_z['DBG_GRW.EPS_ABS_SLOPE']  = eps_slope
-            df_z['DBG_GRW.EPS_VAR_8Q']     = eps_var
-            df_z['DBG_GRW.EPS_BLOCK']      = eps_block
-            df_z['DBG_GRW.RULE40']         = rule40
-            df_z['DBG_GRW.BONUS']          = bonus
-            df_z['DBG_GRW.PENALTY']        = penalty
-            df_z['DBG_GRW.CORE_RAW']       = grw_core
-            df_z['DBG_GRW.GROWTH_F']       = df_z['GROWTH_F']
+        if str(os.environ.get("GRW_DBG_DETAIL", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+            df_z['GRW_Q_DBG'] = pd.Series(df['GRW_Q_RAW'], index=df.index, dtype=float)
+            df_z['GRW_A_DBG'] = pd.Series(df['GRW_A_RAW'], index=df.index, dtype=float)
+            df_z['GRW_WQ_DBG'] = wq_series
+            df_z['GRW_WA_DBG'] = wa_series
 
         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
             + 0.15*df_z['TR_str']
