@@ -921,6 +921,12 @@ class Scorer:
             df_z["GROWTH_F"] = df_z["GROWTH_F"].clip(-3.0, 3.0)
         # === end: BIO LOSS PENALTY =======================================
 
+        _debug_only_cols = [c for c in df_z.columns if c.endswith("_RAW")]
+        _no_score_cols = ["DIV_TTM_PS", "DIV_YOY", "LOW52PCT25_EXCESS", "MA50_OVER_200"]
+        _drop_cols = [c for c in (_debug_only_cols + _no_score_cols) if c in df_z.columns]
+        if _drop_cols:
+            df_z = df_z.drop(columns=_drop_cols, errors="ignore")
+
         assert not any(c.endswith("_RAW") for c in df_z.columns)
         for c in ["DIV_TTM_PS","DIV_YOY","LOW52PCT25_EXCESS","MA50_OVER_200"]:
             assert c not in df_z.columns
