@@ -79,6 +79,47 @@ def _as_numeric_series(s: pd.Series) -> pd.Series:
     return pd.Series(v.values, index=getattr(s, "index", None), dtype=float, name=getattr(s, "name", None))
 
 
+def _scalar(x):
+    """
+    入力を安全に float スカラへ変換する。
+
+    許容する入力パターン:
+      - pandas.Series: 非NaNの最後の値を採用
+      - numpy スカラ/配列: 最後の要素を採用
+      - その他の数値っぽい値: float へ変換
+
+    変換できない場合は np.nan を返す。
+    """
+
+    if x is None:
+        return np.nan
+
+    # pandas.Series の場合は非NaNの最後の値を採用
+    if isinstance(x, pd.Series):
+        s = pd.to_numeric(x, errors="coerce").dropna()
+        return float(s.iloc[-1]) if not s.empty else np.nan
+
+    # numpy スカラ (item() を持つ) ※文字列は除外
+    if hasattr(x, "item") and not isinstance(x, (str, bytes)):
+        try:
+            return float(x.item())
+        except Exception:
+            pass
+
+    # 配列様のオブジェクト
+    try:
+        arr = np.asarray(x, dtype=float).ravel()
+        return float(arr[-1]) if arr.size else np.nan
+    except Exception:
+        pass
+
+    # 最後に素直に float 変換を試す
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+
 def winsorize_s(s: pd.Series, p=0.02):
     if s is None or s.dropna().empty: return s
     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
