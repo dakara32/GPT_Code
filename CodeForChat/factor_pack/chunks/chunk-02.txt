@@ -161,109 +161,124 @@ L438                 continue
 L439         out.sort(key=lambda t: t[0], reverse=True)
 L440         return out
 L441
-L442     def fetch_eps_rev_from_sec(self, tickers: list[str]) -> dict:
-L443         out = {}
-L444         t2cik = self._sec_ticker_map()
-L445         n_map = n_rev = n_eps = 0
-L446         miss_map: list[str] = []
-L447         miss_facts: list[str] = []
-L448         for t in tickers:
-L449             base = (t or "").upper()
-L450             candidates: list[str] = []
-L451             for key in [base, *self._normalize_ticker(t)]:
-L452                 if key and key not in candidates:
-L453                     candidates.append(key)
-L454             cik = next((t2cik.get(key) for key in candidates if t2cik.get(key)), None)
-L455             if not cik:
-L456                 out[t] = {}
-L457                 miss_map.append(t)
-L458                 continue
-L459             try:
-L460                 j = self._sec_companyfacts(cik)
-L461                 facts = j or {}
-L462                 rev_tags = [
-L463                     "Revenues",
-L464                     "RevenueFromContractWithCustomerExcludingAssessedTax",
-L465                     "SalesRevenueNet",
-L466                     "SalesRevenueGoodsNet",
-L467                     "SalesRevenueServicesNet",
-L468                     "Revenue",
-L469                 ]
-L470                 eps_tags = [
-L471                     "EarningsPerShareDiluted",
-L472                     "EarningsPerShareBasicAndDiluted",
-L473                     "EarningsPerShare",
-L474                     "EarningsPerShareBasic",
-L475                 ]
-L476                 rev_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], rev_tags)
-L477                 eps_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], eps_tags)
-L478                 rev_q_items = self._only_quarterly(rev_arr)
-L479                 eps_q_items = self._only_quarterly(eps_arr)
-L480                 # (date,value) で取得
-L481                 rev_pairs = self._series_from_facts_with_dates(rev_q_items)
-L482                 eps_pairs = self._series_from_facts_with_dates(eps_q_items)
-L483                 rev_vals = [v for (_d, v) in rev_pairs]
-L484                 eps_vals = [v for (_d, v) in eps_pairs]
-L485                 rev_q = float(rev_vals[0]) if rev_vals else float("nan")
-L486                 eps_q = float(eps_vals[0]) if eps_vals else float("nan")
-L487                 rev_ttm = float(sum(v for v in rev_vals[:4] if v == v)) if rev_vals else float("nan")
-L488                 eps_ttm = float(sum(v for v in eps_vals[:4] if v == v)) if eps_vals else float("nan")
-L489                 out[t] = {
-L490                     "eps_q_recent": eps_q,
-L491                     "eps_ttm": eps_ttm,
-L492                     "rev_q_recent": rev_q,
-L493                     "rev_ttm": rev_ttm,
-L494                     # 後段でDatetimeIndex化できるよう (date,value) を保持。値だけの互換キーも残す。
-L495                     # 3年運用に合わせて四半期は直近12本のみ保持（約3年=12Q）
-L496                     "eps_q_series_pairs": eps_pairs[:12],
-L497                     "rev_q_series_pairs": rev_pairs[:12],
-L498                     "eps_q_series": eps_vals[:12],
-L499                     "rev_q_series": rev_vals[:12],
-L500                 }
-L501                 n_map += 1
-L502                 if rev_vals:
-L503                     n_rev += 1
-L504                 if eps_vals:
-L505                     n_eps += 1
-L506             except Exception:
-L507                 out[t] = {}
-L508                 miss_facts.append(t)
-L509             time.sleep(0.30)
-L510         # 取得サマリをログ（Actionsで確認しやすいよう print）
-L511         try:
-L512             total = len(tickers)
-L513             print(f"[SEC] map={n_map}/{total}  rev_q_hit={n_rev}  eps_q_hit={n_eps}")
-L514             # デバッグ: 取得本数の分布（先頭のみ）
-L515             try:
-L516                 lens = [len((out.get(t, {}) or {}).get("rev_q_series", [])) for t in tickers]
-L517                 print(f"[SEC] rev_q_series length: min={min(lens) if lens else 0} "
-L518                       f"p25={np.percentile(lens,25) if lens else 0} median={np.median(lens) if lens else 0} "
-L519                       f"p75={np.percentile(lens,75) if lens else 0} max={max(lens) if lens else 0}")
-L520             except Exception:
-L521                 pass
-L522             if miss_map:
-L523                 print(f"[SEC] no CIK map: {len(miss_map)} (サンプル例) {miss_map[:20]}")
-L524             if miss_facts:
-L525                 print(f"[SEC] CIKあり だが対象factなし: {len(miss_facts)} (サンプル例) {miss_facts[:20]}")
-L526         except Exception:
-L527             pass
-L528         return out
-L529
-L530     def sec_dryrun_sample(self, tickers: list[str] | None = None) -> None:
-L531         if not _env_true("SEC_DRYRUN_SAMPLE", False):
-L532             return
-L533         sample = tickers or ["BRK.B", "BF.B", "GOOGL", "META", "UBER", "PBR.A", "TSM", "NARI", "EVBN", "SWAV"]
-L534         print(f"[SEC-DRYRUN] sample tickers: {sample}")
-L535         try:
-L536             t2cik = self._sec_ticker_map()
-L537             hits = 0
-L538             for sym in sample:
-L539                 candidates: list[str] = []
-L540
-L541                 def add(key: str) -> None:
-L542                     if key and key not in candidates:
-L543                         candidates.append(key)
+L442     def _series_q_and_a(self, facts: list[dict]) -> tuple[list[Tuple[str, float]], list[Tuple[str, float]]]:
+L443         """四半期・年次の両seriesを抽出して返す（formで簡易判定）。"""
+L444         if not facts:
+L445             return [], []
+L446         q_items = self._only_quarterly(list(facts))
+L447         annual_forms = {"10-K", "10-K/A", "20-F", "20-F/A"}
+L448         a_items = [x for x in facts if str((x or {}).get("form", "")).upper() in annual_forms]
+L449         a_items.sort(key=lambda x: (x.get("end") or ""), reverse=True)
+L450         return self._series_from_facts_with_dates(q_items), self._series_from_facts_with_dates(a_items)
+L451
+L452     @staticmethod
+L453     def _ttm_from_q_or_a(q_vals: list[float], a_vals: list[float]) -> float:
+L454         """四半期TTM（4本合算）を優先し、欠損時は年次値で補完。"""
+L455         import math
+L456
+L457         def _clean(vals: list[float]) -> list[float]:
+L458             out: list[float] = []
+L459             for v in vals:
+L460                 try:
+L461                     f = float(v)
+L462                 except Exception:
+L463                     continue
+L464                 if math.isfinite(f):
+L465                     out.append(f)
+L466                 else:
+L467                     out.append(float("nan"))
+L468             return out
+L469
+L470         def _sum4(vs: list[float]) -> float:
+L471             filtered = [v for v in vs[:4] if v == v]
+L472             if len(filtered) >= 2:
+L473                 return float(sum(filtered))
+L474             if len(filtered) == 1:
+L475                 return float(filtered[0])
+L476             return float("nan")
+L477
+L478         q_clean = _clean(q_vals or [])
+L479         ttm_q = _sum4(q_clean)
+L480         if ttm_q == ttm_q:
+L481             return ttm_q
+L482         for v in _clean(a_vals or []):
+L483             if v == v:
+L484                 return float(v)
+L485         return float("nan")
+L486
+L487     def fetch_eps_rev_from_sec(self, tickers: list[str]) -> dict:
+L488         out = {}
+L489         t2cik = self._sec_ticker_map()
+L490         n_map = n_rev = n_eps = 0
+L491         miss_map: list[str] = []
+L492         miss_facts: list[str] = []
+L493         for t in tickers:
+L494             base = (t or "").upper()
+L495             candidates: list[str] = []
+L496             for key in [base, *self._normalize_ticker(t)]:
+L497                 if key and key not in candidates:
+L498                     candidates.append(key)
+L499             cik = next((t2cik.get(key) for key in candidates if t2cik.get(key)), None)
+L500             if not cik:
+L501                 out[t] = {}
+L502                 miss_map.append(t)
+L503                 continue
+L504             try:
+L505                 j = self._sec_companyfacts(cik)
+L506                 facts = j or {}
+L507                 rev_tags = [
+L508                     "Revenues",
+L509                     "RevenueFromContractWithCustomerExcludingAssessedTax",
+L510                     "SalesRevenueNet",
+L511                     "SalesRevenueGoodsNet",
+L512                     "SalesRevenueServicesNet",
+L513                     "Revenue",
+L514                 ]
+L515                 eps_tags = [
+L516                     "EarningsPerShareDiluted",
+L517                     "EarningsPerShareBasicAndDiluted",
+L518                     "EarningsPerShare",
+L519                     "EarningsPerShareBasic",
+L520                 ]
+L521                 rev_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], rev_tags)
+L522                 eps_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], eps_tags)
+L523                 rev_q_pairs, rev_a_pairs = self._series_q_and_a(rev_arr)
+L524                 eps_q_pairs, eps_a_pairs = self._series_q_and_a(eps_arr)
+L525
+L526                 rev_q_pairs = rev_q_pairs[:12]
+L527                 eps_q_pairs = eps_q_pairs[:12]
+L528                 rev_a_pairs = rev_a_pairs[:6]
+L529                 eps_a_pairs = eps_a_pairs[:6]
+L530
+L531                 def _vals(pairs: list[tuple[str, float]]) -> list[float]:
+L532                     vals: list[float] = []
+L533                     for _d, v in pairs:
+L534                         try:
+L535                             vals.append(float(v))
+L536                         except Exception:
+L537                             vals.append(float("nan"))
+L538                     return vals
+L539
+L540                 rev_q_vals = _vals(rev_q_pairs)
+L541                 eps_q_vals = _vals(eps_q_pairs)
+L542                 rev_a_vals = _vals(rev_a_pairs)
+L543                 eps_a_vals = _vals(eps_a_pairs)
 L544
-L545                 add((sym or "").upper())
-L546                 for alt in self._norm
+L545                 def _first_valid(vals: list[float]) -> float:
+L546                     for v in vals:
+L547                         if v == v:
+L548                             return float(v)
+L549                     return float("nan")
+L550
+L551                 def _nth_valid(vals: list[float], n: int) -> float:
+L552                     idx = 0
+L553                     for v in vals:
+L554                         if v == v:
+L555                             if idx == n:
+L556                                 return float(v)
+L557                             idx += 1
+L558                     return float("nan")
+L559
+L560                 def _quarter_from_annual(vals: list[float]) -> float:
+
 ```

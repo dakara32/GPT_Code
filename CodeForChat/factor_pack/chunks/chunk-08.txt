@@ -1,5 +1,214 @@
 ```text
- Scorer:
+ avgD,
+L1607               "sum_score": sumD, "objective": objD},
+L1608         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
+L1609
+L1610     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
+L1611     try:
+L1612         _low_df = (pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
+L1613               .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
+L1614               .sort_values("G_plus_D")
+L1615               .head(10)
+L1616               .round(3))
+L1617         low_msg = "Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string(index=True, index_names=False)
+L1618         _post_slack({"text": f"```{low_msg}```"})
+L1619     except Exception as _e:
+L1620         _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
+L1621
+L1622     return sb
+L1623
+L1624 if __name__ == "__main__":
+L1625     run_pipeline()
+```
+
+## <scorer.py>
+```text
+L1 # scorer.py
+L2 # kawatest
+L3 # =============================================================================
+L4 # Scorer: ファクター/指標の生成と合成スコア算出を担う純粋層
+L5 #
+L6 # 【このファイルだけ読めば分かるポイント】
+L7 # - 入力(InputBundle)は「価格/出来高/ベンチ/基本情報/EPS/FCF/リターン」を含むDTO
+L8 # - 出力(FeatureBundle)は「raw特徴量 df」「標準化 df_z」「G/D スコア」「欠損ログ」
+L9 # - 重み等のコンフィグ(PipelineConfig)は factor から渡す（cfg 必須）
+L10 # - 旧カラム名は Scorer 内で自動リネームして受け入れ（後方互換）
+L11 #   例) eps_ttm -> EPS_TTM, eps_q_recent -> EPS_Q_LastQ, fcf_ttm -> FCF_TTM
+L12 #
+L13 # 【I/O契約（Scorerが参照するInputBundleフィールド）】
+L14 #   - cand: List[str]    … 候補銘柄（単体実行では未使用）
+L15 #   - tickers: List[str] … 対象銘柄リスト
+L16 #   - bench: str         … ベンチマークティッカー（例 '^GSPC'）
+L17 #   - data: pd.DataFrame … yfinance download結果 ('Close','Volume' 等の階層列)
+L18 #   - px: pd.DataFrame   … data['Close'] 相当（終値）
+L19 #   - spx: pd.Series     … ベンチマークの終値
+L20 #   - tickers_bulk: object         … yfinance.Tickers
+L21 #   - info: Dict[str, dict]        … yfinance info per ticker
+L22 #   - eps_df: pd.DataFrame         … 必須列: EPS_TTM, EPS_Q_LastQ（旧名も可）
+L23 #   - fcf_df: pd.DataFrame         … 必須列: FCF_TTM（旧名も可）
+L24 #   - returns: pd.DataFrame        … px[tickers].pct_change() 相当
+L25 #
+L26 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
+L27 # =============================================================================
+L28
+L29 import json, logging, os, requests, sys, warnings
+L30 import numpy as np
+L31 import pandas as pd
+L32 import yfinance as yf
+L33 from typing import Any, TYPE_CHECKING
+L34 from scipy.stats import zscore
+L35 from datetime import datetime as _dt
+L36
+L37 if TYPE_CHECKING:
+L38     from factor import PipelineConfig  # type: ignore  # 実行時importなし（循環回避）
+L39
+L40 logger = logging.getLogger(__name__)
+L41
+L42
+L43 def _log(stage, msg):
+L44     try:
+L45         print(f"[DBG][{_dt.utcnow().isoformat(timespec='seconds')}Z][{stage}] {msg}")
+L46     except Exception:
+L47         print(f"[DBG][{stage}] {msg}")
+L48
+L49
+L50 # ---- Dividend Helpers -------------------------------------------------------
+L51 def _last_close(t, price_map=None):
+L52     if price_map and (c := price_map.get(t)) is not None: return float(c)
+L53     try:
+L54         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
+L55         return float(h.iloc[-1]) if len(h) else np.nan
+L56     except Exception:
+L57         return np.nan
+L58
+L59 def _ttm_div_sum(t, lookback_days=400):
+L60     try:
+L61         div = yf.Ticker(t).dividends
+L62         if div is None or len(div) == 0: return 0.0
+L63         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
+L64         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
+L65         return ttm if ttm > 0 else float(div.tail(4).sum())
+L66     except Exception:
+L67         return 0.0
+L68
+L69 def ttm_div_yield_portfolio(tickers, price_map=None):
+L70     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
+L71     return float(np.mean(ys)) if ys else 0.0
+L72
+L73 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
+L74 def _as_numeric_series(s: pd.Series) -> pd.Series:
+L75     """Series を float dtype に強制変換し、index を保持する。"""
+L76     if s is None:
+L77         return pd.Series(dtype=float)
+L78     v = pd.to_numeric(s, errors="coerce")
+L79     return pd.Series(v.values, index=getattr(s, "index", None), dtype=float, name=getattr(s, "name", None))
+L80
+L81
+L82 def _scalar(x):
+L83     """
+L84     入力を安全に float スカラへ変換する。
+L85
+L86     許容する入力パターン:
+L87       - pandas.Series: 非NaNの最後の値を採用
+L88       - numpy スカラ/配列: 最後の要素を採用
+L89       - その他の数値っぽい値: float へ変換
+L90
+L91     変換できない場合は np.nan を返す。
+L92     """
+L93
+L94     if x is None:
+L95         return np.nan
+L96
+L97     # pandas.Series の場合は非NaNの最後の値を採用
+L98     if isinstance(x, pd.Series):
+L99         s = pd.to_numeric(x, errors="coerce").dropna()
+L100         return float(s.iloc[-1]) if not s.empty else np.nan
+L101
+L102     # numpy スカラ (item() を持つ) ※文字列は除外
+L103     if hasattr(x, "item") and not isinstance(x, (str, bytes)):
+L104         try:
+L105             return float(x.item())
+L106         except Exception:
+L107             pass
+L108
+L109     # 配列様のオブジェクト
+L110     try:
+L111         arr = np.asarray(x, dtype=float).ravel()
+L112         return float(arr[-1]) if arr.size else np.nan
+L113     except Exception:
+L114         pass
+L115
+L116     # 最後に素直に float 変換を試す
+L117     try:
+L118         return float(x)
+L119     except Exception:
+L120         return np.nan
+L121
+L122
+L123 def winsorize_s(s: pd.Series, p=0.02):
+L124     if s is None or s.dropna().empty: return s
+L125     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L126
+L127 def robust_z(s: pd.Series, p=0.02):
+L128     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L129
+L130 def robust_z_keepnan(s: pd.Series) -> pd.Series:
+L131     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
+L132     if s is None:
+L133         return pd.Series(dtype=float)
+L134     v = pd.to_numeric(s, errors="coerce")
+L135     m = np.nanmedian(v)
+L136     mad = np.nanmedian(np.abs(v - m))
+L137     z = (v - m) / (1.4826 * mad + 1e-9)
+L138     if np.nanstd(z) < 1e-9:
+L139         r = v.rank(method="average", na_option="keep")
+L140         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
+L141     return pd.Series(z, index=v.index, dtype=float)
+L142
+L143
+L144 def _safe_div(a, b):
+L145     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
+L146     except Exception: return np.nan
+L147
+L148 def _safe_last(series: pd.Series, default=np.nan):
+L149     try: return float(series.iloc[-1])
+L150     except Exception: return default
+L151
+L152
+L153 def _ensure_series(x):
+L154     if x is None:
+L155         return pd.Series(dtype=float)
+L156     if isinstance(x, pd.Series):
+L157         return x.dropna()
+L158     if isinstance(x, (list, tuple)):
+L159         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
+L160             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
+L161             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
+L162             return pd.Series(v, index=dt).dropna()
+L163         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
+L164     try:
+L165         return pd.Series(x).dropna()
+L166     except Exception:
+L167         return pd.Series(dtype=float)
+L168
+L169
+L170 def _to_quarterly(s: pd.Series) -> pd.Series:
+L171     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
+L172         return s
+L173     return s.resample("Q").last().dropna()
+L174
+L175
+L176 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
+L177     if qs is None or qs.empty:
+L178         return pd.Series(dtype=float)
+L179     ttm = qs.rolling(4, min_periods=2).sum()
+L180     yoy = ttm.pct_change(4)
+L181     return yoy
+L182
+L183
+L184
+L185
+L186 class Scorer:
 L187     """
 L188     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
 L189     - cfg は必須（factor.PipelineConfig を渡す）。
@@ -75,161 +284,5 @@ L258         try:
 L259             bs = tk.quarterly_balance_sheet
 L260             if bs is not None and not bs.empty:
 L261                 c = bs.columns[0]
-L262                 for k in ("Total Debt","Long Term Debt","Short Long Term Debt"):
-L263                     if k in bs.index: debt = float(bs.loc[k,c]); break
-L264                 for k in ("Cash And Cash Equivalents","Cash And Cash Equivalents And Short Term Investments","Cash"):
-L265                     if k in bs.index: cash = float(bs.loc[k,c]); break
-L266         except Exception: pass
-L267         if pd.notna(mc): return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
-L268         return np.nan
-L269
-L270     @staticmethod
-L271     def dividend_status(ticker: str) -> str:
-L272         t = yf.Ticker(ticker)
-L273         try:
-L274             if not t.dividends.empty: return "has"
-L275         except Exception: return "unknown"
-L276         try:
-L277             a = t.actions
-L278             if (a is not None and not a.empty and "Stock Splits" in a.columns and a["Stock Splits"].abs().sum()>0): return "none_confident"
-L279         except Exception: pass
-L280         try:
-L281             fi = t.fast_info
-L282             if any(getattr(fi,k,None) for k in ("last_dividend_date","dividend_rate","dividend_yield")): return "maybe_missing"
-L283         except Exception: pass
-L284         return "unknown"
-L285
-L286     @staticmethod
-L287     def div_streak(t):
-L288         try:
-L289             divs = yf.Ticker(t).dividends.dropna(); ann = divs.groupby(divs.index.year).sum(); ann = ann[ann.index<pd.Timestamp.today().year]
-L290             years, streak = sorted(ann.index), 0
-L291             for i in range(len(years)-1,0,-1):
-L292                 if ann[years[i]] > ann[years[i-1]]: streak += 1
-L293                 else: break
-L294             return streak
-L295         except Exception: return 0
-L296
-L297     @staticmethod
-L298     def fetch_finnhub_metrics(symbol):
-L299         api_key = os.environ.get("FINNHUB_API_KEY")
-L300         if not api_key: return {}
-L301         url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":api_key}
-L302         try:
-L303             r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
-L304             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.get('enterpriseValue') else None}
-L305         except Exception: return {}
-L306
-L307     @staticmethod
-L308     def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
-L309         r, m = series.pct_change().dropna(), market.pct_change().dropna()
-L310         n = min(len(r), len(m), lookback)
-L311         if n<60: return np.nan
-L312         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
-L313         return np.nan if var==0 else cov/var
-L314
-L315     @staticmethod
-L316     def spx_to_alpha(spx: pd.Series, bands=(0.03,0.10), w=(0.6,0.4),
-L317                      span=5, q=(0.20,0.40), alphas=(0.05,0.08,0.10)) -> float:
-L318         """
-L319         S&P500指数のみから擬似breadthを作り、履歴分位でαを段階決定。
-L320         bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
-L321         """
-L322         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
-L323         b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
-L324         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
-L325         b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
-L326         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
-L327
-L328     @staticmethod
-L329     def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
-L330         """
-L331         同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
-L332         戻り値は降順ソート済み。
-L333         """
-L334         s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
-L335         cnt, pen = {}, {}
-L336         for t in order:
-L337             sec = sectors.get(t, "U"); cnt[sec] = cnt.get(sec,0) + 1; pen[t] = alpha*max(0, cnt[sec]-cap)
-L338         return (s - pd.Series(pen)).sort_values(ascending=False)
-L339
-L340     @staticmethod
-L341     def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08, hard: int|None=5) -> list[str]:
-L342         """
-L343         soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
-L344         """
-L345         eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
-L346         if not hard:
-L347             return list(eff.head(N).index)
-L348         pick, used = [], {}
-L349         for t in eff.index:
-L350             s = sectors.get(t, "U")
-L351             if used.get(s,0) < hard:
-L352                 pick.append(t); used[s] = used.get(s,0) + 1
-L353             if len(pick) == N: break
-L354         return pick
-L355
-L356     @staticmethod
-L357     def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
-L358         """
-L359         各営業日の trend_template 合格本数（合格“本数”=C）を返す。
-L360         - px: 列=ticker（ベンチは含めない）
-L361         - spx: ベンチマーク Series（px.index に整列）
-L362         - win_days: 末尾の計算対象営業日数（None→全体、既定600は呼び出し側指定）
-L363         ベクトル化＆rollingのみで軽量。欠損は False 扱い。
-L364         """
-L365         import numpy as np, pandas as pd
-L366         if px is None or px.empty:
-L367             return pd.Series(dtype=int)
-L368         px = px.dropna(how="all", axis=1)
-L369         if win_days and win_days > 0:
-L370             px = px.tail(win_days)
-L371         if px.empty:
-L372             return pd.Series(dtype=int)
-L373         spx = spx.reindex(px.index).ffill()
-L374
-L375         ma50  = px.rolling(50).mean()
-L376         ma150 = px.rolling(150).mean()
-L377         ma200 = px.rolling(200).mean()
-L378
-L379         tt = (px > ma150)
-L380         tt &= (px > ma200)
-L381         tt &= (ma150 > ma200)
-L382         tt &= (ma200 - ma200.shift(21) > 0)
-L383         tt &= (ma50  > ma150)
-L384         tt &= (ma50  > ma200)
-L385         tt &= (px    > ma50)
-L386
-L387         lo252 = px.rolling(252).min()
-L388         hi252 = px.rolling(252).max()
-L389         tt &= (px.divide(lo252).sub(1.0) >= 0.30)   # P_OVER_LOW52 >= 0.30
-L390         tt &= (px >= (0.75 * hi252))                # NEAR_52W_HIGH >= -0.25
-L391
-L392         r12  = px.divide(px.shift(252)).sub(1.0)
-L393         br12 = spx.divide(spx.shift(252)).sub(1.0)
-L394         r1   = px.divide(px.shift(22)).sub(1.0)
-L395         br1  = spx.divide(spx.shift(22)).sub(1.0)
-L396         rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
-L397         tt &= (rs >= 0.10)
-L398
-L399         return tt.fillna(False).sum(axis=1).astype(int)
-L400
-L401     # ---- スコア集計（DTO/Configを受け取り、FeatureBundleを返す） ----
-L402     def aggregate_scores(self, ib: Any, cfg):
-L403         if cfg is None:
-L404             raise ValueError("cfg is required; pass factor.PipelineConfig")
-L405         self._validate_ib_for_scorer(ib)
-L406
-L407         px, spx, tickers = ib.px, ib.spx, ib.tickers
-L408         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
-L409
-L410         df, missing_logs = pd.DataFrame(index=tickers), []
-L411         df['EPS_SERIES'] = pd.Series([None] * len(df), index=df.index, dtype=object)
-L412         debug_mode = bool(getattr(cfg, "debug_mode", False))
-L413         for t in tickers:
-L414             d, s = info[t], px[t]; ev = self.ev_fallback(d, tickers_bulk.tickers[t])
-L415             try:
-L416                 volume_series_full = ib.data['Volume'][t]
-L417             except Exception:
-L418                 volume_series_full = 
+L262            
 ```
