@@ -166,131 +166,119 @@ L46     except Exception:
 L47         print(f"[DBG][{stage}] {msg}")
 L48
 L49
-L50 # ---- Debug helpers ----------------------------------------------------------
-L51 def _flatten_for_debug(d, prefix="DBG_GRW"):
-L52     """
-L53     ネストしたdict/list/tupleを、df_z列に入れやすい一次元dictへ。
-L54     例: {"w":0.68,"path":"P5","core":{"rev_yoy_mean":1.73,"eps_yoy_mean":0.72,"accel":0.45}}
-L55       -> {"DBG_GRW.w":0.68,"DBG_GRW.path":"P5","DBG_GRW.core.rev_yoy_mean":1.73,...}
-L56     """
-L57     out = {}
-L58     if d is None:
-L59         return out
-L60
-L61     def rec(k, v):
-L62         if isinstance(v, dict):
-L63             for kk, vv in v.items():
-L64                 rec(f"{k}.{str(kk)}", vv)
-L65         elif isinstance(v, (list, tuple, np.ndarray)):
-L66             try:
-L67                 out[k] = list(v[:6])
-L68             except Exception:
-L69                 out[k] = list(v)
-L70         else:
-L71             out[k] = v
+L50 # ---- Dividend Helpers -------------------------------------------------------
+L51 def _last_close(t, price_map=None):
+L52     if price_map and (c := price_map.get(t)) is not None: return float(c)
+L53     try:
+L54         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
+L55         return float(h.iloc[-1]) if len(h) else np.nan
+L56     except Exception:
+L57         return np.nan
+L58
+L59 def _ttm_div_sum(t, lookback_days=400):
+L60     try:
+L61         div = yf.Ticker(t).dividends
+L62         if div is None or len(div) == 0: return 0.0
+L63         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
+L64         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
+L65         return ttm if ttm > 0 else float(div.tail(4).sum())
+L66     except Exception:
+L67         return 0.0
+L68
+L69 def ttm_div_yield_portfolio(tickers, price_map=None):
+L70     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
+L71     return float(np.mean(ys)) if ys else 0.0
 L72
-L73     if isinstance(d, dict):
-L74         for k, v in d.items():
-L75             rec(f"{prefix}.{str(k)}", v)
-L76     return out
-L77
-L78
-L79 # ---- Dividend Helpers -------------------------------------------------------
-L80 def _last_close(t, price_map=None):
-L81     if price_map and (c := price_map.get(t)) is not None: return float(c)
-L82     try:
-L83         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
-L84         return float(h.iloc[-1]) if len(h) else np.nan
-L85     except Exception:
-L86         return np.nan
-L87
-L88 def _ttm_div_sum(t, lookback_days=400):
-L89     try:
-L90         div = yf.Ticker(t).dividends
-L91         if div is None or len(div) == 0: return 0.0
-L92         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
-L93         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
-L94         return ttm if ttm > 0 else float(div.tail(4).sum())
-L95     except Exception:
-L96         return 0.0
-L97
-L98 def ttm_div_yield_portfolio(tickers, price_map=None):
-L99     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
-L100     return float(np.mean(ys)) if ys else 0.0
+L73 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
+L74 def _as_numeric_series(s: pd.Series) -> pd.Series:
+L75     """Series を float dtype に強制変換し、index を保持する。"""
+L76     if s is None:
+L77         return pd.Series(dtype=float)
+L78     v = pd.to_numeric(s, errors="coerce")
+L79     return pd.Series(v.values, index=getattr(s, "index", None), dtype=float, name=getattr(s, "name", None))
+L80
+L81
+L82 def winsorize_s(s: pd.Series, p=0.02):
+L83     if s is None or s.dropna().empty: return s
+L84     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
+L85
+L86 def robust_z(s: pd.Series, p=0.02):
+L87     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
+L88
+L89 def robust_z_keepnan(s: pd.Series) -> pd.Series:
+L90     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
+L91     if s is None:
+L92         return pd.Series(dtype=float)
+L93     v = pd.to_numeric(s, errors="coerce")
+L94     m = np.nanmedian(v)
+L95     mad = np.nanmedian(np.abs(v - m))
+L96     z = (v - m) / (1.4826 * mad + 1e-9)
+L97     if np.nanstd(z) < 1e-9:
+L98         r = v.rank(method="average", na_option="keep")
+L99         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
+L100     return pd.Series(z, index=v.index, dtype=float)
 L101
-L102 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
-L103 def _as_numeric_series(s: pd.Series) -> pd.Series:
-L104     """Series を float dtype に強制変換し、index を保持する。"""
-L105     if s is None:
-L106         return pd.Series(dtype=float)
-L107     v = pd.to_numeric(s, errors="coerce")
-L108     return pd.Series(v.values, index=getattr(s, "index", None), dtype=float, name=getattr(s, "name", None))
-L109
+L102
+L103 def _safe_div(a, b):
+L104     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
+L105     except Exception: return np.nan
+L106
+L107 def _safe_last(series: pd.Series, default=np.nan):
+L108     try: return float(series.iloc[-1])
+L109     except Exception: return default
 L110
-L111 def winsorize_s(s: pd.Series, p=0.02):
-L112     if s is None or s.dropna().empty: return s
-L113     lo, hi = np.nanpercentile(s.astype(float), [100*p, 100*(1-p)]); return s.clip(lo, hi)
-L114
-L115 def robust_z(s: pd.Series, p=0.02):
-L116     s2 = winsorize_s(s,p); return np.nan_to_num(zscore(s2.fillna(s2.mean())))
-L117
-L118 def robust_z_keepnan(s: pd.Series) -> pd.Series:
-L119     """robust_z variant that preserves NaNs and falls back to rank-z when needed."""
-L120     if s is None:
-L121         return pd.Series(dtype=float)
-L122     v = pd.to_numeric(s, errors="coerce")
-L123     m = np.nanmedian(v)
-L124     mad = np.nanmedian(np.abs(v - m))
-L125     z = (v - m) / (1.4826 * mad + 1e-9)
-L126     if np.nanstd(z) < 1e-9:
-L127         r = v.rank(method="average", na_option="keep")
-L128         z = (r - np.nanmean(r)) / (np.nanstd(r) + 1e-9)
-L129     return pd.Series(z, index=v.index, dtype=float)
-L130
-L131
-L132 def _safe_div(a, b):
-L133     try: return np.nan if (b is None or float(b)==0 or pd.isna(b)) else float(a)/float(b)
-L134     except Exception: return np.nan
-L135
-L136 def _safe_last(series: pd.Series, default=np.nan):
-L137     try: return float(series.iloc[-1])
-L138     except Exception: return default
-L139
-L140
-L141 def _ensure_series(x):
-L142     if x is None:
-L143         return pd.Series(dtype=float)
-L144     if isinstance(x, pd.Series):
-L145         return x.dropna()
-L146     if isinstance(x, (list, tuple)):
-L147         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
-L148             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
-L149             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
-L150             return pd.Series(v, index=dt).dropna()
-L151         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
-L152     try:
-L153         return pd.Series(x).dropna()
-L154     except Exception:
-L155         return pd.Series(dtype=float)
-L156
-L157
-L158 def _to_quarterly(s: pd.Series) -> pd.Series:
-L159     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
-L160         return s
-L161     return s.resample("Q").last().dropna()
-L162
-L163
-L164 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
-L165     if qs is None or qs.empty:
-L166         return pd.Series(dtype=float)
-L167     ttm = qs.rolling(4, min_periods=2).sum()
-L168     yoy = ttm.pct_change(4)
-L169     return yoy
-L170
-L171
-L172 def _nz(x) -> float:
-L173     if x is None:
-L174         return 0.0
-L175     try:
-L176
+L111
+L112 def _ensure_series(x):
+L113     if x is None:
+L114         return pd.Series(dtype=float)
+L115     if isinstance(x, pd.Series):
+L116         return x.dropna()
+L117     if isinstance(x, (list, tuple)):
+L118         if len(x) and isinstance(x[0], (tuple, list)) and len(x[0]) == 2:
+L119             dt = pd.to_datetime([d for d, _ in x], errors="coerce")
+L120             v = pd.to_numeric([_v for _, _v in x], errors="coerce")
+L121             return pd.Series(v, index=dt).dropna()
+L122         return pd.Series(pd.to_numeric(list(x), errors="coerce")).dropna()
+L123     try:
+L124         return pd.Series(x).dropna()
+L125     except Exception:
+L126         return pd.Series(dtype=float)
+L127
+L128
+L129 def _to_quarterly(s: pd.Series) -> pd.Series:
+L130     if s.empty or not isinstance(s.index, pd.DatetimeIndex):
+L131         return s
+L132     return s.resample("Q").last().dropna()
+L133
+L134
+L135 def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
+L136     if qs is None or qs.empty:
+L137         return pd.Series(dtype=float)
+L138     ttm = qs.rolling(4, min_periods=2).sum()
+L139     yoy = ttm.pct_change(4)
+L140     return yoy
+L141
+L142
+L143
+L144
+L145 class Scorer:
+L146     """
+L147     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
+L148     - cfg は必須（factor.PipelineConfig を渡す）。
+L149     - 旧カラム名を自動リネームして新スキーマに吸収します。
+L150     """
+L151
+L152     # === 先頭で旧→新カラム名マップ（移行用） ===
+L153     EPS_RENAME = {"eps_ttm":"EPS_TTM", "eps_q_recent":"EPS_Q_LastQ"}
+L154     FCF_RENAME = {"fcf_ttm":"FCF_TTM"}
+L155
+L156     # === スキーマ簡易チェック（最低限） ===
+L157     @staticmethod
+L158     def _validate_ib_for_scorer(ib: Any):
+L159         miss = [a for a in ["tickers","bench","data","px","spx","tickers_bulk","info","eps_df","fcf_df","returns"] if not hasattr(ib,a) or getattr(ib,a) is None]
+L160         if miss: raise ValueError(f"InputBundle is missing required attributes for Scorer: {miss}")
+L161         if any(c in ib.eps_df.columns for c in Scorer.EPS_RENAME): ib.eps_df.rename(columns=Scorer.EPS_RENAME, inplace=True)
+L162         if any(c in ib.fcf_df.columns for c in Scorer.FCF_RENAME): ib.fcf_df.rename(columns=Scorer.FCF_RENAME, inplace=True)
+L163         need_eps, need_fcf = {"EPS_TTM","EPS_Q_LastQ"},{"FCF_TTM"}
+L164         if not need_ep
 ```
