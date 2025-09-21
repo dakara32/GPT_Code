@@ -47,35 +47,6 @@ def _log(stage, msg):
         print(f"[DBG][{stage}] {msg}")
 
 
-# ---- Debug helpers ----------------------------------------------------------
-def _flatten_for_debug(d, prefix="DBG_GRW"):
-    """
-    ネストしたdict/list/tupleを、df_z列に入れやすい一次元dictへ。
-    例: {"w":0.68,"path":"P5","core":{"rev_yoy_mean":1.73,"eps_yoy_mean":0.72,"accel":0.45}}
-      -> {"DBG_GRW.w":0.68,"DBG_GRW.path":"P5","DBG_GRW.core.rev_yoy_mean":1.73,...}
-    """
-    out = {}
-    if d is None:
-        return out
-
-    def rec(k, v):
-        if isinstance(v, dict):
-            for kk, vv in v.items():
-                rec(f"{k}.{str(kk)}", vv)
-        elif isinstance(v, (list, tuple, np.ndarray)):
-            try:
-                out[k] = list(v[:6])
-            except Exception:
-                out[k] = list(v)
-        else:
-            out[k] = v
-
-    if isinstance(d, dict):
-        for k, v in d.items():
-            rec(f"{prefix}.{str(k)}", v)
-    return out
-
-
 # ---- Dividend Helpers -------------------------------------------------------
 def _last_close(t, price_map=None):
     if price_map and (c := price_map.get(t)) is not None: return float(c)
@@ -169,292 +140,8 @@ def _ttm_yoy_from_quarterly(qs: pd.Series) -> pd.Series:
     return yoy
 
 
-def _nz(x) -> float:
-    if x is None:
-        return 0.0
-    try:
-        value = float(x)
-    except Exception:
-        return 0.0
-    if not np.isfinite(value):
-        return 0.0
-    return value
 
 
-def _winsor(x, lo=-2.0, hi=2.0) -> float:
-    v = _nz(x)
-    if v < lo:
-        return float(lo)
-    if v > hi:
-        return float(hi)
-    return float(v)
-
-
-def _round_debug(x, ndigits: int = 4):
-    try:
-        value = float(x)
-    except Exception:
-        return None
-    if not np.isfinite(value):
-        return None
-    return round(value, ndigits)
-
-
-def _calc_grw_flexible(
-    ticker: str,
-    info_entry: dict | None,
-    close_series: pd.Series | None,
-    volume_series: pd.Series | None,
-):
-    info_entry = info_entry if isinstance(info_entry, dict) else {}
-
-    s_rev_q = _ensure_series(info_entry.get("SEC_REV_Q_SERIES"))
-    s_eps_q = _ensure_series(info_entry.get("SEC_EPS_Q_SERIES"))
-    s_rev_y = _ensure_series(info_entry.get("SEC_REV_Y_SERIES"))
-
-    nQ = int(getattr(s_rev_q, "size", 0))
-    nY = int(getattr(s_rev_y, "size", 0))
-
-    parts: dict[str, Any] = {"nQ": nQ, "nY": nY}
-    path = "NONE"
-    w = 0.0
-
-    def _valid_ratio(a, b):
-        try:
-            na, nb = float(a), float(b)
-        except Exception:
-            return None
-        if not np.isfinite(na) or not np.isfinite(nb) or nb == 0:
-            return None
-        return na, nb
-
-    def yoy_q(series: pd.Series) -> float | None:
-        s = _ensure_series(series)
-        if s.empty:
-            return None
-        s = s.sort_index()
-        if isinstance(s.index, pd.DatetimeIndex):
-            last_idx = s.index[-1]
-            window_start = last_idx - pd.DateOffset(months=15)
-            window_end = last_idx - pd.DateOffset(months=9)
-            candidates = s.loc[(s.index >= window_start) & (s.index <= window_end)]
-            if candidates.empty:
-                candidates = s.loc[s.index <= window_end]
-            if candidates.empty:
-                return None
-            v1 = candidates.iloc[-1]
-            v0 = s.iloc[-1]
-        else:
-            if s.size < 5:
-                return None
-            v0 = s.iloc[-1]
-            v1 = s.iloc[-5]
-        pair = _valid_ratio(v0, v1)
-        if pair is None:
-            return None
-        a, b = pair
-        return float(a / b - 1.0)
-
-    def qoq(series: pd.Series) -> float | None:
-        s = _ensure_series(series)
-        if s.size < 2:
-            return None
-        s = s.sort_index()
-        v0, v1 = s.iloc[-1], s.iloc[-2]
-        pair = _valid_ratio(v0, v1)
-        if pair is None:
-            return None
-        a, b = pair
-        return float(a / b - 1.0)
-
-    def ttm_delta(series: pd.Series) -> float | None:
-        s = _ensure_series(series)
-        if s.size < 2:
-            return None
-        s = s.sort_index()
-        k = int(min(4, s.size))
-        cur_slice = s.iloc[-k:]
-        prev_slice = s.iloc[:-k]
-        if prev_slice.empty:
-            return None
-        prev_k = int(min(k, prev_slice.size))
-        cur_sum = float(cur_slice.sum())
-        prev_sum = float(prev_slice.iloc[-prev_k:].sum())
-        pair = _valid_ratio(cur_sum, prev_sum)
-        if pair is None:
-            return None
-        a, b = pair
-        return float(a / b - 1.0)
-
-    def yoy_y(series: pd.Series) -> float | None:
-        s = _ensure_series(series)
-        if s.size < 2:
-            return None
-        s = s.sort_index()
-        v0, v1 = s.iloc[-1], s.iloc[-2]
-        pair = _valid_ratio(v0, v1)
-        if pair is None:
-            return None
-        a, b = pair
-        return float(a / b - 1.0)
-
-    def price_proxy_growth() -> float | None:
-        if not isinstance(close_series, pd.Series):
-            return None
-        close = close_series.sort_index().dropna()
-        if close.empty:
-            return None
-        hh_window = int(min(126, len(close)))
-        if hh_window < 20:
-            return None
-        hh = close.rolling(hh_window).max().iloc[-1]
-        prox = None
-        if np.isfinite(hh) and hh > 0:
-            prox = float(close.iloc[-1] / hh)
-        rs6 = None
-        if len(close) >= 63:
-            rs6 = float(close.pct_change(63).iloc[-1])
-        rs12 = None
-        if len(close) >= 126:
-            rs12 = float(close.pct_change(126).iloc[-1])
-        vexp = None
-        if isinstance(volume_series, pd.Series):
-            vol = volume_series.reindex(close.index).dropna()
-            if len(vol) >= 50:
-                v20 = vol.rolling(20).mean().iloc[-1]
-                v50 = vol.rolling(50).mean().iloc[-1]
-                if np.isfinite(v20) and np.isfinite(v50) and v50 > 0:
-                    vexp = float(v20 / v50 - 1.0)
-        prox = 0.0 if prox is None or not np.isfinite(prox) else prox
-        rs6 = 0.0 if rs6 is None or not np.isfinite(rs6) else rs6
-        rs12 = 0.0 if rs12 is None or not np.isfinite(rs12) else rs12
-        vexp = 0.0 if vexp is None or not np.isfinite(vexp) else vexp
-        return 0.5 * prox + 0.3 * rs6 + 0.2 * rs12 + 0.2 * vexp
-
-    price_alt = price_proxy_growth() or 0.0
-    core = 0.0
-    core_raw = 0.0
-    price_raw = price_alt
-
-    if nQ >= 5:
-        path = "P5"
-        yq = yoy_q(s_rev_q)
-        parts["rev_yoy_q"] = yq
-        tmp_prev = s_rev_q.iloc[:-1] if s_rev_q.size > 1 else s_rev_q
-        acc = None
-        if tmp_prev.size >= 5 and yq is not None:
-            yq_prev = yoy_q(tmp_prev)
-            if yq_prev is not None:
-                acc = float(yq - yq_prev)
-        parts["rev_acc_q"] = acc
-        eps_yoy = yoy_q(s_eps_q) if s_eps_q.size >= 5 else None
-        parts["eps_yoy_q"] = eps_yoy
-        eps_acc = None
-        if eps_yoy is not None and s_eps_q.size > 5:
-            eps_prev = s_eps_q.iloc[:-1]
-            if eps_prev.size >= 5:
-                eps_prev_yoy = yoy_q(eps_prev)
-                if eps_prev_yoy is not None:
-                    eps_acc = float(eps_yoy - eps_prev_yoy)
-        parts["eps_acc_q"] = eps_acc
-        w = 1.0
-        core_raw = (
-            0.60 * _nz(yq)
-            + 0.20 * _nz(acc)
-            + 0.15 * _nz(eps_yoy)
-            + 0.05 * _nz(eps_acc)
-        )
-        price_alt = 0.0
-    elif 2 <= nQ <= 4:
-        path = "P24"
-        rev_qoq = qoq(s_rev_q)
-        rev_ttm2 = ttm_delta(s_rev_q)
-        parts["rev_qoq"] = rev_qoq
-        parts["rev_ttm2"] = rev_ttm2
-        eps_qoq = qoq(s_eps_q) if s_eps_q.size >= 2 else None
-        parts["eps_qoq"] = eps_qoq
-        w = min(1.0, nQ / 5.0)
-        core_raw = 0.6 * _nz(rev_qoq) + 0.3 * _nz(rev_ttm2) + 0.1 * _nz(eps_qoq)
-    else:
-        path = "P1Y"
-        rev_yoy_y = yoy_y(s_rev_y) if nY >= 2 else None
-        parts["rev_yoy_y"] = rev_yoy_y
-        w = 0.6 * min(1.0, nY / 3.0) if nY >= 2 else 0.4
-        core_raw = _nz(rev_yoy_y)
-        if nQ <= 1 and nY < 2 and price_alt == 0.0:
-            price_alt = price_proxy_growth() or 0.0
-
-    core = _winsor(core_raw, lo=-1.5, hi=1.5)
-    price_alt = _winsor(price_alt, lo=-1.5, hi=1.5)
-    grw = _winsor(w * core + (1.0 - w) * (0.5 * _nz(price_alt)), lo=-2.0, hi=2.0)
-
-    parts.update(
-        {
-            "core_raw": core_raw,
-            "core": core,
-            "price_proxy_raw": price_raw,
-            "price_proxy": price_alt,
-            "weight": w,
-            "score": grw,
-        }
-    )
-
-    parts_out: dict[str, Any] = {
-        "nQ": nQ,
-        "nY": nY,
-    }
-    for key, value in parts.items():
-        if key in ("nQ", "nY"):
-            continue
-        rounded = _round_debug(value)
-        parts_out[key] = rounded
-
-    parts_out["path"] = path
-    parts_out["w"] = _round_debug(w)
-
-    info_entry["DEBUG_GRW_PATH"] = path
-    info_entry["DEBUG_GRW_PARTS"] = json.dumps(parts_out, ensure_ascii=False, sort_keys=True)
-    info_entry["DEBUG_GRW_PARTS_DICT"] = dict(parts_out)
-    info_entry["GRW_SCORE"] = grw
-    info_entry["GRW_WEIGHT"] = w
-    info_entry["GRW_CORE"] = core
-    info_entry["GRW_PRICE_PROXY"] = price_alt
-
-    return {
-        "score": grw,
-        "path": path,
-        "parts": info_entry["DEBUG_GRW_PARTS"],
-        "parts_dict": dict(parts_out),
-        "weight": w,
-        "core": core,
-        "price_proxy": price_alt,
-    }
-
-
-D_WEIGHTS_EFF = None  # 出力表示互換のため
-
-
-def _scalar(v):
-    """単一セル代入用に値をスカラーへ正規化する。
-
-    - pandas Series -> .iloc[-1]（最後を採用）
-    - list/tuple/ndarray -> 最後の要素
-    - それ以外          -> そのまま
-    取得失敗時は np.nan を返す。
-    """
-    import numpy as _np
-    import pandas as _pd
-    try:
-        if isinstance(v, _pd.Series):
-            return v.iloc[-1] if len(v) else _np.nan
-        if isinstance(v, (list, tuple, _np.ndarray)):
-            return v[-1] if len(v) else _np.nan
-        return v
-    except Exception:
-        return _np.nan
-
-
-# ---- Scorer 本体 -------------------------------------------------------------
 class Scorer:
     """
     - factor.py からは `aggregate_scores(ib, cfg)` を呼ぶだけでOK。
@@ -688,76 +375,6 @@ class Scorer:
                 volume_series_full = ib.data['Volume'][t]
             except Exception:
                 volume_series_full = None
-
-            grw_result = _calc_grw_flexible(t, d, s, volume_series_full)
-            grw_score = grw_result.get('score')
-            try:
-                grw_score_val = float(grw_score)
-            except Exception:
-                grw_score_val = np.nan
-            df.loc[t,'GRW_FLEX_SCORE'] = grw_score
-            df.loc[t,'GRW_FLEX_WEIGHT'] = grw_result.get('weight')
-            df.loc[t,'GRW_FLEX_CORE'] = grw_result.get('core')
-            df.loc[t,'GRW_FLEX_PRICE'] = grw_result.get('price_proxy')
-            df.loc[t,'DEBUG_GRW_PATH'] = grw_result.get('path')
-            df.loc[t,'DEBUG_GRW_PARTS'] = grw_result.get('parts')
-
-            if debug_mode:
-                try:
-                    parts_dict = grw_result.get('parts_dict')
-                    flat = _flatten_for_debug(parts_dict, "DBG_GRW") if parts_dict else {}
-                    if grw_result.get('path') is not None:
-                        flat.setdefault("DBG_GRW.path", grw_result.get('path'))
-                    if grw_result.get('weight') is not None:
-                        flat.setdefault("DBG_GRW.w", grw_result.get('weight'))
-                    for key, value in flat.items():
-                        df.loc[t, key] = value
-
-                    series_rev_q = _ensure_series(d.get("SEC_REV_Q_SERIES"))
-                    series_eps_q = _ensure_series(d.get("SEC_EPS_Q_SERIES"))
-                    if isinstance(series_rev_q, pd.Series) and series_rev_q.size >= 8:
-                        rev_yoy = (series_rev_q / series_rev_q.shift(4) - 1).dropna()
-                        if not rev_yoy.empty:
-                            df.loc[t, "DBG_GRW.rev_yoy_last4"] = list(rev_yoy.tail(4).round(4))
-                            df.loc[t, "DBG_GRW.rev_yoy_mean"] = float(np.nanmean(rev_yoy)) if len(rev_yoy) > 0 else None
-                            df.loc[t, "DBG_GRW.rev_yoy_med"] = float(np.nanmedian(rev_yoy)) if len(rev_yoy) > 0 else None
-                    if isinstance(series_eps_q, pd.Series) and series_eps_q.size >= 8:
-                        eps_yoy = (series_eps_q / series_eps_q.shift(4) - 1).dropna()
-                        if not eps_yoy.empty:
-                            df.loc[t, "DBG_GRW.eps_yoy_last4"] = list(eps_yoy.tail(4).round(4))
-                            df.loc[t, "DBG_GRW.eps_yoy_mean"] = float(np.nanmean(eps_yoy)) if len(eps_yoy) > 0 else None
-                            df.loc[t, "DBG_GRW.eps_yoy_med"] = float(np.nanmedian(eps_yoy)) if len(eps_yoy) > 0 else None
-
-                    base_pos = []
-                    for key in ("DBG_GRW.rev_yoy_mean", "DBG_GRW.eps_yoy_mean", "DBG_GRW.core.ttm_yoy"):
-                        if key in df.columns:
-                            val = df.at[t, key]
-                            if val is not None and not pd.isna(val):
-                                try:
-                                    base_pos.append(float(val))
-                                except Exception:
-                                    continue
-                    if base_pos:
-                        median_base = float(np.nanmedian(base_pos))
-                        if (
-                            np.isfinite(median_base)
-                            and median_base > 0.30
-                            and np.isfinite(grw_score_val)
-                            and grw_score_val < 0
-                        ):
-                            row_dbg = df.loc[t] if t in df.index else {}
-                            path_dbg = row_dbg.get('DBG_GRW.path') if hasattr(row_dbg, 'get') else None
-                            weight_dbg = row_dbg.get('DBG_GRW.w') if hasattr(row_dbg, 'get') else None
-                            logger.warning(
-                                "[GRW-SANITY] %s: median_base=%.3f but GROWTH_F=%.3f  path=%s w=%s",
-                                t,
-                                median_base,
-                                grw_score_val,
-                                path_dbg,
-                                weight_dbg,
-                            )
-                except Exception:
-                    pass
 
             # --- 基本特徴 ---
             df.loc[t,'TR']   = self.trend(s)
@@ -1165,67 +782,48 @@ class Scorer:
         df_z['TREND_SLOPE_REV_YR'] = slope_rev_yr_combo.clip(-3.0, 3.0)
         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
 
-        # ===== GRW flexible score (variable data paths) =====
-        grw_raw = pd.to_numeric(df.get('GRW_FLEX_SCORE'), errors="coerce")
+        # ===== GRW 固定レシピ =====
+        def _z(name):
+            ser = df_z.get(name)
+            if isinstance(ser, pd.Series):
+                return pd.to_numeric(ser, errors="coerce").fillna(0.0)
+            return pd.Series(0.0, index=df_z.index)
 
-        # EPSトレンドスロープをGRWに加算
-        if 'TREND_SLOPE_EPS' in df_z.columns:
-            try:
-                grw_raw = grw_raw + 0.2 * df_z['TREND_SLOPE_EPS']
-            except Exception as e:
-                print("[WARN] failed to add TREND_SLOPE_EPS to GRW_FLEX_SCORE:", e)
+        rev_yoy   = _z('REV_Q_YOY')
+        rev_acc   = _z('REV_YOY_ACC')
+        rev_var   = _z('REV_YOY_VAR')
+        rev_block = (0.70*rev_yoy + 0.30*rev_acc) - 0.20*rev_var.clip(lower=0)
+        rev_block = rev_block.clip(-3.0, 3.0)
 
-        df_z['GROWTH_F'] = robust_z_keepnan(grw_raw).clip(-3.0, 3.0)
-        df_z['GRW_FLEX_WEIGHT'] = pd.to_numeric(df.get('GRW_FLEX_WEIGHT'), errors="coerce")
+        eps_qyoy  = _z('EPS_Q_YOY')
+        eps_pos   = _z('EPS_POS')
+        eps_slope = _z('EPS_ABS_SLOPE')
+        eps_block = (0.40*eps_qyoy + 0.20*eps_pos + 0.40*eps_slope).clip(-3.0, 3.0)
+
+        rule40  = _z('RULE40')
+        eps_var = _z('EPS_VAR_8Q')
+        bonus   = 0.10*rule40
+        penalty = 0.10*eps_var.clip(lower=0)
+
+        grw_core = (0.65*rev_block + 0.35*eps_block + bonus - penalty)
+        grw_core = grw_core.clip(-2.5, 2.5)
+        df_z['GROWTH_F'] = robust_z_keepnan(grw_core).clip(-3.0, 3.0)
+
+        df_z['GRW_FLEX_WEIGHT'] = 1.0
+
         if debug_mode:
-            dbg_cols = [c for c in df.columns if isinstance(c, str) and c.startswith("DBG_GRW.")]
-            for col in dbg_cols:
-                df_z[col] = df[col]
-
-        # Debug dump for GRW composition (console OFF by default; enable only with env)
-        if bool(os.getenv("GRW_CONSOLE_DEBUG")):
-            try:
-                cols = ['GROWTH_F', 'GRW_FLEX_WEIGHT']
-                use_cols = [c for c in cols if c in df_z.columns]
-                i = df_z[use_cols].copy() if use_cols else pd.DataFrame(index=df_z.index)
-                i.sort_values('GROWTH_F', ascending=False, inplace=True)
-                limit = max(0, min(40, len(i)))
-                print("[DEBUG: GRW]")
-                for t in i.index[:limit]:
-                    row = i.loc[t]
-                    parts = []
-                    if pd.notna(row.get('GROWTH_F')):
-                        parts.append(f"GROWTH_F={row.get('GROWTH_F'):.3f}")
-                    raw_val = grw_raw.get(t) if isinstance(grw_raw, pd.Series) else np.nan
-                    if pd.notna(raw_val):
-                        parts.append(f"GRW_FLEX_SCORE={raw_val:.3f}")
-                    weight_val = row.get('GRW_FLEX_WEIGHT')
-                    if pd.notna(weight_val):
-                        parts.append(f"w={weight_val:.2f}")
-                    path_val = None
-                    try:
-                        path_val = info.get(t, {}).get('DEBUG_GRW_PATH')
-                    except Exception:
-                        path_val = None
-                    if not path_val and 'DEBUG_GRW_PATH' in df.columns:
-                        path_val = df.at[t, 'DEBUG_GRW_PATH']
-                    if path_val:
-                        parts.append(f"PATH={path_val}")
-                    parts_json = None
-                    try:
-                        parts_json = info.get(t, {}).get('DEBUG_GRW_PARTS')
-                    except Exception:
-                        parts_json = None
-                    if not parts_json and 'DEBUG_GRW_PARTS' in df.columns:
-                        parts_json = df.at[t, 'DEBUG_GRW_PARTS']
-                    if parts_json:
-                        parts.append(f"PARTS={parts_json}")
-                    if not parts:
-                        parts.append('no-data')
-                    print(f"Ticker: {t} | " + " ".join(parts))
-                print()
-            except Exception as exc:
-                print(f"[ERR] GRW debug dump failed: {exc}")
+            df_z['DBG_GRW.REV_YOY']       = rev_yoy
+            df_z['DBG_GRW.REV_ACC']       = rev_acc
+            df_z['DBG_GRW.REV_BLOCK']     = rev_block
+            df_z['DBG_GRW.EPS_Q_YOY']     = eps_qyoy
+            df_z['DBG_GRW.EPS_POS']       = eps_pos
+            df_z['DBG_GRW.EPS_ABS_SLOPE'] = eps_slope
+            df_z['DBG_GRW.EPS_BLOCK']     = eps_block
+            df_z['DBG_GRW.RULE40']        = rule40
+            df_z['DBG_GRW.EPS_VAR_8Q']    = eps_var
+            df_z['DBG_GRW.BONUS']         = bonus
+            df_z['DBG_GRW.PENALTY']       = penalty
+            df_z['DBG_GRW.CORE_BEFORE_Z'] = grw_core
 
         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
             + 0.15*df_z['TR_str']
