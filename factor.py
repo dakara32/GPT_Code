@@ -1247,7 +1247,7 @@ class Output:
             add = [t for t in near_G if t not in set(G_UNI)][:10]
             if len(add) < 10:
                 try:
-                    aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False)
+                    aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False)
                     out_now = sorted(set(exist) - set(top_G + top_D))  # 今回 OUT
                     used = set(G_UNI + add)
                     def _push(lst):
@@ -1532,13 +1532,13 @@ def run_pipeline() -> SelectionBundle:
     )
     sc = Scorer()
     top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G)
-    poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False).index)
+    poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False).index)
     alpha = Scorer.spx_to_alpha(inb.spx)
     sectors = {t:(inb.info.get(t,{}).get("sector") or "U") for t in poolG}; scores = {t:Scorer.g_score.get(t,0.0) for t in poolG}
     top_G = Scorer.pick_top_softcap(scores, sectors, N=N_G, cap=2, alpha=alpha, hard=5)
     sc._top_G = top_G
     try:
-        aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).sort_values(ascending=False)
+        aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False)
         sc._near_G = [t for t in aggG.index if t not in set(top_G)][:10]
     except Exception:
         pass
@@ -1546,6 +1546,7 @@ def run_pipeline() -> SelectionBundle:
     effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
     top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D)
+    poolD = list(getattr(sc, "_agg_D", pd.Series(dtype=float)).dropna().sort_values(ascending=False).index)
     fb = getattr(sc, "_feat", None)
     near_G = getattr(sc, "_near_G", [])
     selected12 = list(top_G)
