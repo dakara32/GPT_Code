@@ -439,6 +439,51 @@ class Input:
         out.sort(key=lambda t: t[0], reverse=True)
         return out
 
+    def _series_q_and_a(self, facts: list[dict]) -> tuple[list[Tuple[str, float]], list[Tuple[str, float]]]:
+        """四半期・年次の両seriesを抽出して返す（formで簡易判定）。"""
+        if not facts:
+            return [], []
+        q_items = self._only_quarterly(list(facts))
+        annual_forms = {"10-K", "10-K/A", "20-F", "20-F/A"}
+        a_items = [x for x in facts if str((x or {}).get("form", "")).upper() in annual_forms]
+        a_items.sort(key=lambda x: (x.get("end") or ""), reverse=True)
+        return self._series_from_facts_with_dates(q_items), self._series_from_facts_with_dates(a_items)
+
+    @staticmethod
+    def _ttm_from_q_or_a(q_vals: list[float], a_vals: list[float]) -> float:
+        """四半期TTM（4本合算）を優先し、欠損時は年次値で補完。"""
+        import math
+
+        def _clean(vals: list[float]) -> list[float]:
+            out: list[float] = []
+            for v in vals:
+                try:
+                    f = float(v)
+                except Exception:
+                    continue
+                if math.isfinite(f):
+                    out.append(f)
+                else:
+                    out.append(float("nan"))
+            return out
+
+        def _sum4(vs: list[float]) -> float:
+            filtered = [v for v in vs[:4] if v == v]
+            if len(filtered) >= 2:
+                return float(sum(filtered))
+            if len(filtered) == 1:
+                return float(filtered[0])
+            return float("nan")
+
+        q_clean = _clean(q_vals or [])
+        ttm_q = _sum4(q_clean)
+        if ttm_q == ttm_q:
+            return ttm_q
+        for v in _clean(a_vals or []):
+            if v == v:
+                return float(v)
+        return float("nan")
+
     def fetch_eps_rev_from_sec(self, tickers: list[str]) -> dict:
         out = {}
         t2cik = self._sec_ticker_map()
@@ -475,33 +520,119 @@ class Input:
                 ]
                 rev_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], rev_tags)
                 eps_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], eps_tags)
-                rev_q_items = self._only_quarterly(rev_arr)
-                eps_q_items = self._only_quarterly(eps_arr)
-                # (date,value) で取得
-                rev_pairs = self._series_from_facts_with_dates(rev_q_items)
-                eps_pairs = self._series_from_facts_with_dates(eps_q_items)
-                rev_vals = [v for (_d, v) in rev_pairs]
-                eps_vals = [v for (_d, v) in eps_pairs]
-                rev_q = float(rev_vals[0]) if rev_vals else float("nan")
-                eps_q = float(eps_vals[0]) if eps_vals else float("nan")
-                rev_ttm = float(sum(v for v in rev_vals[:4] if v == v)) if rev_vals else float("nan")
-                eps_ttm = float(sum(v for v in eps_vals[:4] if v == v)) if eps_vals else float("nan")
+                rev_q_pairs, rev_a_pairs = self._series_q_and_a(rev_arr)
+                eps_q_pairs, eps_a_pairs = self._series_q_and_a(eps_arr)
+
+                rev_q_pairs = rev_q_pairs[:12]
+                eps_q_pairs = eps_q_pairs[:12]
+                rev_a_pairs = rev_a_pairs[:6]
+                eps_a_pairs = eps_a_pairs[:6]
+
+                def _vals(pairs: list[tuple[str, float]]) -> list[float]:
+                    vals: list[float] = []
+                    for _d, v in pairs:
+                        try:
+                            vals.append(float(v))
+                        except Exception:
+                            vals.append(float("nan"))
+                    return vals
+
+                rev_q_vals = _vals(rev_q_pairs)
+                eps_q_vals = _vals(eps_q_pairs)
+                rev_a_vals = _vals(rev_a_pairs)
+                eps_a_vals = _vals(eps_a_pairs)
+
+                def _first_valid(vals: list[float]) -> float:
+                    for v in vals:
+                        if v == v:
+                            return float(v)
+                    return float("nan")
+
+                def _nth_valid(vals: list[float], n: int) -> float:
+                    idx = 0
+                    for v in vals:
+                        if v == v:
+                            if idx == n:
+                                return float(v)
+                            idx += 1
+                    return float("nan")
+
+                def _quarter_from_annual(vals: list[float]) -> float:
+                    v = _first_valid(vals)
+                    return float(v / 4.0) if v == v else float("nan")
+
+                def _quarter_from_annual_prev(vals: list[float]) -> float:
+                    v = _nth_valid(vals, 1)
+                    return float(v / 4.0) if v == v else float("nan")
+
+                rev_lastq = _first_valid(rev_q_vals)
+                if rev_lastq != rev_lastq:
+                    rev_lastq = _quarter_from_annual(rev_a_vals)
+                eps_lastq = _first_valid(eps_q_vals)
+                if eps_lastq != eps_lastq:
+                    eps_lastq = _quarter_from_annual(eps_a_vals)
+
+                rev_lastq_prev = _nth_valid(rev_q_vals, 4)
+                if rev_lastq_prev != rev_lastq_prev:
+                    rev_lastq_prev = _quarter_from_annual_prev(rev_a_vals)
+                eps_lastq_prev = _nth_valid(eps_q_vals, 4)
+                if eps_lastq_prev != eps_lastq_prev:
+                    eps_lastq_prev = _quarter_from_annual_prev(eps_a_vals)
+
+                rev_ttm = self._ttm_from_q_or_a(rev_q_vals, rev_a_vals)
+                eps_ttm = self._ttm_from_q_or_a(eps_q_vals, eps_a_vals)
+                rev_ttm_prev = self._ttm_from_q_or_a(rev_q_vals[4:], rev_a_vals[1:])
+                eps_ttm_prev = self._ttm_from_q_or_a(eps_q_vals[4:], eps_a_vals[1:])
+
+                rev_annual_latest = _first_valid(rev_a_vals)
+                rev_annual_prev = _nth_valid(rev_a_vals, 1)
+                eps_annual_latest = _first_valid(eps_a_vals)
+                eps_annual_prev = _nth_valid(eps_a_vals, 1)
+
+                def _cagr3(vals: list[float]) -> float:
+                    vals_valid = [v for v in vals if v == v]
+                    if len(vals_valid) >= 3:
+                        latest, base = float(vals_valid[0]), float(vals_valid[2])
+                        if latest > 0 and base > 0:
+                            try:
+                                return float((latest / base) ** (1 / 2) - 1.0)
+                            except Exception:
+                                return float("nan")
+                    return float("nan")
+
+                rev_cagr3 = _cagr3(rev_a_vals)
+                eps_cagr3 = _cagr3(eps_a_vals)
+
                 out[t] = {
-                    "eps_q_recent": eps_q,
+                    "eps_q_recent": eps_lastq,
                     "eps_ttm": eps_ttm,
-                    "rev_q_recent": rev_q,
+                    "eps_ttm_prev": eps_ttm_prev,
+                    "eps_lastq_prev": eps_lastq_prev,
+                    "rev_q_recent": rev_lastq,
                     "rev_ttm": rev_ttm,
+                    "rev_ttm_prev": rev_ttm_prev,
+                    "rev_lastq_prev": rev_lastq_prev,
                     # 後段でDatetimeIndex化できるよう (date,value) を保持。値だけの互換キーも残す。
                     # 3年運用に合わせて四半期は直近12本のみ保持（約3年=12Q）
-                    "eps_q_series_pairs": eps_pairs[:12],
-                    "rev_q_series_pairs": rev_pairs[:12],
-                    "eps_q_series": eps_vals[:12],
-                    "rev_q_series": rev_vals[:12],
+                    "eps_q_series_pairs": eps_q_pairs,
+                    "rev_q_series_pairs": rev_q_pairs,
+                    "eps_q_series": eps_q_vals,
+                    "rev_q_series": rev_q_vals,
+                    "eps_a_series_pairs": eps_a_pairs,
+                    "rev_a_series_pairs": rev_a_pairs,
+                    "eps_a_series": eps_a_vals,
+                    "rev_a_series": rev_a_vals,
+                    "eps_annual_latest": eps_annual_latest,
+                    "eps_annual_prev": eps_annual_prev,
+                    "rev_annual_latest": rev_annual_latest,
+                    "rev_annual_prev": rev_annual_prev,
+                    "eps_cagr3": eps_cagr3,
+                    "rev_cagr3": rev_cagr3,
                 }
                 n_map += 1
-                if rev_vals:
+                if any(v == v for v in rev_q_vals) or any(v == v for v in rev_a_vals):
                     n_rev += 1
-                if eps_vals:
+                if any(v == v for v in eps_q_vals) or any(v == v for v in eps_a_vals):
                     n_eps += 1
             except Exception:
                 out[t] = {}
@@ -732,7 +863,23 @@ class Input:
                                     rev_q = float(rev_series.iloc[0])
                 except Exception:
                     pass
-            eps_rows.append({"ticker":t,"eps_ttm":eps_ttm,"eps_q_recent":eps_q,"rev_ttm":rev_ttm,"rev_q_recent":rev_q})
+            eps_rows.append({
+                "ticker": t,
+                "eps_ttm": eps_ttm,
+                "eps_ttm_prev": sec_t.get("eps_ttm_prev", np.nan),
+                "eps_q_recent": eps_q,
+                "eps_q_prev": sec_t.get("eps_lastq_prev", np.nan),
+                "rev_ttm": rev_ttm,
+                "rev_ttm_prev": sec_t.get("rev_ttm_prev", np.nan),
+                "rev_q_recent": rev_q,
+                "rev_q_prev": sec_t.get("rev_lastq_prev", np.nan),
+                "eps_annual_latest": sec_t.get("eps_annual_latest", np.nan),
+                "eps_annual_prev": sec_t.get("eps_annual_prev", np.nan),
+                "rev_annual_latest": sec_t.get("rev_annual_latest", np.nan),
+                "rev_annual_prev": sec_t.get("rev_annual_prev", np.nan),
+                "eps_cagr3": sec_t.get("eps_cagr3", np.nan),
+                "rev_cagr3": sec_t.get("rev_cagr3", np.nan),
+            })
         return self.impute_eps_ttm(pd.DataFrame(eps_rows).set_index("ticker"))
 
     def prepare_data(self):
@@ -914,9 +1061,19 @@ class Input:
             eps_df = eps_df[~eps_df.index.duplicated(keep="last")]
         eps_df = eps_df.assign(
             EPS_TTM=eps_df["eps_ttm"],
+            EPS_TTM_PREV=eps_df.get("eps_ttm_prev", np.nan),
             EPS_Q_LastQ=eps_df["eps_q_recent"],
+            EPS_Q_Prev=eps_df.get("eps_q_prev", np.nan),
             REV_TTM=eps_df["rev_ttm"],
+            REV_TTM_PREV=eps_df.get("rev_ttm_prev", np.nan),
             REV_Q_LastQ=eps_df["rev_q_recent"],
+            REV_Q_Prev=eps_df.get("rev_q_prev", np.nan),
+            EPS_A_LATEST=eps_df.get("eps_annual_latest", np.nan),
+            EPS_A_PREV=eps_df.get("eps_annual_prev", np.nan),
+            REV_A_LATEST=eps_df.get("rev_annual_latest", np.nan),
+            REV_A_PREV=eps_df.get("rev_annual_prev", np.nan),
+            EPS_A_CAGR3=eps_df.get("eps_cagr3", np.nan),
+            REV_A_CAGR3=eps_df.get("rev_cagr3", np.nan),
         )
         # ここで非NaN件数をサマリ表示（欠損状況の即時把握用）
         try:
