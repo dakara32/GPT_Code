@@ -22,6 +22,7 @@
 #   - eps_df: pd.DataFrame         … 必須列: EPS_TTM, EPS_Q_LastQ（旧名も可）
 #   - fcf_df: pd.DataFrame         … 必須列: FCF_TTM（旧名も可）
 #   - returns: pd.DataFrame        … px[tickers].pct_change() 相当
+#   - missing_logs: pd.DataFrame   … 補完後の欠損ログ
 #
 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
 # =============================================================================
@@ -408,7 +409,7 @@ class Scorer:
         px, spx, tickers = ib.px, ib.spx, ib.tickers
         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
 
-        df, missing_logs = pd.DataFrame(index=tickers), []
+        df = pd.DataFrame(index=tickers)
         df['EPS_SERIES'] = pd.Series([None] * len(df), index=df.index, dtype=object)
         debug_mode = bool(getattr(cfg, "debug_mode", False))
         eps_cols = set(getattr(eps_df, "columns", []))
@@ -616,13 +617,7 @@ class Scorer:
                 for col in need_finnhub:
                     val = fin_data.get(col)
                     if val is not None and not pd.isna(val): df.loc[t,col] = val
-            for col in fin_cols + ['EPS','RS','TR_str','DIV_STREAK']:
-                if pd.isna(df.loc[t,col]):
-                    if col=='DIV':
-                        status = self.dividend_status(t)
-                        if status!='none_confident': missing_logs.append({'Ticker':t,'Column':col,'Status':status})
-                    else:
-                        missing_logs.append({'Ticker':t,'Column':col})
+            # 欠損ログは factor 側で補完後に集約する（ここでは検知のみ）
 
         def _pick_series(entry: dict, keys: list[str]):
             for k in keys:
@@ -1006,19 +1001,18 @@ class Scorer:
         # --- 重みは cfg を優先（外部があればそれを使用） ---
         # ① 全銘柄で G/D スコアを算出（unmasked）
         g_weights = pd.Series(cfg.weights.g, dtype=float)
-        need_g_candidates = ["GROWTH_F", "MOM"]
-        mask_g = pd.Series(True, index=df_z.index, dtype=bool)
-        for c in need_g_candidates:
-            if c in df_z.columns:
-                mask_g &= df_z[c].notna()
-            else:
-                mask_g &= False
-        for c in need_g_candidates:
+        need_g = ["GROWTH_F", "MOM"]
+        dbg_cols = ["GROWTH_F", "MOM", "VOL"]
+        if all(c in df_z.columns for c in need_g):
+            mask_g = df_z[need_g].notna().all(axis=1)
+        else:
+            mask_g = pd.Series(False, index=df_z.index, dtype=bool)
+        for c in dbg_cols:
             if c in df_z.columns:
                 df_z[f"DBGRW.{c}"] = df_z[c]
         df_fill_g = df_z.reindex(columns=g_weights.index, fill_value=np.nan).copy()
         for c in df_fill_g.columns:
-            if c not in need_g_candidates:
+            if c not in need_g:
                 df_fill_g[c] = df_fill_g[c].fillna(0)
         g_score_all = _as_numeric_series(
             df_fill_g.mul(g_weights.reindex(df_fill_g.columns)).sum(axis=1, skipna=False)
@@ -1104,11 +1098,18 @@ class Scorer:
         df_full_z = df_z.copy()
 
         from factor import FeatureBundle  # type: ignore  # 実行時importなし（循環回避）
+        missing_logs_df = getattr(ib, "missing_logs", pd.DataFrame())
+        if not isinstance(missing_logs_df, pd.DataFrame):
+            try:
+                missing_logs_df = pd.DataFrame(missing_logs_df)
+            except Exception:
+                missing_logs_df = pd.DataFrame()
+
         return FeatureBundle(df=df,
             df_z=df_z,
             g_score=g_score,
             d_score_all=d_score_all,
-            missing_logs=pd.DataFrame(missing_logs),
+            missing_logs=missing_logs_df,
             df_full=df_full,
             df_full_z=df_full_z,
             scaler=None)
