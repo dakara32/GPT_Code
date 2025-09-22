@@ -29,10 +29,19 @@ exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_ticker
 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
 g_weights = {'GROWTH_F':0.30,'MOM':0.60,'VOL':-0.10}
-D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "-0.8"))
-FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
+D_BETA_MODE = os.environ.get("D_BETA_MODE", "z").lower()   # "raw" or "z"
+D_BETA_CUTOFF = float(os.environ.get("D_BETA_CUTOFF", "-0.8"))
+FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_CUTOFF}}}
 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
+
+def _zscore_series(s: pd.Series) -> pd.Series:
+    # NaNはそのまま、標準偏差0なら全NaNにする（暴走防止）
+    v = s.astype(float)
+    m, std = v.mean(skipna=True), v.std(skipna=True, ddof=0)
+    if not np.isfinite(std) or std == 0:
+        return pd.Series(index=v.index, dtype=float)
+    return (v - m) / std
 
 # DRRS 初期プール・各種パラメータ
 corrM = 45
@@ -1358,7 +1367,7 @@ class Output:
         return work, truncated, total
 
     # --- 表示（元 display_results のロジックそのまま） ---
-    def display_results(self, *, exist, bench, df_z, g_score, d_score_all,
+    def display_results(self, *, exist, bench, df_raw=None, df_z, g_score, d_score_all,
                         init_G, init_D, top_G, top_D, **kwargs):
         logger.info("📌 reached display_results")
         pd.set_option('display.float_format','{:.3f}'.format)
@@ -1379,6 +1388,15 @@ class Output:
             agg_D = getattr(sc, "_agg_D", None)
         except Exception:
             sc = agg_G = agg_D = None
+        beta_raw_series = pd.Series(dtype=float)
+        beta_z_series = pd.Series(dtype=float)
+        try:
+            if df_raw is not None and hasattr(df_raw, "columns") and 'BETA' in df_raw.columns:
+                beta_raw_series = df_raw['BETA'].astype(float)
+                beta_z_series = _zscore_series(beta_raw_series)
+        except Exception:
+            beta_raw_series = pd.Series(dtype=float)
+            beta_z_series = pd.Series(dtype=float)
         class _SeriesProxy:
             __slots__ = ("primary", "fallback")
             def __init__(self, primary, fallback): self.primary, self.fallback = primary, fallback
@@ -1428,8 +1446,10 @@ class Output:
         print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
 
         extra_D = [t for t in init_D if t not in top_D][:5]; D_UNI = top_D + extra_D
-        cols_D = ['QAL','YLD','VOL','TRD']; d_disp = pd.DataFrame(index=D_UNI)
+        cols_D = ['QAL','YLD','VOL','TRD','BETA_RAW','BETA_Z']; d_disp = pd.DataFrame(index=D_UNI)
         d_disp['QAL'], d_disp['YLD'], d_disp['VOL'], d_disp['TRD'] = df_z.loc[D_UNI,'D_QAL'], df_z.loc[D_UNI,'D_YLD'], df_z.loc[D_UNI,'D_VOL_RAW'], df_z.loc[D_UNI,'D_TRD']
+        d_disp['BETA_RAW'] = beta_raw_series.reindex(D_UNI)
+        d_disp['BETA_Z'] = beta_z_series.reindex(D_UNI)
         dsc_series = pd.Series({t: d_score_all.get(t) for t in D_UNI}, name='DSC')
         self.d_table = pd.concat([d_disp, dsc_series], axis=1); self.d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
         self.d_formatters = {col:"{:.2f}".format for col in cols_D}; self.d_formatters['DSC']="{:.3f}".format
@@ -1442,6 +1462,8 @@ class Output:
             if add:
                 d_disp2 = pd.DataFrame(index=add)
                 d_disp2['QAL'], d_disp2['YLD'], d_disp2['VOL'], d_disp2['TRD'] = df_z.loc[add,'D_QAL'], df_z.loc[add,'D_YLD'], df_z.loc[add,'D_VOL_RAW'], df_z.loc[add,'D_TRD']
+                d_disp2['BETA_RAW'] = beta_raw_series.reindex(add)
+                d_disp2['BETA_Z'] = beta_z_series.reindex(add)
                 near_tbl = pd.concat([d_disp2, pd.Series({t: d_score_all.get(t) for t in add}, name='DSC')], axis=1)
                 self.d_table = pd.concat([self.d_table, near_tbl], axis=0)
         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
@@ -1621,7 +1643,31 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         sc._feat = fb
         agg = fb.g_score if group == "G" else fb.d_score_all
         if group == "D" and hasattr(fb, "df"):
-            agg = agg[fb.df['BETA'] < D_BETA_MAX]
+            beta_raw = fb.df['BETA'].astype(float)
+            if D_BETA_MODE == "z":
+                beta_for_filter = _zscore_series(beta_raw)
+            else:
+                beta_for_filter = beta_raw
+
+            beta_mask = (beta_for_filter <= D_BETA_CUTOFF).reindex(agg.index, fill_value=False)
+            agg = agg[beta_mask]
+
+            if isinstance(agg, pd.Series):
+                _min = agg.min(skipna=True)
+                floor = (0.0 if not np.isfinite(_min) else float(_min)) - 1e6
+                agg = agg.fillna(floor)
+
+            try:
+                logger.info(
+                    "D-filter mode=%s cutoff=%s | pass=%d raw[mean=%.3f std=%.3f] z[mean≈0 std≈1]",
+                    D_BETA_MODE,
+                    D_BETA_CUTOFF,
+                    int(beta_mask.sum()),
+                    float(beta_raw.mean(skipna=True)),
+                    float(beta_raw.std(skipna=True, ddof=0)),
+                )
+            except Exception:
+                pass
 
     if hasattr(sc, "filter_candidates"):
         agg = agg[sc.filter_candidates(inb, agg, group, cfg)]
@@ -1756,6 +1802,7 @@ def run_pipeline() -> SelectionBundle:
             out.display_results(
                 exist=exist,
                 bench=bench,
+                df_raw=fb.df,
                 df_z=fb.df_z,
                 g_score=fb.g_score,
                 d_score_all=fb.d_score_all,
