@@ -80,6 +80,16 @@ def _as_numeric_series(s: pd.Series) -> pd.Series:
     return pd.Series(v.values, index=getattr(s, "index", None), dtype=float, name=getattr(s, "name", None))
 
 
+def _plain_zscore_series(s: pd.Series) -> pd.Series:
+    v = pd.to_numeric(s, errors="coerce")
+    mean = v.mean(skipna=True)
+    std = v.std(skipna=True, ddof=0)
+    if not np.isfinite(std) or std == 0:
+        return pd.Series(index=v.index, dtype=float)
+    out = (v - mean) / std
+    return pd.Series(out.values, index=v.index, dtype=float)
+
+
 def _scalar(x):
     """
     入力を安全に float スカラへ変換する。
@@ -941,19 +951,34 @@ class Scorer:
 
         # df_z 全明細をページングしてログ出力（最小版）
         if getattr(cfg, "debug_mode", False):
+            beta_debug_cols = []
+            if isinstance(df, pd.DataFrame):
+                try:
+                    beta_raw = df.get('BETA') if 'BETA' in df.columns else None
+                    if beta_raw is not None:
+                        beta_raw = pd.to_numeric(beta_raw, errors="coerce")
+                        df_z['BETA_RAW'] = beta_raw.reindex(df_z.index)
+                        df_z['BETA_Z'] = _plain_zscore_series(df_z['BETA_RAW'])
+                        beta_debug_cols.extend(['BETA_RAW', 'BETA_Z'])
+                except Exception:
+                    beta_debug_cols.clear()
             pd.set_option("display.max_columns", None)
             pd.set_option("display.max_colwidth", None)
             pd.set_option("display.width", None)
             page = int(getattr(cfg, "debug_dfz_page", 50))  # デフォルト50行単位
             n = len(df_z)
             logger.info("=== df_z FULL DUMP start === rows=%d cols=%d page=%d", n, df_z.shape[1], page)
-            for i in range(0, n, page):
-                j = min(i + page, n)
-                try:
-                    chunk_str = df_z.iloc[i:j].to_string()
-                except Exception:
-                    chunk_str = df_z.iloc[i:j].astype(str).to_string()
-                logger.info("--- df_z rows %d..%d ---\n%s", i, j-1, chunk_str)
+            try:
+                for i in range(0, n, page):
+                    j = min(i + page, n)
+                    try:
+                        chunk_str = df_z.iloc[i:j].to_string()
+                    except Exception:
+                        chunk_str = df_z.iloc[i:j].astype(str).to_string()
+                    logger.info("--- df_z rows %d..%d ---\n%s", i, j-1, chunk_str)
+            finally:
+                if beta_debug_cols:
+                    df_z.drop(columns=[c for c in beta_debug_cols if c in df_z.columns], inplace=True)
             logger.info("=== df_z FULL DUMP end ===")
 
         # === begin: BIO LOSS PENALTY =====================================

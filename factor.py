@@ -32,7 +32,7 @@ g_weights = {'GROWTH_F':0.30,'MOM':0.60,'VOL':-0.10}
 D_BETA_MODE = os.environ.get("D_BETA_MODE", "z").lower()   # "raw" or "z"
 D_BETA_CUTOFF = float(os.environ.get("D_BETA_CUTOFF", "-0.8"))
 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_CUTOFF}}}
-D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
+D_weights = {'QAL':0.15,'YLD':0.25,'VOL':-0.40,'TRD':0.20}
 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
 
 def _zscore_series(s: pd.Series) -> pd.Series:
@@ -1388,15 +1388,6 @@ class Output:
             agg_D = getattr(sc, "_agg_D", None)
         except Exception:
             sc = agg_G = agg_D = None
-        beta_raw_series = pd.Series(dtype=float)
-        beta_z_series = pd.Series(dtype=float)
-        try:
-            if df_raw is not None and hasattr(df_raw, "columns") and 'BETA' in df_raw.columns:
-                beta_raw_series = df_raw['BETA'].astype(float)
-                beta_z_series = _zscore_series(beta_raw_series)
-        except Exception:
-            beta_raw_series = pd.Series(dtype=float)
-            beta_z_series = pd.Series(dtype=float)
         class _SeriesProxy:
             __slots__ = ("primary", "fallback")
             def __init__(self, primary, fallback): self.primary, self.fallback = primary, fallback
@@ -1446,10 +1437,8 @@ class Output:
         print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
 
         extra_D = [t for t in init_D if t not in top_D][:5]; D_UNI = top_D + extra_D
-        cols_D = ['QAL','YLD','VOL','TRD','BETA_RAW','BETA_Z']; d_disp = pd.DataFrame(index=D_UNI)
+        cols_D = ['QAL','YLD','VOL','TRD']; d_disp = pd.DataFrame(index=D_UNI)
         d_disp['QAL'], d_disp['YLD'], d_disp['VOL'], d_disp['TRD'] = df_z.loc[D_UNI,'D_QAL'], df_z.loc[D_UNI,'D_YLD'], df_z.loc[D_UNI,'D_VOL_RAW'], df_z.loc[D_UNI,'D_TRD']
-        d_disp['BETA_RAW'] = beta_raw_series.reindex(D_UNI)
-        d_disp['BETA_Z'] = beta_z_series.reindex(D_UNI)
         dsc_series = pd.Series({t: d_score_all.get(t) for t in D_UNI}, name='DSC')
         self.d_table = pd.concat([d_disp, dsc_series], axis=1); self.d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
         self.d_formatters = {col:"{:.2f}".format for col in cols_D}; self.d_formatters['DSC']="{:.3f}".format
@@ -1462,8 +1451,6 @@ class Output:
             if add:
                 d_disp2 = pd.DataFrame(index=add)
                 d_disp2['QAL'], d_disp2['YLD'], d_disp2['VOL'], d_disp2['TRD'] = df_z.loc[add,'D_QAL'], df_z.loc[add,'D_YLD'], df_z.loc[add,'D_VOL_RAW'], df_z.loc[add,'D_TRD']
-                d_disp2['BETA_RAW'] = beta_raw_series.reindex(add)
-                d_disp2['BETA_Z'] = beta_z_series.reindex(add)
                 near_tbl = pd.concat([d_disp2, pd.Series({t: d_score_all.get(t) for t in add}, name='DSC')], axis=1)
                 self.d_table = pd.concat([self.d_table, near_tbl], axis=0)
         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
