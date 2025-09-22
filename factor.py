@@ -1283,8 +1283,15 @@ class Selector:
         union = [t for t in pool_tickers if t in returns_df.columns]
         for t in g_fixed:
             if t not in union: union.append(t)
-        Rdf_all = returns_df[union]; Rdf_all = Rdf_all.iloc[-lookback:] if len(Rdf_all)>=lookback else Rdf_all; Rdf_all = Rdf_all.dropna()
-        pool_eff, g_eff = [t for t in pool_tickers if t in Rdf_all.columns], [t for t in g_fixed if t in Rdf_all.columns]
+        Rdf_all = returns_df[union]
+        Rdf_all = Rdf_all.iloc[-lookback:] if len(Rdf_all) >= lookback else Rdf_all
+        _thresh = max(1, int(0.8 * len(Rdf_all)))
+        Rdf_all = Rdf_all.dropna(axis=1, thresh=_thresh)
+        Rdf_all = Rdf_all.dropna()
+        pool_eff, g_eff = (
+            [t for t in pool_tickers if t in Rdf_all.columns],
+            [t for t in g_fixed if t in Rdf_all.columns],
+        )
         if len(pool_eff)==0: return dict(idx=[], tickers=[], avg_res_corr=np.nan, sum_score=0.0, objective=-np.inf)
         score = score_ser.reindex(pool_eff).to_numpy(dtype=np.float32)
         C_all = cls.residual_corr(Rdf_all.to_numpy(), n_pc=n_pc, shrink=shrink)
