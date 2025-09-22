@@ -1,8 +1,5 @@
 '''ROLE: Orchestration ONLY（外部I/O・SSOT・Slack出力）, 計算は scorer.py'''
 # === NOTE: 機能・入出力・ログ文言・例外挙動は不変。安全な短縮（import統合/複数代入/内包表記/メソッドチェーン/一行化/空行圧縮など）のみ適用 ===
-BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
-SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
-SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
 import logging, os, time, requests
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -19,6 +16,93 @@ import config
 
 import warnings, atexit, threading
 from collections import Counter, defaultdict
+
+# === 定数・設定・DTO（import直後に集約） ===
+BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
+SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
+SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
+
+debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
+
+_CSV_LOAD_START = perf_counter()
+exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
+CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
+N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
+g_weights = {'GROWTH_F':0.30,'MOM':0.60,'VOL':-0.10}
+D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "-0.8"))
+FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
+D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
+_fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
+
+# DRRS 初期プール・各種パラメータ
+corrM = 45
+DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
+DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
+
+# クロス相関ペナルティ（未定義なら設定）
+try: CROSS_MU_GD
+except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+
+# 出力関連
+RESULTS_DIR = "results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# === 共有DTO（クラス間I/O契約）＋ Config ===
+@dataclass(frozen=True)
+class InputBundle:
+    # Input → Scorer で受け渡す素材（I/O禁止の生データ）
+    cand: List[str]
+    tickers: List[str]
+    bench: str
+    data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
+    px: pd.DataFrame                # data['Close']
+    spx: pd.Series                  # data['Close'][bench]
+    tickers_bulk: object            # yfinance.Tickers
+    info: Dict[str, dict]           # yfinance info per ticker
+    eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
+    fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
+    returns: pd.DataFrame           # px[tickers].pct_change()
+    missing_logs: pd.DataFrame
+
+@dataclass(frozen=True)
+class FeatureBundle:
+    df: pd.DataFrame
+    df_z: pd.DataFrame
+    g_score: pd.Series
+    d_score_all: pd.Series
+    missing_logs: pd.DataFrame
+    df_full: pd.DataFrame | None = None
+    df_full_z: pd.DataFrame | None = None
+    scaler: Any | None = None
+
+@dataclass(frozen=True)
+class SelectionBundle:
+    resG: dict
+    resD: dict
+    top_G: List[str]
+    top_D: List[str]
+    init_G: List[str]
+    init_D: List[str]
+
+@dataclass(frozen=True)
+class WeightsConfig:
+    g: Dict[str,float]
+    d: Dict[str,float]
+
+@dataclass(frozen=True)
+class DRRSParams:
+    corrM: int
+    shrink: float
+    G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
+    D: Dict[str,float]
+    cross_mu_gd: float
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    weights: WeightsConfig
+    drrs: DRRSParams
+    price_max: float
+    debug_mode: bool = False
 
 # ---------- 重複警告の集約ロジック ----------
 _warn_lock = threading.Lock()
@@ -96,8 +180,6 @@ if _WARN_HARD_LIMIT > 0:
 # ---------- ここまでで警告の“可視性は維持”しつつ“重複で行数爆発”を抑止 ----------
 
 # その他
-debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
-
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=(logging.INFO if debug_mode else logging.WARNING), force=True)
 
@@ -111,87 +193,11 @@ class T:
         T.t = now
 
 T.log("start")
-
-# === ユニバースと定数（冒頭に固定） ===
-exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
+try:
+    T.t = _CSV_LOAD_START
+except NameError:
+    pass
 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
-CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
-N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
-g_weights = {'GROWTH_F':0.30,'MOM':0.60,'VOL':-0.10}
-D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "0.8"))
-FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
-D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
-_fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
-
-# DRRS 初期プール・各種パラメータ
-corrM = 45
-DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
-DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
-
-# クロス相関ペナルティ（未定義なら設定）
-try: CROSS_MU_GD
-except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
-
-# 出力関連
-RESULTS_DIR = "results"
-os.makedirs(RESULTS_DIR, exist_ok=True)
-
-# === 共有DTO（クラス間I/O契約）＋ Config ===
-@dataclass(frozen=True)
-class InputBundle:
-    # Input → Scorer で受け渡す素材（I/O禁止の生データ）
-    cand: List[str]
-    tickers: List[str]
-    bench: str
-    data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
-    px: pd.DataFrame                # data['Close']
-    spx: pd.Series                  # data['Close'][bench]
-    tickers_bulk: object            # yfinance.Tickers
-    info: Dict[str, dict]           # yfinance info per ticker
-    eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
-    fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
-    returns: pd.DataFrame           # px[tickers].pct_change()
-    missing_logs: pd.DataFrame
-
-@dataclass(frozen=True)
-class FeatureBundle:
-    df: pd.DataFrame
-    df_z: pd.DataFrame
-    g_score: pd.Series
-    d_score_all: pd.Series
-    missing_logs: pd.DataFrame
-    df_full: pd.DataFrame | None = None
-    df_full_z: pd.DataFrame | None = None
-    scaler: Any | None = None
-
-@dataclass(frozen=True)
-class SelectionBundle:
-    resG: dict
-    resD: dict
-    top_G: List[str]
-    top_D: List[str]
-    init_G: List[str]
-    init_D: List[str]
-
-@dataclass(frozen=True)
-class WeightsConfig:
-    g: Dict[str,float]
-    d: Dict[str,float]
-
-@dataclass(frozen=True)
-class DRRSParams:
-    corrM: int
-    shrink: float
-    G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
-    D: Dict[str,float]
-    cross_mu_gd: float
-
-@dataclass(frozen=True)
-class PipelineConfig:
-    weights: WeightsConfig
-    drrs: DRRSParams
-    price_max: float
-    debug_mode: bool = False
 
 # === Utilities ===
 def aggregate_warnings(rows, key="message", max_items=10):
@@ -1352,11 +1358,12 @@ class Output:
         print("📈 ファクター分散最適化の結果")
         miss_df, truncated, total = self._prepare_missing_display(self.miss_df)
         self._miss_disp_info = (miss_df, truncated, total)
-        if not miss_df.empty:
-            print("Missing Data:")
-            print(miss_df.to_string(index=False))
+        lines = compact_missing_lines(miss_df)
+        if lines:
+            txt = "Missing Data:\n```" + "\n".join(lines) + "```"
             if truncated:
-                print(f"...省略 ({total}件中 上位20件のみ表示)")
+                txt += f"\n...省略 ({total}件中 上位20件のみ表示)"
+            print(txt)
 
         # ---- 表示用：Changes/Near-Miss のスコア源を“最終集計”に統一するプロキシ ----
         try:
@@ -1524,15 +1531,10 @@ class Output:
         message = "📈 ファクター分散最適化の結果\n"
         miss_df, truncated, total = self._miss_disp_info or self._prepare_missing_display(self.miss_df)
         lines = compact_missing_lines(miss_df, limit=300)
-        if lines:
-            missing_txt = "Missing Data\n" + "\n".join(lines)
-            message += missing_txt + "\n"
-            if truncated:
-                trunc_note = f"...省略 ({total}件中 上位20件のみ表示)"
-                message += trunc_note + "\n"
-                missing_txt += f"\n{trunc_note}"
-            if SLACK_WEBHOOK_URL:
-                _slack_send_text_chunks(SLACK_WEBHOOK_URL, missing_txt)
+        missing_txt = "Missing Data:\n```" + "\n".join(lines) + "```" if lines else ""
+        trunc_note = f"...省略 ({total}件中 上位20件のみ表示)" if truncated else ""
+        if missing_txt:
+            message += missing_txt + ("\n" + trunc_note if trunc_note else "") + "\n"
         message += _blk(_inject_filter_suffix(self.g_title, "G"), self.g_table, self.g_formatters, drop=("TRD",))
         message += _blk(_inject_filter_suffix(self.d_title, "D"), self.d_table, self.d_formatters)
         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table, 'empty', False) else f"```{self.io_table.to_string(index=False)}```\n")

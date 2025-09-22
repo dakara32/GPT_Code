@@ -922,11 +922,12 @@ class Scorer:
         df_z['GROWTH_F'] = grw_series
         df_z['GRW_FLEX_WEIGHT'] = 1.0  # 現状は固定（SECの可用性に依らず）
 
-        if str(os.environ.get("GRW_DBG_DETAIL", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+        if 'GRW_Q_RAW' in df.columns:
             df_z['GRW_Q_DBG'] = pd.Series(df['GRW_Q_RAW'], index=df.index, dtype=float)
+        if 'GRW_A_RAW' in df.columns:
             df_z['GRW_A_DBG'] = pd.Series(df['GRW_A_RAW'], index=df.index, dtype=float)
-            df_z['GRW_WQ_DBG'] = wq_series
-            df_z['GRW_WA_DBG'] = wa_series
+        df_z['GRW_WQ_DBG'] = wq_series
+        df_z['GRW_WA_DBG'] = wa_series
 
         df_z['MOM_F'] = robust_z(0.40*df_z['RS']
             + 0.15*df_z['TR_str']
