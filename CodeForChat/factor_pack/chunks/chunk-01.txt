@@ -2,7 +2,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, factor.py, scorer.py, .github/workflows/weekly-report.yml, documents/README.md, documents/factor_design.md
-# 作成日時: 2025-09-22 11:46:47 (JST)
+# 作成日時: 2025-09-22 12:38:16 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -69,270 +69,267 @@ L28 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_ti
 L29 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
 L30 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
 L31 g_weights = {'GROWTH_F':0.30,'MOM':0.60,'VOL':-0.10}
-L32 D_BETA_MAX = float(os.environ.get("D_BETA_MAX", "-0.8"))
-L33 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_MAX}}}
-L34 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
-L35 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
-L36
-L37 # DRRS 初期プール・各種パラメータ
-L38 corrM = 45
-L39 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
-L40 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
-L41
-L42 # クロス相関ペナルティ（未定義なら設定）
-L43 try: CROSS_MU_GD
-L44 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+L32 D_BETA_MODE = os.environ.get("D_BETA_MODE", "z").lower()   # "raw" or "z"
+L33 D_BETA_CUTOFF = float(os.environ.get("D_BETA_CUTOFF", "-0.8"))
+L34 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_CUTOFF}}}
+L35 D_weights = {'QAL':0.1,'YLD':0.3,'VOL':-0.5,'TRD':0.1}
+L36 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
+L37
+L38 def _zscore_series(s: pd.Series) -> pd.Series:
+L39     # NaNはそのまま、標準偏差0なら全NaNにする（暴走防止）
+L40     v = s.astype(float)
+L41     m, std = v.mean(skipna=True), v.std(skipna=True, ddof=0)
+L42     if not np.isfinite(std) or std == 0:
+L43         return pd.Series(index=v.index, dtype=float)
+L44     return (v - m) / std
 L45
-L46 # 出力関連
-L47 RESULTS_DIR = "results"
-L48 os.makedirs(RESULTS_DIR, exist_ok=True)
-L49
-L50 # === 共有DTO（クラス間I/O契約）＋ Config ===
-L51 @dataclass(frozen=True)
-L52 class InputBundle:
-L53     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
-L54     cand: List[str]
-L55     tickers: List[str]
-L56     bench: str
-L57     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
-L58     px: pd.DataFrame                # data['Close']
-L59     spx: pd.Series                  # data['Close'][bench]
-L60     tickers_bulk: object            # yfinance.Tickers
-L61     info: Dict[str, dict]           # yfinance info per ticker
-L62     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
-L63     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
-L64     returns: pd.DataFrame           # px[tickers].pct_change()
-L65     missing_logs: pd.DataFrame
-L66
-L67 @dataclass(frozen=True)
-L68 class FeatureBundle:
-L69     df: pd.DataFrame
-L70     df_z: pd.DataFrame
-L71     g_score: pd.Series
-L72     d_score_all: pd.Series
-L73     missing_logs: pd.DataFrame
-L74     df_full: pd.DataFrame | None = None
-L75     df_full_z: pd.DataFrame | None = None
-L76     scaler: Any | None = None
-L77
-L78 @dataclass(frozen=True)
-L79 class SelectionBundle:
-L80     resG: dict
-L81     resD: dict
-L82     top_G: List[str]
-L83     top_D: List[str]
-L84     init_G: List[str]
-L85     init_D: List[str]
+L46 # DRRS 初期プール・各種パラメータ
+L47 corrM = 45
+L48 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
+L49 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
+L50
+L51 # クロス相関ペナルティ（未定義なら設定）
+L52 try: CROSS_MU_GD
+L53 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+L54
+L55 # 出力関連
+L56 RESULTS_DIR = "results"
+L57 os.makedirs(RESULTS_DIR, exist_ok=True)
+L58
+L59 # === 共有DTO（クラス間I/O契約）＋ Config ===
+L60 @dataclass(frozen=True)
+L61 class InputBundle:
+L62     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
+L63     cand: List[str]
+L64     tickers: List[str]
+L65     bench: str
+L66     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
+L67     px: pd.DataFrame                # data['Close']
+L68     spx: pd.Series                  # data['Close'][bench]
+L69     tickers_bulk: object            # yfinance.Tickers
+L70     info: Dict[str, dict]           # yfinance info per ticker
+L71     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
+L72     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
+L73     returns: pd.DataFrame           # px[tickers].pct_change()
+L74     missing_logs: pd.DataFrame
+L75
+L76 @dataclass(frozen=True)
+L77 class FeatureBundle:
+L78     df: pd.DataFrame
+L79     df_z: pd.DataFrame
+L80     g_score: pd.Series
+L81     d_score_all: pd.Series
+L82     missing_logs: pd.DataFrame
+L83     df_full: pd.DataFrame | None = None
+L84     df_full_z: pd.DataFrame | None = None
+L85     scaler: Any | None = None
 L86
 L87 @dataclass(frozen=True)
-L88 class WeightsConfig:
-L89     g: Dict[str,float]
-L90     d: Dict[str,float]
-L91
-L92 @dataclass(frozen=True)
-L93 class DRRSParams:
-L94     corrM: int
-L95     shrink: float
-L96     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
-L97     D: Dict[str,float]
-L98     cross_mu_gd: float
-L99
-L100 @dataclass(frozen=True)
-L101 class PipelineConfig:
-L102     weights: WeightsConfig
-L103     drrs: DRRSParams
-L104     price_max: float
-L105     debug_mode: bool = False
-L106
-L107 # ---------- 重複警告の集約ロジック ----------
-L108 _warn_lock = threading.Lock()
-L109 _warn_seen = set()                     # 初回表示済みキー
-L110 _warn_count = Counter()                # (category, message, module) → 件数
-L111 _warn_first_ctx = {}                   # 初回の (filename, lineno)
-L112
-L113 def _warn_key(message, category, filename, lineno, *_args, **_kwargs):
-L114     # "同じ警告" を定義: カテゴリ + 正規化メッセージ + モジュールパス(先頭数階層)
-L115     mod = filename.split("/site-packages/")[-1] if "/site-packages/" in filename else filename
-L116     mod = mod.rsplit("/", 3)[-1]  # 長すぎ抑制（末尾3階層まで）
-L117     msg = str(message).strip()
-L118     return (category.__name__, msg, mod)
-L119
-L120 _orig_showwarning = warnings.showwarning
+L88 class SelectionBundle:
+L89     resG: dict
+L90     resD: dict
+L91     top_G: List[str]
+L92     top_D: List[str]
+L93     init_G: List[str]
+L94     init_D: List[str]
+L95
+L96 @dataclass(frozen=True)
+L97 class WeightsConfig:
+L98     g: Dict[str,float]
+L99     d: Dict[str,float]
+L100
+L101 @dataclass(frozen=True)
+L102 class DRRSParams:
+L103     corrM: int
+L104     shrink: float
+L105     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
+L106     D: Dict[str,float]
+L107     cross_mu_gd: float
+L108
+L109 @dataclass(frozen=True)
+L110 class PipelineConfig:
+L111     weights: WeightsConfig
+L112     drrs: DRRSParams
+L113     price_max: float
+L114     debug_mode: bool = False
+L115
+L116 # ---------- 重複警告の集約ロジック ----------
+L117 _warn_lock = threading.Lock()
+L118 _warn_seen = set()                     # 初回表示済みキー
+L119 _warn_count = Counter()                # (category, message, module) → 件数
+L120 _warn_first_ctx = {}                   # 初回の (filename, lineno)
 L121
-L122 def _compact_showwarning(message, category, filename, lineno, file=None, line=None):
-L123     key = _warn_key(message, category, filename, lineno)
-L124     with _warn_lock:
-L125         _warn_count[key] += 1
-L126         if key not in _warn_seen:
-L127             # 初回だけ1行で出す（カテゴリ | モジュール | メッセージ）
-L128             _warn_seen.add(key)
-L129             _warn_first_ctx[key] = (filename, lineno)
-L130             # 1行フォーマット（行数節約）
-L131             txt = f"[WARN][{category.__name__}] {message} | {filename}:{lineno}"
-L132             print(txt)
-L133         # 2回目以降は出さない（集約）
-L134
-L135 warnings.showwarning = _compact_showwarning
-L136
-L137 # ベースポリシー: 通常は警告を出す（default）→ ただし同一メッセージは集約
-L138 warnings.resetwarnings()
-L139 warnings.simplefilter("default")
-L140
-L141 # 2) ピンポイント間引き: yfinance 'Ticker.earnings' は "once"（初回のみ可視化）
-L142 warnings.filterwarnings(
-L143     "once",
-L144     message="'Ticker.earnings' is deprecated",
-L145     category=DeprecationWarning,
-L146     module="yfinance"
-L147 )
-L148
-L149 # 3) 最終サマリ: 同一警告が何回出たかを最後に1行で
-L150 @atexit.register
-L151 def _print_warning_summary():
-L152     suppressed = []
-L153     for key, cnt in _warn_count.items():
-L154         if cnt > 1:
-L155             (cat, msg, mod) = key
-L156             filename, lineno = _warn_first_ctx.get(key, ("", 0))
-L157             suppressed.append((cnt, cat, msg, mod, filename, lineno))
-L158     if suppressed:
-L159         suppressed.sort(reverse=True)  # 件数降順
-L160         # 最多上位だけ出す（必要なら上限制御：ここでは上位10件）
-L161         top = suppressed[:10]
-L162         print(f"[WARN-SUMMARY] duplicated warning groups: {len(suppressed)}")
-L163         for cnt, cat, msg, mod, filename, lineno in top:
-L164             print(f"[WARN-SUMMARY] {cnt-1} more | [{cat}] {msg} | {mod} ({filename}:{lineno})")
-L165         if len(suppressed) > len(top):
-L166             print(f"[WARN-SUMMARY] ... and {len(suppressed)-len(top)} more groups suppressed")
-L167
-L168 # 4) 追加（任意）: 1ジョブあたりの総警告上限を設定したい場合
-L169 #    例: 上限1000を超えたら以降は完全サイレント
-L170 _WARN_HARD_LIMIT = int(os.getenv("WARN_HARD_LIMIT", "0") or "0")  # 0なら無効
-L171 if _WARN_HARD_LIMIT > 0:
-L172     _orig_warn_func = warnings.warn
-L173     def _limited_warn(*a, **k):
-L174         total = sum(_warn_count.values())
-L175         if total < _WARN_HARD_LIMIT:
-L176             return _orig_warn_func(*a, **k)
-L177         # 超過後は捨てる（最後にsummaryだけ残る）
-L178     warnings.warn = _limited_warn
-L179
-L180 # ---------- ここまでで警告の“可視性は維持”しつつ“重複で行数爆発”を抑止 ----------
-L181
-L182 # その他
-L183 logger = logging.getLogger(__name__)
-L184 logging.basicConfig(level=(logging.INFO if debug_mode else logging.WARNING), force=True)
-L185
-L186 class T:
-L187     t = perf_counter()
+L122 def _warn_key(message, category, filename, lineno, *_args, **_kwargs):
+L123     # "同じ警告" を定義: カテゴリ + 正規化メッセージ + モジュールパス(先頭数階層)
+L124     mod = filename.split("/site-packages/")[-1] if "/site-packages/" in filename else filename
+L125     mod = mod.rsplit("/", 3)[-1]  # 長すぎ抑制（末尾3階層まで）
+L126     msg = str(message).strip()
+L127     return (category.__name__, msg, mod)
+L128
+L129 _orig_showwarning = warnings.showwarning
+L130
+L131 def _compact_showwarning(message, category, filename, lineno, file=None, line=None):
+L132     key = _warn_key(message, category, filename, lineno)
+L133     with _warn_lock:
+L134         _warn_count[key] += 1
+L135         if key not in _warn_seen:
+L136             # 初回だけ1行で出す（カテゴリ | モジュール | メッセージ）
+L137             _warn_seen.add(key)
+L138             _warn_first_ctx[key] = (filename, lineno)
+L139             # 1行フォーマット（行数節約）
+L140             txt = f"[WARN][{category.__name__}] {message} | {filename}:{lineno}"
+L141             print(txt)
+L142         # 2回目以降は出さない（集約）
+L143
+L144 warnings.showwarning = _compact_showwarning
+L145
+L146 # ベースポリシー: 通常は警告を出す（default）→ ただし同一メッセージは集約
+L147 warnings.resetwarnings()
+L148 warnings.simplefilter("default")
+L149
+L150 # 2) ピンポイント間引き: yfinance 'Ticker.earnings' は "once"（初回のみ可視化）
+L151 warnings.filterwarnings(
+L152     "once",
+L153     message="'Ticker.earnings' is deprecated",
+L154     category=DeprecationWarning,
+L155     module="yfinance"
+L156 )
+L157
+L158 # 3) 最終サマリ: 同一警告が何回出たかを最後に1行で
+L159 @atexit.register
+L160 def _print_warning_summary():
+L161     suppressed = []
+L162     for key, cnt in _warn_count.items():
+L163         if cnt > 1:
+L164             (cat, msg, mod) = key
+L165             filename, lineno = _warn_first_ctx.get(key, ("", 0))
+L166             suppressed.append((cnt, cat, msg, mod, filename, lineno))
+L167     if suppressed:
+L168         suppressed.sort(reverse=True)  # 件数降順
+L169         # 最多上位だけ出す（必要なら上限制御：ここでは上位10件）
+L170         top = suppressed[:10]
+L171         print(f"[WARN-SUMMARY] duplicated warning groups: {len(suppressed)}")
+L172         for cnt, cat, msg, mod, filename, lineno in top:
+L173             print(f"[WARN-SUMMARY] {cnt-1} more | [{cat}] {msg} | {mod} ({filename}:{lineno})")
+L174         if len(suppressed) > len(top):
+L175             print(f"[WARN-SUMMARY] ... and {len(suppressed)-len(top)} more groups suppressed")
+L176
+L177 # 4) 追加（任意）: 1ジョブあたりの総警告上限を設定したい場合
+L178 #    例: 上限1000を超えたら以降は完全サイレント
+L179 _WARN_HARD_LIMIT = int(os.getenv("WARN_HARD_LIMIT", "0") or "0")  # 0なら無効
+L180 if _WARN_HARD_LIMIT > 0:
+L181     _orig_warn_func = warnings.warn
+L182     def _limited_warn(*a, **k):
+L183         total = sum(_warn_count.values())
+L184         if total < _WARN_HARD_LIMIT:
+L185             return _orig_warn_func(*a, **k)
+L186         # 超過後は捨てる（最後にsummaryだけ残る）
+L187     warnings.warn = _limited_warn
 L188
-L189     @staticmethod
-L190     def log(tag):
-L191         now = perf_counter()
-L192         print(f"[T] {tag}: {now - T.t:.2f}s")
-L193         T.t = now
+L189 # ---------- ここまでで警告の“可視性は維持”しつつ“重複で行数爆発”を抑止 ----------
+L190
+L191 # その他
+L192 logger = logging.getLogger(__name__)
+L193 logging.basicConfig(level=(logging.INFO if debug_mode else logging.WARNING), force=True)
 L194
-L195 T.log("start")
-L196 try:
-L197     T.t = _CSV_LOAD_START
-L198 except NameError:
-L199     pass
-L200 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
-L201
-L202 # === Utilities ===
-L203 def aggregate_warnings(rows, key="message", max_items=10):
-L204     """
-L205     同一内容の警告を '×N' 表記でまとめる。機能変更なし（位置のみ移動）。
-L206     rows: List[Dict] または List[str]
-L207     """
-L208     from collections import Counter
-L209
-L210     if not rows:
-L211         return []
-L212
-L213     if isinstance(rows[0], dict):
-L214         msgs = [str(r.get(key, "")) for r in rows if r.get(key)]
-L215     else:
-L216         msgs = [str(r) for r in rows if r]
-L217
-L218     cnt = Counter(msgs)
-L219     out = [f"{m} ×{n}" if n > 1 else m for m, n in cnt.most_common()]
-L220     return out[:max_items]
+L195 class T:
+L196     t = perf_counter()
+L197
+L198     @staticmethod
+L199     def log(tag):
+L200         now = perf_counter()
+L201         print(f"[T] {tag}: {now - T.t:.2f}s")
+L202         T.t = now
+L203
+L204 T.log("start")
+L205 try:
+L206     T.t = _CSV_LOAD_START
+L207 except NameError:
+L208     pass
+L209 T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
+L210
+L211 # === Utilities ===
+L212 def aggregate_warnings(rows, key="message", max_items=10):
+L213     """
+L214     同一内容の警告を '×N' 表記でまとめる。機能変更なし（位置のみ移動）。
+L215     rows: List[Dict] または List[str]
+L216     """
+L217     from collections import Counter
+L218
+L219     if not rows:
+L220         return []
 L221
-L222
-L223 def compact_missing_lines(missing_df, limit=300):
-L224     if missing_df is None or getattr(missing_df, "empty", True):
-L225         return []
+L222     if isinstance(rows[0], dict):
+L223         msgs = [str(r.get(key, "")) for r in rows if r.get(key)]
+L224     else:
+L225         msgs = [str(r) for r in rows if r]
 L226
-L227     df = missing_df.copy()
-L228     if "ticker" not in df.columns:
-L229         df = df.reset_index().rename(columns={"index": "ticker"})
+L227     cnt = Counter(msgs)
+L228     out = [f"{m} ×{n}" if n > 1 else m for m, n in cnt.most_common()]
+L229     return out[:max_items]
 L230
-L231     out: list[str] = []
-L232     for _, r in df.iterrows():
-L233         tags: list[str] = []
-L234         if bool(r.get("EPS_missing", False)):
-L235             tags.append("eps")
-L236         if bool(r.get("REV_missing", False)):
-L237             tags.append("rev")
-L238         if tags:
-L239             ticker = r.get("ticker")
-L240             if pd.isna(ticker) or ticker is None:
-L241                 ticker = "(unknown)"
-L242             else:
-L243                 ticker = str(ticker)
-L244             out.append(f"{ticker} : {', '.join(tags)}")
-L245         if len(out) >= limit:
-L246             out.append("...")
-L247             break
-L248
-L249     return out
-L250
-L251 # === 共通ユーティリティ（複数クラスで使用） ===
-L252 # (unused local utils removed – use scorer.py versions if needed)
-L253
-L254 def _build_missing_logs_after_impute(eps_df: pd.DataFrame) -> pd.DataFrame:
-L255     df = eps_df.copy()
-L256     required_cols = [
-L257         "EPS_TTM",
-L258         "EPS_Q_LastQ",
-L259         "EPS_A_LATEST",
-L260         "REV_TTM",
-L261         "REV_Q_LastQ",
-L262         "REV_A_LATEST",
-L263     ]
-L264     for col in required_cols:
-L265         if col not in df.columns:
-L266             df[col] = np.nan
-L267
-L268     miss_eps = df["EPS_TTM"].isna() & df["EPS_Q_LastQ"].isna() & df["EPS_A_LATEST"].isna()
-L269     miss_rev = df["REV_TTM"].isna() & df["REV_Q_LastQ"].isna() & df["REV_A_LATEST"].isna()
-L270
-L271     rows: list[dict] = []
-L272     for ticker, row in df.iterrows():
-L273         eps_missing = bool(miss_eps.loc[ticker])
-L274         rev_missing = bool(miss_rev.loc[ticker])
-L275         if not (eps_missing or rev_missing):
-L276             continue
-L277         rows.append({
-L278             "ticker": ticker,
-L279             "EPS_missing": eps_missing,
-L280             "REV_missing": rev_missing,
-L281             "eps_imputed": bool(row.get("eps_imputed", False)),
-L282             "EPS_TTM": row.get("EPS_TTM"),
-L283             "EPS_Q_LastQ": row.get("EPS_Q_LastQ"),
-L284             "EPS_A_LATEST": row.get("EPS_A_LATEST"),
-L285             "REV_TTM": row.get("REV_TTM"),
-L286             "REV_Q_LastQ": row.get("REV_Q_LastQ"),
-L287             "REV_A_LATEST": row.get("REV_A_LATEST"),
-L288         })
-L289
-L290     if not rows:
-L291         return pd.DataFrame(
-L292             columns=[
-L293                 "ticker",
-L294                 "EPS_missing",
-L295                 "REV_missing",
-L296                 "eps_imputed",
-L297                 "EPS_TTM",
+L231
+L232 def compact_missing_lines(missing_df, limit=300):
+L233     if missing_df is None or getattr(missing_df, "empty", True):
+L234         return []
+L235
+L236     df = missing_df.copy()
+L237     if "ticker" not in df.columns:
+L238         df = df.reset_index().rename(columns={"index": "ticker"})
+L239
+L240     out: list[str] = []
+L241     for _, r in df.iterrows():
+L242         tags: list[str] = []
+L243         if bool(r.get("EPS_missing", False)):
+L244             tags.append("eps")
+L245         if bool(r.get("REV_missing", False)):
+L246             tags.append("rev")
+L247         if tags:
+L248             ticker = r.get("ticker")
+L249             if pd.isna(ticker) or ticker is None:
+L250                 ticker = "(unknown)"
+L251             else:
+L252                 ticker = str(ticker)
+L253             out.append(f"{ticker} : {', '.join(tags)}")
+L254         if len(out) >= limit:
+L255             out.append("...")
+L256             break
+L257
+L258     return out
+L259
+L260 # === 共通ユーティリティ（複数クラスで使用） ===
+L261 # (unused local utils removed – use scorer.py versions if needed)
+L262
+L263 def _build_missing_logs_after_impute(eps_df: pd.DataFrame) -> pd.DataFrame:
+L264     df = eps_df.copy()
+L265     required_cols = [
+L266         "EPS_TTM",
+L267         "EPS_Q_LastQ",
+L268         "EPS_A_LATEST",
+L269         "REV_TTM",
+L270         "REV_Q_LastQ",
+L271         "REV_A_LATEST",
+L272     ]
+L273     for col in required_cols:
+L274         if col not in df.columns:
+L275             df[col] = np.nan
+L276
+L277     miss_eps = df["EPS_TTM"].isna() & df["EPS_Q_LastQ"].isna() & df["EPS_A_LATEST"].isna()
+L278     miss_rev = df["REV_TTM"].isna() & df["REV_Q_LastQ"].isna() & df["REV_A_LATEST"].isna()
+L279
+L280     rows: list[dict] = []
+L281     for ticker, row in df.iterrows():
+L282         eps_missing = bool(miss_eps.loc[ticker])
+L283         rev_missing = bool(miss_rev.loc[ticker])
+L284         if not (eps_missing or rev_missing):
+L285             continue
+L286         rows.append({
+L287             "ticker": ticker,
+L288             "EPS_missing": eps_missing,
+L289             "REV_missing": rev_missing,
+L290             "eps_imputed": bool(row.get("eps_imputed", False)),
+L291             "EPS_TTM": row.get("EPS_TTM"),
+L292             "EPS_Q_LastQ": row.get("EPS_Q_LastQ"),
+L293             "EPS_A_LATEST": row.get("EPS_A_LATEST"),
+L294             "REV
 ```

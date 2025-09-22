@@ -1,5 +1,55 @@
 ```text
-      # === Z化と合成 ===
+eps_yoy, grw_a_rev_yoy, grw_a_eps_cagr, grw_a_rev_cagr)
+L769         ]
+L770
+L771         df['GRW_Q_RAW'] = pd.Series(grw_q_combined, index=df.index, dtype=float)
+L772         df['GRW_A_RAW'] = pd.Series(grw_a_combined, index=df.index, dtype=float)
+L773
+L774         def _trend_template_pass(row, rs_alpha_thresh=0.10):
+L775             c1 = (row.get('P_OVER_150', np.nan) > 0) and (row.get('P_OVER_200', np.nan) > 0)
+L776             c2 = (row.get('MA150_OVER_200', np.nan) > 0)
+L777             c3 = (row.get('MA200_SLOPE_1M', np.nan) > 0)
+L778             c4 = (row.get('MA50_OVER_150', np.nan) > 0) and (row.get('MA50_OVER_200', np.nan) > 0)
+L779             c5 = (row.get('TR_str', np.nan) > 0)
+L780             c6 = (row.get('P_OVER_LOW52', np.nan) >= 0.30)
+L781             c7 = (row.get('NEAR_52W_HIGH', np.nan) >= -0.25)
+L782             c8 = (row.get('RS', np.nan) >= 0.10)
+L783             return bool(c1 and c2 and c3 and c4 and c5 and c6 and c7 and c8)
+L784
+L785         if 'trend_template' not in df.columns: df['trend_template'] = df.apply(_trend_template_pass, axis=1).fillna(False)
+L786         assert 'trend_template' in df.columns
+L787
+L788         def _calc_eps_abs_slope(eps_series, n=12):
+L789             try:
+L790                 if isinstance(eps_series, pd.Series):
+L791                     series = pd.to_numeric(eps_series, errors="coerce").dropna()
+L792                 elif isinstance(eps_series, (list, tuple, np.ndarray)):
+L793                     series = pd.Series(eps_series, dtype=float).dropna()
+L794                 else:
+L795                     return 0.0
+L796             except Exception:
+L797                 return 0.0
+L798
+L799             if series.empty:
+L800                 return 0.0
+L801
+L802             tail = series.tail(n).to_numpy(dtype=float)
+L803             if tail.size < 2:
+L804                 return 0.0
+L805
+L806             x = np.arange(tail.size, dtype=float)
+L807             x = x - x.mean()
+L808             y = tail - tail.mean()
+L809             denom = np.dot(x, x)
+L810             if denom == 0:
+L811                 return 0.0
+L812             slope = float(np.dot(x, y) / denom)
+L813             return slope
+L814
+L815         df['EPS_ABS_SLOPE'] = df['EPS_SERIES'].apply(_calc_eps_abs_slope).astype(float)
+L816         df.drop(columns=['EPS_SERIES'], inplace=True)
+L817
+L818         # === Z化と合成 ===
 L819         for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
 L820
 L821         df_z = pd.DataFrame(index=df.index)
@@ -180,54 +230,5 @@ L995         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
 L996
 L997         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
 L998         df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
-L999         df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
-L1000         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
-L1001
-L1002         # --- 重みは cfg を優先（外部があればそれを使用） ---
-L1003         # ① 全銘柄で G/D スコアを算出（unmasked）
-L1004         g_weights = pd.Series(cfg.weights.g, dtype=float)
-L1005         need_g = ["GROWTH_F", "MOM"]
-L1006         dbg_cols = ["GROWTH_F", "MOM", "VOL"]
-L1007         if all(c in df_z.columns for c in need_g):
-L1008             mask_g = df_z[need_g].notna().all(axis=1)
-L1009         else:
-L1010             mask_g = pd.Series(False, index=df_z.index, dtype=bool)
-L1011         for c in dbg_cols:
-L1012             if c in df_z.columns:
-L1013                 df_z[f"DBGRW.{c}"] = df_z[c]
-L1014         df_fill_g = df_z.reindex(columns=g_weights.index, fill_value=np.nan).copy()
-L1015         for c in df_fill_g.columns:
-L1016             if c not in need_g:
-L1017                 df_fill_g[c] = df_fill_g[c].fillna(0)
-L1018         g_score_all = _as_numeric_series(
-L1019             df_fill_g.mul(g_weights.reindex(df_fill_g.columns)).sum(axis=1, skipna=False)
-L1020         )
-L1021         g_score_all = g_score_all.where(mask_g)
-L1022
-L1023         d_comp = pd.concat({
-L1024             'QAL': df_z['D_QAL'],
-L1025             'YLD': df_z['D_YLD'],
-L1026             'VOL': df_z['D_VOL_RAW'],
-L1027             'TRD': df_z['D_TRD']
-L1028         }, axis=1)
-L1029         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
-L1030         globals()['D_WEIGHTS_EFF'] = dw.copy()
-L1031         need_d_candidates = ["VOL", "QAL"]
-L1032         mask_d = pd.Series(True, index=d_comp.index, dtype=bool)
-L1033         for c in need_d_candidates:
-L1034             if c in d_comp.columns:
-L1035                 mask_d &= d_comp[c].notna()
-L1036             else:
-L1037                 mask_d &= False
-L1038         df_fill_d = d_comp.copy()
-L1039         for c in df_fill_d.columns:
-L1040             if c not in need_d_candidates:
-L1041                 df_fill_d[c] = df_fill_d[c].fillna(0)
-L1042         d_score_all = _as_numeric_series(
-L1043             df_fill_d.mul(dw, axis=1).sum(axis=1, skipna=False)
-L1044         )
-L1045         d_score_all = d_score_all.where(mask_d)
-L1046
-L1047         # ② テンプレ判定（既存ロジックそのまま）
-L1048         mask = df['tren
+L999         df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5
 ```

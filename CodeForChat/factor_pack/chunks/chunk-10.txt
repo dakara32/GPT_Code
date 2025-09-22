@@ -1,5 +1,50 @@
 ```text
-
+):
+L310         r, m = series.pct_change().dropna(), market.pct_change().dropna()
+L311         n = min(len(r), len(m), lookback)
+L312         if n<60: return np.nan
+L313         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
+L314         return np.nan if var==0 else cov/var
+L315
+L316     @staticmethod
+L317     def spx_to_alpha(spx: pd.Series, bands=(0.03,0.10), w=(0.6,0.4),
+L318                      span=5, q=(0.20,0.40), alphas=(0.05,0.08,0.10)) -> float:
+L319         """
+L320         S&P500指数のみから擬似breadthを作り、履歴分位でαを段階決定。
+L321         bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
+L322         """
+L323         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
+L324         b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
+L325         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
+L326         b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
+L327         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
+L328
+L329     @staticmethod
+L330     def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
+L331         """
+L332         同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
+L333         戻り値は降順ソート済み。
+L334         """
+L335         s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
+L336         cnt, pen = {}, {}
+L337         for t in order:
+L338             sec = sectors.get(t, "U"); cnt[sec] = cnt.get(sec,0) + 1; pen[t] = alpha*max(0, cnt[sec]-cap)
+L339         return (s - pd.Series(pen)).sort_values(ascending=False)
+L340
+L341     @staticmethod
+L342     def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08, hard: int|None=5) -> list[str]:
+L343         """
+L344         soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
+L345         """
+L346         eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
+L347         eff = eff.dropna()
+L348         if not hard:
+L349             return list(eff.head(N).index)
+L350         pick, used = [], {}
+L351         for t in eff.index:
+L352             s = sectors.get(t, "U")
+L353             if used.get(s,0) < hard:
+L354                 pick.append(t); used[s] = used.get(s,0) + 1
 L355             if len(pick) == N: break
 L356         return pick
 L357
@@ -186,47 +231,5 @@ L537             df.loc[t,'MARKET_CAP'] = d.get('marketCap',np.nan); adv60 = np.
 L538             try:
 L539                 if isinstance(volume_series_full, pd.Series):
 L540                     vol_series = volume_series_full.reindex(s.index).dropna()
-L541                     if len(vol_series) >= 5:
-L542                         aligned_px = s.reindex(vol_series.index).dropna()
-L543                         if len(aligned_px) == len(vol_series):
-L544                             dv = (vol_series*aligned_px).rolling(60).mean()
-L545                             if not dv.dropna().empty:
-L546                                 adv60 = float(dv.dropna().iloc[-1])
-L547             except Exception:
-L548                 pass
-L549             df.loc[t,'ADV60_USD'] = adv60
-L550
-L551             # --- Rule of 40 や周辺 ---
-L552             total_rev_ttm = d.get('totalRevenue',np.nan)
-L553             FCF_MGN = _safe_div(fcf_val, total_rev_ttm)
-L554             df.loc[t,'FCF_MGN'] = FCF_MGN
-L555             rule40 = np.nan
-L556             try:
-L557                 r = df.loc[t,'REV']; rule40 = (r if pd.notna(r) else np.nan) + (FCF_MGN if pd.notna(FCF_MGN) else np.nan)
-L558             except Exception: pass
-L559             df.loc[t,'RULE40'] = rule40
-L560
-L561             # --- トレンド補助 ---
-L562             sma50  = s.rolling(50).mean()
-L563             sma150 = s.rolling(150).mean()
-L564             sma200 = s.rolling(200).mean()
-L565             p = _safe_last(s)
-L566
-L567             df.loc[t,'MA50_OVER_150'] = (_safe_last(sma50)/_safe_last(sma150) - 1
-L568                 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan)
-L569             df.loc[t,'MA150_OVER_200'] = (_safe_last(sma150)/_safe_last(sma200) - 1
-L570                 if pd.notna(_safe_last(sma150)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan)
-L571
-L572             lo52 = s[-252:].min() if len(s)>=252 else s.min()
-L573             df.loc[t,'P_OVER_LOW52'] = (p/lo52 - 1) if (lo52 and lo52>0 and pd.notna(p)) else np.nan
-L574
-L575             df.loc[t,'MA200_SLOPE_1M'] = np.nan
-L576             if len(sma200.dropna()) >= 21:
-L577                 cur200 = _safe_last(sma200)
-L578                 old2001 = float(sma200.iloc[-21])
-L579                 if old2001:
-L580                     df.loc[t,'MA200_SLOPE_1M'] = cur200/old2001 - 1
-L581
-L582             df.loc[t,'P_OVER_150'] = p/_safe_last(sma150)-1 if pd.notna(_safe_last(sma150)) and _safe_last(sma150)!=0 else np.nan
-L583             df.loc[t,'P_OVER_200'] = p/_safe_last(sma200)-1 if pd.notna(_safe_last(sma200)) an
+L541                     if 
 ```

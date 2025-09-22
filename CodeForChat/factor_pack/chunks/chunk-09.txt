@@ -1,5 +1,67 @@
 ```text
-turn float(x.item())
+ def _log(stage, msg):
+L45     try:
+L46         print(f"[DBG][{_dt.utcnow().isoformat(timespec='seconds')}Z][{stage}] {msg}")
+L47     except Exception:
+L48         print(f"[DBG][{stage}] {msg}")
+L49
+L50
+L51 # ---- Dividend Helpers -------------------------------------------------------
+L52 def _last_close(t, price_map=None):
+L53     if price_map and (c := price_map.get(t)) is not None: return float(c)
+L54     try:
+L55         h = yf.Ticker(t).history(period="5d")["Close"].dropna()
+L56         return float(h.iloc[-1]) if len(h) else np.nan
+L57     except Exception:
+L58         return np.nan
+L59
+L60 def _ttm_div_sum(t, lookback_days=400):
+L61     try:
+L62         div = yf.Ticker(t).dividends
+L63         if div is None or len(div) == 0: return 0.0
+L64         cutoff = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=lookback_days)
+L65         ttm = float(div[div.index.tz_localize(None) >= cutoff].sum())
+L66         return ttm if ttm > 0 else float(div.tail(4).sum())
+L67     except Exception:
+L68         return 0.0
+L69
+L70 def ttm_div_yield_portfolio(tickers, price_map=None):
+L71     ys = [(lambda c, s: (s/c) if (np.isfinite(c) and c>0 and s>0) else 0.0)(_last_close(t, price_map), _ttm_div_sum(t)) for t in tickers]
+L72     return float(np.mean(ys)) if ys else 0.0
+L73
+L74 # ---- 簡易ユーティリティ（安全な短縮のみ） -----------------------------------
+L75 def _as_numeric_series(s: pd.Series) -> pd.Series:
+L76     """Series を float dtype に強制変換し、index を保持する。"""
+L77     if s is None:
+L78         return pd.Series(dtype=float)
+L79     v = pd.to_numeric(s, errors="coerce")
+L80     return pd.Series(v.values, index=getattr(s, "index", None), dtype=float, name=getattr(s, "name", None))
+L81
+L82
+L83 def _scalar(x):
+L84     """
+L85     入力を安全に float スカラへ変換する。
+L86
+L87     許容する入力パターン:
+L88       - pandas.Series: 非NaNの最後の値を採用
+L89       - numpy スカラ/配列: 最後の要素を採用
+L90       - その他の数値っぽい値: float へ変換
+L91
+L92     変換できない場合は np.nan を返す。
+L93     """
+L94
+L95     if x is None:
+L96         return np.nan
+L97
+L98     # pandas.Series の場合は非NaNの最後の値を採用
+L99     if isinstance(x, pd.Series):
+L100         s = pd.to_numeric(x, errors="coerce").dropna()
+L101         return float(s.iloc[-1]) if not s.empty else np.nan
+L102
+L103     # numpy スカラ (item() を持つ) ※文字列は除外
+L104     if hasattr(x, "item") and not isinstance(x, (str, bytes)):
+L105         try:
+L106             return float(x.item())
 L107         except Exception:
 L108             pass
 L109
@@ -202,50 +264,5 @@ L305             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrow
 L306         except Exception: return {}
 L307
 L308     @staticmethod
-L309     def calc_beta(series: pd.Series, market: pd.Series, lookback=252):
-L310         r, m = series.pct_change().dropna(), market.pct_change().dropna()
-L311         n = min(len(r), len(m), lookback)
-L312         if n<60: return np.nan
-L313         r, m = r.iloc[-n:], m.iloc[-n:]; cov, var = np.cov(r, m)[0,1], np.var(m)
-L314         return np.nan if var==0 else cov/var
-L315
-L316     @staticmethod
-L317     def spx_to_alpha(spx: pd.Series, bands=(0.03,0.10), w=(0.6,0.4),
-L318                      span=5, q=(0.20,0.40), alphas=(0.05,0.08,0.10)) -> float:
-L319         """
-L320         S&P500指数のみから擬似breadthを作り、履歴分位でαを段階決定。
-L321         bands=(±3%, ±10%), w=(50DMA,200DMA), 分位q=(20%,40%), alphas=(低,中,高)
-L322         """
-L323         ma50, ma200 = spx.rolling(50).mean(), spx.rolling(200).mean()
-L324         b50, b200 = ((spx/ma50 - 1)+bands[0])/(2*bands[0]), ((spx/ma200 - 1)+bands[1])/(2*bands[1])
-L325         hist = (w[0]*b50 + w[1]*b200).clip(0,1).ewm(span=span).mean()
-L326         b, (lo, mid) = float(hist.iloc[-1]), (float(hist.quantile(q[0])), float(hist.quantile(q[1])))
-L327         return alphas[0] if b < lo else alphas[1] if b < mid else alphas[2]
-L328
-L329     @staticmethod
-L330     def soft_cap_effective_scores(scores: pd.Series|dict, sectors: dict, cap=2, alpha=0.08) -> pd.Series:
-L331         """
-L332         同一セクターcap超過（3本目以降）に α×段階減点を課した“有効スコア”Seriesを返す。
-L333         戻り値は降順ソート済み。
-L334         """
-L335         s = pd.Series(scores, dtype=float); order = s.sort_values(ascending=False).index
-L336         cnt, pen = {}, {}
-L337         for t in order:
-L338             sec = sectors.get(t, "U"); cnt[sec] = cnt.get(sec,0) + 1; pen[t] = alpha*max(0, cnt[sec]-cap)
-L339         return (s - pd.Series(pen)).sort_values(ascending=False)
-L340
-L341     @staticmethod
-L342     def pick_top_softcap(scores: pd.Series|dict, sectors: dict, N: int, cap=2, alpha=0.08, hard: int|None=5) -> list[str]:
-L343         """
-L344         soft-cap適用後の上位Nティッカーを返す。hard>0なら非常用ハード上限で同一セクター超過を間引く（既定=5）。
-L345         """
-L346         eff = Scorer.soft_cap_effective_scores(scores, sectors, cap, alpha)
-L347         eff = eff.dropna()
-L348         if not hard:
-L349             return list(eff.head(N).index)
-L350         pick, used = [], {}
-L351         for t in eff.index:
-L352             s = sectors.get(t, "U")
-L353             if used.get(s,0) < hard:
-L354                 pick.append(t); used[s] = used.get(s,0) + 1
+L309     def calc_beta(series: pd.Series, market: pd.Series, lookback=252
 ```

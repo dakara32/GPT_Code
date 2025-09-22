@@ -1,5 +1,54 @@
 ```text
-d_template']
+'])
+L1000         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
+L1001
+L1002         # --- 重みは cfg を優先（外部があればそれを使用） ---
+L1003         # ① 全銘柄で G/D スコアを算出（unmasked）
+L1004         g_weights = pd.Series(cfg.weights.g, dtype=float)
+L1005         need_g = ["GROWTH_F", "MOM"]
+L1006         dbg_cols = ["GROWTH_F", "MOM", "VOL"]
+L1007         if all(c in df_z.columns for c in need_g):
+L1008             mask_g = df_z[need_g].notna().all(axis=1)
+L1009         else:
+L1010             mask_g = pd.Series(False, index=df_z.index, dtype=bool)
+L1011         for c in dbg_cols:
+L1012             if c in df_z.columns:
+L1013                 df_z[f"DBGRW.{c}"] = df_z[c]
+L1014         df_fill_g = df_z.reindex(columns=g_weights.index, fill_value=np.nan).copy()
+L1015         for c in df_fill_g.columns:
+L1016             if c not in need_g:
+L1017                 df_fill_g[c] = df_fill_g[c].fillna(0)
+L1018         g_score_all = _as_numeric_series(
+L1019             df_fill_g.mul(g_weights.reindex(df_fill_g.columns)).sum(axis=1, skipna=False)
+L1020         )
+L1021         g_score_all = g_score_all.where(mask_g)
+L1022
+L1023         d_comp = pd.concat({
+L1024             'QAL': df_z['D_QAL'],
+L1025             'YLD': df_z['D_YLD'],
+L1026             'VOL': df_z['D_VOL_RAW'],
+L1027             'TRD': df_z['D_TRD']
+L1028         }, axis=1)
+L1029         dw = pd.Series(cfg.weights.d, dtype=float).reindex(['QAL','YLD','VOL','TRD']).fillna(0.0)
+L1030         globals()['D_WEIGHTS_EFF'] = dw.copy()
+L1031         need_d_candidates = ["VOL", "QAL"]
+L1032         mask_d = pd.Series(True, index=d_comp.index, dtype=bool)
+L1033         for c in need_d_candidates:
+L1034             if c in d_comp.columns:
+L1035                 mask_d &= d_comp[c].notna()
+L1036             else:
+L1037                 mask_d &= False
+L1038         df_fill_d = d_comp.copy()
+L1039         for c in df_fill_d.columns:
+L1040             if c not in need_d_candidates:
+L1041                 df_fill_d[c] = df_fill_d[c].fillna(0)
+L1042         d_score_all = _as_numeric_series(
+L1043             df_fill_d.mul(dw, axis=1).sum(axis=1, skipna=False)
+L1044         )
+L1045         d_score_all = d_score_all.where(mask_d)
+L1046
+L1047         # ② テンプレ判定（既存ロジックそのまま）
+L1048         mask = df['trend_template']
 L1049         if not bool(mask.any()):
 L1050             mask = ((df.get('P_OVER_LOW52', np.nan) >= 0.25) &
 L1051                 (df.get('NEAR_52W_HIGH', np.nan) >= -0.30) &
@@ -235,82 +284,5 @@ L19 - ヒステリシス: 前回モードに依存（EMERG→解除は23本以�
 L20
 L21 ## レジーム別の現金・ドリフト
 L22  - **通常(NORMAL)** : 現金 **10%** / ドリフト閾値 **12%**
-L23  - **警戒(CAUTION)** : 現金 **12.5%** / ドリフト閾値 **14%**
-L24  - **緊急(EMERG)** : 現金 **20%** / **ドリフト売買停止**（20×5%に全戻しのみ）
-L25
-L26 ## モード別の推奨“保有銘柄数”（MMF≒現金）
-L27 *各枠=5%（20銘柄均等）。モード移行時は**Gの枠数のみ**調整し、外した枠は現金として保持。*
-L28
-L29 - **NORMAL:** G **12** / D **8** / 現金化枠 **0**  
-L30 - **CAUTION:** G **10** / D **8** / 現金化枠 **2**（= 10%）  
-L31 - **EMERG:** G **8**  / D **8** / 現金化枠 **4**（= 20%）  
-L32
-L33 > 実運用：⭐️低スコアのGから順に外す。解除時はfactor上位から補充。
-L34
-L35 ## トレーリングストップ
-L36 - **基本TS (モード別):** NORMAL **15%** / CAUTION **13%** / EMERG **10%**
-L37 - 含み益が **+30% / +60% / +100%** 到達で、基本から **-3pt / -6pt / -8pt** 引き上げ
-L38 - TS発動で減少した銘柄は翌日以降に補充（※緊急モード中は補充しない）
-L39
-L40 ## 半戻し（リバランス）手順
-L41 ドリフトチェックで**アラート**が出た場合（合計|drift| がモード閾値を超過、EMERG除く）、翌営業日の米国寄付きで下記を実施する。
-L42
-L43 1. **売却（必須）**  
-L44    Slackテーブルの **Δqty がマイナスの銘柄を売却** する（寄付き成行推奨）。  
-L45    これは「半戻し」計算に基づく過重量の削減を意味する。
-L46
-L47 2. **購入（任意・半戻し目安）**  
-L48    半戻し後の合計|drift|を**シミュレーション値（Slackヘッダに表示）**に近づけることを目安に、  
-L49    **任意の銘柄を買い増し**してバランスを取る（Δqtyがプラスの銘柄を優先してもよい）。
-L50
-L51 3. **トレーリングストップの再設定（必須）**  
-L52    すべての保有銘柄について、最新の評価額に合わせてTSを**再発注／更新**する。  
-L53    ルールは下記（利益到達で段階的にタイト化）：  
-L54    - **基本TS:** -15%  
-L55    - **+30% 到達 → TS -12%**  
-L56    - **+60% 到達 → TS -9%**  
-L57    - **+100% 到達 → TS -7%**  
-L58    ※ストップ価格の引き上げは許可、**引き下げは不可**（利益保全の原則）。
-L59
-L60 4. **例外（EMERGモード）**  
-L61    緊急(EMERG)では**ドリフト由来の売買は停止（∞）**。20銘柄×各5%への**全戻し**のみ許容。
-L62
-L63 5. **実行タイミング**
-L64    - 判定：米国市場終値直後
-L65    - 執行：翌営業日の米国寄付き成行
-L66
-L67 ## モード移行の実務手順（超シンプル）
-L68 モードが変わったら、**MMF≒現金**として扱い、**Gの枠数だけ**を調整する：
-L69 1. **Gを削る**（CAUTION/EMERG）  
-L70    - ⭐️低スコアのGから順に外す。  
-L71    - **`current_tickers.csv` から外すG銘柄の行を削除**（＝その枠は現金化）。
-L72 2. **現金として保持**  
-L73    - 外した枠は現金（またはMMF相当）でプール。  
-L74 3. **復帰時の補充**（NORMALへ）  
-L75    - **`current_tickers.csv` に銘柄を追加**（factor上位から）。  
-L76    - 以降は日次ドリフト/TSルールに従う。
-L77
-L78 > driftは `target_ratio = 1/銘柄数` を自動適用。行数に応じて自動で均等比率が再計算される。
-L79
-L80 ## 入替銘柄選定
-L81 - Oxfordキャピタル／インカム、Alpha Investor、Motley Fool Stock Advisor、moomooスクリーニング等を参考にchatGPTで検討
-L82 - 年間NISA枠はGrowth群の中から低ボラ銘柄を選定し利用。長期保持にはこだわらない。
-L83
-L84 ## 再エントリー（クールダウン）
-L85 - TSヒット後の同銘柄再INは **8営業日** のクールダウンを設ける（期間中は再IN禁止）
-L86
-L87 ## 実行タイミング
-L88 - 判定：米国市場終値直後
-L89 - 執行：翌営業日の米国寄付き成行
-```
-
-## <documents/factor_design.md>
-```text
-L1 # factor.py 詳細設計書
-L2
-L3 ## 概要
-L4 - 既存ポートフォリオの銘柄と検討中の銘柄群を同時に扱う銘柄選定パイプライン。
-L5 - 価格・財務データを取り込みスコアリングとDRRS選定を行うことで、以下のアウトプットを得る。
-L6   - 採用銘柄と惜しくも漏れた銘柄のスコア一覧
-L7   - IN/OUTのティッカーリス
+L23  - **警戒(CAUTION)** : 現金 **12.5%** / 
 ```
