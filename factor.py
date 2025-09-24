@@ -15,7 +15,7 @@ from scorer import Scorer, ttm_div_yield_portfolio, _log, _as_numeric_series
 import config
 
 import warnings, atexit, threading
-from collections import Counter, defaultdict
+from collections import Counter
 
 # === 定数・設定・DTO（import直後に集約） ===
 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
@@ -192,90 +192,27 @@ if _WARN_HARD_LIMIT > 0:
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=(logging.INFO if debug_mode else logging.WARNING), force=True)
 
-class T:
-    t = perf_counter()
+_T0 = [perf_counter()]
 
-    @staticmethod
-    def log(tag):
-        now = perf_counter()
-        print(f"[T] {tag}: {now - T.t:.2f}s")
-        T.t = now
 
-T.log("start")
+def _tlog(tag: str) -> None:
+    now = perf_counter()
+    print(f"[T] {tag}: {now - _T0[0]:.2f}s")
+    _T0[0] = now
+
+
+_tlog("start")
 try:
-    T.t = _CSV_LOAD_START
+    _T0[0] = _CSV_LOAD_START
 except NameError:
     pass
-T.log(f"csv loaded: exist={len(exist)} cand={len(cand)}")
+_tlog(f"csv loaded: exist={len(exist)} cand={len(cand)}")
 
 # === Utilities ===
-def aggregate_warnings(rows, key="message", max_items=10):
-    """
-    同一内容の警告を '×N' 表記でまとめる。機能変更なし（位置のみ移動）。
-    rows: List[Dict] または List[str]
-    """
-    from collections import Counter
-
-    if not rows:
-        return []
-
-    if isinstance(rows[0], dict):
-        msgs = [str(r.get(key, "")) for r in rows if r.get(key)]
-    else:
-        msgs = [str(r) for r in rows if r]
-
-    cnt = Counter(msgs)
-    out = [f"{m} ×{n}" if n > 1 else m for m, n in cnt.most_common()]
-    return out[:max_items]
+# （ここには “本体ロジック直下で使う軽量ヘルパ” のみを残す）
 
 
 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
-
-def _post_slack(payload: dict):
-    url = os.getenv("SLACK_WEBHOOK_URL")
-    if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-    try:
-        requests.post(url, json=payload).raise_for_status()
-    except Exception as e:
-        print(f"⚠️ Slack通知エラー: {e}")
-
-def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
-    """Slackへテキストを分割送信（コードブロック形式）。"""
-
-    def _post_text(payload: str) -> None:
-        try:
-            resp = requests.post(url, json={"text": payload})
-            print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
-            if resp is not None:
-                resp.raise_for_status()
-        except Exception as e:
-            print(f"[ERR] debug_post_failed: {e}")
-
-    body = (text or "").strip()
-    if not body:
-        print("[DBG] skip debug send: empty body")
-        return
-
-    block, block_len = [], 0
-
-    def _flush():
-        nonlocal block, block_len
-        if block:
-            _post_text("```" + "\n".join(block) + "```")
-            block, block_len = [], 0
-
-    for raw in body.splitlines():
-        line = raw or ""
-        while len(line) > chunk:
-            head, line = line[:chunk], line[chunk:]
-            _flush()
-            _post_text("```" + head + "```")
-        add_len = len(line) if not block else len(line) + 1
-        if block and block_len + add_len > chunk:
-            _flush(); add_len = len(line)
-        block.append(line)
-        block_len += add_len
-    _flush()
 
 def _disjoint_keepG(top_G, top_D, poolD):
     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
@@ -827,7 +764,7 @@ class Input:
 
     def compute_fcf_with_fallback(self, tickers: list[str], finnhub_api_key: str|None=None) -> pd.DataFrame:
         yf_df = self.fetch_cfo_capex_ttm_yf(tickers)
-        T.log("financials (yf) done")
+        _tlog("financials (yf) done")
         miss_mask = yf_df[["cfo_ttm_yf","capex_ttm_yf","fcf_ttm_yf_direct"]].isna().any(axis=1)
         need = yf_df.index[miss_mask].tolist(); print(f"[T] yf financials missing: {len(need)} {need[:10]}{'...' if len(need)>10 else ''}")
         if need:
@@ -941,16 +878,16 @@ class Input:
 
         cand_prices = {orig: _price(orig, ysym) for orig, ysym in zip(self.cand, cand_y)}
         cand_f = [t for t, p in cand_prices.items() if p <= self.price_max]
-        T.log("price cap filter done (CAND_PRICE_MAX)")
+        _tlog("price cap filter done (CAND_PRICE_MAX)")
         # 入力ティッカーの重複を除去し、現行→候補の順序を維持
         # ユニバース確定（元ティッカー保持）。yfinance には後で変換して渡す
         tickers = list(dict.fromkeys(self.exist + cand_f))
         yf_map = {t: _to_yf(t) for t in tickers}
         yf_list = list(dict.fromkeys([yf_map[t] for t in tickers]))
-        T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
+        _tlog(f"universe prepared: unique={len(tickers)} bench={self.bench}")
         data = yf.download(yf_list + [self.bench], period="600d",
                            auto_adjust=True, progress=False, threads=False)
-        T.log("yf.download done")
+        _tlog("yf.download done")
         inv = {v: k for k, v in yf_map.items()}
         px = data["Close"].dropna(how="all", axis=1).ffill(limit=2)
         px = px.rename(columns=inv)
@@ -967,7 +904,7 @@ class Input:
             px, spx = px.tail(clip_days + 1), spx.tail(clip_days + 1)
             logger.info("[T] price window clipped by env: %d rows (PRICE_CLIP_DAYS=%d)", len(px), clip_days)
         else:
-            logger.info("[T] price window clip skipped; rows=%d", len(px))
+            logger.debug("[T] price window clip skipped; rows=%d", len(px))
         tickers_bulk, info = yf.Tickers(" ".join(yf_list)), {}
         for orig, ysym in yf_map.items():
             if ysym in tickers_bulk.tickers:
@@ -1122,9 +1059,9 @@ class Input:
         except Exception:
             pass
         fcf_df = self.compute_fcf_with_fallback(tickers, finnhub_api_key=self.api_key)
-        T.log("eps/fcf prep done")
+        _tlog("eps/fcf prep done")
         returns = px[tickers].pct_change()
-        T.log("price prep/returns done")
+        _tlog("price prep/returns done")
         return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns, missing_logs=missing_logs)
 
 # === Selector：相関低減・選定（スコア＆リターンだけ読む） ===
@@ -1511,7 +1448,7 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
     if hasattr(sc, "score_build_features"):
         feat = sc.score_build_features(inb)
         if not hasattr(sc, "_feat_logged"):
-            T.log("features built (scorer)")
+            _tlog("features built (scorer)")
             sc._feat_logged = True
         agg = sc.score_aggregate(feat, group, cfg) if hasattr(sc, "score_aggregate") else feat
     else:
@@ -1521,7 +1458,7 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         else:
             fb = sc._feat
         if not hasattr(sc, "_feat_logged"):
-            T.log("features built (scorer)")
+            _tlog("features built (scorer)")
             sc._feat_logged = True
         agg = fb.g_score if group == "G" else fb.d_score_all
         if group == "D" and hasattr(fb, "df"):
@@ -1584,7 +1521,7 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         sum_sc = res["sum_score"]; obj = res["objective"]
         if group == "D":
             _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
-            T.log("selection finalized (G/D)")
+            _tlog("selection finalized (G/D)")
     try:
         inc = [t for t in exist if t in agg.index]
         pick = _sticky_keep_current(
@@ -1604,7 +1541,7 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
         pass
 
     if group == "D":
-        T.log("save done")
+        _tlog("save done")
     if group == "G":
         sc._top_G = pick
     return pick, avg_r, sum_sc, obj
@@ -1695,6 +1632,77 @@ def run_pipeline() -> SelectionBundle:
         _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
 
     return sb
+
+
+# --- Slack / warning helpers (relocated without logic changes) ---
+
+
+def aggregate_warnings(rows, key="message", max_items=10):
+    """同一内容の警告を '×N' 表記でまとめる。"""
+    from collections import Counter
+
+    if not rows:
+        return []
+
+    if rows and isinstance(rows[0], dict):
+        msgs = [str(r.get(key, "")) for r in rows if r.get(key)]
+    else:
+        msgs = [str(r) for r in rows if r]
+
+    cnt = Counter(msgs)
+    return [f"{m} ×{n}" if n > 1 else m for m, n in cnt.most_common()][:max_items]
+
+
+def _post_slack(payload: dict):
+    url = os.getenv("SLACK_WEBHOOK_URL")
+    if not url:
+        print("⚠️ SLACK_WEBHOOK_URL 未設定")
+        return
+    try:
+        requests.post(url, json=payload).raise_for_status()
+    except Exception as e:
+        print(f"⚠️ Slack通知エラー: {e}")
+
+
+def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
+    """Slackへテキストを分割送信（コードブロック形式）。"""
+
+    def _post_text(payload: str) -> None:
+        try:
+            resp = requests.post(url, json={"text": payload})
+            print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
+            if resp is not None:
+                resp.raise_for_status()
+        except Exception as e:
+            print(f"[ERR] debug_post_failed: {e}")
+
+    body = (text or "").strip()
+    if not body:
+        print("[DBG] skip debug send: empty body")
+        return
+
+    block, block_len = [], 0
+
+    def _flush():
+        nonlocal block, block_len
+        if block:
+            _post_text("```" + "\n".join(block) + "```")
+            block, block_len = [], 0
+
+    for raw in body.splitlines():
+        line = raw or ""
+        while len(line) > chunk:
+            head, line = line[:chunk], line[chunk:]
+            _flush()
+            _post_text("```" + head + "```")
+        add_len = len(line) if not block else len(line) + 1
+        if block and block_len + add_len > chunk:
+            _flush()
+            add_len = len(line)
+        block.append(line)
+        block_len += add_len
+    _flush()
+
 
 if __name__ == "__main__":
     run_pipeline()
