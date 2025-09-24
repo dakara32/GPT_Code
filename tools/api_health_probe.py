@@ -65,6 +65,30 @@ def _read_tickers(path: str) -> List[str]:
     except Exception:
         return []
 
+def _autodiscover_csv() -> tuple[str|None, str|None]:
+    """
+    リポジトリ内から current*.csv / candidate*.csv を再帰探索し、最初に見つけたものを返す。
+    明示指定（ENV）があればそれを優先。見つからなければ None。
+    """
+    cur = CSV_CURRENT if os.path.exists(CSV_CURRENT) else None
+    cand = CSV_CANDIDATE if os.path.exists(CSV_CANDIDATE) else None
+    if cur and cand:
+        return cur, cand
+
+    for root, _, files in os.walk(".", topdown=True):
+        for fn in files:
+            if not fn.lower().endswith(".csv"):
+                continue
+            path = os.path.join(root, fn)
+            name = fn.lower()
+            if not cur and "current" in name:
+                cur = path
+            if not cand and "candidate" in name:
+                cand = path
+        if cur and cand:
+            break
+    return cur, cand
+
 def _fmt_ms(ms: int) -> str:
     return f"{ms}ms" if ms < 1000 else f"{ms/1000:.2f}s"
 
@@ -290,9 +314,21 @@ def sec_health(tickers: List[str]) -> Tuple[str, Dict]:
 # Orchestration
 # ================================================================
 def main():
-    tickers=sorted(set(_read_tickers(CSV_CURRENT)+_read_tickers(CSV_CANDIDATE)))
+    cur_path, cand_path = _autodiscover_csv()
+    if not cur_path or not cand_path:
+        msg = f"⚠️ CSV not found. cur={cur_path} cand={cand_path} (set CSV_CURRENT/CSV_CANDIDATE or place files)"
+        print(msg); _post_slack(msg)
+        if SOFT_FAIL:
+            sys.exit(0)
+        sys.exit(78)
+
+    tickers=sorted(set(_read_tickers(cur_path)+_read_tickers(cand_path)))
     if not tickers:
-        print("No tickers from CSV."); sys.exit(2)
+        msg = f"⚠️ No tickers from CSV. cur={cur_path} cand={cand_path}"
+        print(msg); _post_slack(msg)
+        if SOFT_FAIL:
+            sys.exit(0)
+        sys.exit(78)
 
     # YF
     det_price,meta_price=yf_price_health(tickers)
