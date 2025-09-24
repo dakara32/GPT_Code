@@ -229,91 +229,6 @@ def aggregate_warnings(rows, key="message", max_items=10):
     return out[:max_items]
 
 
-def compact_missing_lines(missing_df, limit=300):
-    if missing_df is None or getattr(missing_df, "empty", True):
-        return []
-
-    df = missing_df.copy()
-    if "ticker" not in df.columns:
-        df = df.reset_index().rename(columns={"index": "ticker"})
-
-    out: list[str] = []
-    for _, r in df.iterrows():
-        tags: list[str] = []
-        if bool(r.get("EPS_missing", False)):
-            tags.append("eps")
-        if bool(r.get("REV_missing", False)):
-            tags.append("rev")
-        if tags:
-            ticker = r.get("ticker")
-            if pd.isna(ticker) or ticker is None:
-                ticker = "(unknown)"
-            else:
-                ticker = str(ticker)
-            out.append(f"{ticker} : {', '.join(tags)}")
-        if len(out) >= limit:
-            out.append("...")
-            break
-
-    return out
-
-# === 共通ユーティリティ（複数クラスで使用） ===
-# (unused local utils removed – use scorer.py versions if needed)
-
-def _build_missing_logs_after_impute(eps_df: pd.DataFrame) -> pd.DataFrame:
-    df = eps_df.copy()
-    required_cols = [
-        "EPS_TTM",
-        "EPS_Q_LastQ",
-        "EPS_A_LATEST",
-        "REV_TTM",
-        "REV_Q_LastQ",
-        "REV_A_LATEST",
-    ]
-    for col in required_cols:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    miss_eps = df["EPS_TTM"].isna() & df["EPS_Q_LastQ"].isna() & df["EPS_A_LATEST"].isna()
-    miss_rev = df["REV_TTM"].isna() & df["REV_Q_LastQ"].isna() & df["REV_A_LATEST"].isna()
-
-    rows: list[dict] = []
-    for ticker, row in df.iterrows():
-        eps_missing = bool(miss_eps.loc[ticker])
-        rev_missing = bool(miss_rev.loc[ticker])
-        if not (eps_missing or rev_missing):
-            continue
-        rows.append({
-            "ticker": ticker,
-            "EPS_missing": eps_missing,
-            "REV_missing": rev_missing,
-            "eps_imputed": bool(row.get("eps_imputed", False)),
-            "EPS_TTM": row.get("EPS_TTM"),
-            "EPS_Q_LastQ": row.get("EPS_Q_LastQ"),
-            "EPS_A_LATEST": row.get("EPS_A_LATEST"),
-            "REV_TTM": row.get("REV_TTM"),
-            "REV_Q_LastQ": row.get("REV_Q_LastQ"),
-            "REV_A_LATEST": row.get("REV_A_LATEST"),
-        })
-
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "ticker",
-                "EPS_missing",
-                "REV_missing",
-                "eps_imputed",
-                "EPS_TTM",
-                "EPS_Q_LastQ",
-                "EPS_A_LATEST",
-                "REV_TTM",
-                "REV_Q_LastQ",
-                "REV_A_LATEST",
-            ]
-        )
-
-    return pd.DataFrame(rows)
-
 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
 
 def _post_slack(payload: dict):
@@ -412,9 +327,12 @@ class Input:
     # ---- （Input専用）EPS補完・FCF算出系 ----
     @staticmethod
     def _sec_headers():
-        mail = (os.getenv("SEC_CONTACT_EMAIL") or "yasonba55@gmail.com").strip()
-        app = (os.getenv("SEC_APP_NAME") or "FactorBot/1.0").strip()
-        return {"User-Agent": f"{app} ({mail})", "From": mail, "Accept": "application/json"}
+        mail = (os.getenv("SEC_CONTACT_EMAIL") or os.getenv("SEC_EMAIL") or "").strip()
+        ua = f"factor-selection/1 (+mailto:{mail})" if mail else "factor-selection/1"
+        headers = {"User-Agent": ua[:200], "Accept": "application/json"}
+        if mail:
+            headers["From"] = mail[:200]
+        return headers
 
     @staticmethod
     def _sec_get(url: str, retries: int = 3, backoff: float = 0.5):
@@ -1194,7 +1112,7 @@ class Input:
             EPS_A_CAGR3=eps_df.get("eps_cagr3", np.nan),
             REV_A_CAGR3=eps_df.get("rev_cagr3", np.nan),
         )
-        missing_logs = _build_missing_logs_after_impute(eps_df)
+        missing_logs = pd.DataFrame()
         # ここで非NaN件数をサマリ表示（欠損状況の即時把握用）
         try:
             n = len(eps_df)
@@ -1374,12 +1292,6 @@ class Output:
         print("📈 ファクター分散最適化の結果")
         miss_df, truncated, total = self._prepare_missing_display(self.miss_df)
         self._miss_disp_info = (miss_df, truncated, total)
-        lines = compact_missing_lines(miss_df)
-        if lines:
-            txt = "Missing Data:\n```" + "\n".join(lines) + "```"
-            if truncated:
-                txt += f"\n...省略 ({total}件中 上位20件のみ表示)"
-            print(txt)
 
         # ---- 表示用：Changes/Near-Miss のスコア源を“最終集計”に統一するプロキシ ----
         try:
@@ -1545,12 +1457,6 @@ class Output:
             return f"{title}\n```{tbl.to_string(formatters=fmt)}```\n"
 
         message = "📈 ファクター分散最適化の結果\n"
-        miss_df, truncated, total = self._miss_disp_info or self._prepare_missing_display(self.miss_df)
-        lines = compact_missing_lines(miss_df, limit=300)
-        missing_txt = "Missing Data:\n```" + "\n".join(lines) + "```" if lines else ""
-        trunc_note = f"...省略 ({total}件中 上位20件のみ表示)" if truncated else ""
-        if missing_txt:
-            message += missing_txt + ("\n" + trunc_note if trunc_note else "") + "\n"
         message += _blk(_inject_filter_suffix(self.g_title, "G"), self.g_table, self.g_formatters, drop=("TRD",))
         message += _blk(_inject_filter_suffix(self.d_title, "D"), self.d_table, self.d_formatters)
         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table, 'empty', False) else f"```{self.io_table.to_string(index=False)}```\n")
