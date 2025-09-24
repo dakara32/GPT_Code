@@ -423,7 +423,19 @@ def main():
     det_sec   = f"{icon_for(levels_map['SEC'     ])} {det_sec}"
     det_finn  = f"{icon_for(levels_map['FINNHUB' ])} {det_finn}"
 
-    summary=f"{emoji} API_HEALTH {worst}{outage_note} (exit_on={EXIT_ON_LEVEL})\n{det_price} | {det_info} | {det_fin} | {det_sec} | {det_finn}"
+    # ステータス行は「見出し→改行→メトリクス」形式に整形
+    def _fmt_block(s: str, key: str) -> str:
+        # 例: "⚠️ YF_PRICE:DEGRADED ok=..." -> "⚠️ YF_PRICE:\nDEGRADED ok=..."
+        return s.replace(f"{key}:", f"{key}:\n", 1)
+    status_lines = [
+        f"{emoji} API_HEALTH {worst}{outage_note} (exit_on={EXIT_ON_LEVEL})",
+        _fmt_block(det_price, "YF_PRICE"),
+        _fmt_block(det_info, "YF_INFO"),
+        _fmt_block(det_fin, "YF_FIN"),
+        _fmt_block(det_sec, "SEC"),
+        _fmt_block(det_finn, "FINNHUB"),
+    ]
+    summary = "\n".join(status_lines)
     has_problem=("DEGRADED" in worst) or ("DOWN" in worst)
 
     if has_problem:
@@ -431,15 +443,15 @@ def main():
         lines=[]
         if meta_price["missing"] or meta_price["nf"]:
             xs=[*meta_price["nf"],*meta_price["missing"]]
-            lines.append("YF_PRICE NG:\n" + all_list(xs))
+            lines.append("🆖YF_PRICE NG:\n" + all_list(xs))
         if meta_info["bad"]:
-            lines.append("YF_INFO NG:\n" + all_list(meta_info["bad"]))
+            lines.append("🆖YF_INFO NG:\n" + all_list(meta_info["bad"]))
         if meta_fin["bad"]:
-            lines.append("YF_FIN NG:\n" + all_list(meta_fin["bad"]))
+            lines.append("🆖YF_FIN NG:\n" + all_list(meta_fin["bad"]))
         if meta_sec["bad"]:
-            lines.append("SEC NG:\n" + all_list(meta_sec["bad"]))
+            lines.append("🆖SEC NG:\n" + all_list(meta_sec["bad"]))
         if meta_finn.get("bad"):
-            lines.append("FINNHUB NG:\n" + all_list(meta_finn["bad"]))
+            lines.append("🆖FINNHUB NG:\n" + all_list(meta_finn["bad"]))
         text=summary + ("\n" + "\n".join(lines) if lines else "")
     else:
         text=summary
