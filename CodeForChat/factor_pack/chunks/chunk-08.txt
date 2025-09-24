@@ -1,62 +1,5 @@
 ```text
-alues("G_plus_D")
-L1608               .head(10)
-L1609               .round(3))
-L1610         low_msg = "Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string(index=True, index_names=False)
-L1611         _post_slack({"text": f"```{low_msg}```"})
-L1612     except Exception as _e:
-L1613         _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
-L1614
-L1615     return sb
-L1616
-L1617
-L1618 # --- Slack / warning helpers (relocated without logic changes) ---
-L1619
-L1620
-L1621 def _post_slack(payload: dict):
-L1622     url = os.getenv("SLACK_WEBHOOK_URL")
-L1623     if not url:
-L1624         print("⚠️ SLACK_WEBHOOK_URL 未設定")
-L1625         return
-L1626     try:
-L1627         requests.post(url, json=payload).raise_for_status()
-L1628     except Exception as e:
-L1629         print(f"⚠️ Slack通知エラー: {e}")
-L1630
-L1631
-L1632 if __name__ == "__main__":
-L1633     run_pipeline()
-```
 
-## <scorer.py>
-```text
-L1 # scorer.py
-L2 # kawatest
-L3 # =============================================================================
-L4 # Scorer: ファクター/指標の生成と合成スコア算出を担う純粋層
-L5 #
-L6 # 【このファイルだけ読めば分かるポイント】
-L7 # - 入力(InputBundle)は「価格/出来高/ベンチ/基本情報/EPS/FCF/リターン」を含むDTO
-L8 # - 出力(FeatureBundle)は「raw特徴量 df」「標準化 df_z」「G/D スコア」「欠損ログ」
-L9 # - 重み等のコンフィグ(PipelineConfig)は factor から渡す（cfg 必須）
-L10 # - 旧カラム名は Scorer 内で自動リネームして受け入れ（後方互換）
-L11 #   例) eps_ttm -> EPS_TTM, eps_q_recent -> EPS_Q_LastQ, fcf_ttm -> FCF_TTM
-L12 #
-L13 # 【I/O契約（Scorerが参照するInputBundleフィールド）】
-L14 #   - cand: List[str]    … 候補銘柄（単体実行では未使用）
-L15 #   - tickers: List[str] … 対象銘柄リスト
-L16 #   - bench: str         … ベンチマークティッカー（例 '^GSPC'）
-L17 #   - data: pd.DataFrame … yfinance download結果 ('Close','Volume' 等の階層列)
-L18 #   - px: pd.DataFrame   … data['Close'] 相当（終値）
-L19 #   - spx: pd.Series     … ベンチマークの終値
-L20 #   - tickers_bulk: object         … yfinance.Tickers
-L21 #   - info: Dict[str, dict]        … yfinance info per ticker
-L22 #   - eps_df: pd.DataFrame         … 必須列: EPS_TTM, EPS_Q_LastQ（旧名も可）
-L23 #   - fcf_df: pd.DataFrame         … 必須列: FCF_TTM（旧名も可）
-L24 #   - returns: pd.DataFrame        … px[tickers].pct_change() 相当
-L25 #   - missing_logs: pd.DataFrame   … 補完後の欠損ログ
-L26 #
-L27 # ※入出力の形式・例外文言は既存実装を変えません（安全な短縮のみ）
 L28 # =============================================================================
 L29
 L30 import json, logging, os, requests, sys, warnings
@@ -291,5 +234,42 @@ L258         r = (s/b).dropna()
 L259         if len(r) < win: return np.nan
 L260         y, x = np.log(r.iloc[-win:]), np.arange(win, dtype=float)
 L261         try: return float(np.polyfit(x, y, 1)[0])
-L262         except Exception: return
+L262         except Exception: return np.nan
+L263
+L264     @staticmethod
+L265     def ev_fallback(info_t: dict, tk: yf.Ticker) -> float:
+L266         ev = info_t.get('enterpriseValue', np.nan)
+L267         if pd.notna(ev) and ev>0: return float(ev)
+L268         mc, debt, cash = info_t.get('marketCap', np.nan), np.nan, np.nan
+L269         try:
+L270             bs = tk.quarterly_balance_sheet
+L271             if bs is not None and not bs.empty:
+L272                 c = bs.columns[0]
+L273                 for k in ("Total Debt","Long Term Debt","Short Long Term Debt"):
+L274                     if k in bs.index: debt = float(bs.loc[k,c]); break
+L275                 for k in ("Cash And Cash Equivalents","Cash And Cash Equivalents And Short Term Investments","Cash"):
+L276                     if k in bs.index: cash = float(bs.loc[k,c]); break
+L277         except Exception: pass
+L278         if pd.notna(mc): return float(mc + (0 if pd.isna(debt) else debt) - (0 if pd.isna(cash) else cash))
+L279         return np.nan
+L280
+L281     @staticmethod
+L282     def div_streak(t):
+L283         try:
+L284             divs = yf.Ticker(t).dividends.dropna(); ann = divs.groupby(divs.index.year).sum(); ann = ann[ann.index<pd.Timestamp.today().year]
+L285             years, streak = sorted(ann.index), 0
+L286             for i in range(len(years)-1,0,-1):
+L287                 if ann[years[i]] > ann[years[i-1]]: streak += 1
+L288                 else: break
+L289             return streak
+L290         except Exception: return 0
+L291
+L292     @staticmethod
+L293     def fetch_finnhub_metrics(symbol):
+L294         api_key = os.environ.get("FINNHUB_API_KEY")
+L295         if not api_key: return {}
+L296         url, params = "https://finnhub.io/api/v1/stock/metric", {"symbol":symbol,"metric":"all","token":api_key}
+L297         try:
+L298             r = requests.get(url, params=params, timeout=10); r.raise_for_status(); m = r.json().get("metric",{})
+L299             return {'EPS':m.get('epsGrowthTTMYoy'),'REV':m.get('revenueGrowthTTMYoy'),'ROE':m.get('roeTTM'),'BETA':m.get('beta'),'DIV':m.get('dividendYieldIndicatedAnnual'),'FCF':(m.get('freeCashFlowTTM')/m.get('enterpriseValue')) if m.get('freeCashFlowTTM') and m.ge
 ```
