@@ -1,28 +1,5 @@
 ```text
-ma")
-L1027             return any(k in ind for k in keys)
-L1028
-L1029         tickers_s = pd.Index(df_z.index)
-L1030         is_bio = pd.Series({t: _is_bio_like(t) for t in tickers_s})
-L1031         is_loss = pd.Series({t: (pd.notna(df.loc[t,"EPS"]) and df.loc[t,"EPS"] <= 0) for t in tickers_s})
-L1032         mask_bio_loss = (is_bio & is_loss).reindex(df_z.index).fillna(False)
-L1033
-L1034         if bool(mask_bio_loss.any()) and penalty_z > 0:
-L1035             df_z.loc[mask_bio_loss, "GROWTH_F"] = df_z.loc[mask_bio_loss, "GROWTH_F"] - penalty_z
-L1036             df_z["GROWTH_F"] = df_z["GROWTH_F"].clip(-3.0, 3.0)
-L1037         # === end: BIO LOSS PENALTY =======================================
-L1038
-L1039         _debug_only_cols = [c for c in df_z.columns if c.endswith("_RAW")]
-L1040         _no_score_cols = ["DIV_TTM_PS", "DIV_YOY", "LOW52PCT25_EXCESS", "MA50_OVER_200"]
-L1041         _drop_cols = [c for c in (_debug_only_cols + _no_score_cols) if c in df_z.columns]
-L1042         if _drop_cols:
-L1043             df_z = df_z.drop(columns=_drop_cols, errors="ignore")
-L1044
-L1045         assert not any(c.endswith("_RAW") for c in df_z.columns)
-L1046         for c in ["DIV_TTM_PS","DIV_YOY","LOW52PCT25_EXCESS","MA50_OVER_200"]:
-L1047             assert c not in df_z.columns
-L1048
-L1049         df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
+f_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
 L1050         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
 L1051
 L1052         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
@@ -147,99 +124,190 @@ L1170             df_full_z=df_full_z,
 L1171             scaler=None)
 L1172
 L1173 def _apply_growth_entry_flags(feature_df, bundle, self_obj, win_breakout=5, win_pullback=5):
-L1174     """
-L1175     G枠ユニバースに対し、ブレイクアウト確定/押し目反発の「直近N営業日内の発火」を判定し、
-L1176     次の列を feature_df に追加する（index=ticker）。
-L1177       - G_BREAKOUT_recent_5d : bool
-L1178       - G_BREAKOUT_last_date : str "YYYY-MM-DD"
-L1179       - G_PULLBACK_recent_5d : bool
-L1180       - G_PULLBACK_last_date : str "YYYY-MM-DD"
-L1181       - G_PIVOT_price        : float
-L1182     失敗しても例外は握り潰し、既存処理を阻害しない。
-L1183     """
-L1184     try:
-L1185         px   = bundle.px                      # 終値 DataFrame
-L1186         hi   = bundle.data['High']
-L1187         lo   = bundle.data['Low']
-L1188         vol  = bundle.data['Volume']
-L1189         bench= bundle.spx                     # ベンチマーク Series
-L1190
-L1191         # Gユニバース推定：self.g_universe 優先 → feature_df['group']=='G' → 全銘柄
-L1192         g_universe = getattr(self_obj, "g_universe", None)
-L1193         if g_universe is None:
-L1194             try:
-L1195                 g_universe = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
-L1196             except Exception:
-L1197                 g_universe = list(feature_df.index)
-L1198         if not g_universe:
-L1199             return feature_df
-L1200
-L1201         # 指標
-L1202         px = px.ffill(limit=2)
-L1203         ema21 = px[g_universe].ewm(span=21, adjust=False).mean()
-L1204         ma50  = px[g_universe].rolling(50).mean()
-L1205         ma150 = px[g_universe].rolling(150).mean()
-L1206         ma200 = px[g_universe].rolling(200).mean()
-L1207         atr20 = (hi[g_universe] - lo[g_universe]).rolling(20).mean()
-L1208         vol20 = vol[g_universe].rolling(20).mean()
-L1209         vol50 = vol[g_universe].rolling(50).mean()
-L1210
-L1211         # トレンドテンプレート合格
-L1212         trend_template_ok = (px[g_universe] > ma50) & (px[g_universe] > ma150) & (px[g_universe] > ma200) \
-L1213                             & (ma150 > ma200) & (ma200.diff() > 0)
-L1214
-L1215         # 汎用ピボット：直近65営業日の高値（当日除外）
-L1216         pivot_price = hi[g_universe].rolling(65).max().shift(1)
-L1217
-L1218         # 相対力：年内高値更新
-L1219         bench_aligned = bench.reindex(px.index).ffill()
-L1220         rs = px[g_universe].div(bench_aligned, axis=0)
-L1221         rs_high = rs.rolling(252).max().shift(1)
-L1222
-L1223         # ブレイクアウト「発生日」：条件立ち上がり
-L1224         breakout_today = trend_template_ok & (px[g_universe] > pivot_price) \
-L1225                          & (vol[g_universe] >= 1.5 * vol50) & (rs > rs_high)
-L1226         breakout_event = breakout_today & ~breakout_today.shift(1).fillna(False)
-L1227
-L1228         # 押し目反発「発生日」：EMA21帯×出来高ドライアップ×前日高値越え×終値EMA21上
-L1229         near_ema21_band = px[g_universe].between(ema21 - atr20, ema21 + atr20)
-L1230         volume_dryup = (vol20 / vol50) <= 1.0
-L1231         pullback_bounce_confirmed = (px[g_universe] > hi[g_universe].shift(1)) & (px[g_universe] > ema21)
-L1232         pullback_today = trend_template_ok & near_ema21_band & volume_dryup & pullback_bounce_confirmed
-L1233         pullback_event = pullback_today & ~pullback_today.shift(1).fillna(False)
-L1234
-L1235         # 直近N営業日内の発火 / 最終発生日
-L1236         rows = []
-L1237         for t in g_universe:
-L1238             def _recent_and_date(s, win):
-L1239                 sw = s[t].iloc[-win:]
-L1240                 if sw.any():
-L1241                     d = sw[sw].index[-1]
-L1242                     return True, d.strftime("%Y-%m-%d")
-L1243                 return False, ""
-L1244             br_recent, br_date = _recent_and_date(breakout_event, win_breakout)
-L1245             pb_recent, pb_date = _recent_and_date(pullback_event, win_pullback)
-L1246             rows.append((t, {
-L1247                 "G_BREAKOUT_recent_5d": br_recent,
-L1248                 "G_BREAKOUT_last_date": br_date,
-L1249                 "G_PULLBACK_recent_5d": pb_recent,
-L1250                 "G_PULLBACK_last_date": pb_date,
-L1251                 "G_PIVOT_price": float(pivot_price[t].iloc[-1]) if t in pivot_price.columns else float('nan'),
-L1252             }))
-L1253         flags = pd.DataFrame({k: v for k, v in rows}).T
-L1254
-L1255         # 列を作成・上書き
-L1256         cols = ["G_BREAKOUT_recent_5d","G_BREAKOUT_last_date","G_PULLBACK_recent_5d","G_PULLBACK_last_date","G_PIVOT_price"]
-L1257         for c in cols:
-L1258             if c not in feature_df.columns:
-L1259                 feature_df[c] = np.nan
-L1260         feature_df.loc[flags.index, flags.columns] = flags
-L1261
-L1262     except Exception:
-L1263         pass
-L1264     return feature_df
-L1265
+L1174     """以前はブレイクアウト/押し目反発フラグを付与していたが、現在は無効化。"""
+L1175     return feature_df
+L1176
+L1177
 ```
 
-## <.github/workfl
+## <.github/workflows/weekly-report.yml>
+```text
+L1 name: Weekly Stock Report
+L2
+L3 on:
+L4   push:
+L5     branches: [ main ]
+L6     paths-ignore:
+L7       - 'CodeForChat/**'
+L8   schedule:
+L9     - cron: '0 0 * * 6'  # UTC 00:00 → JST 09:00（土）
+L10   workflow_dispatch:
+L11
+L12 jobs:
+L13   build-and-report:
+L14     runs-on: ubuntu-latest
+L15     permissions:
+L16       contents: write
+L17
+L18     steps:
+L19       - name: Debug start
+L20         run: echo '🚀 DEBUGstarted'
+L21               
+L22       - name: Checkout repository
+L23         uses: actions/checkout@v3
+L24
+L25       - name: Setup Python
+L26         uses: actions/setup-python@v5
+L27         with:
+L28           python-version: '3.x'
+L29           cache: 'pip'
+L30           cache-dependency-path: requirements.txt
+L31
+L32       - name: Install dependencies
+L33         run: pip install -r requirements.txt
+L34
+L35       - name: Prepare results directory
+L36         run: mkdir -p results
+L37
+L38       - name: Run factor & scoring
+L39         env:
+L40           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+L41           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+L42           FIN_THREADS: "8"
+L43         run: python factor.py
+```
+
+## <documents/README.md>
+```text
+L1 # 運用ルール
+L2
+L3 ## 基本構成
+L4 - 20銘柄を均等配分（現金を除き1銘柄あたり5%）
+L5 - moomoo証券で運用
+L6 - **Growth枠 12銘柄 / Defense枠 8銘柄**（NORMAL 基準）
+L7
+L8 ## Barbell Growth-Defense方針
+L9 - Growth枠 **12銘柄**：高成長で乖離源となる攻めの銘柄
+L10 - Defense枠 **8銘柄**：低ボラで安定成長し配当を増やす守りの銘柄
+L11 - 「猛烈に伸びる攻め × 着実に稼ぐ盾」の組合せで乖離→半戻しプレミアムを狙う
+L12
+L13 ## レジーム判定（trend_template 合格“本数”で判定）
+L14 - 合格本数 = current+candidate 全体のうち、trend_template 条件を満たした銘柄の**本数(C)**（基準 N_G=12）
+L15 - しきい値は過去~600営業日の分布から**毎回自動採用**（分位点と運用“床”のmax）
+L16   - 緊急入り: `max(q05, 12本)`（= N_G）
+L17   - 緊急解除: `max(q20, 18本)`（= ceil(1.5×12)）
+L18   - 通常復帰: `max(q60, 36本)`（= 3×N_G）
+L19 - ヒステリシス: 前回モードに依存（EMERG→解除は23本以上、CAUTION→通常は45本以上）
+L20
+L21 ## レジーム別の現金・ドリフト
+L22  - **通常(NORMAL)** : 現金 **10%** / ドリフト閾値 **12%**
+L23  - **警戒(CAUTION)** : 現金 **12.5%** / ドリフト閾値 **14%**
+L24  - **緊急(EMERG)** : 現金 **20%** / **ドリフト売買停止**（20×5%に全戻しのみ）
+L25
+L26 ## モード別の推奨“保有銘柄数”（MMF≒現金）
+L27 *各枠=5%（20銘柄均等）。モード移行時は**Gの枠数のみ**調整し、外した枠は現金として保持。*
+L28
+L29 - **NORMAL:** G **12** / D **8** / 現金化枠 **0**  
+L30 - **CAUTION:** G **10** / D **8** / 現金化枠 **2**（= 10%）  
+L31 - **EMERG:** G **8**  / D **8** / 現金化枠 **4**（= 20%）  
+L32
+L33 > 実運用：⭐️低スコアのGから順に外す。解除時はfactor上位から補充。
+L34
+L35 ## トレーリングストップ
+L36 - **基本TS (モード別):** NORMAL **15%** / CAUTION **13%** / EMERG **10%**
+L37 - 含み益が **+30% / +60% / +100%** 到達で、基本から **-3pt / -6pt / -8pt** 引き上げ
+L38 - TS発動で減少した銘柄は翌日以降に補充（※緊急モード中は補充しない）
+L39
+L40 ## 半戻し（リバランス）手順
+L41 ドリフトチェックで**アラート**が出た場合（合計|drift| がモード閾値を超過、EMERG除く）、翌営業日の米国寄付きで下記を実施する。
+L42
+L43 1. **売却（必須）**  
+L44    Slackテーブルの **Δqty がマイナスの銘柄を売却** する（寄付き成行推奨）。  
+L45    これは「半戻し」計算に基づく過重量の削減を意味する。
+L46
+L47 2. **購入（任意・半戻し目安）**  
+L48    半戻し後の合計|drift|を**シミュレーション値（Slackヘッダに表示）**に近づけることを目安に、  
+L49    **任意の銘柄を買い増し**してバランスを取る（Δqtyがプラスの銘柄を優先してもよい）。
+L50
+L51 3. **トレーリングストップの再設定（必須）**  
+L52    すべての保有銘柄について、最新の評価額に合わせてTSを**再発注／更新**する。  
+L53    ルールは下記（利益到達で段階的にタイト化）：  
+L54    - **基本TS:** -15%  
+L55    - **+30% 到達 → TS -12%**  
+L56    - **+60% 到達 → TS -9%**  
+L57    - **+100% 到達 → TS -7%**  
+L58    ※ストップ価格の引き上げは許可、**引き下げは不可**（利益保全の原則）。
+L59
+L60 4. **例外（EMERGモード）**  
+L61    緊急(EMERG)では**ドリフト由来の売買は停止（∞）**。20銘柄×各5%への**全戻し**のみ許容。
+L62
+L63 5. **実行タイミング**
+L64    - 判定：米国市場終値直後
+L65    - 執行：翌営業日の米国寄付き成行
+L66
+L67 ## モード移行の実務手順（超シンプル）
+L68 モードが変わったら、**MMF≒現金**として扱い、**Gの枠数だけ**を調整する：
+L69 1. **Gを削る**（CAUTION/EMERG）  
+L70    - ⭐️低スコアのGから順に外す。  
+L71    - **`current_tickers.csv` から外すG銘柄の行を削除**（＝その枠は現金化）。
+L72 2. **現金として保持**  
+L73    - 外した枠は現金（またはMMF相当）でプール。  
+L74 3. **復帰時の補充**（NORMALへ）  
+L75    - **`current_tickers.csv` に銘柄を追加**（factor上位から）。  
+L76    - 以降は日次ドリフト/TSルールに従う。
+L77
+L78 > driftは `target_ratio = 1/銘柄数` を自動適用。行数に応じて自動で均等比率が再計算される。
+L79
+L80 ## 入替銘柄選定
+L81 - Oxfordキャピタル／インカム、Alpha Investor、Motley Fool Stock Advisor、moomooスクリーニング等を参考にchatGPTで検討
+L82 - 年間NISA枠はGrowth群の中から低ボラ銘柄を選定し利用。長期保持にはこだわらない。
+L83
+L84 ## 再エントリー（クールダウン）
+L85 - TSヒット後の同銘柄再INは **8営業日** のクールダウンを設ける（期間中は再IN禁止）
+L86
+L87 ## 実行タイミング
+L88 - 判定：米国市場終値直後
+L89 - 執行：翌営業日の米国寄付き成行
+```
+
+## <documents/factor_design.md>
+```text
+L1 # factor.py 詳細設計書
+L2
+L3 ## 概要
+L4 - 既存ポートフォリオの銘柄と検討中の銘柄群を同時に扱う銘柄選定パイプライン。
+L5 - 価格・財務データを取り込みスコアリングとDRRS選定を行うことで、以下のアウトプットを得る。
+L6   - 採用銘柄と惜しくも漏れた銘柄のスコア一覧
+L7   - IN/OUTのティッカーリストとOUT側の低スコア銘柄
+L8   - 新旧ポートフォリオの比較表
+L9   - 検討中銘柄の低スコアランキング（整理用）
+L10
+L11 ## 全体フロー
+L12 1. **Input** – `current_tickers.csv`と`candidate_tickers.csv`を読み込み、yfinanceやFinnhubのAPIから価格・財務データを収集して`InputBundle`を整備。
+L13 2. **Score Calculation** – Scorerが特徴量を計算し因子スコアを合成して`FeatureBundle`を生成。
+L14 3. **Correlation Reduction & Selection** – SelectorがDRRSロジックで相関を抑えつつG/D銘柄を選定し`SelectionBundle`を得る。
+L15 4. **Output** – 採用結果と周辺情報を表・Slack通知として出力。
+L16
+L17 ```mermaid
+L18 flowchart LR
+L19   A[Input\nAPI & 前処理] --> B[Score Calculation\n特徴量・因子合成]
+L20   B --> C[Correlation Reduction\nDRRS選定]
+L21   C --> D[Output\nSlack通知]
+L22 ```
+L23
+L24 ## 定数・設定
+L25 | 変数 | 内容 | 主な用途 |
+L26 | --- | --- | --- |
+L27 | `exist` / `cand` | 現行ポートフォリオと検討中銘柄のティッカーリスト | スコア対象ユニバースの構成、候補整理 |
+L28 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
+L29 | `CAND_PRICE_MAX` | 候補銘柄の許容価格上限 | 高額銘柄の事前除外 |
+L30 | `N_G` / `N_D` | G/D採用枠の件数（**既定: 12 / 8**） | 最終的に選ぶ銘柄数の制約 |
+L31 | `g_weights` / `D_weights` | 各因子の重みdict | G/Dスコア合成 |
+L32 | `D_BETA_MAX` | Dバケットの許容β上限 | 高β銘柄の除外フィルタ |
+L33 | `FILTER_SPEC` | G/Dごとの前処理フィルタ | トレンドマスクやβ上限設定 |
+L34 | `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
+L35 | `DRRS_G` / `DRRS_D` | DRRSパラメータdict | バケット別の相関低減設定 |
+L36 | `DRRS_SHRINK` | 残差相関の対角シュリンク率 | `residual_corr`の安定化 |
+L37 | `CROSS_MU_GD` | G-D間クロス相関ペナルティμ | 2バケット同時最適化で相関抑制 |
+L38 | `RESULTS_DIR` | 選定結果保存ディレクトリ | `_save_sel`/`_
 ```
