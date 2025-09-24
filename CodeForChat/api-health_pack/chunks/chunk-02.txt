@@ -1,263 +1,246 @@
 ```text
-else float(v) for v in cfo_vals]) if any(v is not None for v in cfo_vals) else None
-L243             cap_ttm = np.nansum([np.nan if v is None else float(v) for v in cap_vals]) if any(v is not None for v in cap_vals) else None
-L244             if cfo_ttm is None or cap_ttm is None:
-L245                 j=_finn_get(s,f"{base}/stock/cash-flow",{"symbol":sym,"frequency":"annual","limit":1,"token":FINN_KEY})
-L246                 arr=j.get("cashFlow") or []
-L247                 if arr:
-L248                     item0=arr[0]
-L249                     if cfo_ttm is None:
-L250                         v=pick(item0,_FINN_CFO_KEYS); 
-L251                         if v is not None: cfo_ttm=float(v)
-L252                     if cap_ttm is None:
-L253                         v=pick(item0,_FINN_CAPEX_KEYS); 
-L254                         if v is not None: cap_ttm=float(v)
-L255             if cfo_ttm is None or cap_ttm is None: bad.append(sym)
-L256         except Exception: bad.append(sym)
-L257     ms=_now_ms()-t0
-L258     level="HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-L259     slow=" SLOW" if ms>=TIMEOUT_MS_WARN else ""
-L260     return f"FINNHUB:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}",{
-L261         "level":level,"latency_ms":ms,"bad":bad
-L262     }
-L263
-L264 # ================================================================
-L265 # SEC: companyfacts（Revenue/EPS）ヘルス
-L266 # ================================================================
-L267 def _sec_headers():
-L268     """
-L269     SECは連絡先付きUser-Agent/Fromを強く推奨・一部で必須。
-L270     SEC_EMAILが空なら最低限のUAにしつつ、403発生時は上位でSKIP扱いにする。
-L271     """
-L272     ua = (f"api-health-probe/1 (+mailto:{SEC_EMAIL})" if SEC_EMAIL else "api-health-probe/1")
-L273     hdr = {
-L274         "User-Agent": ua[:200],
-L275         "Accept": "application/json",
-L276     }
-L277     if SEC_EMAIL:
-L278         hdr["From"] = SEC_EMAIL[:200]
-L279     return hdr
-L280
-L281 def _sec_get(url: str, params=None, retries=3, sleep_s: float=0.5):
-L282     """
-L283     403やネットワークエラーは上位でSKIP判定できるよう None を返す。
-L284     """
-L285     for i in range(retries):
-L286         try:
-L287             r = requests.get(url, params=params or {}, headers=_sec_headers(), timeout=15)
-L288             if r.status_code==429:
-L289                 time.sleep(min(2**i*sleep_s, 4.0)); continue
-L290             if r.status_code==403:
-L291                 # UA/From未設定やアクセス制限。上位でSKIP。
-L292                 return None
-L293             r.raise_for_status(); return r.json()
-L294         except Exception:
-L295             time.sleep(min(2**i*sleep_s, 2.0))
-L296     return None
-L297
-L298 def _sec_ticker_map() -> Dict[str,str]:
-L299     j = _sec_get("https://www.sec.gov/files/company_tickers.json")
-L300     if j is None:
-L301         return {}
-L302     out={}
-L303     it=(j.values() if isinstance(j,dict) else j)
-L304     for item in it:
-L305         try:
-L306             t=(item.get("ticker") or item.get("TICKER") or "").upper()
-L307             cik=str(item.get("cik_str") or item.get("CIK") or "").zfill(10)
-L308             if t and cik: out[t]=cik
-L309         except Exception: continue
-L310     return out
-L311
-L312 SEC_REV_TAGS=["Revenues","RevenueFromContractWithCustomerExcludingAssessedTax","SalesRevenueNet","SalesRevenueGoodsNet","SalesRevenueServicesNet","Revenue"]
-L313 SEC_EPS_TAGS=["EarningsPerShareDiluted","EarningsPerShareBasicAndDiluted","EarningsPerShare","EarningsPerShareBasic"]
-L314
-L315 def _normalize_for_sec(sym: str) -> List[str]:
-L316     s=(sym or "").upper(); outs=[]; add=lambda x: outs.append(x) if x and x not in outs else None
-L317     add(s); add(s.replace(".","-")); add(s.replace("-","")); add(s.replace(".","")); return outs
-L318
-L319 def _units_for_tags(facts: dict, spaces: List[str], tags: List[str]) -> list:
-L320     got=[]
-L321     for sp in spaces:
-L322         d=(facts.get("facts") or {}).get(sp) or {}
-L323         for tg in tags:
-L324             arr=(d.get(tg) or {}).get("units") or {}
-L325             for unit, vals in (arr.items() if isinstance(arr,dict) else []):
-L326                 if isinstance(vals,list) and vals: got.append(vals)
-L327     return got
-L328
-L329 def _series_q_and_a(arrs: list) -> Tuple[list, list]:
-L330     q_pairs,a_pairs=[],[]
-L331     for vals in arrs:
-L332         for v in vals:
-L333             try:
-L334                 dt=v.get("end") or v.get("fy"); val=float(v.get("val")); form=(v.get("form") or "").upper()
-L335                 if "10-Q" in form or "6-K" in form or form=="Q": q_pairs.append((dt,val))
-L336                 elif "10-K" in form or "20-F" in form or form=="K": a_pairs.append((dt,val))
-L337             except Exception: pass
-L338     q_pairs=sorted(q_pairs,key=lambda x: str(x[0]),reverse=True)
-L339     a_pairs=sorted(a_pairs,key=lambda x: str(x[0]),reverse=True)
-L340     return q_pairs,a_pairs
-L341
-L342 def sec_health(tickers: List[str]) -> Tuple[str, Dict]:
-L343     t0=_now_ms(); t2cik=_sec_ticker_map(); bad=[]
-L344     # CIKマップが取れない（403/ネット断/UA未設定など）はSKIPPED
-L345     if not t2cik:
-L346         ms=_now_ms()-t0
-L347         note="no SEC_EMAIL/403" if not SEC_EMAIL else "SEC endpoint blocked"
-L348         det=f"SEC:SKIPPED ({note}) latency={_fmt_ms(ms)}"
-L349         return det,{"level":"SKIPPED","latency_ms":ms,"bad":[]}
-L350     for t in tickers:
-L351         cands=_normalize_for_sec(t); cik=next((t2cik.get(x) for x in cands if t2cik.get(x)), None)
-L352         if not cik: bad.append(t); continue
-L353         try:
-L354             j=_sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
-L355             if j is None:
-L356                 bad.append(t); continue
-L357             rev_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_REV_TAGS)
-L358             eps_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_EPS_TAGS)
-L359             rev_q,rev_a=_series_q_and_a(rev_arr); eps_q,eps_a=_series_q_and_a(eps_arr)
-L360             if not (rev_q or rev_a) or not (eps_q or eps_a): bad.append(t)
-L361         except Exception: bad.append(t)
-L362         time.sleep(0.30)  # SEC負荷配慮
-L363     ms=_now_ms()-t0
-L364     level="HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-L365     slow=" SLOW" if ms>=TIMEOUT_MS_WARN else ""
-L366     return f"SEC:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}",{
-L367         "level":level,"latency_ms":ms,"bad":bad
-L368     }
-L369
-L370 # ================================================================
-L371 # Orchestration
-L372 # ================================================================
-L373 def main():
-L374     cur_path, cand_path = _autodiscover_csv()
-L375     if not cur_path or not cand_path:
-L376         msg = f"⚠️ CSV not found. cur={cur_path} cand={cand_path} (set CSV_CURRENT/CSV_CANDIDATE or place files)"
-L377         print(msg); _post_slack(msg)
-L378         if SOFT_FAIL:
-L379             sys.exit(0)
-L380         sys.exit(78)
-L381
-L382     tickers=sorted(set(_read_tickers(cur_path)+_read_tickers(cand_path)))
-L383     if not tickers:
-L384         msg = f"⚠️ No tickers from CSV. cur={cur_path} cand={cand_path}"
+245             def pick(item,keys):
+L246                 for k in keys:
+L247                     if k in item and item[k] is not None: return item[k]
+L248             cfo_vals=[pick(x,_FINN_CFO_KEYS) for x in arr[:4]]
+L249             cap_vals=[pick(x,_FINN_CAPEX_KEYS) for x in arr[:4]]
+L250             cfo_ttm = np.nansum([np.nan if v is None else float(v) for v in cfo_vals]) if any(v is not None for v in cfo_vals) else None
+L251             cap_ttm = np.nansum([np.nan if v is None else float(v) for v in cap_vals]) if any(v is not None for v in cap_vals) else None
+L252             if cfo_ttm is None or cap_ttm is None:
+L253                 j=_finn_get(s,f"{base}/stock/cash-flow",{"symbol":sym,"frequency":"annual","limit":1,"token":FINN_KEY})
+L254                 arr=j.get("cashFlow") or []
+L255                 if arr:
+L256                     item0=arr[0]
+L257                     if cfo_ttm is None:
+L258                         v=pick(item0,_FINN_CFO_KEYS); 
+L259                         if v is not None: cfo_ttm=float(v)
+L260                     if cap_ttm is None:
+L261                         v=pick(item0,_FINN_CAPEX_KEYS); 
+L262                         if v is not None: cap_ttm=float(v)
+L263             if cfo_ttm is None or cap_ttm is None: bad.append(sym)
+L264         except Exception: bad.append(sym)
+L265     ms=_now_ms()-t0
+L266     level="HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
+L267     slow=" SLOW" if ms>=TIMEOUT_MS_WARN else ""
+L268     return f"FINNHUB:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}",{
+L269         "level":level,"latency_ms":ms,"bad":bad
+L270     }
+L271
+L272 # ================================================================
+L273 # SEC: companyfacts（Revenue/EPS）ヘルス
+L274 # ================================================================
+L275 def _sec_headers():
+L276     """
+L277     SECは連絡先付きUser-Agent/Fromを強く推奨・一部で必須。
+L278     SEC_EMAILが空なら最低限のUAにしつつ、403発生時は上位でSKIP扱いにする。
+L279     """
+L280     ua = (f"api-health-probe/1 (+mailto:{SEC_EMAIL})" if SEC_EMAIL else "api-health-probe/1")
+L281     hdr = {
+L282         "User-Agent": ua[:200],
+L283         "Accept": "application/json",
+L284     }
+L285     if SEC_EMAIL:
+L286         hdr["From"] = SEC_EMAIL[:200]
+L287     return hdr
+L288
+L289 def _sec_get(url: str, params=None, retries=3, sleep_s: float=0.5):
+L290     """
+L291     403やネットワークエラーは上位でSKIP判定できるよう None を返す。
+L292     """
+L293     for i in range(retries):
+L294         try:
+L295             r = requests.get(url, params=params or {}, headers=_sec_headers(), timeout=15)
+L296             if r.status_code==429:
+L297                 time.sleep(min(2**i*sleep_s, 4.0)); continue
+L298             if r.status_code==403:
+L299                 # UA/From未設定やアクセス制限。上位でSKIP。
+L300                 return None
+L301             r.raise_for_status(); return r.json()
+L302         except Exception:
+L303             time.sleep(min(2**i*sleep_s, 2.0))
+L304     return None
+L305
+L306 def _sec_ticker_map() -> Dict[str,str]:
+L307     j = _sec_get("https://www.sec.gov/files/company_tickers.json")
+L308     if j is None:
+L309         return {}
+L310     out={}
+L311     it=(j.values() if isinstance(j,dict) else j)
+L312     for item in it:
+L313         try:
+L314             t=(item.get("ticker") or item.get("TICKER") or "").upper()
+L315             cik=str(item.get("cik_str") or item.get("CIK") or "").zfill(10)
+L316             if t and cik: out[t]=cik
+L317         except Exception: continue
+L318     return out
+L319
+L320 SEC_REV_TAGS=["Revenues","RevenueFromContractWithCustomerExcludingAssessedTax","SalesRevenueNet","SalesRevenueGoodsNet","SalesRevenueServicesNet","Revenue"]
+L321 SEC_EPS_TAGS=["EarningsPerShareDiluted","EarningsPerShareBasicAndDiluted","EarningsPerShare","EarningsPerShareBasic"]
+L322
+L323 def _normalize_for_sec(sym: str) -> List[str]:
+L324     s=(sym or "").upper(); outs=[]; add=lambda x: outs.append(x) if x and x not in outs else None
+L325     add(s); add(s.replace(".","-")); add(s.replace("-","")); add(s.replace(".","")); return outs
+L326
+L327 def _units_for_tags(facts: dict, spaces: List[str], tags: List[str]) -> list:
+L328     got=[]
+L329     for sp in spaces:
+L330         d=(facts.get("facts") or {}).get(sp) or {}
+L331         for tg in tags:
+L332             arr=(d.get(tg) or {}).get("units") or {}
+L333             for unit, vals in (arr.items() if isinstance(arr,dict) else []):
+L334                 if isinstance(vals,list) and vals: got.append(vals)
+L335     return got
+L336
+L337 def _series_q_and_a(arrs: list) -> Tuple[list, list]:
+L338     q_pairs,a_pairs=[],[]
+L339     for vals in arrs:
+L340         for v in vals:
+L341             try:
+L342                 dt=v.get("end") or v.get("fy"); val=float(v.get("val")); form=(v.get("form") or "").upper()
+L343                 if "10-Q" in form or "6-K" in form or form=="Q": q_pairs.append((dt,val))
+L344                 elif "10-K" in form or "20-F" in form or form=="K": a_pairs.append((dt,val))
+L345             except Exception: pass
+L346     q_pairs=sorted(q_pairs,key=lambda x: str(x[0]),reverse=True)
+L347     a_pairs=sorted(a_pairs,key=lambda x: str(x[0]),reverse=True)
+L348     return q_pairs,a_pairs
+L349
+L350 def sec_health(tickers: List[str]) -> Tuple[str, Dict]:
+L351     t0=_now_ms(); t2cik=_sec_ticker_map(); bad=[]
+L352     # CIKマップが取れない（403/ネット断/UA未設定など）はSKIPPED
+L353     if not t2cik:
+L354         ms=_now_ms()-t0
+L355         note="no SEC_EMAIL/403" if not SEC_EMAIL else "SEC endpoint blocked"
+L356         det=f"SEC:SKIPPED ({note}) latency={_fmt_ms(ms)}"
+L357         return det,{"level":"SKIPPED","latency_ms":ms,"bad":[]}
+L358     for t in tickers:
+L359         cands=_normalize_for_sec(t); cik=next((t2cik.get(x) for x in cands if t2cik.get(x)), None)
+L360         if not cik: bad.append(t); continue
+L361         try:
+L362             j=_sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
+L363             if j is None:
+L364                 bad.append(t); continue
+L365             rev_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_REV_TAGS)
+L366             eps_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_EPS_TAGS)
+L367             rev_q,rev_a=_series_q_and_a(rev_arr); eps_q,eps_a=_series_q_and_a(eps_arr)
+L368             if not (rev_q or rev_a) or not (eps_q or eps_a): bad.append(t)
+L369         except Exception: bad.append(t)
+L370         time.sleep(0.30)  # SEC負荷配慮
+L371     ms=_now_ms()-t0
+L372     level="HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
+L373     slow=" SLOW" if ms>=TIMEOUT_MS_WARN else ""
+L374     return f"SEC:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}",{
+L375         "level":level,"latency_ms":ms,"bad":bad
+L376     }
+L377
+L378 # ================================================================
+L379 # Orchestration
+L380 # ================================================================
+L381 def main():
+L382     cur_path, cand_path = _autodiscover_csv()
+L383     if not cur_path or not cand_path:
+L384         msg = f"⚠️ CSV not found. cur={cur_path} cand={cand_path} (set CSV_CURRENT/CSV_CANDIDATE or place files)"
 L385         print(msg); _post_slack(msg)
 L386         if SOFT_FAIL:
 L387             sys.exit(0)
 L388         sys.exit(78)
 L389
-L390     # YF
-L391     det_price,meta_price=yf_price_health(tickers)
-L392     det_info ,meta_info =yf_fastinfo_health(tickers)
-L393     det_fin  ,meta_fin  =yf_financials_health(tickers)
-L394
-L395     # SEC
-L396     det_sec  ,meta_sec  =sec_health(tickers)
+L390     tickers=sorted(set(_read_tickers(cur_path)+_read_tickers(cand_path)))
+L391     if not tickers:
+L392         msg = f"⚠️ No tickers from CSV. cur={cur_path} cand={cand_path}"
+L393         print(msg); _post_slack(msg)
+L394         if SOFT_FAIL:
+L395             sys.exit(0)
+L396         sys.exit(78)
 L397
-L398     # Finnhub（必要時のみ。YF財務NG銘柄へのフォールバック検証）
-L399     need_finn=meta_fin["bad"]
-L400     det_finn,meta_finn  =finnhub_health(need_finn if need_finn else tickers[:0])
-L401
-L402     # API別レベル
-L403     levels_map = {
-L404         "YF_PRICE": meta_price["level"],
-L405         "YF_INFO" : meta_info ["level"],
-L406         "YF_FIN"  : meta_fin  ["level"],
-L407         "SEC"     : meta_sec  ["level"],
-L408         "FINNHUB" : meta_finn.get("level","SKIPPED"),
-L409     }
-L410     pri={"DOWN":3,"DEGRADED":2,"HEALTHY":1,"SKIPPED":0}
-L411     # コアAPI（OPTIONAL_APIS 以外）のワースト
-L412     core_levels = [lvl for api,lvl in levels_map.items() if api not in OPTIONAL_APIS]
-L413     core_worst = max(core_levels, key=lambda x: pri.get(x,0)) if core_levels else "HEALTHY"
-L414     # 全体ワースト（表示用）
-L415     all_worst  = max(levels_map.values(), key=lambda x: pri.get(x,0))
-L416     # ただし、DOWN が OPTIONAL_APIS のみから来ている場合は全体を DEGRADED までに抑制
-L417     if all_worst=="DOWN" and core_worst!="DOWN":
-L418         worst = "DEGRADED"
-L419     else:
-L420         worst = all_worst
-L421     emoji={"HEALTHY":"✅","DEGRADED":"⚠️","DOWN":"🛑"}.get(worst,"ℹ️")
-L422
-L423     # 共通障害（同一日だけの欠損が過半）を簡易検知（価格系列ベース）
-L424     outage_note=""
-L425     try:
-L426         from collections import Counter
-L427         missing_dates=meta_price.get("per_ticker_missing",{})
-L428         date_counter=Counter(); one_day_missing=0
-L429         for _,info in missing_dates.items():
-L430             dates=info.get("dates",set()); max_gap=info.get("max_gap",0)
-L431             if len(dates)==1 and max_gap==1:
-L432                 one_day_missing+=1; date_counter.update(dates)
-L433         threshold=max(1,len(tickers)//2)
-L434         if one_day_missing>=threshold:
-L435             (missing_day,hits),=date_counter.most_common(1)
-L436             outage_note=f" | OUTAGE: common_missing_day={missing_day} hits={hits}"
-L437             if worst=="HEALTHY":
-L438                 worst="DEGRADED"; emoji="🟠"
-L439     except Exception:
-L440         pass
-L441
-L442     summary=f"{emoji} API_HEALTH {worst}{outage_note}\n{det_price} | {det_info} | {det_fin} | {det_sec} | {det_finn}"
-L443     has_problem=("DEGRADED" in worst) or ("DOWN" in worst)
-L444
-L445     if has_problem:
-L446         def head(xs): return ", ".join(xs[:10]) + (f" …(+{len(xs)-10})" if len(xs)>10 else "")
-L447         lines=[]
-L448         if meta_price["missing"] or meta_price["nf"]:
-L449             xs=[*meta_price["nf"],*meta_price["missing"]]; lines.append(f"YF_PRICE NG: {head(xs)}")
-L450         if meta_info["bad"]:  lines.append(f"YF_INFO NG: {head(meta_info['bad'])}")
-L451         if meta_fin["bad"]:   lines.append(f"YF_FIN NG: {head(meta_fin['bad'])}")
-L452         if meta_sec["bad"]:   lines.append(f"SEC NG: {head(meta_sec['bad'])}")
-L453         if meta_finn.get("bad"): lines.append(f"FINNHUB NG: {head(meta_finn['bad'])}")
-L454         text=summary + ("\n" + "\n".join(lines) if lines else "")
-L455     else:
-L456         text=summary
-L457
-L458     print(text); _post_slack(text)
-L459     if SOFT_FAIL:
-L460         sys.exit(0)
-L461     # 退出コードは“コアAPIの状態”を優先（OPTIONALがDOWNでも exit 20 にしない）
-L462     exit_by = core_worst if core_worst!="HEALTHY" else worst
-L463     sys.exit(0 if exit_by=="HEALTHY" else 10 if exit_by=="DEGRADED" else 20)
-L464
-L465 if __name__=="__main__":
-L466     main()
-```
-
-## <.github/workflows/api-health.yml>
-```text
-L1 name: api-health-probe
-L2 on:
-L3   push:
-L4     branches: [ main ]
-L5
-L6 jobs:
-L7   probe:
-L8     runs-on: ubuntu-latest
-L9     timeout-minutes: 10
-L10     steps:
-L11       - uses: actions/checkout@v4
-L12       - name: Show repo tree (CSV check)
-L13         run: |
-L14           echo "== ls -R for quick CSV check =="
-L15           ls -R | head -n 300
-L16           echo "== grep probable csv files =="
-L17           (git ls-files | grep -Ei '(current|candidate).*\.csv$' || true)
-L18       - uses: actions/setup-python@v5
-L19         with:
-L20           python-version: "3.11"
-L21       - name: Install deps
-L22         run: |
-L23           python -m pip install --upgrade pip
-L24           pip install yfinance pandas numpy requests
-L25       - name: Run API health probe
-L26         env:
-L27           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-L28           FINNHUB_API_KEY:   ${{ secrets.FINNHUB_API_KEY }}
-L29           SEC_EMAIL:         ${{ secrets.SEC_EMAIL }}
-L30           # 上書きしたい場合だけ指定（例: CSV_CURRENT: data/current.csv）
-L31           # CSV_CURRENT:       current.csv
-L32           
+L398     # YF
+L399     det_price,meta_price=yf_price_health(tickers)
+L400     det_info ,meta_info =yf_fastinfo_health(tickers)
+L401     det_fin  ,meta_fin  =yf_financials_health(tickers)
+L402
+L403     # SEC
+L404     det_sec  ,meta_sec  =sec_health(tickers)
+L405
+L406     # Finnhub（必要時のみ。YF財務NG銘柄へのフォールバック検証）
+L407     need_finn=meta_fin["bad"]
+L408     det_finn,meta_finn  =finnhub_health(need_finn if need_finn else tickers[:0])
+L409
+L410     # API別レベル
+L411     levels_map = {
+L412         "YF_PRICE": meta_price["level"],
+L413         "YF_INFO" : meta_info ["level"],
+L414         "YF_FIN"  : meta_fin  ["level"],
+L415         "SEC"     : meta_sec  ["level"],
+L416         "FINNHUB" : meta_finn.get("level","SKIPPED"),
+L417     }
+L418     pri={"DOWN":3,"DEGRADED":2,"HEALTHY":1,"SKIPPED":0}
+L419     # コアAPI（OPTIONAL_APIS 以外）のワースト
+L420     core_levels = [lvl for api,lvl in levels_map.items() if api not in OPTIONAL_APIS]
+L421     core_worst = max(core_levels, key=lambda x: pri.get(x,0)) if core_levels else "HEALTHY"
+L422     # 全体ワースト（表示用）
+L423     all_worst  = max(levels_map.values(), key=lambda x: pri.get(x,0))
+L424     # ただし、DOWN が OPTIONAL_APIS のみから来ている場合は全体を DEGRADED までに抑制
+L425     if all_worst=="DOWN" and core_worst!="DOWN":
+L426         worst = "DEGRADED"
+L427     else:
+L428         worst = all_worst
+L429     emoji={"HEALTHY":"✅","DEGRADED":"⚠️","DOWN":"🛑"}.get(worst,"ℹ️")
+L430
+L431     # 共通障害（同一日だけの欠損が過半）を簡易検知（価格系列ベース）
+L432     outage_note=""
+L433     try:
+L434         from collections import Counter
+L435         missing_dates=meta_price.get("per_ticker_missing",{})
+L436         date_counter=Counter(); one_day_missing=0
+L437         for _,info in missing_dates.items():
+L438             dates=info.get("dates",set()); max_gap=info.get("max_gap",0)
+L439             if len(dates)==1 and max_gap==1:
+L440                 one_day_missing+=1; date_counter.update(dates)
+L441         threshold=max(1,len(tickers)//2)
+L442         if one_day_missing>=threshold:
+L443             (missing_day,hits),=date_counter.most_common(1)
+L444             outage_note=f" | OUTAGE: common_missing_day={missing_day} hits={hits}"
+L445             if worst=="HEALTHY":
+L446                 worst="DEGRADED"; emoji="🟠"
+L447     except Exception:
+L448         pass
+L449
+L450     summary=f"{emoji} API_HEALTH {worst}{outage_note} (exit_on={EXIT_ON_LEVEL})\n{det_price} | {det_info} | {det_fin} | {det_sec} | {det_finn}"
+L451     has_problem=("DEGRADED" in worst) or ("DOWN" in worst)
+L452
+L453     if has_problem:
+L454         def head_problem(xs): return ", ".join(xs[:10]) + (f" …(+{len(xs)-10})" if len(xs)>10 else "")
+L455         lines=[]
+L456         if meta_price["missing"] or meta_price["nf"]:
+L457             xs=[*meta_price["nf"],*meta_price["missing"]]; lines.append(f"YF_PRICE NG: {head_problem(xs)}")
+L458         if meta_info["bad"]:  lines.append(f"YF_INFO NG: {head_problem(meta_info['bad'])}")
+L459         if meta_fin["bad"]:   lines.append(f"YF_FIN NG: {head_problem(meta_fin['bad'])}")
+L460         if meta_sec["bad"]:   lines.append(f"SEC NG: {head_problem(meta_sec['bad'])}")
+L461         if meta_finn.get("bad"): lines.append(f"FINNHUB NG: {head_problem(meta_finn['bad'])}")
+L462         text=summary + ("\n" + "\n".join(lines) if lines else "")
+L463     else:
+L464         text=summary
+L465
+L466     # “変なティッカー”は毎回通報
+L467     def head_pair(pairs):
+L468         xs=[f"{a}->{b}" for (a,b) in pairs[:10]]
+L469         return ", ".join(xs) + (f" …(+{len(pairs)-10})" if len(pairs)>10 else "")
+L470     def head(xs):
+L471         return ", ".join(xs[:10]) + (f" …(+{len(xs)-10})" if len(xs)>10 else "")
+L472     alias_fixed = meta_price.get("alias_fixed", [])
+L473     still_missing = meta_price.get("nf", [])
+L474     weird_lines = []
+L475     if alias_fixed:
+L476         weird_lines.append(f"Weird tickers (alias fixed): {head_pair(alias_fixed)}")
+L477     if still_missing:
+L478         weird_lines.append(f"Weird tickers (not found): {head(still_missing)}")
+L479     if weird_lines:
+L480         text = text + "\n" + "\n".join(weird_lines)
+L481
+L482     print(text); _post_slack(text)
+L483     if SOFT_FAIL: sys.exit(0)
+L484     # 退出判定：基準は“コアAPIの状態”。OPTIONALがDOWNでも coreがHEALTHY/DEGRADEDなら緩和。
+L485     exit_by = core_worst if core_worst!="HEALTHY" else worst
+L486     def _rank(x): return {"HEALTHY":1,"DEGRADED":2,"DOWN":3}.get(x,0)
+L487     # EXIT_ON_LEVEL 未満なら成功終了
+L488   
 ```

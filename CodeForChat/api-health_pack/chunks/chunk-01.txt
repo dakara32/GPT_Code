@@ -2,7 +2,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: tools/api_health_probe.py, .github/workflows/api-health.yml
-# 作成日時: 2025-09-24 16:45:47 (JST)
+# 作成日時: 2025-09-24 17:32:11 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -49,206 +49,209 @@ L37 SEC_EMAIL   = os.getenv("SEC_EMAIL","")
 L38 MAX_WORKERS = int(os.getenv("MAX_WORKERS","8"))
 L39 # “任意API”の扱い：ここに列挙されたAPIがDOWNでも全体は最大DEGRADED止まり
 L40 OPTIONAL_APIS = set([x.strip().upper() for x in os.getenv("OPTIONAL_APIS","FINNHUB").split(",") if x.strip()])
-L41
-L42 # ---- Utils
-L43 def _now_ms() -> int: return int(time.time()*1000)
-L44
-L45 def _post_slack(text: str):
-L46     if not SLACK_WEBHOOK:
-L47         print("[SLACK] webhook missing; print only\n"+text); return
-L48     try:
-L49         r = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=5)
-L50         print(f"[SLACK] status={r.status_code}"); r.raise_for_status()
-L51     except Exception as e: print(f"[SLACK] send error: {e}")
-L52
-L53 def _read_tickers(path: str) -> List[str]:
-L54     if not os.path.exists(path): return []
-L55     # 'ticker','symbol','Symbol','Ticker' の列に対応。無ければ1列CSVも許容。
-L56     try:
-L57         df = pd.read_csv(path)
-L58         for c in ["ticker","symbol","Symbol","Ticker"]:
-L59             if c in df.columns:
-L60                 col = df[c].astype(str).str.strip()
-L61                 return [t for t in col if t and t.lower()!="nan"]
-L62         with open(path, newline="") as f:
-L63             rd = csv.reader(f)
-L64             vals = [row[0].strip() for row in rd if row]
-L65             if vals and vals[0].lower() in ("ticker","symbol"): vals = vals[1:]
-L66             return [v for v in vals if v]
-L67     except Exception:
-L68         return []
-L69
-L70 def _autodiscover_csv() -> tuple[str|None, str|None]:
-L71     """
-L72     リポジトリ内から current*.csv / candidate*.csv を再帰探索し、最初に見つけたものを返す。
-L73     明示指定（ENV）があればそれを優先。見つからなければ None。
-L74     """
-L75     cur = CSV_CURRENT if os.path.exists(CSV_CURRENT) else None
-L76     cand = CSV_CANDIDATE if os.path.exists(CSV_CANDIDATE) else None
-L77     if cur and cand:
-L78         return cur, cand
-L79
-L80     for root, _, files in os.walk(".", topdown=True):
-L81         for fn in files:
-L82             if not fn.lower().endswith(".csv"):
-L83                 continue
-L84             path = os.path.join(root, fn)
-L85             name = fn.lower()
-L86             if not cur and "current" in name:
-L87                 cur = path
-L88             if not cand and "candidate" in name:
-L89                 cand = path
-L90         if cur and cand:
-L91             break
-L92     return cur, cand
-L93
-L94 def _fmt_ms(ms: int) -> str:
-L95     return f"{ms}ms" if ms < 1000 else f"{ms/1000:.2f}s"
-L96
-L97 # ---- Ticker 正規化（YF用）
-L98 def _yf_variants(sym: str):
-L99     s = (sym or "").upper()
-L100     cands = []
-L101     def add(x):
-L102         if x and x not in cands: cands.append(x)
-L103     add(s)
-L104     add(s.replace(".","-"))   # BRK.B -> BRK-B, PBR.A -> PBR-A
-L105     add(re.sub(r"[.\-^]", "", s))  # 記号除去
-L106     return cands
-L107
-L108 # ================================================================
-L109 # Yahoo Finance: price series ヘルス
+L41 # 退出条件（既定: DEGRADED）。DOWNにすれば「DOWNの時だけ失敗」
+L42 EXIT_ON_LEVEL = os.getenv("EXIT_ON_LEVEL","DEGRADED").upper()
+L43
+L44 # ---- Utils
+L45 def _now_ms() -> int: return int(time.time()*1000)
+L46
+L47 def _post_slack(text: str):
+L48     if not SLACK_WEBHOOK:
+L49         print("[SLACK] webhook missing; print only\n"+text); return
+L50     try:
+L51         r = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=5)
+L52         print(f"[SLACK] status={r.status_code}"); r.raise_for_status()
+L53     except Exception as e: print(f"[SLACK] send error: {e}")
+L54
+L55 def _read_tickers(path: str) -> List[str]:
+L56     if not os.path.exists(path): return []
+L57     # 'ticker','symbol','Symbol','Ticker' の列に対応。無ければ1列CSVも許容。
+L58     try:
+L59         df = pd.read_csv(path)
+L60         for c in ["ticker","symbol","Symbol","Ticker"]:
+L61             if c in df.columns:
+L62                 col = df[c].astype(str).str.strip()
+L63                 return [t for t in col if t and t.lower()!="nan"]
+L64         with open(path, newline="") as f:
+L65             rd = csv.reader(f)
+L66             vals = [row[0].strip() for row in rd if row]
+L67             if vals and vals[0].lower() in ("ticker","symbol"): vals = vals[1:]
+L68             return [v for v in vals if v]
+L69     except Exception:
+L70         return []
+L71
+L72 def _autodiscover_csv() -> tuple[str|None, str|None]:
+L73     """
+L74     リポジトリ内から current*.csv / candidate*.csv を再帰探索し、最初に見つけたものを返す。
+L75     明示指定（ENV）があればそれを優先。見つからなければ None。
+L76     """
+L77     cur = CSV_CURRENT if os.path.exists(CSV_CURRENT) else None
+L78     cand = CSV_CANDIDATE if os.path.exists(CSV_CANDIDATE) else None
+L79     if cur and cand:
+L80         return cur, cand
+L81
+L82     for root, _, files in os.walk(".", topdown=True):
+L83         for fn in files:
+L84             if not fn.lower().endswith(".csv"):
+L85                 continue
+L86             path = os.path.join(root, fn)
+L87             name = fn.lower()
+L88             if not cur and "current" in name:
+L89                 cur = path
+L90             if not cand and "candidate" in name:
+L91                 cand = path
+L92         if cur and cand:
+L93             break
+L94     return cur, cand
+L95
+L96 def _fmt_ms(ms: int) -> str:
+L97     return f"{ms}ms" if ms < 1000 else f"{ms/1000:.2f}s"
+L98
+L99 # ---- Ticker 正規化（YF用）
+L100 def _yf_variants(sym: str):
+L101     s = (sym or "").upper()
+L102     cands = []
+L103     def add(x):
+L104         if x and x not in cands: cands.append(x)
+L105     add(s)
+L106     add(s.replace(".","-"))   # BRK.B -> BRK-B, PBR.A -> PBR-A
+L107     add(re.sub(r"[.\-^]", "", s))  # 記号除去
+L108     return cands
+L109
 L110 # ================================================================
-L111 def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
-L112     t0 = _now_ms()
-L113     data = yf.download(tickers, period=YF_PERIOD, auto_adjust=True, progress=False, threads=True)
-L114     close = data["Close"] if isinstance(data, pd.DataFrame) and "Close" in data else pd.DataFrame()
-L115     per_ticker_missing = {}; nf=[]; missing=[]; ok=[]
-L116     for t in tickers:
-L117         if t not in close.columns:
-L118             # 簡易ノーマライズ後、個別で5dだけ再取得して最低限の生存確認
-L119             recovered = False
-L120             for alias in _yf_variants(t):
-L121                 try:
-L122                     s = yf.Ticker(alias).history(period="5d", auto_adjust=True)["Close"]
-L123                     if isinstance(s, pd.Series) and s.notna().sum() > 0:
-L124                         recovered = True
-L125                         break
-L126                 except Exception:
-L127                     pass
-L128             if not recovered:
-L129                 nf.append(t); per_ticker_missing[t]={"dates":set(),"max_gap":0}; continue
-L130             # 再取得で回復した場合はOK扱い（dates/max_gapは空のまま）
-L131             ok.append(t); per_ticker_missing.setdefault(t, {"dates":set(),"max_gap":0}); continue
-L132         s = close[t]; n = s.shape[0]; nn = int(s.notna().sum())
-L133         isna = s.isna().values; idx = s.index
-L134         total_nan = int(isna.sum()); cur=max_gap=0
-L135         dates = set(str(d.date()) for d,v in zip(idx,isna) if v)
-L136         for v in isna:
-L137             if v: cur+=1
-L138             else:
-L139                 if cur>0: max_gap=max(max_gap,cur); cur=0
-L140         if cur>0: max_gap=max(max_gap,cur)
-L141         per_ticker_missing[t] = {"dates":dates,"max_gap":max_gap}
-L142         if nn==0 or total_nan>0 or n<YF_MIN_LEN: missing.append(t)
-L143         else: ok.append(t)
-L144     ms = _now_ms()-t0
-L145     level = "HEALTHY" if len(ok)==len(tickers) else ("DEGRADED" if len(ok)>=len(tickers)//2 else "DOWN")
-L146     slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
-L147     return f"YF_PRICE:{level} ok={len(ok)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
-L148         "level":level,"latency_ms":ms,"ok":ok,"nf":nf,"missing":missing,
-L149         "per_ticker_missing":per_ticker_missing
-L150     }
-L151
-L152 # ================================================================
-L153 # Yahoo Finance: fast_info.lastPrice ヘルス
-L154 # ================================================================
-L155 def yf_fastinfo_health(tickers: List[str]) -> Tuple[str, Dict]:
-L156     t0 = _now_ms(); tk = yf.Tickers(" ".join(tickers)); bad=[]
-L157     for t in tickers:
-L158         try:
-L159             v = tk.tickers[t].fast_info.get("lastPrice", None)
-L160             if v is None or (isinstance(v,float) and math.isnan(v)): bad.append(t)
-L161         except Exception: bad.append(t)
-L162     ms=_now_ms()-t0
-L163     level = "HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-L164     slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
-L165     return f"YF_INFO:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
-L166         "level":level,"latency_ms":ms,"bad":bad
-L167     }
-L168
-L169 # ================================================================
-L170 # Yahoo Finance: financials（CFO/Capex/FCF）ヘルス
-L171 # ================================================================
-L172 _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"],
-L173                "capex":["Capital Expenditure","Capital Expenditures"]}
-L174 def _pick_row(df: pd.DataFrame, names: List[str]) -> pd.Series|None:
-L175     if df is None or df.empty: return None
-L176     idx_lower = {str(i).lower():i for i in df.index}
-L177     for n in names:
-L178         k = n.lower()
-L179         if k in idx_lower: return df.loc[idx_lower[k]]
-L180     return None
-L181 def _sum_last_n(s: pd.Series|None, n:int) -> float|None:
-L182     if s is None or s.empty: return None
-L183     v = s.dropna().astype(float); return None if v.empty else v.iloc[:n].sum()
-L184 def _latest(s: pd.Series|None) -> float|None:
-L185     if s is None or s.empty: return None
-L186     v = s.dropna().astype(float); return v.iloc[0] if not v.empty else None
-L187
-L188 def yf_financials_health(tickers: List[str]) -> Tuple[str, Dict]:
-L189     t0=_now_ms(); bad=[]
-L190     def one(t):
-L191         try:
-L192             tk = yf.Ticker(t)
-L193             qcf = tk.quarterly_cashflow
-L194             cfo_q = _pick_row(qcf, _CF_ALIASES["cfo"])
-L195             cap_q = _pick_row(qcf, _CF_ALIASES["capex"])
-L196             fcf_q = _pick_row(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
-L197             cfo = _sum_last_n(cfo_q,4); cap = _sum_last_n(cap_q,4); fcf = _sum_last_n(fcf_q,4)
-L198             if any(v is None for v in (cfo,cap,fcf)):
-L199                 acf = tk.cashflow
-L200                 if cfo is None: cfo=_latest(_pick_row(acf,_CF_ALIASES["cfo"]))
-L201                 if cap is None: cap=_latest(_pick_row(acf,_CF_ALIASES["capex"]))
-L202                 if fcf is None: fcf=_latest(_pick_row(acf,["Free Cash Flow","FreeCashFlow","Free cash flow"]))
-L203             return None if all(v is not None for v in (cfo,cap,fcf)) else t
-L204         except Exception: return t
-L205     with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-L206         for r in ex.map(one, tickers):
-L207             if r: bad.append(r)
-L208     ms=_now_ms()-t0
-L209     level = "HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-L210     slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
-L211     return f"YF_FIN:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
-L212         "level":level,"latency_ms":ms,"bad":bad
-L213     }
-L214
-L215 # ================================================================
-L216 # Finnhub: cash-flow（CFO/Capex）ヘルス（フォールバック）
-L217 # ================================================================
-L218 _FINN_CFO_KEYS   = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
-L219 _FINN_CAPEX_KEYS = ["capitalExpenditure","capitalExpenditures","purchaseOfPPE","investmentsInPropertyPlantAndEquipment"]
-L220
-L221 def _finn_get(session: requests.Session, url: str, params: dict, retries: int=3, sleep_s: float=0.5):
-L222     for i in range(retries):
-L223         r = session.get(url, params=params, timeout=15)
-L224         if r.status_code==429:
-L225             time.sleep(min(2**i*sleep_s, 4.0)); continue
-L226         r.raise_for_status(); return r.json()
-L227     r.raise_for_status()
+L111 # Yahoo Finance: price series ヘルス
+L112 # ================================================================
+L113 def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
+L114     t0 = _now_ms()
+L115     data = yf.download(tickers, period=YF_PERIOD, auto_adjust=True, progress=False, threads=True)
+L116     close = data["Close"] if isinstance(data, pd.DataFrame) and "Close" in data else pd.DataFrame()
+L117     per_ticker_missing = {}
+L118     nf=[]          # 一括でも別名再試行でも取得できず
+L119     missing=[]     # 列はあるがNaN/不足
+L120     ok=[]          # 問題なし
+L121     alias_fixed=[] # (orig, alias) 別名で回復
+L122     for t in tickers:
+L123         if t not in close.columns:
+L124             # 簡易ノーマライズ後、個別で5dだけ再取得して最低限の生存確認
+L125             recovered = False
+L126             for alias in _yf_variants(t):
+L127                 try:
+L128                     s = yf.Ticker(alias).history(period="5d", auto_adjust=True)["Close"]
+L129                     if isinstance(s, pd.Series) and s.notna().sum() > 0:
+L130                         recovered = True
+L131                         alias_fixed.append((t, alias))
+L132                         break
+L133                 except Exception:
+L134                     pass
+L135             if not recovered:
+L136                 nf.append(t); per_ticker_missing[t]={"dates":set(),"max_gap":0}; continue
+L137             # 再取得で回復した場合はOK扱い（dates/max_gapは空のまま）
+L138             ok.append(t); per_ticker_missing.setdefault(t, {"dates":set(),"max_gap":0}); continue
+L139         s = close[t]; n = s.shape[0]; nn = int(s.notna().sum())
+L140         isna = s.isna().values; idx = s.index
+L141         total_nan = int(isna.sum()); cur=max_gap=0
+L142         dates = set(str(d.date()) for d,v in zip(idx,isna) if v)
+L143         for v in isna:
+L144             if v: cur+=1
+L145             else:
+L146                 if cur>0: max_gap=max(max_gap,cur); cur=0
+L147         if cur>0: max_gap=max(max_gap,cur)
+L148         per_ticker_missing[t] = {"dates":dates,"max_gap":max_gap}
+L149         if nn==0 or total_nan>0 or n<YF_MIN_LEN: missing.append(t)
+L150         else: ok.append(t)
+L151     ms = _now_ms()-t0
+L152     level = "HEALTHY" if len(ok)==len(tickers) else ("DEGRADED" if len(ok)>=len(tickers)//2 else "DOWN")
+L153     slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
+L154     return f"YF_PRICE:{level} ok={len(ok)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
+L155         "level":level,"latency_ms":ms,"ok":ok,"nf":nf,"missing":missing,
+L156         "per_ticker_missing":per_ticker_missing,
+L157         "alias_fixed": alias_fixed
+L158     }
+L159
+L160 # ================================================================
+L161 # Yahoo Finance: fast_info.lastPrice ヘルス
+L162 # ================================================================
+L163 def yf_fastinfo_health(tickers: List[str]) -> Tuple[str, Dict]:
+L164     t0 = _now_ms(); tk = yf.Tickers(" ".join(tickers)); bad=[]
+L165     for t in tickers:
+L166         try:
+L167             v = tk.tickers[t].fast_info.get("lastPrice", None)
+L168             if v is None or (isinstance(v,float) and math.isnan(v)): bad.append(t)
+L169         except Exception: bad.append(t)
+L170     ms=_now_ms()-t0
+L171     level = "HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
+L172     slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
+L173     return f"YF_INFO:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
+L174         "level":level,"latency_ms":ms,"bad":bad
+L175     }
+L176
+L177 # ================================================================
+L178 # Yahoo Finance: financials（CFO/Capex/FCF）ヘルス
+L179 # ================================================================
+L180 _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"],
+L181                "capex":["Capital Expenditure","Capital Expenditures"]}
+L182 def _pick_row(df: pd.DataFrame, names: List[str]) -> pd.Series|None:
+L183     if df is None or df.empty: return None
+L184     idx_lower = {str(i).lower():i for i in df.index}
+L185     for n in names:
+L186         k = n.lower()
+L187         if k in idx_lower: return df.loc[idx_lower[k]]
+L188     return None
+L189 def _sum_last_n(s: pd.Series|None, n:int) -> float|None:
+L190     if s is None or s.empty: return None
+L191     v = s.dropna().astype(float); return None if v.empty else v.iloc[:n].sum()
+L192 def _latest(s: pd.Series|None) -> float|None:
+L193     if s is None or s.empty: return None
+L194     v = s.dropna().astype(float); return v.iloc[0] if not v.empty else None
+L195
+L196 def yf_financials_health(tickers: List[str]) -> Tuple[str, Dict]:
+L197     t0=_now_ms(); bad=[]
+L198     def one(t):
+L199         try:
+L200             tk = yf.Ticker(t)
+L201             qcf = tk.quarterly_cashflow
+L202             cfo_q = _pick_row(qcf, _CF_ALIASES["cfo"])
+L203             cap_q = _pick_row(qcf, _CF_ALIASES["capex"])
+L204             fcf_q = _pick_row(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
+L205             cfo = _sum_last_n(cfo_q,4); cap = _sum_last_n(cap_q,4); fcf = _sum_last_n(fcf_q,4)
+L206             if any(v is None for v in (cfo,cap,fcf)):
+L207                 acf = tk.cashflow
+L208                 if cfo is None: cfo=_latest(_pick_row(acf,_CF_ALIASES["cfo"]))
+L209                 if cap is None: cap=_latest(_pick_row(acf,_CF_ALIASES["capex"]))
+L210                 if fcf is None: fcf=_latest(_pick_row(acf,["Free Cash Flow","FreeCashFlow","Free cash flow"]))
+L211             return None if all(v is not None for v in (cfo,cap,fcf)) else t
+L212         except Exception: return t
+L213     with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+L214         for r in ex.map(one, tickers):
+L215             if r: bad.append(r)
+L216     ms=_now_ms()-t0
+L217     level = "HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
+L218     slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
+L219     return f"YF_FIN:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
+L220         "level":level,"latency_ms":ms,"bad":bad
+L221     }
+L222
+L223 # ================================================================
+L224 # Finnhub: cash-flow（CFO/Capex）ヘルス（フォールバック）
+L225 # ================================================================
+L226 _FINN_CFO_KEYS   = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
+L227 _FINN_CAPEX_KEYS = ["capitalExpenditure","capitalExpenditures","purchaseOfPPE","investmentsInPropertyPlantAndEquipment"]
 L228
-L229 def finnhub_health(tickers: List[str]) -> Tuple[str, Dict]:
-L230     if not FINN_KEY:
-L231         return "FINNHUB:SKIPPED (no key)", dict(level="SKIPPED",bad=[])
-L232     t0=_now_ms(); base="https://finnhub.io/api/v1"; s=requests.Session(); bad=[]
-L233     for sym in tickers:
-L234         try:
-L235             j=_finn_get(s,f"{base}/stock/cash-flow",{"symbol":sym,"frequency":"quarterly","limit":8,"token":FINN_KEY})
-L236             arr=j.get("cashFlow") or []
-L237             def pick(item,keys):
-L238                 for k in keys:
-L239                     if k in item and item[k] is not None: return item[k]
-L240             cfo_vals=[pick(x,_FINN_CFO_KEYS) for x in arr[:4]]
-L241             cap_vals=[pick(x,_FINN_CAPEX_KEYS) for x in arr[:4]]
-L242             cfo_ttm = np.nansum([np.nan if v is None 
+L229 def _finn_get(session: requests.Session, url: str, params: dict, retries: int=3, sleep_s: float=0.5):
+L230     for i in range(retries):
+L231         r = session.get(url, params=params, timeout=15)
+L232         if r.status_code==429:
+L233             time.sleep(min(2**i*sleep_s, 4.0)); continue
+L234         r.raise_for_status(); return r.json()
+L235     r.raise_for_status()
+L236
+L237 def finnhub_health(tickers: List[str]) -> Tuple[str, Dict]:
+L238     if not FINN_KEY:
+L239         return "FINNHUB:SKIPPED (no key)", dict(level="SKIPPED",bad=[])
+L240     t0=_now_ms(); base="https://finnhub.io/api/v1"; s=requests.Session(); bad=[]
+L241     for sym in tickers:
+L242         try:
+L243             j=_finn_get(s,f"{base}/stock/cash-flow",{"symbol":sym,"frequency":"quarterly","limit":8,"token":FINN_KEY})
+L244             arr=j.get("cashFlow") or []
+L
 ```
