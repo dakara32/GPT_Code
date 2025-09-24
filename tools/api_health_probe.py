@@ -18,7 +18,7 @@ Env (optional):
 Exit codes:
   HEALTHY=0, DEGRADED=10, DOWN=20 （SOFT_FAIL=1なら常に0）
 """
-import os, sys, time, json, math, csv, concurrent.futures as cf
+import os, sys, time, json, math, csv, re, concurrent.futures as cf
 from typing import List, Dict, Tuple
 import pandas as pd
 import numpy as np
@@ -36,6 +36,8 @@ FINN_KEY    = os.getenv("FINNHUB_API_KEY")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL") or os.getenv("SLACK_WEBHOOK")
 SEC_EMAIL   = os.getenv("SEC_EMAIL","")
 MAX_WORKERS = int(os.getenv("MAX_WORKERS","8"))
+# “任意API”の扱い：ここに列挙されたAPIがDOWNでも全体は最大DEGRADED止まり
+OPTIONAL_APIS = set([x.strip().upper() for x in os.getenv("OPTIONAL_APIS","FINNHUB").split(",") if x.strip()])
 
 # ---- Utils
 def _now_ms() -> int: return int(time.time()*1000)
@@ -92,6 +94,17 @@ def _autodiscover_csv() -> tuple[str|None, str|None]:
 def _fmt_ms(ms: int) -> str:
     return f"{ms}ms" if ms < 1000 else f"{ms/1000:.2f}s"
 
+# ---- Ticker 正規化（YF用）
+def _yf_variants(sym: str):
+    s = (sym or "").upper()
+    cands = []
+    def add(x):
+        if x and x not in cands: cands.append(x)
+    add(s)
+    add(s.replace(".","-"))   # BRK.B -> BRK-B, PBR.A -> PBR-A
+    add(re.sub(r"[.\-^]", "", s))  # 記号除去
+    return cands
+
 # ================================================================
 # Yahoo Finance: price series ヘルス
 # ================================================================
@@ -102,7 +115,20 @@ def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
     per_ticker_missing = {}; nf=[]; missing=[]; ok=[]
     for t in tickers:
         if t not in close.columns:
-            nf.append(t); per_ticker_missing[t]={"dates":set(),"max_gap":0}; continue
+            # 簡易ノーマライズ後、個別で5dだけ再取得して最低限の生存確認
+            recovered = False
+            for alias in _yf_variants(t):
+                try:
+                    s = yf.Ticker(alias).history(period="5d", auto_adjust=True)["Close"]
+                    if isinstance(s, pd.Series) and s.notna().sum() > 0:
+                        recovered = True
+                        break
+                except Exception:
+                    pass
+            if not recovered:
+                nf.append(t); per_ticker_missing[t]={"dates":set(),"max_gap":0}; continue
+            # 再取得で回復した場合はOK扱い（dates/max_gapは空のまま）
+            ok.append(t); per_ticker_missing.setdefault(t, {"dates":set(),"max_gap":0}); continue
         s = close[t]; n = s.shape[0]; nn = int(s.notna().sum())
         isna = s.isna().values; idx = s.index
         total_nan = int(isna.sum()); cur=max_gap=0
@@ -373,10 +399,25 @@ def main():
     need_finn=meta_fin["bad"]
     det_finn,meta_finn  =finnhub_health(need_finn if need_finn else tickers[:0])
 
-    # 最悪レベル
-    levels=[meta_price["level"],meta_info["level"],meta_fin["level"],meta_sec["level"],meta_finn.get("level","SKIPPED")]
+    # API別レベル
+    levels_map = {
+        "YF_PRICE": meta_price["level"],
+        "YF_INFO" : meta_info ["level"],
+        "YF_FIN"  : meta_fin  ["level"],
+        "SEC"     : meta_sec  ["level"],
+        "FINNHUB" : meta_finn.get("level","SKIPPED"),
+    }
     pri={"DOWN":3,"DEGRADED":2,"HEALTHY":1,"SKIPPED":0}
-    worst=max(levels,key=lambda x: pri.get(x,0))
+    # コアAPI（OPTIONAL_APIS 以外）のワースト
+    core_levels = [lvl for api,lvl in levels_map.items() if api not in OPTIONAL_APIS]
+    core_worst = max(core_levels, key=lambda x: pri.get(x,0)) if core_levels else "HEALTHY"
+    # 全体ワースト（表示用）
+    all_worst  = max(levels_map.values(), key=lambda x: pri.get(x,0))
+    # ただし、DOWN が OPTIONAL_APIS のみから来ている場合は全体を DEGRADED までに抑制
+    if all_worst=="DOWN" and core_worst!="DOWN":
+        worst = "DEGRADED"
+    else:
+        worst = all_worst
     emoji={"HEALTHY":"✅","DEGRADED":"⚠️","DOWN":"🛑"}.get(worst,"ℹ️")
 
     # 共通障害（同一日だけの欠損が過半）を簡易検知（価格系列ベース）
@@ -415,8 +456,11 @@ def main():
         text=summary
 
     print(text); _post_slack(text)
-    if SOFT_FAIL: sys.exit(0)
-    sys.exit(0 if worst=="HEALTHY" else 10 if worst=="DEGRADED" else 20)
+    if SOFT_FAIL:
+        sys.exit(0)
+    # 退出コードは“コアAPIの状態”を優先（OPTIONALがDOWNでも exit 20 にしない）
+    exit_by = core_worst if core_worst!="HEALTHY" else worst
+    sys.exit(0 if exit_by=="HEALTHY" else 10 if exit_by=="DEGRADED" else 20)
 
 if __name__=="__main__":
     main()
