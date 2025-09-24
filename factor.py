@@ -1731,25 +1731,7 @@ def run_pipeline() -> SelectionBundle:
     effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
     top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D)
-    poolD = list(getattr(sc, "_agg_D", pd.Series(dtype=float)).dropna().sort_values(ascending=False).index)
     fb = getattr(sc, "_feat", None)
-    near_G = getattr(sc, "_near_G", [])
-    selected12 = list(top_G)
-    df = fb.df if fb is not None else pd.DataFrame()
-    guni = _infer_g_universe(df, selected12, near_G)
-    lines = [
-        "【G枠レポート｜週次モニタ（直近5営業日）】",
-        f"選定{N_G}: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else f"選定{N_G}: なし",
-        f"次点10: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点10: なし",
-    ]
-
-    try:
-        webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
-        if webhook:
-            requests.post(webhook, json={"text": "\n".join([s for s in lines if s != ""])}, timeout=10)
-    except Exception:
-        pass
-
     out = Output()
     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
     try:
