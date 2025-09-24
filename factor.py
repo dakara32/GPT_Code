@@ -1407,25 +1407,6 @@ class Output:
         except Exception as e:
             print(f"[ERR] main_post_failed: {e}")
 
-def _infer_g_universe(feature_df, selected12=None, near5=None):
-    try:
-        out = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
-        if out: return out
-    except Exception:
-        pass
-    base = set()
-    for lst in (selected12 or []), (near5 or []):
-        for x in (lst or []): base.add(x)
-    return list(base) if base else list(feature_df.index)
-
-def _fmt_with_fire_mark(tickers, feature_df):
-    # breakout/pullback 補助は廃止 → no-op（安全のため列参照なし）
-    return [str(t) for t in (tickers or [])]
-
-def _label_recent_event(t, feature_df):
-    # ラベル付けは廃止 → no-op
-    return t
-
 # === パイプライン可視化：G/D共通フロー（出力は不変） ===
 
 def io_build_input_bundle() -> InputBundle:
@@ -1637,22 +1618,6 @@ def run_pipeline() -> SelectionBundle:
 # --- Slack / warning helpers (relocated without logic changes) ---
 
 
-def aggregate_warnings(rows, key="message", max_items=10):
-    """同一内容の警告を '×N' 表記でまとめる。"""
-    from collections import Counter
-
-    if not rows:
-        return []
-
-    if rows and isinstance(rows[0], dict):
-        msgs = [str(r.get(key, "")) for r in rows if r.get(key)]
-    else:
-        msgs = [str(r) for r in rows if r]
-
-    cnt = Counter(msgs)
-    return [f"{m} ×{n}" if n > 1 else m for m, n in cnt.most_common()][:max_items]
-
-
 def _post_slack(payload: dict):
     url = os.getenv("SLACK_WEBHOOK_URL")
     if not url:
@@ -1662,46 +1627,6 @@ def _post_slack(payload: dict):
         requests.post(url, json=payload).raise_for_status()
     except Exception as e:
         print(f"⚠️ Slack通知エラー: {e}")
-
-
-def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
-    """Slackへテキストを分割送信（コードブロック形式）。"""
-
-    def _post_text(payload: str) -> None:
-        try:
-            resp = requests.post(url, json={"text": payload})
-            print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
-            if resp is not None:
-                resp.raise_for_status()
-        except Exception as e:
-            print(f"[ERR] debug_post_failed: {e}")
-
-    body = (text or "").strip()
-    if not body:
-        print("[DBG] skip debug send: empty body")
-        return
-
-    block, block_len = [], 0
-
-    def _flush():
-        nonlocal block, block_len
-        if block:
-            _post_text("```" + "\n".join(block) + "```")
-            block, block_len = [], 0
-
-    for raw in body.splitlines():
-        line = raw or ""
-        while len(line) > chunk:
-            head, line = line[:chunk], line[chunk:]
-            _flush()
-            _post_text("```" + head + "```")
-        add_len = len(line) if not block else len(line) + 1
-        if block and block_len + add_len > chunk:
-            _flush()
-            add_len = len(line)
-        block.append(line)
-        block_len += add_len
-    _flush()
 
 
 if __name__ == "__main__":
