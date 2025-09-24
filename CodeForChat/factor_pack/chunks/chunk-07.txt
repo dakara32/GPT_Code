@@ -38,207 +38,202 @@ L1406                 r.raise_for_status()
 L1407         except Exception as e:
 L1408             print(f"[ERR] main_post_failed: {e}")
 L1409
-L1410 def _infer_g_universe(feature_df, selected12=None, near5=None):
-L1411     try:
-L1412         out = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
-L1413         if out: return out
-L1414     except Exception:
-L1415         pass
-L1416     base = set()
-L1417     for lst in (selected12 or []), (near5 or []):
-L1418         for x in (lst or []): base.add(x)
-L1419     return list(base) if base else list(feature_df.index)
-L1420
-L1421 def _fmt_with_fire_mark(tickers, feature_df):
-L1422     # breakout/pullback 補助は廃止 → no-op（安全のため列参照なし）
-L1423     return [str(t) for t in (tickers or [])]
-L1424
-L1425 def _label_recent_event(t, feature_df):
-L1426     # ラベル付けは廃止 → no-op
-L1427     return t
+L1410 # === パイプライン可視化：G/D共通フロー（出力は不変） ===
+L1411
+L1412 def io_build_input_bundle() -> InputBundle:
+L1413     """
+L1414     既存の『データ取得→前処理』を実行し、InputBundle を返す。
+L1415     処理内容・列名・丸め・例外・ログ文言は現行どおり（変更禁止）。
+L1416     """
+L1417     state = Input(cand=cand, exist=exist, bench=bench, price_max=CAND_PRICE_MAX, finnhub_api_key=FINNHUB_API_KEY).prepare_data()
+L1418     return InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench, data=state["data"], px=state["px"], spx=state["spx"], tickers_bulk=state["tickers_bulk"], info=state["info"], eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"], missing_logs=state["missing_logs"])
+L1419
+L1420 def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
+L1421               n_target: int) -> tuple[list, float, float, float]:
+L1422     """
+L1423     G/Dを同一手順で処理：採点→フィルター→選定（相関低減込み）。
+L1424     戻り値：(pick, avg_res_corr, sum_score, objective)
+L1425     JSON保存は既存フォーマット（キー名・丸め桁・順序）を踏襲。
+L1426     """
+L1427     sc.cfg = cfg
 L1428
-L1429 # === パイプライン可視化：G/D共通フロー（出力は不変） ===
-L1430
-L1431 def io_build_input_bundle() -> InputBundle:
-L1432     """
-L1433     既存の『データ取得→前処理』を実行し、InputBundle を返す。
-L1434     処理内容・列名・丸め・例外・ログ文言は現行どおり（変更禁止）。
-L1435     """
-L1436     state = Input(cand=cand, exist=exist, bench=bench, price_max=CAND_PRICE_MAX, finnhub_api_key=FINNHUB_API_KEY).prepare_data()
-L1437     return InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench, data=state["data"], px=state["px"], spx=state["spx"], tickers_bulk=state["tickers_bulk"], info=state["info"], eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"], missing_logs=state["missing_logs"])
-L1438
-L1439 def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
-L1440               n_target: int) -> tuple[list, float, float, float]:
-L1441     """
-L1442     G/Dを同一手順で処理：採点→フィルター→選定（相関低減込み）。
-L1443     戻り値：(pick, avg_res_corr, sum_score, objective)
-L1444     JSON保存は既存フォーマット（キー名・丸め桁・順序）を踏襲。
-L1445     """
-L1446     sc.cfg = cfg
-L1447
-L1448     if hasattr(sc, "score_build_features"):
-L1449         feat = sc.score_build_features(inb)
-L1450         if not hasattr(sc, "_feat_logged"):
-L1451             _tlog("features built (scorer)")
-L1452             sc._feat_logged = True
-L1453         agg = sc.score_aggregate(feat, group, cfg) if hasattr(sc, "score_aggregate") else feat
-L1454     else:
-L1455         if not hasattr(sc, "_feat"):
-L1456             fb = sc.aggregate_scores(inb, cfg)
-L1457             sc._feat = fb
-L1458         else:
-L1459             fb = sc._feat
-L1460         if not hasattr(sc, "_feat_logged"):
-L1461             _tlog("features built (scorer)")
-L1462             sc._feat_logged = True
-L1463         agg = fb.g_score if group == "G" else fb.d_score_all
-L1464         if group == "D" and hasattr(fb, "df"):
-L1465             beta_raw = fb.df['BETA'].astype(float)
-L1466             if D_BETA_MODE == "z":
-L1467                 beta_for_filter = _zscore_series(beta_raw)
-L1468             else:
-L1469                 beta_for_filter = beta_raw
-L1470
-L1471             beta_mask = (beta_for_filter <= D_BETA_CUTOFF).reindex(agg.index, fill_value=False)
-L1472             agg = agg[beta_mask]
-L1473
-L1474             if isinstance(agg, pd.Series):
-L1475                 _min = agg.min(skipna=True)
-L1476                 floor = (0.0 if not np.isfinite(_min) else float(_min)) - 1e6
-L1477                 agg = agg.fillna(floor)
-L1478
-L1479             try:
-L1480                 logger.info(
-L1481                     "D-filter mode=%s cutoff=%s | pass=%d raw[mean=%.3f std=%.3f] z[mean≈0 std≈1]",
-L1482                     D_BETA_MODE,
-L1483                     D_BETA_CUTOFF,
-L1484                     int(beta_mask.sum()),
-L1485                     float(beta_raw.mean(skipna=True)),
-L1486                     float(beta_raw.std(skipna=True, ddof=0)),
-L1487                 )
-L1488             except Exception:
-L1489                 pass
-L1490
-L1491     if hasattr(sc, "filter_candidates"):
-L1492         agg = agg[sc.filter_candidates(inb, agg, group, cfg)]
-L1493
-L1494     if isinstance(agg, pd.Series):
-L1495         agg = _as_numeric_series(agg)
-L1496
-L1497     selector = Selector()
-L1498     if hasattr(sc, "select_diversified"):
-L1499         pick, avg_r, sum_sc, obj = sc.select_diversified(agg, group, cfg, n_target,
-L1500             selector=selector, prev_tickers=None,
-L1501             corrM=cfg.drrs.corrM, shrink=cfg.drrs.shrink,
-L1502             cross_mu=cfg.drrs.cross_mu_gd)
-L1503     else:
-L1504         if group == "G":
-L1505             init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
-L1506             res = selector.select_bucket_drrs(returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
-L1507                 n_pc=cfg.drrs.G.get("n_pc", 3), gamma=cfg.drrs.G.get("gamma", 1.2),
-L1508                 lam=cfg.drrs.G.get("lam", 0.68),
-L1509                 lookback=cfg.drrs.G.get("lookback", 252),
-L1510                 shrink=cfg.drrs.shrink, g_fixed_tickers=None, mu=0.0)
-L1511         else:
-L1512             init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
-L1513             g_fixed = getattr(sc, "_top_G", None)
-L1514             res = selector.select_bucket_drrs(returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
-L1515                 n_pc=cfg.drrs.D.get("n_pc", 4), gamma=cfg.drrs.D.get("gamma", 0.8),
-L1516                 lam=cfg.drrs.D.get("lam", 0.85),
-L1517                 lookback=cfg.drrs.D.get("lookback", 504),
-L1518                 shrink=cfg.drrs.shrink, g_fixed_tickers=g_fixed,
-L1519                 mu=cfg.drrs.cross_mu_gd)
-L1520         pick = res["tickers"]; avg_r = res["avg_res_corr"]
-L1521         sum_sc = res["sum_score"]; obj = res["objective"]
-L1522         if group == "D":
-L1523             _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
-L1524             _tlog("selection finalized (G/D)")
-L1525     try:
-L1526         inc = [t for t in exist if t in agg.index]
-L1527         pick = _sticky_keep_current(
-L1528             agg=agg, pick=pick, incumbents=inc, n_target=n_target,
-L1529             delta_z=SWAP_DELTA_Z, keep_buffer=SWAP_KEEP_BUFFER
-L1530         )
-L1531     except Exception as _e:
-L1532         print(f"[warn] sticky_keep_current skipped: {str(_e)}")
-L1533     # --- Near-Miss: 惜しくも選ばれなかった上位10を保持（Slack表示用） ---
-L1534     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
-L1535     try:
-L1536         pool = agg.drop(index=[t for t in pick if t in agg.index], errors="ignore")
-L1537         near10 = list(pool.sort_values(ascending=False).head(10).index)
-L1538         setattr(sc, f"_near_{group}", near10)
-L1539         setattr(sc, f"_agg_{group}", agg)
-L1540     except Exception:
-L1541         pass
-L1542
-L1543     if group == "D":
-L1544         _tlog("save done")
-L1545     if group == "G":
-L1546         sc._top_G = pick
-L1547     return pick, avg_r, sum_sc, obj
-L1548
-L1549 def run_pipeline() -> SelectionBundle:
-L1550     """
-L1551     G/D共通フローの入口。I/Oはここだけで実施し、計算はScorerに委譲。
-L1552     Slack文言・丸め・順序は既存の Output を用いて変更しない。
-L1553     """
-L1554     inb = io_build_input_bundle()
-L1555     cfg = PipelineConfig(
-L1556         weights=WeightsConfig(g=g_weights, d=D_weights),
-L1557         drrs=DRRSParams(
-L1558             corrM=corrM, shrink=DRRS_SHRINK,
-L1559             G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD
-L1560         ),
-L1561         price_max=CAND_PRICE_MAX,
-L1562         debug_mode=debug_mode
-L1563     )
-L1564     sc = Scorer()
-L1565     top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G)
-L1566     poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False).index)
-L1567     alpha = Scorer.spx_to_alpha(inb.spx)
-L1568     sectors = {t:(inb.info.get(t,{}).get("sector") or "U") for t in poolG}; scores = {t:Scorer.g_score.get(t,0.0) for t in poolG}
-L1569     top_G = Scorer.pick_top_softcap(scores, sectors, N=N_G, cap=2, alpha=alpha, hard=5)
-L1570     sc._top_G = top_G
-L1571     try:
-L1572         aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False)
-L1573         sc._near_G = [t for t in aggG.index if t not in set(top_G)][:10]
-L1574     except Exception:
-L1575         pass
-L1576     base = sum(Scorer.g_score.get(t,0.0) for t in poolG[:N_G])
-L1577     effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
-L1578     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
-L1579     top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D)
-L1580     fb = getattr(sc, "_feat", None)
-L1581     out = Output()
-L1582     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
-L1583     try:
-L1584         out._sc = sc
-L1585     except Exception:
-L1586         pass
-L1587     if hasattr(sc, "_feat"):
-L1588         try:
-L1589             fb = sc._feat
-L1590             out.miss_df = fb.missing_logs
-L1591             out.display_results(
-L1592                 exist=exist,
-L1593                 bench=bench,
-L1594                 df_raw=fb.df,
-L1595                 df_z=fb.df_z,
-L1596                 g_score=fb.g_score,
-L1597                 d_score_all=fb.d_score_all,
-L1598                 init_G=top_G,
-L1599                 init_D=top_D,
-L1600                 top_G=top_G,
-L1601                 top_D=top_D,
-L1602                 df_full_z=getattr(fb, "df_full_z", None),
-L1603                 prev_G=getattr(sc, "_prev_G", exist),
-L1604                 prev_D=getattr(sc, "_prev_D", exist),
-L1605             )
-L1606             try:
-L1607                 DBG_COLS = ["GSC", "GROWTH_F", "MOM", "VOL", "DBGRW.GROWTH_F", "DBGRW.MOM", "DBGRW.VOL"]
-L1608                 cols = [c for c in DBG_COLS if c in fb.df_z.columns]
-L1609                 idx = [t for t in top_G if t in fb.df_z.index]
-L1610                 out.debug_table = fb.df_z.loc[idx, cols].round(2) if idx and cols else None
-L1611             except Exception:
-L1612     
+L1429     if hasattr(sc, "score_build_features"):
+L1430         feat = sc.score_build_features(inb)
+L1431         if not hasattr(sc, "_feat_logged"):
+L1432             _tlog("features built (scorer)")
+L1433             sc._feat_logged = True
+L1434         agg = sc.score_aggregate(feat, group, cfg) if hasattr(sc, "score_aggregate") else feat
+L1435     else:
+L1436         if not hasattr(sc, "_feat"):
+L1437             fb = sc.aggregate_scores(inb, cfg)
+L1438             sc._feat = fb
+L1439         else:
+L1440             fb = sc._feat
+L1441         if not hasattr(sc, "_feat_logged"):
+L1442             _tlog("features built (scorer)")
+L1443             sc._feat_logged = True
+L1444         agg = fb.g_score if group == "G" else fb.d_score_all
+L1445         if group == "D" and hasattr(fb, "df"):
+L1446             beta_raw = fb.df['BETA'].astype(float)
+L1447             if D_BETA_MODE == "z":
+L1448                 beta_for_filter = _zscore_series(beta_raw)
+L1449             else:
+L1450                 beta_for_filter = beta_raw
+L1451
+L1452             beta_mask = (beta_for_filter <= D_BETA_CUTOFF).reindex(agg.index, fill_value=False)
+L1453             agg = agg[beta_mask]
+L1454
+L1455             if isinstance(agg, pd.Series):
+L1456                 _min = agg.min(skipna=True)
+L1457                 floor = (0.0 if not np.isfinite(_min) else float(_min)) - 1e6
+L1458                 agg = agg.fillna(floor)
+L1459
+L1460             try:
+L1461                 logger.info(
+L1462                     "D-filter mode=%s cutoff=%s | pass=%d raw[mean=%.3f std=%.3f] z[mean≈0 std≈1]",
+L1463                     D_BETA_MODE,
+L1464                     D_BETA_CUTOFF,
+L1465                     int(beta_mask.sum()),
+L1466                     float(beta_raw.mean(skipna=True)),
+L1467                     float(beta_raw.std(skipna=True, ddof=0)),
+L1468                 )
+L1469             except Exception:
+L1470                 pass
+L1471
+L1472     if hasattr(sc, "filter_candidates"):
+L1473         agg = agg[sc.filter_candidates(inb, agg, group, cfg)]
+L1474
+L1475     if isinstance(agg, pd.Series):
+L1476         agg = _as_numeric_series(agg)
+L1477
+L1478     selector = Selector()
+L1479     if hasattr(sc, "select_diversified"):
+L1480         pick, avg_r, sum_sc, obj = sc.select_diversified(agg, group, cfg, n_target,
+L1481             selector=selector, prev_tickers=None,
+L1482             corrM=cfg.drrs.corrM, shrink=cfg.drrs.shrink,
+L1483             cross_mu=cfg.drrs.cross_mu_gd)
+L1484     else:
+L1485         if group == "G":
+L1486             init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
+L1487             res = selector.select_bucket_drrs(returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
+L1488                 n_pc=cfg.drrs.G.get("n_pc", 3), gamma=cfg.drrs.G.get("gamma", 1.2),
+L1489                 lam=cfg.drrs.G.get("lam", 0.68),
+L1490                 lookback=cfg.drrs.G.get("lookback", 252),
+L1491                 shrink=cfg.drrs.shrink, g_fixed_tickers=None, mu=0.0)
+L1492         else:
+L1493             init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
+L1494             g_fixed = getattr(sc, "_top_G", None)
+L1495             res = selector.select_bucket_drrs(returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
+L1496                 n_pc=cfg.drrs.D.get("n_pc", 4), gamma=cfg.drrs.D.get("gamma", 0.8),
+L1497                 lam=cfg.drrs.D.get("lam", 0.85),
+L1498                 lookback=cfg.drrs.D.get("lookback", 504),
+L1499                 shrink=cfg.drrs.shrink, g_fixed_tickers=g_fixed,
+L1500                 mu=cfg.drrs.cross_mu_gd)
+L1501         pick = res["tickers"]; avg_r = res["avg_res_corr"]
+L1502         sum_sc = res["sum_score"]; obj = res["objective"]
+L1503         if group == "D":
+L1504             _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
+L1505             _tlog("selection finalized (G/D)")
+L1506     try:
+L1507         inc = [t for t in exist if t in agg.index]
+L1508         pick = _sticky_keep_current(
+L1509             agg=agg, pick=pick, incumbents=inc, n_target=n_target,
+L1510             delta_z=SWAP_DELTA_Z, keep_buffer=SWAP_KEEP_BUFFER
+L1511         )
+L1512     except Exception as _e:
+L1513         print(f"[warn] sticky_keep_current skipped: {str(_e)}")
+L1514     # --- Near-Miss: 惜しくも選ばれなかった上位10を保持（Slack表示用） ---
+L1515     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
+L1516     try:
+L1517         pool = agg.drop(index=[t for t in pick if t in agg.index], errors="ignore")
+L1518         near10 = list(pool.sort_values(ascending=False).head(10).index)
+L1519         setattr(sc, f"_near_{group}", near10)
+L1520         setattr(sc, f"_agg_{group}", agg)
+L1521     except Exception:
+L1522         pass
+L1523
+L1524     if group == "D":
+L1525         _tlog("save done")
+L1526     if group == "G":
+L1527         sc._top_G = pick
+L1528     return pick, avg_r, sum_sc, obj
+L1529
+L1530 def run_pipeline() -> SelectionBundle:
+L1531     """
+L1532     G/D共通フローの入口。I/Oはここだけで実施し、計算はScorerに委譲。
+L1533     Slack文言・丸め・順序は既存の Output を用いて変更しない。
+L1534     """
+L1535     inb = io_build_input_bundle()
+L1536     cfg = PipelineConfig(
+L1537         weights=WeightsConfig(g=g_weights, d=D_weights),
+L1538         drrs=DRRSParams(
+L1539             corrM=corrM, shrink=DRRS_SHRINK,
+L1540             G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD
+L1541         ),
+L1542         price_max=CAND_PRICE_MAX,
+L1543         debug_mode=debug_mode
+L1544     )
+L1545     sc = Scorer()
+L1546     top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G)
+L1547     poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False).index)
+L1548     alpha = Scorer.spx_to_alpha(inb.spx)
+L1549     sectors = {t:(inb.info.get(t,{}).get("sector") or "U") for t in poolG}; scores = {t:Scorer.g_score.get(t,0.0) for t in poolG}
+L1550     top_G = Scorer.pick_top_softcap(scores, sectors, N=N_G, cap=2, alpha=alpha, hard=5)
+L1551     sc._top_G = top_G
+L1552     try:
+L1553         aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False)
+L1554         sc._near_G = [t for t in aggG.index if t not in set(top_G)][:10]
+L1555     except Exception:
+L1556         pass
+L1557     base = sum(Scorer.g_score.get(t,0.0) for t in poolG[:N_G])
+L1558     effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
+L1559     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
+L1560     top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D)
+L1561     fb = getattr(sc, "_feat", None)
+L1562     out = Output()
+L1563     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
+L1564     try:
+L1565         out._sc = sc
+L1566     except Exception:
+L1567         pass
+L1568     if hasattr(sc, "_feat"):
+L1569         try:
+L1570             fb = sc._feat
+L1571             out.miss_df = fb.missing_logs
+L1572             out.display_results(
+L1573                 exist=exist,
+L1574                 bench=bench,
+L1575                 df_raw=fb.df,
+L1576                 df_z=fb.df_z,
+L1577                 g_score=fb.g_score,
+L1578                 d_score_all=fb.d_score_all,
+L1579                 init_G=top_G,
+L1580                 init_D=top_D,
+L1581                 top_G=top_G,
+L1582                 top_D=top_D,
+L1583                 df_full_z=getattr(fb, "df_full_z", None),
+L1584                 prev_G=getattr(sc, "_prev_G", exist),
+L1585                 prev_D=getattr(sc, "_prev_D", exist),
+L1586             )
+L1587             try:
+L1588                 DBG_COLS = ["GSC", "GROWTH_F", "MOM", "VOL", "DBGRW.GROWTH_F", "DBGRW.MOM", "DBGRW.VOL"]
+L1589                 cols = [c for c in DBG_COLS if c in fb.df_z.columns]
+L1590                 idx = [t for t in top_G if t in fb.df_z.index]
+L1591                 out.debug_table = fb.df_z.loc[idx, cols].round(2) if idx and cols else None
+L1592             except Exception:
+L1593                 out.debug_table = None
+L1594         except Exception:
+L1595             pass
+L1596     out.notify_slack()
+L1597     sb = SelectionBundle(resG={"tickers": top_G, "avg_res_corr": avgG,
+L1598               "sum_score": sumG, "objective": objG},
+L1599         resD={"tickers": top_D, "avg_res_corr": avgD,
+L1600               "sum_score": sumD, "objective": objD},
+L1601         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
+L1602
+L1603     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
+L1604     try:
+L1605         _low_df = (pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
+L1606               .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
+L1607               .sort_v
 ```
