@@ -417,6 +417,10 @@ class Scorer:
         self._validate_ib_for_scorer(ib)
 
         px, spx, tickers = ib.px, ib.spx, ib.tickers
+        try:
+            vol = ib.data['Volume']
+        except Exception:
+            vol = getattr(ib, 'vol', None)
         tickers_bulk, info, eps_df, fcf_df = ib.tickers_bulk, ib.info, ib.eps_df, ib.fcf_df
 
         df = pd.DataFrame(index=tickers)
@@ -939,12 +943,38 @@ class Scorer:
         df_z['GRW_WQ_DBG'] = wq_series
         df_z['GRW_WA_DBG'] = wa_series
 
-        df_z['MOM_F'] = robust_z(0.40*df_z['RS']
-            + 0.15*df_z['TR_str']
+        # --- breakout features (常時寄与) ---
+        # NEW_HIGH_20D: (終値 / 直近20日終値の最高値) - 1 → 0未満は0
+        # VOL_RATIO_20D: 出来高(直近5日平均) / 出来高(直近20日平均)
+        try:
+            _px = px.copy()
+            _vol = vol.copy() if vol is not None else None
+            if _vol is None:
+                raise ValueError('volume data missing')
+            _hi20 = _px.rolling(20, min_periods=10).max()
+            _br = (_px / _hi20) - 1.0
+            _new_high_20d = _br.iloc[-1].clip(lower=0)
+            _vol5 = _vol.rolling(5, min_periods=3).mean()
+            _vol20 = _vol.rolling(20, min_periods=10).mean()
+            _vol_ratio_20d = (_vol5 / _vol20).iloc[-1]
+            # Z化（NaNは保持系）→ df_z に整列
+            df_z['NEW_HIGH_20D'] = robust_z_keepnan(pd.to_numeric(_new_high_20d, errors='coerce').reindex(df_z.index))
+            df_z['VOL_RATIO_20D'] = robust_z_keepnan(pd.to_numeric(_vol_ratio_20d, errors='coerce').reindex(df_z.index))
+        except Exception:
+            # フォールバック（計算不能時は0寄与とする）
+            df_z['NEW_HIGH_20D'] = 0.0
+            df_z['VOL_RATIO_20D'] = 0.0
+
+        df_z['MOM_F'] = robust_z(
+              0.30*df_z['RS']
+            + 0.10*df_z['TR_str']
             + 0.15*df_z['RS_SLOPE_6W']
             + 0.15*df_z['RS_SLOPE_13W']
             + 0.10*df_z['MA200_SLOPE_5M']
-            + 0.10*df_z['MA200_UP_STREAK_D']).clip(-3.0,3.0)
+            + 0.05*df_z['MA200_UP_STREAK_D']
+            + 0.10*df_z['NEW_HIGH_20D']
+            + 0.05*df_z['VOL_RATIO_20D']
+        ).clip(-3.0, 3.0)
         df_z['VOL'] = robust_z(df['BETA'])
         df_z['QAL'], df_z['YLD'], df_z['MOM'] = df_z['QUALITY_F'], df_z['YIELD_F'], df_z['MOM_F']
         df_z.drop(columns=['QUALITY_F','YIELD_F','MOM_F'], inplace=True, errors='ignore')
