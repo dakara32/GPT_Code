@@ -1609,11 +1609,14 @@ def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
             sc._feat_logged = True
         agg = sc.score_aggregate(feat, group, cfg) if hasattr(sc, "score_aggregate") else feat
     else:
-        fb = sc.aggregate_scores(inb, cfg)
+        if not hasattr(sc, "_feat"):
+            fb = sc.aggregate_scores(inb, cfg)
+            sc._feat = fb
+        else:
+            fb = sc._feat
         if not hasattr(sc, "_feat_logged"):
             T.log("features built (scorer)")
             sc._feat_logged = True
-        sc._feat = fb
         agg = fb.g_score if group == "G" else fb.d_score_all
         if group == "D" and hasattr(fb, "df"):
             beta_raw = fb.df['BETA'].astype(float)
