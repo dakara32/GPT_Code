@@ -238,18 +238,41 @@ def finnhub_health(tickers: List[str]) -> Tuple[str, Dict]:
 # ================================================================
 # SEC: companyfacts（Revenue/EPS）ヘルス
 # ================================================================
-SEC_HEADERS = {"User-Agent": f"api-health-probe; {SEC_EMAIL}"[:200],"Accept":"application/json"}
+def _sec_headers():
+    """
+    SECは連絡先付きUser-Agent/Fromを強く推奨・一部で必須。
+    SEC_EMAILが空なら最低限のUAにしつつ、403発生時は上位でSKIP扱いにする。
+    """
+    ua = (f"api-health-probe/1 (+mailto:{SEC_EMAIL})" if SEC_EMAIL else "api-health-probe/1")
+    hdr = {
+        "User-Agent": ua[:200],
+        "Accept": "application/json",
+    }
+    if SEC_EMAIL:
+        hdr["From"] = SEC_EMAIL[:200]
+    return hdr
 
 def _sec_get(url: str, params=None, retries=3, sleep_s: float=0.5):
+    """
+    403やネットワークエラーは上位でSKIP判定できるよう None を返す。
+    """
     for i in range(retries):
-        r = requests.get(url, params=params or {}, headers=SEC_HEADERS, timeout=15)
-        if r.status_code==429:
-            time.sleep(min(2**i*sleep_s, 4.0)); continue
-        r.raise_for_status(); return r.json()
-    r.raise_for_status()
+        try:
+            r = requests.get(url, params=params or {}, headers=_sec_headers(), timeout=15)
+            if r.status_code==429:
+                time.sleep(min(2**i*sleep_s, 4.0)); continue
+            if r.status_code==403:
+                # UA/From未設定やアクセス制限。上位でSKIP。
+                return None
+            r.raise_for_status(); return r.json()
+        except Exception:
+            time.sleep(min(2**i*sleep_s, 2.0))
+    return None
 
 def _sec_ticker_map() -> Dict[str,str]:
     j = _sec_get("https://www.sec.gov/files/company_tickers.json")
+    if j is None:
+        return {}
     out={}
     it=(j.values() if isinstance(j,dict) else j)
     for item in it:
@@ -292,11 +315,19 @@ def _series_q_and_a(arrs: list) -> Tuple[list, list]:
 
 def sec_health(tickers: List[str]) -> Tuple[str, Dict]:
     t0=_now_ms(); t2cik=_sec_ticker_map(); bad=[]
+    # CIKマップが取れない（403/ネット断/UA未設定など）はSKIPPED
+    if not t2cik:
+        ms=_now_ms()-t0
+        note="no SEC_EMAIL/403" if not SEC_EMAIL else "SEC endpoint blocked"
+        det=f"SEC:SKIPPED ({note}) latency={_fmt_ms(ms)}"
+        return det,{"level":"SKIPPED","latency_ms":ms,"bad":[]}
     for t in tickers:
         cands=_normalize_for_sec(t); cik=next((t2cik.get(x) for x in cands if t2cik.get(x)), None)
         if not cik: bad.append(t); continue
         try:
             j=_sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
+            if j is None:
+                bad.append(t); continue
             rev_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_REV_TAGS)
             eps_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_EPS_TAGS)
             rev_q,rev_a=_series_q_and_a(rev_arr); eps_q,eps_a=_series_q_and_a(eps_arr)
