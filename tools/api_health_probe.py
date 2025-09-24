@@ -38,6 +38,8 @@ SEC_EMAIL   = os.getenv("SEC_EMAIL","")
 MAX_WORKERS = int(os.getenv("MAX_WORKERS","8"))
 # “任意API”の扱い：ここに列挙されたAPIがDOWNでも全体は最大DEGRADED止まり
 OPTIONAL_APIS = set([x.strip().upper() for x in os.getenv("OPTIONAL_APIS","FINNHUB").split(",") if x.strip()])
+# 退出条件（既定: DEGRADED）。DOWNにすれば「DOWNの時だけ失敗」
+EXIT_ON_LEVEL = os.getenv("EXIT_ON_LEVEL","DEGRADED").upper()
 
 # ---- Utils
 def _now_ms() -> int: return int(time.time()*1000)
@@ -112,7 +114,11 @@ def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
     t0 = _now_ms()
     data = yf.download(tickers, period=YF_PERIOD, auto_adjust=True, progress=False, threads=True)
     close = data["Close"] if isinstance(data, pd.DataFrame) and "Close" in data else pd.DataFrame()
-    per_ticker_missing = {}; nf=[]; missing=[]; ok=[]
+    per_ticker_missing = {}
+    nf=[]          # 一括でも別名再試行でも取得できず
+    missing=[]     # 列はあるがNaN/不足
+    ok=[]          # 問題なし
+    alias_fixed=[] # (orig, alias) 別名で回復
     for t in tickers:
         if t not in close.columns:
             # 簡易ノーマライズ後、個別で5dだけ再取得して最低限の生存確認
@@ -122,6 +128,7 @@ def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
                     s = yf.Ticker(alias).history(period="5d", auto_adjust=True)["Close"]
                     if isinstance(s, pd.Series) and s.notna().sum() > 0:
                         recovered = True
+                        alias_fixed.append((t, alias))
                         break
                 except Exception:
                     pass
@@ -146,7 +153,8 @@ def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
     slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
     return f"YF_PRICE:{level} ok={len(ok)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
         "level":level,"latency_ms":ms,"ok":ok,"nf":nf,"missing":missing,
-        "per_ticker_missing":per_ticker_missing
+        "per_ticker_missing":per_ticker_missing,
+        "alias_fixed": alias_fixed
     }
 
 # ================================================================
@@ -439,28 +447,47 @@ def main():
     except Exception:
         pass
 
-    summary=f"{emoji} API_HEALTH {worst}{outage_note}\n{det_price} | {det_info} | {det_fin} | {det_sec} | {det_finn}"
+    summary=f"{emoji} API_HEALTH {worst}{outage_note} (exit_on={EXIT_ON_LEVEL})\n{det_price} | {det_info} | {det_fin} | {det_sec} | {det_finn}"
     has_problem=("DEGRADED" in worst) or ("DOWN" in worst)
 
     if has_problem:
-        def head(xs): return ", ".join(xs[:10]) + (f" …(+{len(xs)-10})" if len(xs)>10 else "")
+        def head_problem(xs): return ", ".join(xs[:10]) + (f" …(+{len(xs)-10})" if len(xs)>10 else "")
         lines=[]
         if meta_price["missing"] or meta_price["nf"]:
-            xs=[*meta_price["nf"],*meta_price["missing"]]; lines.append(f"YF_PRICE NG: {head(xs)}")
-        if meta_info["bad"]:  lines.append(f"YF_INFO NG: {head(meta_info['bad'])}")
-        if meta_fin["bad"]:   lines.append(f"YF_FIN NG: {head(meta_fin['bad'])}")
-        if meta_sec["bad"]:   lines.append(f"SEC NG: {head(meta_sec['bad'])}")
-        if meta_finn.get("bad"): lines.append(f"FINNHUB NG: {head(meta_finn['bad'])}")
+            xs=[*meta_price["nf"],*meta_price["missing"]]; lines.append(f"YF_PRICE NG: {head_problem(xs)}")
+        if meta_info["bad"]:  lines.append(f"YF_INFO NG: {head_problem(meta_info['bad'])}")
+        if meta_fin["bad"]:   lines.append(f"YF_FIN NG: {head_problem(meta_fin['bad'])}")
+        if meta_sec["bad"]:   lines.append(f"SEC NG: {head_problem(meta_sec['bad'])}")
+        if meta_finn.get("bad"): lines.append(f"FINNHUB NG: {head_problem(meta_finn['bad'])}")
         text=summary + ("\n" + "\n".join(lines) if lines else "")
     else:
         text=summary
 
+    # “変なティッカー”は毎回通報
+    def head_pair(pairs):
+        xs=[f"{a}->{b}" for (a,b) in pairs[:10]]
+        return ", ".join(xs) + (f" …(+{len(pairs)-10})" if len(pairs)>10 else "")
+    def head(xs):
+        return ", ".join(xs[:10]) + (f" …(+{len(xs)-10})" if len(xs)>10 else "")
+    alias_fixed = meta_price.get("alias_fixed", [])
+    still_missing = meta_price.get("nf", [])
+    weird_lines = []
+    if alias_fixed:
+        weird_lines.append(f"Weird tickers (alias fixed): {head_pair(alias_fixed)}")
+    if still_missing:
+        weird_lines.append(f"Weird tickers (not found): {head(still_missing)}")
+    if weird_lines:
+        text = text + "\n" + "\n".join(weird_lines)
+
     print(text); _post_slack(text)
-    if SOFT_FAIL:
-        sys.exit(0)
-    # 退出コードは“コアAPIの状態”を優先（OPTIONALがDOWNでも exit 20 にしない）
+    if SOFT_FAIL: sys.exit(0)
+    # 退出判定：基準は“コアAPIの状態”。OPTIONALがDOWNでも coreがHEALTHY/DEGRADEDなら緩和。
     exit_by = core_worst if core_worst!="HEALTHY" else worst
-    sys.exit(0 if exit_by=="HEALTHY" else 10 if exit_by=="DEGRADED" else 20)
+    def _rank(x): return {"HEALTHY":1,"DEGRADED":2,"DOWN":3}.get(x,0)
+    # EXIT_ON_LEVEL 未満なら成功終了
+    if _rank(exit_by) < _rank(EXIT_ON_LEVEL):
+        sys.exit(0)
+    sys.exit(20 if exit_by=="DOWN" else 10)
 
 if __name__=="__main__":
     main()
