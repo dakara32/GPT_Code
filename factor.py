@@ -1174,52 +1174,14 @@ class Output:
 
     def __init__(self, debug=None):
         # self.debug は使わない（互換のため引数は受けるが無視）
-        self.miss_df = self.g_table = self.d_table = self.io_table = self.df_metrics_fmt = self.debug_table = None
+        self.g_table = self.d_table = None
         self.g_title = self.d_title = ""
         self.g_formatters = self.d_formatters = {}
         # 低スコア（GSC+DSC）Top10 表示/送信用
         self.low10_table = None
-        self.debug_text = ""   # デバッグ用本文はここに一本化
-        self._debug_logged = False
-        self._miss_disp_info: Tuple[pd.DataFrame, bool, int] | None = None
-
-    @staticmethod
-    def _prepare_missing_display(df: pd.DataFrame | None) -> Tuple[pd.DataFrame, bool, int]:
-        if df is None or df.empty:
-            return pd.DataFrame(), False, 0
-        work = df.copy()
-        if 'ticker' not in work.columns:
-            work = work.reset_index()
-            if 'ticker' not in work.columns and 'index' in work.columns:
-                work = work.rename(columns={'index': 'ticker'})
-        bool_cols = [c for c in ['EPS_missing', 'REV_missing'] if c in work.columns]
-        if bool_cols:
-            work = work.loc[work[bool_cols].any(axis=1)]
-        if work.empty:
-            return pd.DataFrame(columns=work.columns), False, 0
-        cols_order = [
-            col for col in [
-                'ticker',
-                'EPS_missing',
-                'REV_missing',
-                'eps_imputed',
-                'EPS_TTM',
-                'EPS_Q_LastQ',
-                'EPS_A_LATEST',
-                'REV_TTM',
-                'REV_Q_LastQ',
-                'REV_A_LATEST',
-            ]
-            if col in work.columns
-        ]
-        if cols_order:
-            work = work.loc[:, cols_order]
-        total = len(work)
-        truncated = False
-        if total > 50:
-            work = work.head(20)
-            truncated = True
-        return work, truncated, total
+        self._changes_empty = True
+        self._changes_text = None
+        self._performance_text = ""
 
     # --- 表示（元 display_results のロジックそのまま） ---
     def display_results(self, *, exist, bench, df_raw=None, df_z, g_score, d_score_all,
@@ -1227,8 +1189,7 @@ class Output:
         logger.info("📌 reached display_results")
         pd.set_option('display.float_format','{:.3f}'.format)
         print("📈 ファクター分散最適化の結果")
-        miss_df, truncated, total = self._prepare_missing_display(self.miss_df)
-        self._miss_disp_info = (miss_df, truncated, total)
+        # 欠損アラート関連処理は削除（Slack送信・ログに未使用のため）
 
         # ---- 表示用：Changes/Near-Miss のスコア源を“最終集計”に統一するプロキシ ----
         try:
@@ -1308,17 +1269,20 @@ class Output:
         in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
         out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
 
-        self.io_table = pd.DataFrame({
+        io_table = pd.DataFrame({
             'IN': pd.Series(in_list),
             '/ OUT': pd.Series(out_list)
         })
         g_list = [f"{g_score.get(t):.3f}" if pd.notna(g_score.get(t)) else '—' for t in out_list]
         d_list = [f"{d_score_all.get(t):.3f}" if pd.notna(d_score_all.get(t)) else '—' for t in out_list]
-        self.io_table['GSC'] = pd.Series(g_list)
-        self.io_table['DSC'] = pd.Series(d_list)
+        io_table['GSC'] = pd.Series(g_list)
+        io_table['DSC'] = pd.Series(d_list)
 
         print("Changes:")
-        print(self.io_table.to_string(index=False))
+        changes_str = io_table.to_string(index=False)
+        print(changes_str)
+        self._changes_empty = io_table.empty
+        self._changes_text = None if self._changes_empty else changes_str
 
         all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False, threads=False)['Close'].ffill(limit=2)
         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
@@ -1338,7 +1302,11 @@ class Output:
         cols_order = ['RET','VOL','SHP','MDD','RAWρ','RESIDρ','DIVY']; df_metrics_pct = df_metrics_pct.reindex(columns=cols_order)
         def _fmt_row(s):
             return pd.Series({'RET':f"{s['RET']:.1f}%",'VOL':f"{s['VOL']:.1f}%",'SHP':f"{s['SHP']:.1f}",'MDD':f"{s['MDD']:.1f}%",'RAWρ':(f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"),'RESIDρ':(f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN"),'DIVY':f"{s['DIVY']:.1f}%"})
-        self.df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1); print("Performance Comparison:"); print(self.df_metrics_fmt.to_string())
+        df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1)
+        metrics_str = df_metrics_fmt.to_string()
+        print("Performance Comparison:")
+        print(metrics_str)
+        self._performance_text = metrics_str
         # === 追加: GSC+DSC が低い順 TOP10 ===
         try:
             all_scores = pd.DataFrame({'GSC': df_z['GSC'], 'DSC': df_z['DSC']}).copy()
@@ -1350,7 +1318,6 @@ class Output:
         except Exception as e:
             print(f"[warn] low-score ranking failed: {e}")
             self.low10_table = None
-        self.debug_text = ""
         if debug_mode:
             logger.info("debug_mode=True: df_z dump handled in scorer; skipping factor-side debug output")
         else:
@@ -1358,7 +1325,6 @@ class Output:
                 "skip debug log: debug_mode=%s debug_text_empty=%s",
                 debug_mode, True
             )
-        self._debug_logged = True
 
     # --- Slack送信（元 notify_slack のロジックそのまま） ---
     def notify_slack(self):
@@ -1396,8 +1362,8 @@ class Output:
         message = "📈 ファクター分散最適化の結果\n"
         message += _blk(_inject_filter_suffix(self.g_title, "G"), self.g_table, self.g_formatters, drop=("TRD",))
         message += _blk(_inject_filter_suffix(self.d_title, "D"), self.d_table, self.d_formatters)
-        message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table, 'empty', False) else f"```{self.io_table.to_string(index=False)}```\n")
-        message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
+        message += "Changes\n" + ("(変更なし)\n" if self._changes_empty else f"```{self._changes_text}```\n")
+        message += "Performance Comparison:\n```" + self._performance_text + "```"
 
         try:
             r = requests.post(SLACK_WEBHOOK_URL, json={"text": message})
@@ -1568,7 +1534,6 @@ def run_pipeline() -> SelectionBundle:
     if hasattr(sc, "_feat"):
         try:
             fb = sc._feat
-            out.miss_df = fb.missing_logs
             out.display_results(
                 exist=exist,
                 bench=bench,
@@ -1584,13 +1549,6 @@ def run_pipeline() -> SelectionBundle:
                 prev_G=getattr(sc, "_prev_G", exist),
                 prev_D=getattr(sc, "_prev_D", exist),
             )
-            try:
-                DBG_COLS = ["GSC", "GROWTH_F", "MOM", "VOL", "DBGRW.GROWTH_F", "DBGRW.MOM", "DBGRW.VOL"]
-                cols = [c for c in DBG_COLS if c in fb.df_z.columns]
-                idx = [t for t in top_G if t in fb.df_z.index]
-                out.debug_table = fb.df_z.loc[idx, cols].round(2) if idx and cols else None
-            except Exception:
-                out.debug_table = None
         except Exception:
             pass
     out.notify_slack()
