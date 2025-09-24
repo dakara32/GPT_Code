@@ -1,7 +1,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: tools/api_health_probe.py, .github/workflows/api-health.yml
-# 作成日時: 2025-09-24 19:09:57 (JST)
+# 作成日時: 2025-09-24 19:35:14 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -103,392 +103,402 @@ L92
 L93 def _fmt_ms(ms: int) -> str:
 L94     return f"{ms}ms" if ms < 1000 else f"{ms/1000:.2f}s"
 L95
-L96 # ==== SEC helpers
-L97 def _sec_headers():
-L98     """
-L99     SECは連絡先付きUser-Agent/Fromが推奨（SEC_CONTACT_EMAIL）。
-L100     連絡先が空でも動かすが、403時は上位でSKIP。
+L96 def _latency_icon(ms: int) -> str:
+L97     return "🐢" if ms >= TIMEOUT_MS_WARN else "✅"
+L98
+L99 # ==== SEC helpers
+L100 def _sec_headers():
 L101     """
-L102     mail = SEC_CONTACT_EMAIL
-L103     ua   = f"api-health-probe/1 ({mail})" if mail else "api-health-probe/1"
-L104     h    = {"User-Agent": ua[:200], "Accept": "application/json"}
-L105     if mail:
-L106         h["From"] = mail[:200]
-L107     return h
-L108
-L109 def _sec_get(url: str, params=None, retries=3, sleep_s: float=0.5):
-L110     last_err = None
-L111     for i in range(retries):
-L112         try:
-L113             r = requests.get(url, params=params or {}, headers=_sec_headers(), timeout=15)
-L114             if r.status_code == 429:
-L115                 time.sleep(min(2**i*sleep_s, 4.0)); continue
-L116             if r.status_code == 403:
-L117                 return None
-L118             r.raise_for_status()
-L119             return r.json()
-L120         except Exception as e:
-L121             last_err = e
-L122             time.sleep(min(2**i*sleep_s, 2.0))
-L123     return None
-L124
-L125 def _sec_ticker_map() -> Dict[str,str]:
-L126     j = _sec_get("https://www.sec.gov/files/company_tickers.json")
-L127     if j is None: return {}
-L128     out={}
-L129     it=(j.values() if isinstance(j,dict) else j)
-L130     for item in it:
-L131         try:
-L132             t=(item.get("ticker") or item.get("TICKER") or "").upper()
-L133             cik=str(item.get("cik_str") or item.get("CIK") or "").zfill(10)
-L134             if t and cik: out[t]=cik
-L135         except Exception: continue
-L136     return out
-L137
-L138 # ==== Yahoo Finance: ticker variants (for recovery)
-L139 def _yf_variants(sym: str):
-L140     s = (sym or "").upper()
-L141     cands = []
-L142     def add(x):
-L143         if x and x not in cands: cands.append(x)
-L144     add(s)
-L145     add(s.replace(".","-"))            # BRK.B -> BRK-B, PBR.A -> PBR-A
-L146     add(re.sub(r"[.\-^]", "", s))      # 記号除去
-L147     return cands
-L148
-L149 # ==== YF: price series health
-L150 def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
-L151     t0 = _now_ms()
-L152     data = yf.download(tickers, period=YF_PERIOD, auto_adjust=True, progress=False, threads=True)
-L153     close = data["Close"] if isinstance(data, pd.DataFrame) and "Close" in data else pd.DataFrame()
-L154
-L155     per_ticker_missing = {}
-L156     nf=[]          # 一括でも別名再試行でも取得できず
-L157     missing=[]     # 列はあるがNaN/不足
-L158     ok=[]          # 問題なし
-L159     alias_fixed=[] # (orig, alias) 別名で回復
-L160
-L161     for t in tickers:
-L162         if t not in close.columns:
-L163             recovered = False
-L164             for alias in _yf_variants(t):
-L165                 try:
-L166                     s = yf.Ticker(alias).history(period="5d", auto_adjust=True)["Close"]
-L167                     if isinstance(s, pd.Series) and s.notna().sum() > 0:
-L168                         recovered = True
-L169                         alias_fixed.append((t, alias))
-L170                         break
-L171                 except Exception:
-L172                     pass
-L173             if not recovered:
-L174                 nf.append(t); per_ticker_missing[t]={"dates":set(),"max_gap":0}; continue
-L175             ok.append(t); per_ticker_missing.setdefault(t, {"dates":set(),"max_gap":0}); continue
-L176
-L177         s = close[t]; n = s.shape[0]; nn = int(s.notna().sum())
-L178         isna = s.isna().values; idx = s.index
-L179         total_nan = int(isna.sum()); cur=max_gap=0
-L180         dates = set(str(d.date()) for d,v in zip(idx,isna) if v)
-L181         for v in isna:
-L182             if v: cur+=1
-L183             else:
-L184                 if cur>0: max_gap=max(max_gap,cur); cur=0
-L185         if cur>0: max_gap=max(max_gap,cur)
-L186         per_ticker_missing[t] = {"dates":dates,"max_gap":max_gap}
-L187         if nn==0 or total_nan>0 or n<YF_MIN_LEN: missing.append(t)
-L188         else: ok.append(t)
-L189
-L190     ms = _now_ms()-t0
-L191     level = "HEALTHY" if len(ok)==len(tickers) else ("DEGRADED" if len(ok)>=len(tickers)//2 else "DOWN")
-L192     slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
-L193     det = f"YF_PRICE:{level} ok={len(ok)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}"
-L194     meta = {"level":level,"latency_ms":ms,"ok":ok,"nf":nf,"missing":missing,
-L195             "per_ticker_missing":per_ticker_missing,"alias_fixed":alias_fixed}
-L196     return det, meta
-L197
-L198 # ==== YF: fast_info health
-L199 def yf_fastinfo_health(tickers: List[str]) -> Tuple[str, Dict]:
-L200     t0 = _now_ms()
-L201     tk = yf.Tickers(" ".join(tickers))
-L202     bad=[]
-L203     for t in tickers:
-L204         try:
-L205             v = tk.tickers[t].fast_info.get("lastPrice", None)
-L206             if v is None or (isinstance(v,float) and math.isnan(v)): bad.append(t)
-L207         except Exception: bad.append(t)
-L208     ms=_now_ms()-t0
-L209     level = "HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-L210     slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
-L211     return f"YF_INFO:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
-L212         "level":level,"latency_ms":ms,"bad":bad
-L213     }
-L214
-L215 # ==== YF: financials health (CFO/Capex/FCF)
-L216 _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"],
-L217                "capex":["Capital Expenditure","Capital Expenditures"]}
-L218 def _pick_row(df: pd.DataFrame, names: List[str]) -> pd.Series|None:
-L219     if df is None or df.empty: return None
-L220     idx_lower = {str(i).lower():i for i in df.index}
-L221     for n in names:
-L222         k = n.lower()
-L223         if k in idx_lower: return df.loc[idx_lower[k]]
-L224     return None
-L225 def _sum_last_n(s: pd.Series|None, n:int) -> float|None:
-L226     if s is None or s.empty: return None
-L227     v = s.dropna().astype(float); return None if v.empty else v.iloc[:n].sum()
-L228 def _latest(s: pd.Series|None) -> float|None:
+L102     SECは連絡先付きUser-Agent/Fromが推奨（SEC_CONTACT_EMAIL）。
+L103     連絡先が空でも動かすが、403時は上位でSKIP。
+L104     """
+L105     mail = SEC_CONTACT_EMAIL
+L106     ua   = f"api-health-probe/1 ({mail})" if mail else "api-health-probe/1"
+L107     h    = {"User-Agent": ua[:200], "Accept": "application/json"}
+L108     if mail:
+L109         h["From"] = mail[:200]
+L110     return h
+L111
+L112 def _sec_get(url: str, params=None, retries=3, sleep_s: float=0.5):
+L113     last_err = None
+L114     for i in range(retries):
+L115         try:
+L116             r = requests.get(url, params=params or {}, headers=_sec_headers(), timeout=15)
+L117             if r.status_code == 429:
+L118                 time.sleep(min(2**i*sleep_s, 4.0)); continue
+L119             if r.status_code == 403:
+L120                 return None
+L121             r.raise_for_status()
+L122             return r.json()
+L123         except Exception as e:
+L124             last_err = e
+L125             time.sleep(min(2**i*sleep_s, 2.0))
+L126     return None
+L127
+L128 def _sec_ticker_map() -> Dict[str,str]:
+L129     j = _sec_get("https://www.sec.gov/files/company_tickers.json")
+L130     if j is None: return {}
+L131     out={}
+L132     it=(j.values() if isinstance(j,dict) else j)
+L133     for item in it:
+L134         try:
+L135             t=(item.get("ticker") or item.get("TICKER") or "").upper()
+L136             cik=str(item.get("cik_str") or item.get("CIK") or "").zfill(10)
+L137             if t and cik: out[t]=cik
+L138         except Exception: continue
+L139     return out
+L140
+L141 # ==== Yahoo Finance: ticker variants (for recovery)
+L142 def _yf_variants(sym: str):
+L143     s = (sym or "").upper()
+L144     cands = []
+L145     def add(x):
+L146         if x and x not in cands: cands.append(x)
+L147     add(s)
+L148     add(s.replace(".","-"))            # BRK.B -> BRK-B, PBR.A -> PBR-A
+L149     add(re.sub(r"[.\-^]", "", s))      # 記号除去
+L150     return cands
+L151
+L152 # ==== YF: price series health
+L153 def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
+L154     t0 = _now_ms()
+L155     data = yf.download(tickers, period=YF_PERIOD, auto_adjust=True, progress=False, threads=True)
+L156     close = data["Close"] if isinstance(data, pd.DataFrame) and "Close" in data else pd.DataFrame()
+L157
+L158     per_ticker_missing = {}
+L159     nf=[]          # 一括でも別名再試行でも取得できず
+L160     missing=[]     # 列はあるがNaN/不足
+L161     ok=[]          # 問題なし
+L162     alias_fixed=[] # (orig, alias) 別名で回復
+L163
+L164     for t in tickers:
+L165         if t not in close.columns:
+L166             recovered = False
+L167             for alias in _yf_variants(t):
+L168                 try:
+L169                     s = yf.Ticker(alias).history(period="5d", auto_adjust=True)["Close"]
+L170                     if isinstance(s, pd.Series) and s.notna().sum() > 0:
+L171                         recovered = True
+L172                         alias_fixed.append((t, alias))
+L173                         break
+L174                 except Exception:
+L175                     pass
+L176             if not recovered:
+L177                 nf.append(t); per_ticker_missing[t]={"dates":set(),"max_gap":0}; continue
+L178             ok.append(t); per_ticker_missing.setdefault(t, {"dates":set(),"max_gap":0}); continue
+L179
+L180         s = close[t]; n = s.shape[0]; nn = int(s.notna().sum())
+L181         isna = s.isna().values; idx = s.index
+L182         total_nan = int(isna.sum()); cur=max_gap=0
+L183         dates = set(str(d.date()) for d,v in zip(idx,isna) if v)
+L184         for v in isna:
+L185             if v: cur+=1
+L186             else:
+L187                 if cur>0: max_gap=max(max_gap,cur); cur=0
+L188         if cur>0: max_gap=max(max_gap,cur)
+L189         per_ticker_missing[t] = {"dates":dates,"max_gap":max_gap}
+L190         if nn==0 or total_nan>0 or n<YF_MIN_LEN: missing.append(t)
+L191         else: ok.append(t)
+L192
+L193     ms = _now_ms()-t0
+L194     total = len(tickers)
+L195     bad = list(dict.fromkeys([*nf, *missing]))
+L196     level = "HEALTHY" if not bad else ("DOWN" if total > 0 and len(bad) >= total else "DEGRADED")
+L197     det = f"YF_PRICE:{level} bad={len(bad)}/{total} latency={_fmt_ms(ms)} {_latency_icon(ms)}"
+L198     meta = {"level":level,"latency_ms":ms,"ok":ok,"nf":nf,"missing":missing,
+L199             "per_ticker_missing":per_ticker_missing,"alias_fixed":alias_fixed,"bad":bad}
+L200     return det, meta
+L201
+L202 # ==== YF: fast_info health
+L203 def yf_fastinfo_health(tickers: List[str]) -> Tuple[str, Dict]:
+L204     t0 = _now_ms()
+L205     tk = yf.Tickers(" ".join(tickers))
+L206     bad=[]
+L207     for t in tickers:
+L208         try:
+L209             v = tk.tickers[t].fast_info.get("lastPrice", None)
+L210             if v is None or (isinstance(v,float) and math.isnan(v)): bad.append(t)
+L211         except Exception: bad.append(t)
+L212     ms=_now_ms()-t0
+L213     total=len(tickers)
+L214     level = "HEALTHY" if not bad else ("DOWN" if total > 0 and len(bad) >= total else "DEGRADED")
+L215     det = f"YF_INFO:{level} bad={len(bad)}/{total} latency={_fmt_ms(ms)} {_latency_icon(ms)}"
+L216     return det, {"level":level,"latency_ms":ms,"bad":bad}
+L217
+L218 # ==== YF: financials health (CFO/Capex/FCF)
+L219 _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"],
+L220                "capex":["Capital Expenditure","Capital Expenditures"]}
+L221 def _pick_row(df: pd.DataFrame, names: List[str]) -> pd.Series|None:
+L222     if df is None or df.empty: return None
+L223     idx_lower = {str(i).lower():i for i in df.index}
+L224     for n in names:
+L225         k = n.lower()
+L226         if k in idx_lower: return df.loc[idx_lower[k]]
+L227     return None
+L228 def _sum_last_n(s: pd.Series|None, n:int) -> float|None:
 L229     if s is None or s.empty: return None
-L230     v = s.dropna().astype(float); return v.iloc[0] if not v.empty else None
-L231
-L232 def yf_financials_health(tickers: List[str]) -> Tuple[str, Dict]:
-L233     t0=_now_ms(); bad=[]
-L234     def one(t):
-L235         try:
-L236             tk = yf.Ticker(t)
-L237             qcf = tk.quarterly_cashflow
-L238             cfo_q = _pick_row(qcf, _CF_ALIASES["cfo"])
-L239             cap_q = _pick_row(qcf, _CF_ALIASES["capex"])
-L240             fcf_q = _pick_row(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
-L241             cfo = _sum_last_n(cfo_q,4); cap = _sum_last_n(cap_q,4); fcf = _sum_last_n(fcf_q,4)
-L242             if any(v is None for v in (cfo,cap,fcf)):
-L243                 acf = tk.cashflow
-L244                 if cfo is None: cfo=_latest(_pick_row(acf,_CF_ALIASES["cfo"]))
-L245                 if cap is None: cap=_latest(_pick_row(acf,_CF_ALIASES["capex"]))
-L246                 if fcf is None: fcf=_latest(_pick_row(acf,["Free Cash Flow","FreeCashFlow","Free cash flow"]))
-L247             return None if all(v is not None for v in (cfo,cap,fcf)) else t
-L248         except Exception: return t
-L249     with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-L250         for r in ex.map(one, tickers):
-L251             if r: bad.append(r)
-L252     ms=_now_ms()-t0
-L253     level = "HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-L254     slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
-L255     return f"YF_FIN:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
-L256         "level":level,"latency_ms":ms,"bad":bad
-L257     }
-L258
-L259 # ==== Finnhub: cash-flow fallback
-L260 _FINN_CFO_KEYS   = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
-L261 _FINN_CAPEX_KEYS = ["capitalExpenditure","capitalExpenditures","purchaseOfPPE","investmentsInPropertyPlantAndEquipment"]
-L262
-L263 def _finn_get(session: requests.Session, url: str, params: dict, retries: int=3, sleep_s: float=0.5):
-L264     for i in range(retries):
-L265         r = session.get(url, params=params, timeout=15)
-L266         if r.status_code==429:
-L267             time.sleep(min(2**i*sleep_s, 4.0)); continue
-L268         r.raise_for_status(); return r.json()
-L269     r.raise_for_status()
-L270
-L271 def finnhub_health(tickers: List[str]) -> Tuple[str, Dict]:
-L272     if not FINN_KEY:
-L273         return "FINNHUB:SKIPPED (no key)", dict(level="SKIPPED",bad=[])
-L274     t0=_now_ms(); base="https://finnhub.io/api/v1"; s=requests.Session(); bad=[]
-L275     for sym in tickers:
-L276         try:
-L277             j=_finn_get(s,f"{base}/stock/cash-flow",{"symbol":sym,"frequency":"quarterly","limit":8,"token":FINN_KEY})
-L278             arr=j.get("cashFlow") or []
-L279             def pick(item,keys):
-L280                 for k in keys:
-L281                     if k in item and item[k] is not None: return item[k]
-L282             cfo_vals=[pick(x,_FINN_CFO_KEYS) for x in arr[:4]]
-L283             cap_vals=[pick(x,_FINN_CAPEX_KEYS) for x in arr[:4]]
-L284             cfo_ttm = np.nansum([np.nan if v is None else float(v) for v in cfo_vals]) if any(v is not None for v in cfo_vals) else None
-L285             cap_ttm = np.nansum([np.nan if v is None else float(v) for v in cap_vals]) if any(v is not None for v in cap_vals) else None
-L286             if cfo_ttm is None or cap_ttm is None:
-L287                 j=_finn_get(s,f"{base}/stock/cash-flow",{"symbol":sym,"frequency":"annual","limit":1,"token":FINN_KEY})
-L288                 arr=j.get("cashFlow") or []
-L289                 if arr:
-L290                     item0=arr[0]
-L291                     if cfo_ttm is None:
-L292                         v=pick(item0,_FINN_CFO_KEYS); 
-L293                         if v is not None: cfo_ttm=float(v)
-L294                     if cap_ttm is None:
-L295                         v=pick(item0,_FINN_CAPEX_KEYS); 
-L296                         if v is not None: cap_ttm=float(v)
-L297             if cfo_ttm is None or cap_ttm is None: bad.append(sym)
-L298         except Exception: bad.append(sym)
-L299     ms=_now_ms()-t0
-L300     level="HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-L301     slow=" SLOW" if ms>=TIMEOUT_MS_WARN else ""
-L302     return f"FINNHUB:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}",{
-L303         "level":level,"latency_ms":ms,"bad":bad
-L304     }
-L305
-L306 # ==== SEC: companyfacts (Revenue/EPS) health
-L307 SEC_REV_TAGS=["Revenues","RevenueFromContractWithCustomerExcludingAssessedTax","SalesRevenueNet","SalesRevenueGoodsNet","SalesRevenueServicesNet","Revenue"]
-L308 SEC_EPS_TAGS=["EarningsPerShareDiluted","EarningsPerShareBasicAndDiluted","EarningsPerShare","EarningsPerShareBasic"]
-L309
-L310 def _units_for_tags(facts: dict, spaces: List[str], tags: List[str]) -> list:
-L311     got=[]
-L312     for sp in spaces:
-L313         d=(facts.get("facts") or {}).get(sp) or {}
-L314         for tg in tags:
-L315             arr=(d.get(tg) or {}).get("units") or {}
-L316             for unit, vals in (arr.items() if isinstance(arr,dict) else []):
-L317                 if isinstance(vals,list) and vals: got.append(vals)
-L318     return got
-L319
-L320 def _series_q_and_a(arrs: list) -> Tuple[list, list]:
-L321     q_pairs,a_pairs=[],[]
-L322     for vals in arrs:
-L323         for v in vals:
-L324             try:
-L325                 dt=v.get("end") or v.get("fy"); val=float(v.get("val")); form=(v.get("form") or "").upper()
-L326                 if "10-Q" in form or "6-K" in form or form=="Q": q_pairs.append((dt,val))
-L327                 elif "10-K" in form or "20-F" in form or form=="K": a_pairs.append((dt,val))
-L328             except Exception: pass
-L329     q_pairs=sorted(q_pairs,key=lambda x: str(x[0]),reverse=True)
-L330     a_pairs=sorted(a_pairs,key=lambda x: str(x[0]),reverse=True)
-L331     return q_pairs,a_pairs
-L332
-L333 def sec_health(tickers: List[str]) -> Tuple[str, Dict]:
-L334     t0=_now_ms(); t2cik=_sec_ticker_map(); bad=[]
-L335     if not t2cik:
-L336         ms=_now_ms()-t0
-L337         det = f"SEC:SKIPPED (no SEC_CONTACT_EMAIL/403) latency={_fmt_ms(ms)}"
-L338         return det, {"level":"SKIPPED","latency_ms":ms,"bad":[]}
-L339     for t in tickers:
-L340         # '.'と'-'のゆらぎを許容した簡易マッチ
-L341         cands = [(t or "").upper(), (t or "").upper().replace(".","-"), (t or "").upper().replace("-",""), (t or "").upper().replace(".","")]
-L342         cik = next((t2cik.get(x) for x in cands if t2cik.get(x)), None)
-L343         if not cik:
-L344             bad.append(t); continue
-L345         try:
-L346             j=_sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
-L347             if j is None: bad.append(t); continue
-L348             rev_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_REV_TAGS)
-L349             eps_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_EPS_TAGS)
-L350             rev_q,rev_a=_series_q_and_a(rev_arr); eps_q,eps_a=_series_q_and_a(eps_arr)
-L351             if not (rev_q or rev_a) or not (eps_q or eps_a): bad.append(t)
-L352         except Exception: bad.append(t)
-L353         time.sleep(0.30)
-L354     ms=_now_ms()-t0
-L355     level="HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-L356     slow=" SLOW" if ms>=TIMEOUT_MS_WARN else ""
-L357     return f"SEC:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}",{
-L358         "level":level,"latency_ms":ms,"bad":bad
-L359     }
-L360
-L361 # ==== Orchestration
-L362 def main():
-L363     cur_path, cand_path = _autodiscover_csv()
-L364     if not cur_path or not cand_path:
-L365         msg = f"⚠️ CSV not found. cur={cur_path} cand={cand_path} (set CSV_CURRENT/CSV_CANDIDATE or place files)"
-L366         print(msg); _post_slack(msg)
-L367         if SOFT_FAIL: sys.exit(0)
-L368         sys.exit(78)
-L369
-L370     tickers=sorted(set(_read_tickers(cur_path)+_read_tickers(cand_path)))
-L371     if not tickers:
-L372         msg = f"⚠️ No tickers from CSV. cur={cur_path} cand={cand_path}"
-L373         print(msg); _post_slack(msg)
-L374         if SOFT_FAIL: sys.exit(0)
-L375         sys.exit(78)
-L376
-L377     det_price,meta_price=yf_price_health(tickers)
-L378     det_info ,meta_info =yf_fastinfo_health(tickers)
-L379     det_fin  ,meta_fin  =yf_financials_health(tickers)
-L380     det_sec  ,meta_sec  =sec_health(tickers)
-L381
-L382     need_finn=meta_fin["bad"]
-L383     det_finn,meta_finn  =finnhub_health(need_finn if need_finn else tickers[:0])
-L384
-L385     levels_map = {
-L386         "YF_PRICE": meta_price["level"],
-L387         "YF_INFO" : meta_info ["level"],
-L388         "YF_FIN"  : meta_fin  ["level"],
-L389         "SEC"     : meta_sec  ["level"],
-L390         "FINNHUB" : meta_finn.get("level","SKIPPED"),
-L391     }
-L392     pri={"DOWN":3,"DEGRADED":2,"HEALTHY":1,"SKIPPED":0}
-L393     core_levels = [lvl for api,lvl in levels_map.items() if api not in OPTIONAL_APIS]
-L394     core_worst = max(core_levels, key=lambda x: pri.get(x,0)) if core_levels else "HEALTHY"
-L395     all_worst  = max(levels_map.values(), key=lambda x: pri.get(x,0))
-L396     worst = "DEGRADED" if (all_worst=="DOWN" and core_worst!="DOWN") else all_worst
-L397     emoji={"HEALTHY":"✅","DEGRADED":"⚠️","DOWN":"🛑"}.get(worst,"ℹ️")
-L398
-L399     # 価格系列の共通障害（同一日だけの欠損が過半）簡易検知
-L400     outage_note=""
-L401     try:
-L402         from collections import Counter
-L403         missing_dates=meta_price.get("per_ticker_missing",{})
-L404         date_counter=Counter(); one_day_missing=0
-L405         for _,info in missing_dates.items():
-L406             dates=info.get("dates",set()); max_gap=info.get("max_gap",0)
-L407             if len(dates)==1 and max_gap==1:
-L408                 one_day_missing+=1; date_counter.update(dates)
-L409         threshold=max(1,len(tickers)//2)
-L410         if one_day_missing>=threshold:
-L411             (missing_day,hits),=date_counter.most_common(1)
-L412             outage_note=f" | OUTAGE: common_missing_day={missing_day} hits={hits}"
-L413             if worst=="HEALTHY": worst="DEGRADED"; emoji="🟠"
-L414     except Exception:
-L415         pass
-L416
-L417     # 各APIのアイコン付与
-L418     def icon_for(level: str) -> str:
-L419         return {"HEALTHY":"✅","DEGRADED":"⚠️","DOWN":"🛑","SKIPPED":"⏭️"}.get(level, "ℹ️")
-L420     det_price = f"{icon_for(levels_map['YF_PRICE'])} {det_price}"
-L421     det_info  = f"{icon_for(levels_map['YF_INFO' ])} {det_info}"
-L422     det_fin   = f"{icon_for(levels_map['YF_FIN'  ])} {det_fin}"
-L423     det_sec   = f"{icon_for(levels_map['SEC'     ])} {det_sec}"
-L424     det_finn  = f"{icon_for(levels_map['FINNHUB' ])} {det_finn}"
+L230     v = s.dropna().astype(float); return None if v.empty else v.iloc[:n].sum()
+L231 def _latest(s: pd.Series|None) -> float|None:
+L232     if s is None or s.empty: return None
+L233     v = s.dropna().astype(float); return v.iloc[0] if not v.empty else None
+L234
+L235 def yf_financials_health(tickers: List[str]) -> Tuple[str, Dict]:
+L236     t0=_now_ms(); bad=[]
+L237     def one(t):
+L238         try:
+L239             tk = yf.Ticker(t)
+L240             qcf = tk.quarterly_cashflow
+L241             cfo_q = _pick_row(qcf, _CF_ALIASES["cfo"])
+L242             cap_q = _pick_row(qcf, _CF_ALIASES["capex"])
+L243             fcf_q = _pick_row(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
+L244             cfo = _sum_last_n(cfo_q,4); cap = _sum_last_n(cap_q,4); fcf = _sum_last_n(fcf_q,4)
+L245             if any(v is None for v in (cfo,cap,fcf)):
+L246                 acf = tk.cashflow
+L247                 if cfo is None: cfo=_latest(_pick_row(acf,_CF_ALIASES["cfo"]))
+L248                 if cap is None: cap=_latest(_pick_row(acf,_CF_ALIASES["capex"]))
+L249                 if fcf is None: fcf=_latest(_pick_row(acf,["Free Cash Flow","FreeCashFlow","Free cash flow"]))
+L250             return None if all(v is not None for v in (cfo,cap,fcf)) else t
+L251         except Exception: return t
+L252     with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+L253         for r in ex.map(one, tickers):
+L254             if r: bad.append(r)
+L255     ms=_now_ms()-t0
+L256     total=len(tickers)
+L257     level = "HEALTHY" if not bad else ("DOWN" if total > 0 and len(bad) >= total else "DEGRADED")
+L258     det = f"YF_FIN:{level} bad={len(bad)}/{total} latency={_fmt_ms(ms)} {_latency_icon(ms)}"
+L259     return det, {"level":level,"latency_ms":ms,"bad":bad}
+L260
+L261 # ==== Finnhub: cash-flow fallback
+L262 _FINN_CFO_KEYS   = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
+L263 _FINN_CAPEX_KEYS = ["capitalExpenditure","capitalExpenditures","purchaseOfPPE","investmentsInPropertyPlantAndEquipment"]
+L264
+L265 def _finn_get(session: requests.Session, url: str, params: dict, retries: int=3, sleep_s: float=0.5):
+L266     for i in range(retries):
+L267         r = session.get(url, params=params, timeout=15)
+L268         if r.status_code==429:
+L269             time.sleep(min(2**i*sleep_s, 4.0)); continue
+L270         r.raise_for_status(); return r.json()
+L271     r.raise_for_status()
+L272
+L273 def finnhub_health(tickers: List[str]) -> Tuple[str, Dict]:
+L274     if not FINN_KEY:
+L275         det = f"FINNHUB:SKIPPED bad=0/{len(tickers)} latency=0ms {_latency_icon(0)} (no key)"
+L276         return det, dict(level="SKIPPED",bad=[],latency_ms=0)
+L277     t0=_now_ms(); base="https://finnhub.io/api/v1"; s=requests.Session(); bad=[]
+L278     for sym in tickers:
+L279         try:
+L280             j=_finn_get(s,f"{base}/stock/cash-flow",{"symbol":sym,"frequency":"quarterly","limit":8,"token":FINN_KEY})
+L281             arr=j.get("cashFlow") or []
+L282             def pick(item,keys):
+L283                 for k in keys:
+L284                     if k in item and item[k] is not None: return item[k]
+L285             cfo_vals=[pick(x,_FINN_CFO_KEYS) for x in arr[:4]]
+L286             cap_vals=[pick(x,_FINN_CAPEX_KEYS) for x in arr[:4]]
+L287             cfo_ttm = np.nansum([np.nan if v is None else float(v) for v in cfo_vals]) if any(v is not None for v in cfo_vals) else None
+L288             cap_ttm = np.nansum([np.nan if v is None else float(v) for v in cap_vals]) if any(v is not None for v in cap_vals) else None
+L289             if cfo_ttm is None or cap_ttm is None:
+L290                 j=_finn_get(s,f"{base}/stock/cash-flow",{"symbol":sym,"frequency":"annual","limit":1,"token":FINN_KEY})
+L291                 arr=j.get("cashFlow") or []
+L292                 if arr:
+L293                     item0=arr[0]
+L294                     if cfo_ttm is None:
+L295                         v=pick(item0,_FINN_CFO_KEYS); 
+L296                         if v is not None: cfo_ttm=float(v)
+L297                     if cap_ttm is None:
+L298                         v=pick(item0,_FINN_CAPEX_KEYS); 
+L299                         if v is not None: cap_ttm=float(v)
+L300             if cfo_ttm is None or cap_ttm is None: bad.append(sym)
+L301         except Exception: bad.append(sym)
+L302     ms=_now_ms()-t0
+L303     total=len(tickers)
+L304     level="HEALTHY" if not bad else ("DOWN" if total>0 and len(bad)>=total else "DEGRADED")
+L305     det = f"FINNHUB:{level} bad={len(bad)}/{total} latency={_fmt_ms(ms)} {_latency_icon(ms)}"
+L306     return det,{"level":level,"latency_ms":ms,"bad":bad}
+L307
+L308 # ==== SEC: companyfacts (Revenue/EPS) health
+L309 SEC_REV_TAGS=["Revenues","RevenueFromContractWithCustomerExcludingAssessedTax","SalesRevenueNet","SalesRevenueGoodsNet","SalesRevenueServicesNet","Revenue"]
+L310 SEC_EPS_TAGS=["EarningsPerShareDiluted","EarningsPerShareBasicAndDiluted","EarningsPerShare","EarningsPerShareBasic"]
+L311
+L312 def _units_for_tags(facts: dict, spaces: List[str], tags: List[str]) -> list:
+L313     got=[]
+L314     for sp in spaces:
+L315         d=(facts.get("facts") or {}).get(sp) or {}
+L316         for tg in tags:
+L317             arr=(d.get(tg) or {}).get("units") or {}
+L318             for unit, vals in (arr.items() if isinstance(arr,dict) else []):
+L319                 if isinstance(vals,list) and vals: got.append(vals)
+L320     return got
+L321
+L322 def _series_q_and_a(arrs: list) -> Tuple[list, list]:
+L323     q_pairs,a_pairs=[],[]
+L324     for vals in arrs:
+L325         for v in vals:
+L326             try:
+L327                 dt=v.get("end") or v.get("fy"); val=float(v.get("val")); form=(v.get("form") or "").upper()
+L328                 if "10-Q" in form or "6-K" in form or form=="Q": q_pairs.append((dt,val))
+L329                 elif "10-K" in form or "20-F" in form or form=="K": a_pairs.append((dt,val))
+L330             except Exception: pass
+L331     q_pairs=sorted(q_pairs,key=lambda x: str(x[0]),reverse=True)
+L332     a_pairs=sorted(a_pairs,key=lambda x: str(x[0]),reverse=True)
+L333     return q_pairs,a_pairs
+L334
+L335 def sec_health(tickers: List[str]) -> Tuple[str, Dict]:
+L336     t0=_now_ms(); t2cik=_sec_ticker_map(); bad=[]
+L337     if not t2cik:
+L338         ms=_now_ms()-t0
+L339         det = f"SEC:SKIPPED bad=0/{len(tickers)} latency={_fmt_ms(ms)} {_latency_icon(ms)} (no SEC_CONTACT_EMAIL/403)"
+L340         return det, {"level":"SKIPPED","latency_ms":ms,"bad":[]}
+L341     for t in tickers:
+L342         # '.'と'-'のゆらぎを許容した簡易マッチ
+L343         cands = [(t or "").upper(), (t or "").upper().replace(".","-"), (t or "").upper().replace("-",""), (t or "").upper().replace(".","")]
+L344         cik = next((t2cik.get(x) for x in cands if t2cik.get(x)), None)
+L345         if not cik:
+L346             bad.append(t); continue
+L347         try:
+L348             j=_sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
+L349             if j is None: bad.append(t); continue
+L350             rev_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_REV_TAGS)
+L351             eps_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_EPS_TAGS)
+L352             rev_q,rev_a=_series_q_and_a(rev_arr); eps_q,eps_a=_series_q_and_a(eps_arr)
+L353             if not (rev_q or rev_a) or not (eps_q or eps_a): bad.append(t)
+L354         except Exception: bad.append(t)
+L355         time.sleep(0.30)
+L356     ms=_now_ms()-t0
+L357     total=len(tickers)
+L358     level="HEALTHY" if not bad else ("DOWN" if total>0 and len(bad)>=total else "DEGRADED")
+L359     det = f"SEC:{level} bad={len(bad)}/{total} latency={_fmt_ms(ms)} {_latency_icon(ms)}"
+L360     return det,{"level":level,"latency_ms":ms,"bad":bad}
+L361
+L362 # ==== Orchestration
+L363 def main():
+L364     cur_path, cand_path = _autodiscover_csv()
+L365     if not cur_path or not cand_path:
+L366         msg = f"⚠️ CSV not found. cur={cur_path} cand={cand_path} (set CSV_CURRENT/CSV_CANDIDATE or place files)"
+L367         print(msg); _post_slack(msg)
+L368         if SOFT_FAIL: sys.exit(0)
+L369         sys.exit(78)
+L370
+L371     tickers=sorted(set(_read_tickers(cur_path)+_read_tickers(cand_path)))
+L372     if not tickers:
+L373         msg = f"⚠️ No tickers from CSV. cur={cur_path} cand={cand_path}"
+L374         print(msg); _post_slack(msg)
+L375         if SOFT_FAIL: sys.exit(0)
+L376         sys.exit(78)
+L377
+L378     det_price,meta_price=yf_price_health(tickers)
+L379     det_info ,meta_info =yf_fastinfo_health(tickers)
+L380     det_fin  ,meta_fin  =yf_financials_health(tickers)
+L381     det_sec  ,meta_sec  =sec_health(tickers)
+L382
+L383     need_finn=meta_fin["bad"]
+L384     det_finn,meta_finn  =finnhub_health(need_finn if need_finn else tickers[:0])
+L385
+L386     levels_map = {
+L387         "YF_PRICE": meta_price["level"],
+L388         "YF_INFO" : meta_info ["level"],
+L389         "YF_FIN"  : meta_fin  ["level"],
+L390         "SEC"     : meta_sec  ["level"],
+L391         "FINNHUB" : meta_finn.get("level","SKIPPED"),
+L392     }
+L393     pri={"DOWN":3,"DEGRADED":2,"HEALTHY":1,"SKIPPED":0}
+L394     core_levels = [lvl for api,lvl in levels_map.items() if api not in OPTIONAL_APIS]
+L395     core_worst = max(core_levels, key=lambda x: pri.get(x,0)) if core_levels else "HEALTHY"
+L396     all_worst  = max(levels_map.values(), key=lambda x: pri.get(x,0))
+L397     worst = "DEGRADED" if (all_worst=="DOWN" and core_worst!="DOWN") else all_worst
+L398     emoji={"HEALTHY":"✅","DEGRADED":"⚠️","DOWN":"🛑"}.get(worst,"ℹ️")
+L399
+L400     # 価格系列の共通障害（同一日だけの欠損が過半）簡易検知
+L401     outage_note=""
+L402     try:
+L403         from collections import Counter
+L404         missing_dates=meta_price.get("per_ticker_missing",{})
+L405         date_counter=Counter(); one_day_missing=0
+L406         for _,info in missing_dates.items():
+L407             dates=info.get("dates",set()); max_gap=info.get("max_gap",0)
+L408             if len(dates)==1 and max_gap==1:
+L409                 one_day_missing+=1; date_counter.update(dates)
+L410         threshold=max(1,len(tickers)//2)
+L411         if one_day_missing>=threshold:
+L412             (missing_day,hits),=date_counter.most_common(1)
+L413             outage_note=f" | OUTAGE: common_missing_day={missing_day} hits={hits}"
+L414             if worst=="HEALTHY": worst="DEGRADED"; emoji="🟠"
+L415     except Exception:
+L416         pass
+L417
+L418     LABELS = {
+L419         "YF_PRICE": "price",
+L420         "YF_INFO": "fast_info",
+L421         "YF_FIN": "financials (CFO/Capex/FCF)",
+L422         "FINNHUB": "cash-flow (fallback)",
+L423         "SEC": "companyfacts (revenue/eps)",
+L424     }
 L425
-L426     # ステータス行は「見出し→改行→メトリクス」形式に整形
-L427     def _fmt_block(s: str, key: str) -> str:
-L428         # 例: "⚠️ YF_PRICE:DEGRADED ok=..." -> "⚠️ YF_PRICE:\nDEGRADED ok=..."
-L429         return s.replace(f"{key}:", f"{key}:\n", 1)
-L430     status_lines = [
-L431         f"{emoji} API_HEALTH {worst}{outage_note} (exit_on={EXIT_ON_LEVEL})",
-L432         _fmt_block(det_price, "YF_PRICE"),
-L433         _fmt_block(det_info, "YF_INFO"),
-L434         _fmt_block(det_fin, "YF_FIN"),
-L435         _fmt_block(det_sec, "SEC"),
-L436         _fmt_block(det_finn, "FINNHUB"),
-L437     ]
-L438     summary = "\n".join(status_lines)
-L439     has_problem=("DEGRADED" in worst) or ("DOWN" in worst)
-L440
-L441     if has_problem:
-L442         def all_list(xs): return ", ".join(xs)
-L443         lines=[]
-L444         if meta_price["missing"] or meta_price["nf"]:
-L445             xs=[*meta_price["nf"],*meta_price["missing"]]
-L446             lines.append("🆖YF_PRICE NG:\n" + all_list(xs))
-L447         if meta_info["bad"]:
-L448             lines.append("🆖YF_INFO NG:\n" + all_list(meta_info["bad"]))
-L449         if meta_fin["bad"]:
-L450             lines.append("🆖YF_FIN NG:\n" + all_list(meta_fin["bad"]))
-L451         if meta_sec["bad"]:
-L452             lines.append("🆖SEC NG:\n" + all_list(meta_sec["bad"]))
-L453         if meta_finn.get("bad"):
-L454             lines.append("🆖FINNHUB NG:\n" + all_list(meta_finn["bad"]))
-L455         text=summary + ("\n" + "\n".join(lines) if lines else "")
-L456     else:
-L457         text=summary
-L458
-L459     # 変なティッカーは毎回全件通報
-L460     def pair_all(pairs): return ", ".join(f"{a}->{b}" for (a,b) in pairs)
-L461     def list_all(xs): return ", ".join(xs)
-L462     alias_fixed = meta_price.get("alias_fixed", [])
-L463     still_missing = meta_price.get("nf", [])
-L464     weird_lines = []
-L465     if alias_fixed:
-L466         weird_lines.append("Weird tickers (alias fixed):\n" + pair_all(alias_fixed))
-L467     if still_missing:
-L468         weird_lines.append("Weird tickers (not found):\n" + list_all(still_missing))
-L469     if weird_lines:
-L470         text = text + "\n" + "\n".join(weird_lines)
-L471
-L472     print(text); _post_slack(text)
-L473     if SOFT_FAIL: sys.exit(0)
-L474     # 退出判定：コアAPIを優先。OPTIONALがDOWNでも coreがHEALTHY/DEGRADEDなら緩和。
-L475     exit_by = core_worst if core_worst!="HEALTHY" else worst
-L476     def _rank(x): return {"HEALTHY":1,"DEGRADED":2,"DOWN":3}.get(x,0)
-L477     if _rank(exit_by) < _rank(EXIT_ON_LEVEL): sys.exit(0)
-L478     sys.exit(20 if exit_by=="DOWN" else 10)
-L479
-L480 if __name__=="__main__":
-L481     main()
+L426     def icon_for(level: str) -> str:
+L427         return {"HEALTHY":"✅","DEGRADED":"⚠️","DOWN":"🛑","SKIPPED":"⏭️"}.get(level, "ℹ️")
+L428
+L429     def _fmt_block(detail: str, key: str) -> str:
+L430         _, _, metrics = detail.partition(":")
+L431         metrics = metrics.lstrip()
+L432         heading = f"{icon_for(levels_map.get(key, ''))} {key}"
+L433         label = LABELS.get(key)
+L434         if label:
+L435             heading += f" ({label})"
+L436         return f"{heading}:\n{metrics}"
+L437
+L438     status_order = [
+L439         ("YF_PRICE", det_price),
+L440         ("YF_INFO", det_info),
+L441         ("YF_FIN", det_fin),
+L442         ("FINNHUB", det_finn),
+L443         ("SEC", det_sec),
+L444     ]
+L445
+L446     status_lines = [f"{emoji} API_HEALTH {worst}{outage_note} (exit_on={EXIT_ON_LEVEL})"]
+L447     status_lines.extend(_fmt_block(detail, key) for key, detail in status_order)
+L448     summary = "\n".join(status_lines)
+L449     has_problem=("DEGRADED" in worst) or ("DOWN" in worst)
+L450
+L451     if has_problem:
+L452         def all_list(xs): return ", ".join(xs)
+L453         lines=[]
+L454         price_bad = meta_price.get("bad") or []
+L455         if price_bad:
+L456             lines.append("🆖YF_PRICE NG:\n" + all_list(price_bad))
+L457         if meta_info.get("bad"):
+L458             lines.append("🆖YF_INFO NG:\n" + all_list(meta_info["bad"]))
+L459         if meta_fin.get("bad"):
+L460             lines.append("🆖YF_FIN NG:\n" + all_list(meta_fin["bad"]))
+L461         if meta_finn.get("bad"):
+L462             lines.append("🆖FINNHUB NG:\n" + all_list(meta_finn["bad"]))
+L463         if meta_sec.get("bad"):
+L464             lines.append("🆖SEC NG:\n" + all_list(meta_sec["bad"]))
+L465         text=summary + ("\n" + "\n".join(lines) if lines else "")
+L466     else:
+L467         text=summary
+L468
+L469     # 変なティッカーは毎回全件通報
+L470     def pair_all(pairs): return ", ".join(f"{a}->{b}" for (a,b) in pairs)
+L471     def list_all(xs): return ", ".join(xs)
+L472     alias_fixed = meta_price.get("alias_fixed", [])
+L473     still_missing = meta_price.get("nf", [])
+L474     weird_lines = []
+L475     if alias_fixed:
+L476         weird_lines.append("Weird tickers (alias fixed):\n" + pair_all(alias_fixed))
+L477     if still_missing:
+L478         weird_lines.append("Weird tickers (not found):\n" + list_all(still_missing))
+L479     if weird_lines:
+L480         text = text + "\n" + "\n".join(weird_lines)
+L481
+L482     print(text); _post_slack(text)
+L483     if SOFT_FAIL: sys.exit(0)
+L484     # 退出判定：コアAPIを優先。OPTIONALがDOWNでも coreがHEALTHY/DEGRADEDなら緩和。
+L485     exit_by = core_worst if core_worst!="HEALTHY" else worst
+L486     def _rank(x): return {"HEALTHY":1,"DEGRADED":2,"DOWN":3}.get(x,0)
+L487     if _rank(exit_by) < _rank(EXIT_ON_LEVEL): sys.exit(0)
+L488     sys.exit(20 if exit_by=="DOWN" else 10)
+L489
+L490 if __name__=="__main__":
+L491     main()
 ```
 
 ## <.github/workflows/api-health.yml>
@@ -504,35 +514,26 @@ L8     runs-on: ubuntu-latest
 L9     timeout-minutes: 10
 L10     steps:
 L11       - uses: actions/checkout@v4
-L12       - name: Show repo tree (CSV check)
-L13         run: |
-L14           echo "== ls -R (top 300 lines) =="
-L15           ls -R | head -n 300 || true
-L16           echo "== probable csv files =="
-L17           (git ls-files | grep -Ei '(current|candidate).*\.csv$' || true)
-L18       - uses: actions/setup-python@v5
-L19         with:
-L20           python-version: "3.11"
-L21       - name: Install deps
-L22         run: |
-L23           python -m pip install --upgrade pip
-L24           pip install yfinance pandas numpy requests
-L25       - name: Run API health probe
-L26         env:
-L27           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-L28           FINNHUB_API_KEY:   ${{ secrets.FINNHUB_API_KEY }}
-L29           # SECメールは選定と同じ名前のシークレット（SEC_CONTACT_EMAIL）から渡す
-L30           SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
-L31           # 判定: DOWN のときだけ失敗（DEGRADEDは成功）
-L32           EXIT_ON_LEVEL:     DOWN
-L33           # 任意のパラメータ（必要に応じて）
-L34           YF_PERIOD:         1y
-L35           YF_MIN_LEN:        "120"
-L36           TIMEOUT_MS_WARN:   "5000"
-L37           SOFT_FAIL:         "0"
-L38         run: |
-L39           python tools/api_health_probe.py
-L40       - name: Mark job outcome
-L41         if: always()
-L42         run: echo "Done."
+L12       - uses: actions/setup-python@v5
+L13         with:
+L14           python-version: "3.11"
+L15       - name: Install deps
+L16         run: |
+L17           python -m pip install --upgrade pip
+L18           pip install yfinance pandas numpy requests
+L19       - name: Run API health probe
+L20         env:
+L21           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+L22           FINNHUB_API_KEY:   ${{ secrets.FINNHUB_API_KEY }}
+L23           SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
+L24           EXIT_ON_LEVEL:     DOWN
+L25           YF_PERIOD:         1y
+L26           YF_MIN_LEN:        "120"
+L27           TIMEOUT_MS_WARN:   "5000"
+L28           SOFT_FAIL:         "0"
+L29         run: |
+L30           python tools/api_health_probe.py
+L31       - name: Mark job outcome
+L32         if: always()
+L33         run: echo "Done."
 ```
