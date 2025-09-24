@@ -18,6 +18,13 @@ BRANCH = "main"
 CHUNK_SIZE = 12000  # iPhoneコピペ配慮で ~9k–14k の範囲で可
 
 FILES_GROUPS = {
+    "drift_pack": [
+        "config.py",
+        "drift.py",
+        ".github/workflows/daily-report.yml",
+        "documents/README.md",
+        "documents/drift_design.md",
+    ],
     "factor_pack": [
         "config.py",
         "factor.py",
@@ -26,21 +33,14 @@ FILES_GROUPS = {
         "documents/README.md",
         "documents/factor_design.md",
     ],
-    "drift_pack": [
-        "config.py",
-        "drift.py",
-        ".github/workflows/daily-report.yml",
-        "documents/README.md",
-        "documents/drift_design.md",
-    ],
-    "yf-health-probe_pack": [
-        "tools/yf_health_probe.py",
-        ".github/workflows/yf-health-probe.yml",
-    ],  
     "make_chat_pack_pack": [
         "tools/make_chat_pack.py",
         ".github/workflows/prepare-chat-pack.yml",
-    ],      
+    ],
+    "api-health_pack": [
+        "tools/api_health_probe.py",
+        ".github/workflows/api-health.yml",
+    ],
 }
 
 def add_line_numbers(body: str) -> str:
