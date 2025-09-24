@@ -1576,25 +1576,11 @@ def _infer_g_universe(feature_df, selected12=None, near5=None):
     return list(base) if base else list(feature_df.index)
 
 def _fmt_with_fire_mark(tickers, feature_df):
-    out = []
-    for t in tickers or []:
-        try:
-            br = bool(feature_df.at[t, "G_BREAKOUT_recent_5d"])
-            pb = bool(feature_df.at[t, "G_PULLBACK_recent_5d"])
-            out.append(f"{t}{' 🔥' if (br or pb) else ''}")
-        except Exception:
-            out.append(t)
-    return out
+    # breakout/pullback 補助は廃止 → no-op（安全のため列参照なし）
+    return [str(t) for t in (tickers or [])]
 
 def _label_recent_event(t, feature_df):
-    try:
-        br = bool(feature_df.at[t, "G_BREAKOUT_recent_5d"]); dbr = str(feature_df.at[t, "G_BREAKOUT_last_date"]) if br else ""
-        pb = bool(feature_df.at[t, "G_PULLBACK_recent_5d"]); dpb = str(feature_df.at[t, "G_PULLBACK_last_date"]) if pb else ""
-        if   br and not pb: return f"{t}（ブレイクアウト確定 {dbr}）"
-        elif pb and not br: return f"{t}（押し目反発 {dpb}）"
-        elif br and pb:     return f"{t}（ブレイクアウト確定 {dbr}／押し目反発 {dpb}）"
-    except Exception:
-        pass
+    # ラベル付けは廃止 → no-op
     return t
 
 # === パイプライン可視化：G/D共通フロー（出力は不変） ===
@@ -1751,23 +1737,11 @@ def run_pipeline() -> SelectionBundle:
     selected12 = list(top_G)
     df = fb.df if fb is not None else pd.DataFrame()
     guni = _infer_g_universe(df, selected12, near_G)
-    try:
-        fire_recent = [t for t in guni
-                       if (str(df.at[t, "G_BREAKOUT_recent_5d"]) == "True") or
-                          (str(df.at[t, "G_PULLBACK_recent_5d"]) == "True")]
-    except Exception: fire_recent = []
-
     lines = [
         "【G枠レポート｜週次モニタ（直近5営業日）】",
-        "【凡例】🔥=直近5営業日内に「ブレイクアウト確定」または「押し目反発」を検知",
         f"選定{N_G}: {', '.join(_fmt_with_fire_mark(selected12, df))}" if selected12 else f"選定{N_G}: なし",
-        f"次点10: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点10: なし",]
-
-    if fire_recent:
-        fire_list = ", ".join([_label_recent_event(t, df) for t in fire_recent])
-        lines.append(f"過去5営業日の検知: {fire_list}")
-    else:
-        lines.append("過去5営業日の検知: なし")
+        f"次点10: {', '.join(_fmt_with_fire_mark(near_G, df))}" if near_G else "次点10: なし",
+    ]
 
     try:
         webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
