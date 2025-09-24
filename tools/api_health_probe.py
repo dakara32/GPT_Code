@@ -2,21 +2,31 @@
 # -*- coding: utf-8 -*-
 """
 api_health_probe.py — 選定プログラム依存API（Yahoo Finance / SEC / Finnhub）の総合ヘルスチェック
-Usage:
-  export SLACK_WEBHOOK_URL=...
-  export FINNHUB_API_KEY=...            # 任意（無ければ FinnhubはSKIPPED）
-  export SEC_EMAIL=you@example.com      # 推奨（SEC User-Agent に使用）
-  python tools/api_health_probe.py
-Env (optional):
+
+機能:
+- CSV自動検出（current*/candidate*）
+- 各APIのヘルス: YF価格/YF fast_info/YF財務/SEC companyfacts/Finnhub cash-flow
+- 遅延測定・しきい値SLOW表示
+- 共通欠損日の簡易OUTAGE検知（価格系列ベース）
+- “変なティッカー”の常時通報（aliasで回復 / not found）
+- Slack通知はアイコン付き、NG銘柄は改行して全件列挙
+- EXIT_ON_LEVEL でCIの失敗基準を制御（既定DEGRADED、workflowでDOWNに設定推奨）
+- Finnhubは任意API（OPTIONAL_APIS=FINNHUB）＝単独DOWNでも全体は最大DEGRADED
+
+Env:
+  SLACK_WEBHOOK_URL=[必須] Slack Incoming Webhook
+  FINNHUB_API_KEY   [任意]
+  SEC_CONTACT_EMAIL [推奨]  # 無い場合はSECをSKIPPED（403回避）
+  # 後方互換: SEC_EMAIL があれば SEC_CONTACT_EMAIL の代替として使用
   CSV_CURRENT=./current.csv
   CSV_CANDIDATE=./candidate.csv
   YF_PERIOD=1y
   YF_MIN_LEN=120
   TIMEOUT_MS_WARN=5000
   MAX_WORKERS=8
-  SOFT_FAIL=0   # 1なら常にexit 0
-Exit codes:
-  HEALTHY=0, DEGRADED=10, DOWN=20 （SOFT_FAIL=1なら常に0）
+  OPTIONAL_APIS=FINNHUB
+  EXIT_ON_LEVEL=DEGRADED  # workflow側で DOWN を指定すると“DOWNの時だけ”失敗
+  SOFT_FAIL=0             # 1なら常にexit 0
 """
 import os, sys, time, json, math, csv, re, concurrent.futures as cf
 from typing import List, Dict, Tuple
@@ -25,36 +35,34 @@ import numpy as np
 import requests
 import yfinance as yf
 
-# ---- Settings
+# ==== Settings
 CSV_CURRENT = os.getenv("CSV_CURRENT","./current.csv")
 CSV_CANDIDATE= os.getenv("CSV_CANDIDATE","./candidate.csv")
 YF_PERIOD   = os.getenv("YF_PERIOD","1y")
 YF_MIN_LEN  = int(os.getenv("YF_MIN_LEN","120"))
 TIMEOUT_MS_WARN = int(os.getenv("TIMEOUT_MS_WARN","5000"))
 SOFT_FAIL   = os.getenv("SOFT_FAIL","0") == "1"
-FINN_KEY    = os.getenv("FINNHUB_API_KEY")
+FINN_KEY      = os.getenv("FINNHUB_API_KEY")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL") or os.getenv("SLACK_WEBHOOK")
-SEC_EMAIL   = os.getenv("SEC_EMAIL","")
+# SECメールは SEC_CONTACT_EMAIL を優先（後方互換で SEC_EMAIL）
+SEC_CONTACT_EMAIL = (os.getenv("SEC_CONTACT_EMAIL") or os.getenv("SEC_EMAIL") or "").strip()
 MAX_WORKERS = int(os.getenv("MAX_WORKERS","8"))
-# “任意API”の扱い：ここに列挙されたAPIがDOWNでも全体は最大DEGRADED止まり
 OPTIONAL_APIS = set([x.strip().upper() for x in os.getenv("OPTIONAL_APIS","FINNHUB").split(",") if x.strip()])
-# 退出条件（既定: DEGRADED）。DOWNにすれば「DOWNの時だけ失敗」
 EXIT_ON_LEVEL = os.getenv("EXIT_ON_LEVEL","DEGRADED").upper()
 
-# ---- Utils
+# ==== Utils
 def _now_ms() -> int: return int(time.time()*1000)
 
 def _post_slack(text: str):
     if not SLACK_WEBHOOK:
         print("[SLACK] webhook missing; print only\n"+text); return
     try:
-        r = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=5)
+        r = requests.post(SLACK_WEBHOOK, json={"text": text}, timeout=8)
         print(f"[SLACK] status={r.status_code}"); r.raise_for_status()
     except Exception as e: print(f"[SLACK] send error: {e}")
 
 def _read_tickers(path: str) -> List[str]:
     if not os.path.exists(path): return []
-    # 'ticker','symbol','Symbol','Ticker' の列に対応。無ければ1列CSVも許容。
     try:
         df = pd.read_csv(path)
         for c in ["ticker","symbol","Symbol","Ticker"]:
@@ -70,58 +78,88 @@ def _read_tickers(path: str) -> List[str]:
         return []
 
 def _autodiscover_csv() -> tuple[str|None, str|None]:
-    """
-    リポジトリ内から current*.csv / candidate*.csv を再帰探索し、最初に見つけたものを返す。
-    明示指定（ENV）があればそれを優先。見つからなければ None。
-    """
-    cur = CSV_CURRENT if os.path.exists(CSV_CURRENT) else None
-    cand = CSV_CANDIDATE if os.path.exists(CSV_CANDIDATE) else None
-    if cur and cand:
-        return cur, cand
-
+    cur, cand = (CSV_CURRENT if os.path.exists(CSV_CURRENT) else None,
+                 CSV_CANDIDATE if os.path.exists(CSV_CANDIDATE) else None)
+    if cur and cand: return cur, cand
     for root, _, files in os.walk(".", topdown=True):
         for fn in files:
-            if not fn.lower().endswith(".csv"):
-                continue
-            path = os.path.join(root, fn)
-            name = fn.lower()
-            if not cur and "current" in name:
-                cur = path
-            if not cand and "candidate" in name:
-                cand = path
-        if cur and cand:
-            break
+            if not fn.lower().endswith(".csv"): continue
+            p = os.path.join(root, fn); fl = fn.lower()
+            if "current" in fl and not cur: cur = p
+            if "candidate" in fl and not cand: cand = p
+        if cur and cand: break
     return cur, cand
 
 def _fmt_ms(ms: int) -> str:
     return f"{ms}ms" if ms < 1000 else f"{ms/1000:.2f}s"
 
-# ---- Ticker 正規化（YF用）
+# ==== SEC helpers
+def _sec_headers():
+    """
+    SECは連絡先付きUser-Agent/Fromが推奨（SEC_CONTACT_EMAIL）。
+    連絡先が空でも動かすが、403時は上位でSKIP。
+    """
+    mail = SEC_CONTACT_EMAIL
+    ua   = f"api-health-probe/1 ({mail})" if mail else "api-health-probe/1"
+    h    = {"User-Agent": ua[:200], "Accept": "application/json"}
+    if mail:
+        h["From"] = mail[:200]
+    return h
+
+def _sec_get(url: str, params=None, retries=3, sleep_s: float=0.5):
+    last_err = None
+    for i in range(retries):
+        try:
+            r = requests.get(url, params=params or {}, headers=_sec_headers(), timeout=15)
+            if r.status_code == 429:
+                time.sleep(min(2**i*sleep_s, 4.0)); continue
+            if r.status_code == 403:
+                return None
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            time.sleep(min(2**i*sleep_s, 2.0))
+    return None
+
+def _sec_ticker_map() -> Dict[str,str]:
+    j = _sec_get("https://www.sec.gov/files/company_tickers.json")
+    if j is None: return {}
+    out={}
+    it=(j.values() if isinstance(j,dict) else j)
+    for item in it:
+        try:
+            t=(item.get("ticker") or item.get("TICKER") or "").upper()
+            cik=str(item.get("cik_str") or item.get("CIK") or "").zfill(10)
+            if t and cik: out[t]=cik
+        except Exception: continue
+    return out
+
+# ==== Yahoo Finance: ticker variants (for recovery)
 def _yf_variants(sym: str):
     s = (sym or "").upper()
     cands = []
     def add(x):
         if x and x not in cands: cands.append(x)
     add(s)
-    add(s.replace(".","-"))   # BRK.B -> BRK-B, PBR.A -> PBR-A
-    add(re.sub(r"[.\-^]", "", s))  # 記号除去
+    add(s.replace(".","-"))            # BRK.B -> BRK-B, PBR.A -> PBR-A
+    add(re.sub(r"[.\-^]", "", s))      # 記号除去
     return cands
 
-# ================================================================
-# Yahoo Finance: price series ヘルス
-# ================================================================
+# ==== YF: price series health
 def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
     t0 = _now_ms()
     data = yf.download(tickers, period=YF_PERIOD, auto_adjust=True, progress=False, threads=True)
     close = data["Close"] if isinstance(data, pd.DataFrame) and "Close" in data else pd.DataFrame()
+
     per_ticker_missing = {}
     nf=[]          # 一括でも別名再試行でも取得できず
     missing=[]     # 列はあるがNaN/不足
     ok=[]          # 問題なし
     alias_fixed=[] # (orig, alias) 別名で回復
+
     for t in tickers:
         if t not in close.columns:
-            # 簡易ノーマライズ後、個別で5dだけ再取得して最低限の生存確認
             recovered = False
             for alias in _yf_variants(t):
                 try:
@@ -134,8 +172,8 @@ def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
                     pass
             if not recovered:
                 nf.append(t); per_ticker_missing[t]={"dates":set(),"max_gap":0}; continue
-            # 再取得で回復した場合はOK扱い（dates/max_gapは空のまま）
             ok.append(t); per_ticker_missing.setdefault(t, {"dates":set(),"max_gap":0}); continue
+
         s = close[t]; n = s.shape[0]; nn = int(s.notna().sum())
         isna = s.isna().values; idx = s.index
         total_nan = int(isna.sum()); cur=max_gap=0
@@ -148,20 +186,20 @@ def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
         per_ticker_missing[t] = {"dates":dates,"max_gap":max_gap}
         if nn==0 or total_nan>0 or n<YF_MIN_LEN: missing.append(t)
         else: ok.append(t)
+
     ms = _now_ms()-t0
     level = "HEALTHY" if len(ok)==len(tickers) else ("DEGRADED" if len(ok)>=len(tickers)//2 else "DOWN")
     slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
-    return f"YF_PRICE:{level} ok={len(ok)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
-        "level":level,"latency_ms":ms,"ok":ok,"nf":nf,"missing":missing,
-        "per_ticker_missing":per_ticker_missing,
-        "alias_fixed": alias_fixed
-    }
+    det = f"YF_PRICE:{level} ok={len(ok)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}"
+    meta = {"level":level,"latency_ms":ms,"ok":ok,"nf":nf,"missing":missing,
+            "per_ticker_missing":per_ticker_missing,"alias_fixed":alias_fixed}
+    return det, meta
 
-# ================================================================
-# Yahoo Finance: fast_info.lastPrice ヘルス
-# ================================================================
+# ==== YF: fast_info health
 def yf_fastinfo_health(tickers: List[str]) -> Tuple[str, Dict]:
-    t0 = _now_ms(); tk = yf.Tickers(" ".join(tickers)); bad=[]
+    t0 = _now_ms()
+    tk = yf.Tickers(" ".join(tickers))
+    bad=[]
     for t in tickers:
         try:
             v = tk.tickers[t].fast_info.get("lastPrice", None)
@@ -174,9 +212,7 @@ def yf_fastinfo_health(tickers: List[str]) -> Tuple[str, Dict]:
         "level":level,"latency_ms":ms,"bad":bad
     }
 
-# ================================================================
-# Yahoo Finance: financials（CFO/Capex/FCF）ヘルス
-# ================================================================
+# ==== YF: financials health (CFO/Capex/FCF)
 _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"],
                "capex":["Capital Expenditure","Capital Expenditures"]}
 def _pick_row(df: pd.DataFrame, names: List[str]) -> pd.Series|None:
@@ -220,9 +256,7 @@ def yf_financials_health(tickers: List[str]) -> Tuple[str, Dict]:
         "level":level,"latency_ms":ms,"bad":bad
     }
 
-# ================================================================
-# Finnhub: cash-flow（CFO/Capex）ヘルス（フォールバック）
-# ================================================================
+# ==== Finnhub: cash-flow fallback
 _FINN_CFO_KEYS   = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
 _FINN_CAPEX_KEYS = ["capitalExpenditure","capitalExpenditures","purchaseOfPPE","investmentsInPropertyPlantAndEquipment"]
 
@@ -269,60 +303,9 @@ def finnhub_health(tickers: List[str]) -> Tuple[str, Dict]:
         "level":level,"latency_ms":ms,"bad":bad
     }
 
-# ================================================================
-# SEC: companyfacts（Revenue/EPS）ヘルス
-# ================================================================
-def _sec_headers():
-    """
-    SECは連絡先付きUser-Agent/Fromを強く推奨・一部で必須。
-    SEC_EMAILが空なら最低限のUAにしつつ、403発生時は上位でSKIP扱いにする。
-    """
-    ua = (f"api-health-probe/1 (+mailto:{SEC_EMAIL})" if SEC_EMAIL else "api-health-probe/1")
-    hdr = {
-        "User-Agent": ua[:200],
-        "Accept": "application/json",
-    }
-    if SEC_EMAIL:
-        hdr["From"] = SEC_EMAIL[:200]
-    return hdr
-
-def _sec_get(url: str, params=None, retries=3, sleep_s: float=0.5):
-    """
-    403やネットワークエラーは上位でSKIP判定できるよう None を返す。
-    """
-    for i in range(retries):
-        try:
-            r = requests.get(url, params=params or {}, headers=_sec_headers(), timeout=15)
-            if r.status_code==429:
-                time.sleep(min(2**i*sleep_s, 4.0)); continue
-            if r.status_code==403:
-                # UA/From未設定やアクセス制限。上位でSKIP。
-                return None
-            r.raise_for_status(); return r.json()
-        except Exception:
-            time.sleep(min(2**i*sleep_s, 2.0))
-    return None
-
-def _sec_ticker_map() -> Dict[str,str]:
-    j = _sec_get("https://www.sec.gov/files/company_tickers.json")
-    if j is None:
-        return {}
-    out={}
-    it=(j.values() if isinstance(j,dict) else j)
-    for item in it:
-        try:
-            t=(item.get("ticker") or item.get("TICKER") or "").upper()
-            cik=str(item.get("cik_str") or item.get("CIK") or "").zfill(10)
-            if t and cik: out[t]=cik
-        except Exception: continue
-    return out
-
+# ==== SEC: companyfacts (Revenue/EPS) health
 SEC_REV_TAGS=["Revenues","RevenueFromContractWithCustomerExcludingAssessedTax","SalesRevenueNet","SalesRevenueGoodsNet","SalesRevenueServicesNet","Revenue"]
 SEC_EPS_TAGS=["EarningsPerShareDiluted","EarningsPerShareBasicAndDiluted","EarningsPerShare","EarningsPerShareBasic"]
-
-def _normalize_for_sec(sym: str) -> List[str]:
-    s=(sym or "").upper(); outs=[]; add=lambda x: outs.append(x) if x and x not in outs else None
-    add(s); add(s.replace(".","-")); add(s.replace("-","")); add(s.replace(".","")); return outs
 
 def _units_for_tags(facts: dict, spaces: List[str], tags: List[str]) -> list:
     got=[]
@@ -349,25 +332,25 @@ def _series_q_and_a(arrs: list) -> Tuple[list, list]:
 
 def sec_health(tickers: List[str]) -> Tuple[str, Dict]:
     t0=_now_ms(); t2cik=_sec_ticker_map(); bad=[]
-    # CIKマップが取れない（403/ネット断/UA未設定など）はSKIPPED
     if not t2cik:
         ms=_now_ms()-t0
-        note="no SEC_EMAIL/403" if not SEC_EMAIL else "SEC endpoint blocked"
-        det=f"SEC:SKIPPED ({note}) latency={_fmt_ms(ms)}"
-        return det,{"level":"SKIPPED","latency_ms":ms,"bad":[]}
+        det = f"SEC:SKIPPED (no SEC_CONTACT_EMAIL/403) latency={_fmt_ms(ms)}"
+        return det, {"level":"SKIPPED","latency_ms":ms,"bad":[]}
     for t in tickers:
-        cands=_normalize_for_sec(t); cik=next((t2cik.get(x) for x in cands if t2cik.get(x)), None)
-        if not cik: bad.append(t); continue
+        # '.'と'-'のゆらぎを許容した簡易マッチ
+        cands = [(t or "").upper(), (t or "").upper().replace(".","-"), (t or "").upper().replace("-",""), (t or "").upper().replace(".","")]
+        cik = next((t2cik.get(x) for x in cands if t2cik.get(x)), None)
+        if not cik:
+            bad.append(t); continue
         try:
             j=_sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
-            if j is None:
-                bad.append(t); continue
+            if j is None: bad.append(t); continue
             rev_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_REV_TAGS)
             eps_arr=_units_for_tags(j,["us-gaap","ifrs-full"],SEC_EPS_TAGS)
             rev_q,rev_a=_series_q_and_a(rev_arr); eps_q,eps_a=_series_q_and_a(eps_arr)
             if not (rev_q or rev_a) or not (eps_q or eps_a): bad.append(t)
         except Exception: bad.append(t)
-        time.sleep(0.30)  # SEC負荷配慮
+        time.sleep(0.30)
     ms=_now_ms()-t0
     level="HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
     slow=" SLOW" if ms>=TIMEOUT_MS_WARN else ""
@@ -375,39 +358,30 @@ def sec_health(tickers: List[str]) -> Tuple[str, Dict]:
         "level":level,"latency_ms":ms,"bad":bad
     }
 
-# ================================================================
-# Orchestration
-# ================================================================
+# ==== Orchestration
 def main():
     cur_path, cand_path = _autodiscover_csv()
     if not cur_path or not cand_path:
         msg = f"⚠️ CSV not found. cur={cur_path} cand={cand_path} (set CSV_CURRENT/CSV_CANDIDATE or place files)"
         print(msg); _post_slack(msg)
-        if SOFT_FAIL:
-            sys.exit(0)
+        if SOFT_FAIL: sys.exit(0)
         sys.exit(78)
 
     tickers=sorted(set(_read_tickers(cur_path)+_read_tickers(cand_path)))
     if not tickers:
         msg = f"⚠️ No tickers from CSV. cur={cur_path} cand={cand_path}"
         print(msg); _post_slack(msg)
-        if SOFT_FAIL:
-            sys.exit(0)
+        if SOFT_FAIL: sys.exit(0)
         sys.exit(78)
 
-    # YF
     det_price,meta_price=yf_price_health(tickers)
     det_info ,meta_info =yf_fastinfo_health(tickers)
     det_fin  ,meta_fin  =yf_financials_health(tickers)
-
-    # SEC
     det_sec  ,meta_sec  =sec_health(tickers)
 
-    # Finnhub（必要時のみ。YF財務NG銘柄へのフォールバック検証）
     need_finn=meta_fin["bad"]
     det_finn,meta_finn  =finnhub_health(need_finn if need_finn else tickers[:0])
 
-    # API別レベル
     levels_map = {
         "YF_PRICE": meta_price["level"],
         "YF_INFO" : meta_info ["level"],
@@ -416,19 +390,13 @@ def main():
         "FINNHUB" : meta_finn.get("level","SKIPPED"),
     }
     pri={"DOWN":3,"DEGRADED":2,"HEALTHY":1,"SKIPPED":0}
-    # コアAPI（OPTIONAL_APIS 以外）のワースト
     core_levels = [lvl for api,lvl in levels_map.items() if api not in OPTIONAL_APIS]
     core_worst = max(core_levels, key=lambda x: pri.get(x,0)) if core_levels else "HEALTHY"
-    # 全体ワースト（表示用）
     all_worst  = max(levels_map.values(), key=lambda x: pri.get(x,0))
-    # ただし、DOWN が OPTIONAL_APIS のみから来ている場合は全体を DEGRADED までに抑制
-    if all_worst=="DOWN" and core_worst!="DOWN":
-        worst = "DEGRADED"
-    else:
-        worst = all_worst
+    worst = "DEGRADED" if (all_worst=="DOWN" and core_worst!="DOWN") else all_worst
     emoji={"HEALTHY":"✅","DEGRADED":"⚠️","DOWN":"🛑"}.get(worst,"ℹ️")
 
-    # 共通障害（同一日だけの欠損が過半）を簡易検知（価格系列ベース）
+    # 価格系列の共通障害（同一日だけの欠損が過半）簡易検知
     outage_note=""
     try:
         from collections import Counter
@@ -442,51 +410,59 @@ def main():
         if one_day_missing>=threshold:
             (missing_day,hits),=date_counter.most_common(1)
             outage_note=f" | OUTAGE: common_missing_day={missing_day} hits={hits}"
-            if worst=="HEALTHY":
-                worst="DEGRADED"; emoji="🟠"
+            if worst=="HEALTHY": worst="DEGRADED"; emoji="🟠"
     except Exception:
         pass
+
+    # 各APIのアイコン付与
+    def icon_for(level: str) -> str:
+        return {"HEALTHY":"✅","DEGRADED":"⚠️","DOWN":"🛑","SKIPPED":"⏭️"}.get(level, "ℹ️")
+    det_price = f"{icon_for(levels_map['YF_PRICE'])} {det_price}"
+    det_info  = f"{icon_for(levels_map['YF_INFO' ])} {det_info}"
+    det_fin   = f"{icon_for(levels_map['YF_FIN'  ])} {det_fin}"
+    det_sec   = f"{icon_for(levels_map['SEC'     ])} {det_sec}"
+    det_finn  = f"{icon_for(levels_map['FINNHUB' ])} {det_finn}"
 
     summary=f"{emoji} API_HEALTH {worst}{outage_note} (exit_on={EXIT_ON_LEVEL})\n{det_price} | {det_info} | {det_fin} | {det_sec} | {det_finn}"
     has_problem=("DEGRADED" in worst) or ("DOWN" in worst)
 
     if has_problem:
-        def head_problem(xs): return ", ".join(xs[:10]) + (f" …(+{len(xs)-10})" if len(xs)>10 else "")
+        def all_list(xs): return ", ".join(xs)
         lines=[]
         if meta_price["missing"] or meta_price["nf"]:
-            xs=[*meta_price["nf"],*meta_price["missing"]]; lines.append(f"YF_PRICE NG: {head_problem(xs)}")
-        if meta_info["bad"]:  lines.append(f"YF_INFO NG: {head_problem(meta_info['bad'])}")
-        if meta_fin["bad"]:   lines.append(f"YF_FIN NG: {head_problem(meta_fin['bad'])}")
-        if meta_sec["bad"]:   lines.append(f"SEC NG: {head_problem(meta_sec['bad'])}")
-        if meta_finn.get("bad"): lines.append(f"FINNHUB NG: {head_problem(meta_finn['bad'])}")
+            xs=[*meta_price["nf"],*meta_price["missing"]]
+            lines.append("YF_PRICE NG:\n" + all_list(xs))
+        if meta_info["bad"]:
+            lines.append("YF_INFO NG:\n" + all_list(meta_info["bad"]))
+        if meta_fin["bad"]:
+            lines.append("YF_FIN NG:\n" + all_list(meta_fin["bad"]))
+        if meta_sec["bad"]:
+            lines.append("SEC NG:\n" + all_list(meta_sec["bad"]))
+        if meta_finn.get("bad"):
+            lines.append("FINNHUB NG:\n" + all_list(meta_finn["bad"]))
         text=summary + ("\n" + "\n".join(lines) if lines else "")
     else:
         text=summary
 
-    # “変なティッカー”は毎回通報
-    def head_pair(pairs):
-        xs=[f"{a}->{b}" for (a,b) in pairs[:10]]
-        return ", ".join(xs) + (f" …(+{len(pairs)-10})" if len(pairs)>10 else "")
-    def head(xs):
-        return ", ".join(xs[:10]) + (f" …(+{len(xs)-10})" if len(xs)>10 else "")
+    # 変なティッカーは毎回全件通報
+    def pair_all(pairs): return ", ".join(f"{a}->{b}" for (a,b) in pairs)
+    def list_all(xs): return ", ".join(xs)
     alias_fixed = meta_price.get("alias_fixed", [])
     still_missing = meta_price.get("nf", [])
     weird_lines = []
     if alias_fixed:
-        weird_lines.append(f"Weird tickers (alias fixed): {head_pair(alias_fixed)}")
+        weird_lines.append("Weird tickers (alias fixed):\n" + pair_all(alias_fixed))
     if still_missing:
-        weird_lines.append(f"Weird tickers (not found): {head(still_missing)}")
+        weird_lines.append("Weird tickers (not found):\n" + list_all(still_missing))
     if weird_lines:
         text = text + "\n" + "\n".join(weird_lines)
 
     print(text); _post_slack(text)
     if SOFT_FAIL: sys.exit(0)
-    # 退出判定：基準は“コアAPIの状態”。OPTIONALがDOWNでも coreがHEALTHY/DEGRADEDなら緩和。
+    # 退出判定：コアAPIを優先。OPTIONALがDOWNでも coreがHEALTHY/DEGRADEDなら緩和。
     exit_by = core_worst if core_worst!="HEALTHY" else worst
     def _rank(x): return {"HEALTHY":1,"DEGRADED":2,"DOWN":3}.get(x,0)
-    # EXIT_ON_LEVEL 未満なら成功終了
-    if _rank(exit_by) < _rank(EXIT_ON_LEVEL):
-        sys.exit(0)
+    if _rank(exit_by) < _rank(EXIT_ON_LEVEL): sys.exit(0)
     sys.exit(20 if exit_by=="DOWN" else 10)
 
 if __name__=="__main__":
