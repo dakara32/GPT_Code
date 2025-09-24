@@ -1,83 +1,5 @@
 ```text
-sma200)) and _safe_last(sma200)!=0 else np.nan
-L598             df.loc[t,'MA50_OVER_200'] = _safe_last(sma50)/_safe_last(sma200)-1 if pd.notna(_safe_last(sma50)) and pd.notna(_safe_last(sma200)) and _safe_last(sma200)!=0 else np.nan
-L599             df.loc[t,'MA200_SLOPE_5M'] = np.nan
-L600             if len(sma200.dropna())>=105:
-L601                 cur200, old200 = _safe_last(sma200), float(sma200.iloc[-105])
-L602                 if old200 and old200!=0: df.loc[t,'MA200_SLOPE_5M'] = cur200/old200 - 1
-L603             # NEW: 200日線が連続で上向きの「日数」
-L604             df.loc[t,'MA200_UP_STREAK_D'] = np.nan
-L605             try:
-L606                 s200 = sma200.dropna()
-L607                 if len(s200) >= 2:
-L608                     diff200 = s200.diff()
-L609                     up = 0
-L610                     for v in diff200.iloc[::-1]:
-L611                         if pd.isna(v) or v <= 0:
-L612                             break
-L613                         up += 1
-L614                     df.loc[t,'MA200_UP_STREAK_D'] = float(up)
-L615             except Exception:
-L616                 pass
-L617             df.loc[t,'LOW52PCT25_EXCESS'] = np.nan if (lo52 is None or lo52<=0 or pd.isna(p)) else (p/(lo52*1.25)-1)
-L618             hi52 = s[-252:].max() if len(s)>=252 else s.max(); df.loc[t,'NEAR_52W_HIGH'] = np.nan
-L619             if hi52 and hi52>0 and pd.notna(p):
-L620                 d_hi = (p/hi52)-1.0; df.loc[t,'NEAR_52W_HIGH'] = -abs(min(0.0, d_hi))
-L621             df.loc[t,'RS_SLOPE_6W'] = self.rs_line_slope(s, ib.spx, 30)
-L622             df.loc[t,'RS_SLOPE_13W'] = self.rs_line_slope(s, ib.spx, 65)
-L623
-L624             df.loc[t,'DIV_STREAK'] = self.div_streak(t)
-L625
-L626             # --- 欠損メモ ---
-L627             fin_cols = ['REV','ROE','BETA','DIV','FCF']
-L628             need_finnhub = [col for col in fin_cols if pd.isna(df.loc[t,col])]
-L629             if need_finnhub:
-L630                 fin_data = self.fetch_finnhub_metrics(t)
-L631                 for col in need_finnhub:
-L632                     val = fin_data.get(col)
-L633                     if val is not None and not pd.isna(val): df.loc[t,col] = val
-L634             # 欠損ログは factor 側で補完後に集約する（ここでは検知のみ）
-L635
-L636         def _pick_series(entry: dict, keys: list[str]):
-L637             for k in keys:
-L638                 val = entry.get(k) if isinstance(entry, dict) else None
-L639                 if val is None:
-L640                     continue
-L641                 try:
-L642                     if hasattr(val, "empty") and getattr(val, "empty"):
-L643                         continue
-L644                 except Exception:
-L645                     pass
-L646                 if isinstance(val, (list, tuple)) and len(val) == 0:
-L647                     continue
-L648                 return val
-L649             return None
-L650
-L651         def _has_sec_series(val) -> bool:
-L652             try:
-L653                 if isinstance(val, pd.Series):
-L654                     return not val.dropna().empty
-L655                 if isinstance(val, (list, tuple)):
-L656                     return any(pd.notna(v) for v in val)
-L657                 return bool(val)
-L658             except Exception:
-L659                 return False
-L660
-L661         def _series_len(val) -> int:
-L662             try:
-L663                 if isinstance(val, pd.Series):
-L664                     return int(val.dropna().size)
-L665                 if isinstance(val, (list, tuple)):
-L666                     return len(val)
-L667                 return int(bool(val))
-L668             except Exception:
-L669                 return 0
-L670
-L671         for t in tickers:
-L672             try:
-L673                 d = info.get(t, {}) or {}
-L674                 rev_series = d.get("SEC_REV_Q_SERIES")
-L675                 eps_series = d.get("SEC_EPS_Q_SERIES")
+       eps_series = d.get("SEC_EPS_Q_SERIES")
 L676                 fallback_qearn = False
 L677                 try:
 L678                     qe = tickers_bulk.tickers[t].quarterly_earnings
@@ -233,5 +155,75 @@ L827             return slope
 L828
 L829         df['EPS_ABS_SLOPE'] = df['EPS_SERIES'].apply(_calc_eps_abs_slope).astype(float)
 L830         df.drop(columns=['EPS_SERIES'], inplace=True)
-L
+L831
+L832         # === Z化と合成 ===
+L833         for col in ['ROE','FCF','REV','EPS']: df[f'{col}_W'] = winsorize_s(df[col], 0.02)
+L834
+L835         df_z = pd.DataFrame(index=df.index)
+L836         for col in ['EPS','REV','ROE','FCF','RS','TR_str','BETA','DIV','DIV_STREAK']: df_z[col] = robust_z(df[col])
+L837         df_z['REV'], df_z['EPS'], df_z['TR'] = robust_z(df['REV_W']), robust_z(df['EPS_W']), robust_z(df['TR'])
+L838         for col in ['P_OVER_150','P_OVER_200','MA200_SLOPE_5M','NEAR_52W_HIGH','RS_SLOPE_6W','RS_SLOPE_13W','MA200_UP_STREAK_D']: df_z[col] = robust_z(df[col])
+L839
+L840         df_z['EPS_ABS_SLOPE'] = robust_z(df['EPS_ABS_SLOPE']).clip(-3.0, 3.0)
+L841
+L842         # === Growth深掘り系（欠損保持z + RAW併載） ===
+L843         grw_cols = ['REV_Q_YOY','EPS_Q_YOY','REV_YOY','EPS_YOY','REV_YOY_ACC','REV_YOY_VAR','FCF_MGN','RULE40','REV_ANN_STREAK']
+L844         for col in grw_cols:
+L845             if col in df.columns:
+L846                 raw = pd.to_numeric(df[col], errors="coerce")
+L847                 df_z[col] = robust_z_keepnan(raw)
+L848         for k in ("TREND_SLOPE_EPS", "TREND_SLOPE_REV"):
+L849             if k in df.columns and k not in df_z.columns:
+L850                 raw = pd.to_numeric(df[k], errors="coerce")
+L851                 df_z[k] = robust_z_keepnan(raw)
+L852         for col in ['DOWNSIDE_DEV','MDD_1Y','RESID_VOL','DOWN_OUTPERF','EXT_200','DIV_VAR5','DIV_FCF_COVER','DEBT2EQ','CURR_RATIO','EPS_VAR_8Q','MARKET_CAP','ADV60_USD']: df_z[col] = robust_z(df[col])
+L853
+L854         df_z['SIZE'], df_z['LIQ'] = robust_z(np.log1p(df['MARKET_CAP'])), robust_z(np.log1p(df['ADV60_USD']))
+L855         df_z['QUALITY_F'] = robust_z(0.6*df['FCF_W'] + 0.4*df['ROE_W']).clip(-3.0,3.0)
+L856         df_z['YIELD_F']   = 0.3*df_z['DIV'] + 0.7*df_z['DIV_STREAK']
+L857
+L858         # EPSが赤字でもFCFが黒字なら実質黒字とみなす
+L859         eps_pos_mask = (df['EPS'] > 0) | (df['FCF_MGN'] > 0)
+L860         df_z['EPS_POS'] = df_z['EPS'].where(eps_pos_mask, 0.0)
+L861
+L862         # ===== トレンドスロープ算出 =====
+L863         def zpos(x):
+L864             arr = robust_z(x)
+L865             idx = getattr(x, 'index', df_z.index)
+L866             return pd.Series(arr, index=idx).fillna(0.0)
+L867
+L868         def relu(x):
+L869             ser = x if isinstance(x, pd.Series) else pd.Series(x, index=df_z.index)
+L870             return ser.clip(lower=0).fillna(0.0)
+L871
+L872         # 売上トレンドスロープ（四半期）
+L873         slope_rev = 0.70*zpos(df_z['REV_Q_YOY']) + 0.30*zpos(df_z['REV_YOY_ACC'])
+L874         noise_rev = relu(robust_z(df_z['REV_YOY_VAR']) - 0.8)
+L875         slope_rev_combo = slope_rev - 0.25*noise_rev
+L876         df_z['TREND_SLOPE_REV'] = slope_rev_combo.clip(-3.0, 3.0)
+L877
+L878         # EPSトレンドスロープ（四半期）
+L879         slope_eps = (
+L880             0.40*zpos(df_z['EPS_Q_YOY']) +
+L881             0.20*zpos(df_z['EPS_POS']) +
+L882             0.40*zpos(df_z['EPS_ABS_SLOPE'])
+L883         )
+L884         df_z['TREND_SLOPE_EPS'] = slope_eps.clip(-3.0, 3.0)
+L885
+L886         # 年次トレンド（サブ）
+L887         slope_rev_yr = zpos(df_z['REV_YOY'])
+L888         slope_eps_yr = zpos(df_z.get('EPS_YOY', pd.Series(0.0, index=df.index)))
+L889         streak_base = df['REV_ANN_STREAK'].clip(lower=0).fillna(0)
+L890         streak_yr = streak_base / (streak_base.abs() + 1.0)
+L891         slope_rev_yr_combo = 0.7*slope_rev_yr + 0.3*streak_yr
+L892         df_z['TREND_SLOPE_REV_YR'] = slope_rev_yr_combo.clip(-3.0, 3.0)
+L893         df_z['TREND_SLOPE_EPS_YR'] = slope_eps_yr.clip(-3.0, 3.0)
+L894
+L895         grw_q_z = robust_z_keepnan(df['GRW_Q_RAW']).clip(-3.0, 3.0)
+L896         grw_a_z = robust_z_keepnan(df['GRW_A_RAW']).clip(-3.0, 3.0)
+L897         df_z['GRW_Q'] = grw_q_z
+L898         df_z['GRW_A'] = grw_a_z
+L899
+L900         try:
+L901             mix = float(os.environ.get("GRW_Q_ANNUAL_
 ```

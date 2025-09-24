@@ -1,7 +1,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, factor.py, scorer.py, .github/workflows/weekly-report.yml, documents/README.md, documents/factor_design.md
-# 作成日時: 2025-09-24 19:35:14 (JST)
+# 作成日時: 2025-09-24 20:31:36 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -268,1569 +268,1475 @@ L228     out = [f"{m} ×{n}" if n > 1 else m for m, n in cnt.most_common()]
 L229     return out[:max_items]
 L230
 L231
-L232 def compact_missing_lines(missing_df, limit=300):
-L233     if missing_df is None or getattr(missing_df, "empty", True):
-L234         return []
-L235
-L236     df = missing_df.copy()
-L237     if "ticker" not in df.columns:
-L238         df = df.reset_index().rename(columns={"index": "ticker"})
-L239
-L240     out: list[str] = []
-L241     for _, r in df.iterrows():
-L242         tags: list[str] = []
-L243         if bool(r.get("EPS_missing", False)):
-L244             tags.append("eps")
-L245         if bool(r.get("REV_missing", False)):
-L246             tags.append("rev")
-L247         if tags:
-L248             ticker = r.get("ticker")
-L249             if pd.isna(ticker) or ticker is None:
-L250                 ticker = "(unknown)"
-L251             else:
-L252                 ticker = str(ticker)
-L253             out.append(f"{ticker} : {', '.join(tags)}")
-L254         if len(out) >= limit:
-L255             out.append("...")
-L256             break
-L257
-L258     return out
-L259
-L260 # === 共通ユーティリティ（複数クラスで使用） ===
-L261 # (unused local utils removed – use scorer.py versions if needed)
-L262
-L263 def _build_missing_logs_after_impute(eps_df: pd.DataFrame) -> pd.DataFrame:
-L264     df = eps_df.copy()
-L265     required_cols = [
-L266         "EPS_TTM",
-L267         "EPS_Q_LastQ",
-L268         "EPS_A_LATEST",
-L269         "REV_TTM",
-L270         "REV_Q_LastQ",
-L271         "REV_A_LATEST",
-L272     ]
-L273     for col in required_cols:
-L274         if col not in df.columns:
-L275             df[col] = np.nan
-L276
-L277     miss_eps = df["EPS_TTM"].isna() & df["EPS_Q_LastQ"].isna() & df["EPS_A_LATEST"].isna()
-L278     miss_rev = df["REV_TTM"].isna() & df["REV_Q_LastQ"].isna() & df["REV_A_LATEST"].isna()
+L232 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
+L233
+L234 def _post_slack(payload: dict):
+L235     url = os.getenv("SLACK_WEBHOOK_URL")
+L236     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+L237     try:
+L238         requests.post(url, json=payload).raise_for_status()
+L239     except Exception as e:
+L240         print(f"⚠️ Slack通知エラー: {e}")
+L241
+L242 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
+L243     """Slackへテキストを分割送信（コードブロック形式）。"""
+L244
+L245     def _post_text(payload: str) -> None:
+L246         try:
+L247             resp = requests.post(url, json={"text": payload})
+L248             print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
+L249             if resp is not None:
+L250                 resp.raise_for_status()
+L251         except Exception as e:
+L252             print(f"[ERR] debug_post_failed: {e}")
+L253
+L254     body = (text or "").strip()
+L255     if not body:
+L256         print("[DBG] skip debug send: empty body")
+L257         return
+L258
+L259     block, block_len = [], 0
+L260
+L261     def _flush():
+L262         nonlocal block, block_len
+L263         if block:
+L264             _post_text("```" + "\n".join(block) + "```")
+L265             block, block_len = [], 0
+L266
+L267     for raw in body.splitlines():
+L268         line = raw or ""
+L269         while len(line) > chunk:
+L270             head, line = line[:chunk], line[chunk:]
+L271             _flush()
+L272             _post_text("```" + head + "```")
+L273         add_len = len(line) if not block else len(line) + 1
+L274         if block and block_len + add_len > chunk:
+L275             _flush(); add_len = len(line)
+L276         block.append(line)
+L277         block_len += add_len
+L278     _flush()
 L279
-L280     rows: list[dict] = []
-L281     for ticker, row in df.iterrows():
-L282         eps_missing = bool(miss_eps.loc[ticker])
-L283         rev_missing = bool(miss_rev.loc[ticker])
-L284         if not (eps_missing or rev_missing):
+L280 def _disjoint_keepG(top_G, top_D, poolD):
+L281     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
+L282     used, D, i = set(top_G), list(top_D), 0
+L283     for j, t in enumerate(D):
+L284         if t not in used:
 L285             continue
-L286         rows.append({
-L287             "ticker": ticker,
-L288             "EPS_missing": eps_missing,
-L289             "REV_missing": rev_missing,
-L290             "eps_imputed": bool(row.get("eps_imputed", False)),
-L291             "EPS_TTM": row.get("EPS_TTM"),
-L292             "EPS_Q_LastQ": row.get("EPS_Q_LastQ"),
-L293             "EPS_A_LATEST": row.get("EPS_A_LATEST"),
-L294             "REV_TTM": row.get("REV_TTM"),
-L295             "REV_Q_LastQ": row.get("REV_Q_LastQ"),
-L296             "REV_A_LATEST": row.get("REV_A_LATEST"),
-L297         })
-L298
-L299     if not rows:
-L300         return pd.DataFrame(
-L301             columns=[
-L302                 "ticker",
-L303                 "EPS_missing",
-L304                 "REV_missing",
-L305                 "eps_imputed",
-L306                 "EPS_TTM",
-L307                 "EPS_Q_LastQ",
-L308                 "EPS_A_LATEST",
-L309                 "REV_TTM",
-L310                 "REV_Q_LastQ",
-L311                 "REV_A_LATEST",
-L312             ]
-L313         )
-L314
-L315     return pd.DataFrame(rows)
-L316
-L317 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
-L318
-L319 def _post_slack(payload: dict):
-L320     url = os.getenv("SLACK_WEBHOOK_URL")
-L321     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-L322     try:
-L323         requests.post(url, json=payload).raise_for_status()
-L324     except Exception as e:
-L325         print(f"⚠️ Slack通知エラー: {e}")
+L286         while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
+L287             i += 1
+L288         if i < len(poolD):
+L289             D[j] = poolD[i]; used.add(D[j]); i += 1
+L290     return top_G, D
+L291
+L292
+L293 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
+L294                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
+L295     import pandas as pd, numpy as np
+L296     sel = list(pick)
+L297     if not sel: return sel
+L298     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
+L299     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
+L300     std = agg.std()
+L301     sigma = float(std) if pd.notna(std) else 0.0
+L302     thresh = kth - delta_z * sigma
+L303     ranked_all = agg.sort_values(ascending=False)
+L304     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
+L305     for t in cand:
+L306         within_score = pd.notna(agg[t]) and agg[t] >= thresh
+L307         within_rank = t in ranked_all.index and ranked_all.index.get_loc(t) < n_target + keep_buffer
+L308         if not (within_score or within_rank):
+L309             continue
+L310         non_inc = [x for x in sel if x not in incumbents]
+L311         if not non_inc:
+L312             break
+L313         weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
+L314         if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
+L315             sel.remove(weakest); sel.append(t)
+L316     if len(sel) > n_target:
+L317         sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
+L318     return sel
+L319
+L320
+L321 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
+L322 class Input:
+L323     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
+L324         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
+L325         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
 L326
-L327 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
-L328     """Slackへテキストを分割送信（コードブロック形式）。"""
-L329
-L330     def _post_text(payload: str) -> None:
-L331         try:
-L332             resp = requests.post(url, json={"text": payload})
-L333             print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
-L334             if resp is not None:
-L335                 resp.raise_for_status()
-L336         except Exception as e:
-L337             print(f"[ERR] debug_post_failed: {e}")
-L338
-L339     body = (text or "").strip()
-L340     if not body:
-L341         print("[DBG] skip debug send: empty body")
-L342         return
-L343
-L344     block, block_len = [], 0
-L345
-L346     def _flush():
-L347         nonlocal block, block_len
-L348         if block:
-L349             _post_text("```" + "\n".join(block) + "```")
-L350             block, block_len = [], 0
-L351
-L352     for raw in body.splitlines():
-L353         line = raw or ""
-L354         while len(line) > chunk:
-L355             head, line = line[:chunk], line[chunk:]
-L356             _flush()
-L357             _post_text("```" + head + "```")
-L358         add_len = len(line) if not block else len(line) + 1
-L359         if block and block_len + add_len > chunk:
-L360             _flush(); add_len = len(line)
-L361         block.append(line)
-L362         block_len += add_len
-L363     _flush()
-L364
-L365 def _disjoint_keepG(top_G, top_D, poolD):
-L366     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
-L367     used, D, i = set(top_G), list(top_D), 0
-L368     for j, t in enumerate(D):
-L369         if t not in used:
-L370             continue
-L371         while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
-L372             i += 1
-L373         if i < len(poolD):
-L374             D[j] = poolD[i]; used.add(D[j]); i += 1
-L375     return top_G, D
-L376
-L377
-L378 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
-L379                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
-L380     import pandas as pd, numpy as np
-L381     sel = list(pick)
-L382     if not sel: return sel
-L383     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
-L384     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
-L385     std = agg.std()
-L386     sigma = float(std) if pd.notna(std) else 0.0
-L387     thresh = kth - delta_z * sigma
-L388     ranked_all = agg.sort_values(ascending=False)
-L389     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
-L390     for t in cand:
-L391         within_score = pd.notna(agg[t]) and agg[t] >= thresh
-L392         within_rank = t in ranked_all.index and ranked_all.index.get_loc(t) < n_target + keep_buffer
-L393         if not (within_score or within_rank):
-L394             continue
-L395         non_inc = [x for x in sel if x not in incumbents]
-L396         if not non_inc:
-L397             break
-L398         weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
-L399         if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
-L400             sel.remove(weakest); sel.append(t)
-L401     if len(sel) > n_target:
-L402         sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
-L403     return sel
-L404
-L405
-L406 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
-L407 class Input:
-L408     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
-L409         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
-L410         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
-L411
-L412     # ---- （Input専用）EPS補完・FCF算出系 ----
+L327     # ---- （Input専用）EPS補完・FCF算出系 ----
+L328     @staticmethod
+L329     def _sec_headers():
+L330         mail = (os.getenv("SEC_CONTACT_EMAIL") or os.getenv("SEC_EMAIL") or "").strip()
+L331         ua = f"factor-selection/1 (+mailto:{mail})" if mail else "factor-selection/1"
+L332         headers = {"User-Agent": ua[:200], "Accept": "application/json"}
+L333         if mail:
+L334             headers["From"] = mail[:200]
+L335         return headers
+L336
+L337     @staticmethod
+L338     def _sec_get(url: str, retries: int = 3, backoff: float = 0.5):
+L339         for i in range(retries):
+L340             r = requests.get(url, headers=Input._sec_headers(), timeout=20)
+L341             if r.status_code in (429, 503, 403):
+L342                 time.sleep(min(2 ** i * backoff, 8.0))
+L343                 continue
+L344             r.raise_for_status(); return r.json()
+L345         r.raise_for_status()
+L346
+L347     @staticmethod
+L348     def _sec_ticker_map():
+L349         import requests
+L350
+L351         url_primary = "https://data.sec.gov/api/xbrl/company_tickers.json"
+L352         url_fallback = "https://www.sec.gov/files/company_tickers.json"
+L353         mp = {}
+L354         try:
+L355             j = Input._sec_get(url_primary)  # 既存の堅牢GET（リトライ・バックオフ）
+L356         except Exception:
+L357             r = requests.get(url_fallback, headers=Input._sec_headers(), timeout=20)
+L358             r.raise_for_status()
+L359             j = r.json()
+L360         # 形状A: {"0": {"ticker":..., "cik_str":...}, ...}
+L361         if isinstance(j, dict) and "0" in j:
+L362             for _, v in (j or {}).items():
+L363                 try:
+L364                     mp[str(v["ticker"]).upper()] = f"{int(v['cik_str']):010d}"
+L365                 except Exception:
+L366                     pass
+L367         # 形状B: [{"ticker":..., "cik_str":...}, ...]
+L368         elif isinstance(j, list):
+L369             for v in j:
+L370                 try:
+L371                     mp[str(v.get("ticker")).upper()] = f"{int(v.get('cik_str')):010d}"
+L372                 except Exception:
+L373                     pass
+L374         # 形状C: {"data":[[idx,ticker,title,cik_str],...]}
+L375         elif isinstance(j, dict) and "data" in j:
+L376             for row in j.get("data") or []:
+L377                 try:
+L378                     t = str(row[1]).upper()
+L379                     c = int(row[3])
+L380                     mp[t] = f"{c:010d}"
+L381                 except Exception:
+L382                     pass
+L383         return mp
+L384
+L385     # --- 追加: ADR/OTC向けの簡易正規化（末尾Y/F, ドット等） ---
+L386     @staticmethod
+L387     def _normalize_ticker(sym: str) -> list[str]:
+L388         s = (sym or "").upper().strip()
+L389         # 追加: 先頭の$や全角の記号を除去
+L390         s = s.lstrip("$").replace("＄", "").replace("．", ".").replace("－", "-")
+L391         cand: list[str] = []
+L392
+L393         def add(x: str) -> None:
+L394             if x and x not in cand:
+L395                 cand.append(x)
+L396
+L397         # 1) 原文を最優先（SECは BRK.B, BF.B など . を正式採用）
+L398         add(s)
+L399         # 2) Yahoo系バリアント（. と - の揺れを相互に）
+L400         if "." in s:
+L401             add(s.replace(".", "-"))
+L402             add(s.replace(".", ""))
+L403         if "-" in s:
+L404             add(s.replace("-", "."))
+L405             add(s.replace("-", ""))
+L406         # 3) ドット・ハイフン・ピリオド無し版（最後の保険）
+L407         add(s.replace("-", "").replace(".", ""))
+L408         # 4) ADR簡易：末尾Y/Fの除去（SECマップは本体ティッカーを持つことがある）
+L409         if len(s) >= 2 and s[-1] in {"Y", "F"}:
+L410             add(s[:-1])
+L411         return cand
+L412
 L413     @staticmethod
-L414     def _sec_headers():
-L415         mail = (os.getenv("SEC_CONTACT_EMAIL") or "yasonba55@gmail.com").strip()
-L416         app = (os.getenv("SEC_APP_NAME") or "FactorBot/1.0").strip()
-L417         return {"User-Agent": f"{app} ({mail})", "From": mail, "Accept": "application/json"}
-L418
-L419     @staticmethod
-L420     def _sec_get(url: str, retries: int = 3, backoff: float = 0.5):
-L421         for i in range(retries):
-L422             r = requests.get(url, headers=Input._sec_headers(), timeout=20)
-L423             if r.status_code in (429, 503, 403):
-L424                 time.sleep(min(2 ** i * backoff, 8.0))
-L425                 continue
-L426             r.raise_for_status(); return r.json()
-L427         r.raise_for_status()
-L428
-L429     @staticmethod
-L430     def _sec_ticker_map():
-L431         import requests
-L432
-L433         url_primary = "https://data.sec.gov/api/xbrl/company_tickers.json"
-L434         url_fallback = "https://www.sec.gov/files/company_tickers.json"
-L435         mp = {}
-L436         try:
-L437             j = Input._sec_get(url_primary)  # 既存の堅牢GET（リトライ・バックオフ）
-L438         except Exception:
-L439             r = requests.get(url_fallback, headers=Input._sec_headers(), timeout=20)
-L440             r.raise_for_status()
-L441             j = r.json()
-L442         # 形状A: {"0": {"ticker":..., "cik_str":...}, ...}
-L443         if isinstance(j, dict) and "0" in j:
-L444             for _, v in (j or {}).items():
-L445                 try:
-L446                     mp[str(v["ticker"]).upper()] = f"{int(v['cik_str']):010d}"
-L447                 except Exception:
-L448                     pass
-L449         # 形状B: [{"ticker":..., "cik_str":...}, ...]
-L450         elif isinstance(j, list):
-L451             for v in j:
-L452                 try:
-L453                     mp[str(v.get("ticker")).upper()] = f"{int(v.get('cik_str')):010d}"
-L454                 except Exception:
-L455                     pass
-L456         # 形状C: {"data":[[idx,ticker,title,cik_str],...]}
-L457         elif isinstance(j, dict) and "data" in j:
-L458             for row in j.get("data") or []:
-L459                 try:
-L460                     t = str(row[1]).upper()
-L461                     c = int(row[3])
-L462                     mp[t] = f"{c:010d}"
-L463                 except Exception:
-L464                     pass
-L465         return mp
-L466
-L467     # --- 追加: ADR/OTC向けの簡易正規化（末尾Y/F, ドット等） ---
-L468     @staticmethod
-L469     def _normalize_ticker(sym: str) -> list[str]:
-L470         s = (sym or "").upper().strip()
-L471         # 追加: 先頭の$や全角の記号を除去
-L472         s = s.lstrip("$").replace("＄", "").replace("．", ".").replace("－", "-")
-L473         cand: list[str] = []
-L474
-L475         def add(x: str) -> None:
-L476             if x and x not in cand:
-L477                 cand.append(x)
+L414     def _sec_companyfacts(cik: str):
+L415         return Input._sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
+L416
+L417     @staticmethod
+L418     def _units_for_tags(facts: dict, namespaces: list[str], tags: list[str]) -> list[dict]:
+L419         """facts から namespace/tag を横断して units 配列を収集（存在順に連結）。"""
+L420         out: list[dict] = []
+L421         facts = (facts or {}).get("facts", {})
+L422         for ns in namespaces:
+L423             node = facts.get(ns, {}) if isinstance(facts, dict) else {}
+L424             for tg in tags:
+L425                 try:
+L426                     units = node[tg]["units"]
+L427                 except Exception:
+L428                     continue
+L429                 picks: list[dict] = []
+L430                 if "USD/shares" in units:
+L431                     picks.extend(list(units["USD/shares"]))
+L432                 if "USD" in units:
+L433                     picks.extend(list(units["USD"]))
+L434                 if not picks:
+L435                     for arr in units.values():
+L436                         picks.extend(list(arr))
+L437                 out.extend(picks)
+L438         return out
+L439
+L440     @staticmethod
+L441     def _only_quarterly(arr: list[dict]) -> list[dict]:
+L442         """companyfactsの混在配列から『四半期』だけを抽出。
+L443
+L444         - frame に "Q" を含む（例: CY2024Q2I）
+L445         - fp が Q1/Q2/Q3/Q4
+L446         - form が 10-Q/10-Q/A/6-K
+L447         """
+L448         if not arr:
+L449             return []
+L450         q_forms = {"10-Q", "10-Q/A", "6-K"}
+L451         out = [
+L452             x
+L453             for x in arr
+L454             if (
+L455                 "Q" in (x.get("frame") or "").upper()
+L456                 or (x.get("fp") or "").upper() in {"Q1", "Q2", "Q3", "Q4"}
+L457                 or (x.get("form") or "").upper() in q_forms
+L458             )
+L459         ]
+L460         out.sort(key=lambda x: (x.get("end") or ""), reverse=True)
+L461         return out
+L462
+L463     @staticmethod
+L464     def _series_from_facts_with_dates(arr, key_val="val", key_dt="end", normalize=float):
+L465         """companyfactsアイテム配列から (date,value) を返す。dateはYYYY-MM-DDを想定。"""
+L466         out: List[Tuple[str, float]] = []
+L467         for x in (arr or []):
+L468             try:
+L469                 d = x.get(key_dt)
+L470                 if d is None:
+L471                     continue
+L472                 v = x.get(key_val)
+L473                 out.append((str(d), normalize(v) if v is not None else float("nan")))
+L474             except Exception:
+L475                 continue
+L476         out.sort(key=lambda t: t[0], reverse=True)
+L477         return out
 L478
-L479         # 1) 原文を最優先（SECは BRK.B, BF.B など . を正式採用）
-L480         add(s)
-L481         # 2) Yahoo系バリアント（. と - の揺れを相互に）
-L482         if "." in s:
-L483             add(s.replace(".", "-"))
-L484             add(s.replace(".", ""))
-L485         if "-" in s:
-L486             add(s.replace("-", "."))
-L487             add(s.replace("-", ""))
-L488         # 3) ドット・ハイフン・ピリオド無し版（最後の保険）
-L489         add(s.replace("-", "").replace(".", ""))
-L490         # 4) ADR簡易：末尾Y/Fの除去（SECマップは本体ティッカーを持つことがある）
-L491         if len(s) >= 2 and s[-1] in {"Y", "F"}:
-L492             add(s[:-1])
-L493         return cand
-L494
-L495     @staticmethod
-L496     def _sec_companyfacts(cik: str):
-L497         return Input._sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
-L498
-L499     @staticmethod
-L500     def _units_for_tags(facts: dict, namespaces: list[str], tags: list[str]) -> list[dict]:
-L501         """facts から namespace/tag を横断して units 配列を収集（存在順に連結）。"""
-L502         out: list[dict] = []
-L503         facts = (facts or {}).get("facts", {})
-L504         for ns in namespaces:
-L505             node = facts.get(ns, {}) if isinstance(facts, dict) else {}
-L506             for tg in tags:
-L507                 try:
-L508                     units = node[tg]["units"]
-L509                 except Exception:
-L510                     continue
-L511                 picks: list[dict] = []
-L512                 if "USD/shares" in units:
-L513                     picks.extend(list(units["USD/shares"]))
-L514                 if "USD" in units:
-L515                     picks.extend(list(units["USD"]))
-L516                 if not picks:
-L517                     for arr in units.values():
-L518                         picks.extend(list(arr))
-L519                 out.extend(picks)
-L520         return out
-L521
-L522     @staticmethod
-L523     def _only_quarterly(arr: list[dict]) -> list[dict]:
-L524         """companyfactsの混在配列から『四半期』だけを抽出。
-L525
-L526         - frame に "Q" を含む（例: CY2024Q2I）
-L527         - fp が Q1/Q2/Q3/Q4
-L528         - form が 10-Q/10-Q/A/6-K
-L529         """
-L530         if not arr:
-L531             return []
-L532         q_forms = {"10-Q", "10-Q/A", "6-K"}
-L533         out = [
-L534             x
-L535             for x in arr
-L536             if (
-L537                 "Q" in (x.get("frame") or "").upper()
-L538                 or (x.get("fp") or "").upper() in {"Q1", "Q2", "Q3", "Q4"}
-L539                 or (x.get("form") or "").upper() in q_forms
-L540             )
-L541         ]
-L542         out.sort(key=lambda x: (x.get("end") or ""), reverse=True)
-L543         return out
-L544
-L545     @staticmethod
-L546     def _series_from_facts_with_dates(arr, key_val="val", key_dt="end", normalize=float):
-L547         """companyfactsアイテム配列から (date,value) を返す。dateはYYYY-MM-DDを想定。"""
-L548         out: List[Tuple[str, float]] = []
-L549         for x in (arr or []):
-L550             try:
-L551                 d = x.get(key_dt)
-L552                 if d is None:
-L553                     continue
-L554                 v = x.get(key_val)
-L555                 out.append((str(d), normalize(v) if v is not None else float("nan")))
-L556             except Exception:
-L557                 continue
-L558         out.sort(key=lambda t: t[0], reverse=True)
-L559         return out
-L560
-L561     def _series_q_and_a(self, facts: list[dict]) -> tuple[list[Tuple[str, float]], list[Tuple[str, float]]]:
-L562         """四半期・年次の両seriesを抽出して返す（formで簡易判定）。"""
-L563         if not facts:
-L564             return [], []
-L565         q_items = self._only_quarterly(list(facts))
-L566         annual_forms = {"10-K", "10-K/A", "20-F", "20-F/A"}
-L567         a_items = [x for x in facts if str((x or {}).get("form", "")).upper() in annual_forms]
-L568         a_items.sort(key=lambda x: (x.get("end") or ""), reverse=True)
-L569         return self._series_from_facts_with_dates(q_items), self._series_from_facts_with_dates(a_items)
-L570
-L571     @staticmethod
-L572     def _ttm_from_q_or_a(q_vals: list[float], a_vals: list[float]) -> float:
-L573         """四半期TTM（4本合算）を優先し、欠損時は年次値で補完。"""
-L574         import math
-L575
-L576         def _clean(vals: list[float]) -> list[float]:
-L577             out: list[float] = []
-L578             for v in vals:
-L579                 try:
-L580                     f = float(v)
-L581                 except Exception:
-L582                     continue
-L583                 if math.isfinite(f):
-L584                     out.append(f)
-L585                 else:
-L586                     out.append(float("nan"))
-L587             return out
-L588
-L589         def _sum4(vs: list[float]) -> float:
-L590             filtered = [v for v in vs[:4] if v == v]
-L591             if len(filtered) >= 2:
-L592                 return float(sum(filtered))
-L593             if len(filtered) == 1:
-L594                 return float(filtered[0])
-L595             return float("nan")
+L479     def _series_q_and_a(self, facts: list[dict]) -> tuple[list[Tuple[str, float]], list[Tuple[str, float]]]:
+L480         """四半期・年次の両seriesを抽出して返す（formで簡易判定）。"""
+L481         if not facts:
+L482             return [], []
+L483         q_items = self._only_quarterly(list(facts))
+L484         annual_forms = {"10-K", "10-K/A", "20-F", "20-F/A"}
+L485         a_items = [x for x in facts if str((x or {}).get("form", "")).upper() in annual_forms]
+L486         a_items.sort(key=lambda x: (x.get("end") or ""), reverse=True)
+L487         return self._series_from_facts_with_dates(q_items), self._series_from_facts_with_dates(a_items)
+L488
+L489     @staticmethod
+L490     def _ttm_from_q_or_a(q_vals: list[float], a_vals: list[float]) -> float:
+L491         """四半期TTM（4本合算）を優先し、欠損時は年次値で補完。"""
+L492         import math
+L493
+L494         def _clean(vals: list[float]) -> list[float]:
+L495             out: list[float] = []
+L496             for v in vals:
+L497                 try:
+L498                     f = float(v)
+L499                 except Exception:
+L500                     continue
+L501                 if math.isfinite(f):
+L502                     out.append(f)
+L503                 else:
+L504                     out.append(float("nan"))
+L505             return out
+L506
+L507         def _sum4(vs: list[float]) -> float:
+L508             filtered = [v for v in vs[:4] if v == v]
+L509             if len(filtered) >= 2:
+L510                 return float(sum(filtered))
+L511             if len(filtered) == 1:
+L512                 return float(filtered[0])
+L513             return float("nan")
+L514
+L515         q_clean = _clean(q_vals or [])
+L516         ttm_q = _sum4(q_clean)
+L517         if ttm_q == ttm_q:
+L518             return ttm_q
+L519         for v in _clean(a_vals or []):
+L520             if v == v:
+L521                 return float(v)
+L522         return float("nan")
+L523
+L524     def fetch_eps_rev_from_sec(self, tickers: list[str]) -> dict:
+L525         out = {}
+L526         t2cik = self._sec_ticker_map()
+L527         n_map = n_rev = n_eps = 0
+L528         miss_map: list[str] = []
+L529         miss_facts: list[str] = []
+L530         for t in tickers:
+L531             base = (t or "").upper()
+L532             candidates: list[str] = []
+L533             for key in [base, *self._normalize_ticker(t)]:
+L534                 if key and key not in candidates:
+L535                     candidates.append(key)
+L536             cik = next((t2cik.get(key) for key in candidates if t2cik.get(key)), None)
+L537             if not cik:
+L538                 out[t] = {}
+L539                 miss_map.append(t)
+L540                 continue
+L541             try:
+L542                 j = self._sec_companyfacts(cik)
+L543                 facts = j or {}
+L544                 rev_tags = [
+L545                     "Revenues",
+L546                     "RevenueFromContractWithCustomerExcludingAssessedTax",
+L547                     "SalesRevenueNet",
+L548                     "SalesRevenueGoodsNet",
+L549                     "SalesRevenueServicesNet",
+L550                     "Revenue",
+L551                 ]
+L552                 eps_tags = [
+L553                     "EarningsPerShareDiluted",
+L554                     "EarningsPerShareBasicAndDiluted",
+L555                     "EarningsPerShare",
+L556                     "EarningsPerShareBasic",
+L557                 ]
+L558                 rev_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], rev_tags)
+L559                 eps_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], eps_tags)
+L560                 rev_q_pairs, rev_a_pairs = self._series_q_and_a(rev_arr)
+L561                 eps_q_pairs, eps_a_pairs = self._series_q_and_a(eps_arr)
+L562
+L563                 rev_q_pairs = rev_q_pairs[:12]
+L564                 eps_q_pairs = eps_q_pairs[:12]
+L565                 rev_a_pairs = rev_a_pairs[:6]
+L566                 eps_a_pairs = eps_a_pairs[:6]
+L567
+L568                 def _vals(pairs: list[tuple[str, float]]) -> list[float]:
+L569                     vals: list[float] = []
+L570                     for _d, v in pairs:
+L571                         try:
+L572                             vals.append(float(v))
+L573                         except Exception:
+L574                             vals.append(float("nan"))
+L575                     return vals
+L576
+L577                 rev_q_vals = _vals(rev_q_pairs)
+L578                 eps_q_vals = _vals(eps_q_pairs)
+L579                 rev_a_vals = _vals(rev_a_pairs)
+L580                 eps_a_vals = _vals(eps_a_pairs)
+L581
+L582                 def _first_valid(vals: list[float]) -> float:
+L583                     for v in vals:
+L584                         if v == v:
+L585                             return float(v)
+L586                     return float("nan")
+L587
+L588                 def _nth_valid(vals: list[float], n: int) -> float:
+L589                     idx = 0
+L590                     for v in vals:
+L591                         if v == v:
+L592                             if idx == n:
+L593                                 return float(v)
+L594                             idx += 1
+L595                     return float("nan")
 L596
-L597         q_clean = _clean(q_vals or [])
-L598         ttm_q = _sum4(q_clean)
-L599         if ttm_q == ttm_q:
-L600             return ttm_q
-L601         for v in _clean(a_vals or []):
-L602             if v == v:
-L603                 return float(v)
-L604         return float("nan")
-L605
-L606     def fetch_eps_rev_from_sec(self, tickers: list[str]) -> dict:
-L607         out = {}
-L608         t2cik = self._sec_ticker_map()
-L609         n_map = n_rev = n_eps = 0
-L610         miss_map: list[str] = []
-L611         miss_facts: list[str] = []
-L612         for t in tickers:
-L613             base = (t or "").upper()
-L614             candidates: list[str] = []
-L615             for key in [base, *self._normalize_ticker(t)]:
-L616                 if key and key not in candidates:
-L617                     candidates.append(key)
-L618             cik = next((t2cik.get(key) for key in candidates if t2cik.get(key)), None)
-L619             if not cik:
-L620                 out[t] = {}
-L621                 miss_map.append(t)
-L622                 continue
-L623             try:
-L624                 j = self._sec_companyfacts(cik)
-L625                 facts = j or {}
-L626                 rev_tags = [
-L627                     "Revenues",
-L628                     "RevenueFromContractWithCustomerExcludingAssessedTax",
-L629                     "SalesRevenueNet",
-L630                     "SalesRevenueGoodsNet",
-L631                     "SalesRevenueServicesNet",
-L632                     "Revenue",
-L633                 ]
-L634                 eps_tags = [
-L635                     "EarningsPerShareDiluted",
-L636                     "EarningsPerShareBasicAndDiluted",
-L637                     "EarningsPerShare",
-L638                     "EarningsPerShareBasic",
-L639                 ]
-L640                 rev_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], rev_tags)
-L641                 eps_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], eps_tags)
-L642                 rev_q_pairs, rev_a_pairs = self._series_q_and_a(rev_arr)
-L643                 eps_q_pairs, eps_a_pairs = self._series_q_and_a(eps_arr)
-L644
-L645                 rev_q_pairs = rev_q_pairs[:12]
-L646                 eps_q_pairs = eps_q_pairs[:12]
-L647                 rev_a_pairs = rev_a_pairs[:6]
-L648                 eps_a_pairs = eps_a_pairs[:6]
-L649
-L650                 def _vals(pairs: list[tuple[str, float]]) -> list[float]:
-L651                     vals: list[float] = []
-L652                     for _d, v in pairs:
-L653                         try:
-L654                             vals.append(float(v))
-L655                         except Exception:
-L656                             vals.append(float("nan"))
-L657                     return vals
-L658
-L659                 rev_q_vals = _vals(rev_q_pairs)
-L660                 eps_q_vals = _vals(eps_q_pairs)
-L661                 rev_a_vals = _vals(rev_a_pairs)
-L662                 eps_a_vals = _vals(eps_a_pairs)
-L663
-L664                 def _first_valid(vals: list[float]) -> float:
-L665                     for v in vals:
-L666                         if v == v:
-L667                             return float(v)
-L668                     return float("nan")
-L669
-L670                 def _nth_valid(vals: list[float], n: int) -> float:
-L671                     idx = 0
-L672                     for v in vals:
-L673                         if v == v:
-L674                             if idx == n:
-L675                                 return float(v)
-L676                             idx += 1
-L677                     return float("nan")
-L678
-L679                 def _quarter_from_annual(vals: list[float]) -> float:
-L680                     v = _first_valid(vals)
-L681                     return float(v / 4.0) if v == v else float("nan")
-L682
-L683                 def _quarter_from_annual_prev(vals: list[float]) -> float:
-L684                     v = _nth_valid(vals, 1)
-L685                     return float(v / 4.0) if v == v else float("nan")
-L686
-L687                 rev_lastq = _first_valid(rev_q_vals)
-L688                 if rev_lastq != rev_lastq:
-L689                     rev_lastq = _quarter_from_annual(rev_a_vals)
-L690                 eps_lastq = _first_valid(eps_q_vals)
-L691                 if eps_lastq != eps_lastq:
-L692                     eps_lastq = _quarter_from_annual(eps_a_vals)
-L693
-L694                 rev_lastq_prev = _nth_valid(rev_q_vals, 4)
-L695                 if rev_lastq_prev != rev_lastq_prev:
-L696                     rev_lastq_prev = _quarter_from_annual_prev(rev_a_vals)
-L697                 eps_lastq_prev = _nth_valid(eps_q_vals, 4)
-L698                 if eps_lastq_prev != eps_lastq_prev:
-L699                     eps_lastq_prev = _quarter_from_annual_prev(eps_a_vals)
-L700
-L701                 rev_ttm = self._ttm_from_q_or_a(rev_q_vals, rev_a_vals)
-L702                 eps_ttm = self._ttm_from_q_or_a(eps_q_vals, eps_a_vals)
-L703                 rev_ttm_prev = self._ttm_from_q_or_a(rev_q_vals[4:], rev_a_vals[1:])
-L704                 eps_ttm_prev = self._ttm_from_q_or_a(eps_q_vals[4:], eps_a_vals[1:])
-L705
-L706                 rev_annual_latest = _first_valid(rev_a_vals)
-L707                 rev_annual_prev = _nth_valid(rev_a_vals, 1)
-L708                 eps_annual_latest = _first_valid(eps_a_vals)
-L709                 eps_annual_prev = _nth_valid(eps_a_vals, 1)
-L710
-L711                 def _cagr3(vals: list[float]) -> float:
-L712                     vals_valid = [v for v in vals if v == v]
-L713                     if len(vals_valid) >= 3:
-L714                         latest, base = float(vals_valid[0]), float(vals_valid[2])
-L715                         if latest > 0 and base > 0:
-L716                             try:
-L717                                 return float((latest / base) ** (1 / 2) - 1.0)
-L718                             except Exception:
-L719                                 return float("nan")
-L720                     return float("nan")
-L721
-L722                 rev_cagr3 = _cagr3(rev_a_vals)
-L723                 eps_cagr3 = _cagr3(eps_a_vals)
-L724
-L725                 out[t] = {
-L726                     "eps_q_recent": eps_lastq,
-L727                     "eps_ttm": eps_ttm,
-L728                     "eps_ttm_prev": eps_ttm_prev,
-L729                     "eps_lastq_prev": eps_lastq_prev,
-L730                     "rev_q_recent": rev_lastq,
-L731                     "rev_ttm": rev_ttm,
-L732                     "rev_ttm_prev": rev_ttm_prev,
-L733                     "rev_lastq_prev": rev_lastq_prev,
-L734                     # 後段でDatetimeIndex化できるよう (date,value) を保持。値だけの互換キーも残す。
-L735                     # 3年運用に合わせて四半期は直近12本のみ保持（約3年=12Q）
-L736                     "eps_q_series_pairs": eps_q_pairs,
-L737                     "rev_q_series_pairs": rev_q_pairs,
-L738                     "eps_q_series": eps_q_vals,
-L739                     "rev_q_series": rev_q_vals,
-L740                     "eps_a_series_pairs": eps_a_pairs,
-L741                     "rev_a_series_pairs": rev_a_pairs,
-L742                     "eps_a_series": eps_a_vals,
-L743                     "rev_a_series": rev_a_vals,
-L744                     "eps_annual_latest": eps_annual_latest,
-L745                     "eps_annual_prev": eps_annual_prev,
-L746                     "rev_annual_latest": rev_annual_latest,
-L747                     "rev_annual_prev": rev_annual_prev,
-L748                     "eps_cagr3": eps_cagr3,
-L749                     "rev_cagr3": rev_cagr3,
-L750                 }
-L751                 n_map += 1
-L752                 if any(v == v for v in rev_q_vals) or any(v == v for v in rev_a_vals):
-L753                     n_rev += 1
-L754                 if any(v == v for v in eps_q_vals) or any(v == v for v in eps_a_vals):
-L755                     n_eps += 1
-L756             except Exception:
-L757                 out[t] = {}
-L758                 miss_facts.append(t)
-L759             time.sleep(0.30)
-L760         # 取得サマリをログ（Actionsで確認しやすいよう print）
-L761         try:
-L762             total = len(tickers)
-L763             print(f"[SEC] map={n_map}/{total}  rev_q_hit={n_rev}  eps_q_hit={n_eps}")
-L764             # デバッグ: 取得本数の分布（先頭のみ）
-L765             try:
-L766                 lens = [len((out.get(t, {}) or {}).get("rev_q_series", [])) for t in tickers]
-L767                 print(f"[SEC] rev_q_series length: min={min(lens) if lens else 0} "
-L768                       f"p25={np.percentile(lens,25) if lens else 0} median={np.median(lens) if lens else 0} "
-L769                       f"p75={np.percentile(lens,75) if lens else 0} max={max(lens) if lens else 0}")
-L770             except Exception:
-L771                 pass
-L772             if miss_map:
-L773                 print(f"[SEC] no CIK map: {len(miss_map)} (サンプル例) {miss_map[:20]}")
-L774             if miss_facts:
-L775                 print(f"[SEC] CIKあり だが対象factなし: {len(miss_facts)} (サンプル例) {miss_facts[:20]}")
-L776         except Exception:
-L777             pass
-L778         return out
-L779
-L780     def sec_dryrun_sample(self, tickers: list[str] | None = None) -> None:
-L781         if not _env_true("SEC_DRYRUN_SAMPLE", False):
-L782             return
-L783         sample = tickers or ["BRK.B", "BF.B", "GOOGL", "META", "UBER", "PBR.A", "TSM", "NARI", "EVBN", "SWAV"]
-L784         print(f"[SEC-DRYRUN] sample tickers: {sample}")
-L785         try:
-L786             t2cik = self._sec_ticker_map()
-L787             hits = 0
-L788             for sym in sample:
-L789                 candidates: list[str] = []
-L790
-L791                 def add(key: str) -> None:
-L792                     if key and key not in candidates:
-L793                         candidates.append(key)
-L794
-L795                 add((sym or "").upper())
-L796                 for alt in self._normalize_ticker(sym):
-L797                     add(alt)
-L798                 if any(t2cik.get(key) for key in candidates):
-L799                     hits += 1
-L800             sec_data = self.fetch_eps_rev_from_sec(sample)
-L801             rev_hits = sum(1 for v in sec_data.values() if v.get("rev_q_series"))
-L802             eps_hits = sum(1 for v in sec_data.values() if v.get("eps_q_series"))
-L803             total = len(sample)
-L804             print(f"[SEC-DRYRUN] CIK map hit: {hits}/{total}  rev_q_series hits: {rev_hits}  eps_q_series hits: {eps_hits}")
-L805         except Exception as e:
-L806             print(f"[SEC-DRYRUN] error: {e}")
-L807     @staticmethod
-L808     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
-L809         out_col = out_col or ttm_col; df = df.copy(); df["eps_imputed"] = False
-L810         cand = df[q_col]*4; ok = df[ttm_col].isna() & cand.replace([np.inf,-np.inf], np.nan).notna()
-L811         df.loc[ok, out_col], df.loc[ok,"eps_imputed"] = cand[ok], True; return df
-L812
-L813     _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"], "capex":["Capital Expenditure","Capital Expenditures"]}
-L814
-L815     @staticmethod
-L816     def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series|None:
-L817         if df is None or df.empty: return None
-L818         idx_lower={str(i).lower():i for i in df.index}
-L819         for n in names:
-L820             k=n.lower()
-L821             if k in idx_lower: return df.loc[idx_lower[k]]
-L822         return None
-L823
-L824     @staticmethod
-L825     def _sum_last_n(s: pd.Series|None, n: int) -> float|None:
-L826         if s is None or s.empty: return None
-L827         v=s.dropna().astype(float); return None if v.empty else v.iloc[:n].sum()
-L828
-L829     @staticmethod
-L830     def _latest(s: pd.Series|None) -> float|None:
-L831         if s is None or s.empty: return None
-L832         v=s.dropna().astype(float); return v.iloc[0] if not v.empty else None
-L833
-L834     def fetch_cfo_capex_ttm_yf(self, tickers: list[str]) -> pd.DataFrame:
-L835         from concurrent.futures import ThreadPoolExecutor, as_completed
-L836         pick, sumn, latest, aliases = self._pick_row, self._sum_last_n, self._latest, self._CF_ALIASES
-L837
-L838         def one(t: str):
-L839             try:
-L840                 tk = yf.Ticker(t)  # ★ セッションは渡さない（YFがcurl_cffiで管理）
-L841                 qcf = tk.quarterly_cashflow
-L842                 cfo_q, capex_q = pick(qcf, aliases["cfo"]), pick(qcf, aliases["capex"])
-L843                 fcf_q = pick(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
-L844                 cfo, capex, fcf = sumn(cfo_q,4), sumn(capex_q,4), sumn(fcf_q,4)
-L845                 if any(v is None for v in (cfo, capex, fcf)):
-L846                     acf = tk.cashflow
-L847                     if cfo   is None: cfo   = latest(pick(acf, aliases["cfo"]))
-L848                     if capex is None: capex = latest(pick(acf, aliases["capex"]))
-L849                     if fcf   is None: fcf   = latest(pick(acf, ["Free Cash Flow","FreeCashFlow","Free cash flow"]))
-L850             except Exception as e:
-L851                 print(f"[warn] yf financials error: {t}: {e}"); cfo=capex=fcf=None
-L852             n=np.nan
-L853             return {"ticker":t,
-L854                     "cfo_ttm_yf":   n if cfo   is None else cfo,
-L855                     "capex_ttm_yf": n if capex is None else capex,
-L856                     "fcf_ttm_yf_direct": n if fcf is None else fcf}
-L857
-L858         rows, mw = [], int(os.getenv("FIN_THREADS","8"))
-L859         with ThreadPoolExecutor(max_workers=mw) as ex:
-L860             rows=[f.result() for f in as_completed(ex.submit(one,t) for t in tickers)]
-L861         return pd.DataFrame(rows).set_index("ticker")
-L862
-L863     _FINN_CFO_KEYS = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
-L864     _FINN_CAPEX_KEYS = ["capitalExpenditure","capitalExpenditures","purchaseOfPPE","investmentsInPropertyPlantAndEquipment"]
-L865
-L866     @staticmethod
-L867     def _first_key(d: dict, keys: list[str]):
-L868         for k in keys:
-L869             if k in d and d[k] is not None: return d[k]
-L870         return None
-L871
-L872     @staticmethod
-L873     def _finn_get(session: requests.Session, url: str, params: dict, retries: int=3, sleep_s: float=0.5):
-L874         for i in range(retries):
-L875             r = session.get(url, params=params, timeout=15)
-L876             if r.status_code==429: time.sleep(min(2**i*sleep_s,4.0)); continue
-L877             r.raise_for_status(); return r.json()
-L878         r.raise_for_status()
-L879
-L880     def fetch_cfo_capex_ttm_finnhub(self, tickers: list[str], api_key: str|None=None) -> pd.DataFrame:
-L881         api_key = api_key or os.getenv("FINNHUB_API_KEY")
-L882         if not api_key: raise ValueError("Finnhub API key not provided. Set FINNHUB_API_KEY or pass api_key=")
-L883         base, s, rows = "https://finnhub.io/api/v1", requests.Session(), []
-L884         for sym in tickers:
-L885             cfo_ttm = capex_ttm = None
-L886             try:
-L887                 j = self._finn_get(s, f"{base}/stock/cash-flow", {"symbol":sym,"frequency":"quarterly","limit":8,"token":api_key})
-L888                 arr = j.get("cashFlow") or []; cfo_vals, capex_vals = [], []
-L889                 for item in arr[:4]:
-L890                     cfo_vals.append(self._first_key(item,self._FINN_CFO_KEYS)); capex_vals.append(self._first_key(item,self._FINN_CAPEX_KEYS))
-L891                 if any(v is not None for v in cfo_vals): cfo_ttm = float(np.nansum([np.nan if v is None else float(v) for v in cfo_vals]))
-L892                 if any(v is not None for v in capex_vals): capex_ttm = float(np.nansum([np.nan if v is None else float(v) for v in capex_vals]))
-L893             except Exception: pass
-L894             if cfo_ttm is None or capex_ttm is None:
-L895                 try:
-L896                     j = self._finn_get(s, f"{base}/stock/cash-flow", {"symbol":sym,"frequency":"annual","limit":1,"token":api_key})
-L897                     arr = j.get("cashFlow") or []
-L898                     if arr:
-L899                         item0 = arr[0]
-L900                         if cfo_ttm is None:
-L901                             v = self._first_key(item0,self._FINN_CFO_KEYS)
-L902                             if v is not None: cfo_ttm = float(v)
-L903                         if capex_ttm is None:
-L904                             v = self._first_key(item0,self._FINN_CAPEX_KEYS)
-L905                             if v is not None: capex_ttm = float(v)
-L906                 except Exception: pass
-L907             rows.append({"ticker":sym,"cfo_ttm_fh":np.nan if cfo_ttm is None else cfo_ttm,"capex_ttm_fh":np.nan if capex_ttm is None else capex_ttm})
-L908         return pd.DataFrame(rows).set_index("ticker")
-L909
-L910     def compute_fcf_with_fallback(self, tickers: list[str], finnhub_api_key: str|None=None) -> pd.DataFrame:
-L911         yf_df = self.fetch_cfo_capex_ttm_yf(tickers)
-L912         T.log("financials (yf) done")
-L913         miss_mask = yf_df[["cfo_ttm_yf","capex_ttm_yf","fcf_ttm_yf_direct"]].isna().any(axis=1)
-L914         need = yf_df.index[miss_mask].tolist(); print(f"[T] yf financials missing: {len(need)} {need[:10]}{'...' if len(need)>10 else ''}")
-L915         if need:
-L916             fh_df = self.fetch_cfo_capex_ttm_finnhub(need, api_key=finnhub_api_key)
-L917             df = yf_df.join(fh_df, how="left")
-L918             for col_yf, col_fh in [("cfo_ttm_yf","cfo_ttm_fh"),("capex_ttm_yf","capex_ttm_fh")]:
-L919                 df[col_yf] = df[col_yf].fillna(df[col_fh])
-L920             print("[T] financials (finnhub) done (fallback only)")
-L921         else:
-L922             df = yf_df.assign(cfo_ttm_fh=np.nan, capex_ttm_fh=np.nan)
-L923             print("[T] financials (finnhub) skipped (no missing)")
-L924         df["cfo_ttm"]  = df["cfo_ttm_yf"].where(df["cfo_ttm_yf"].notna(), df["cfo_ttm_fh"])
-L925         df["capex_ttm"] = df["capex_ttm_yf"].where(df["capex_ttm_yf"].notna(), df["capex_ttm_fh"])
-L926         cfo, capex = pd.to_numeric(df["cfo_ttm"], errors="coerce"), pd.to_numeric(df["capex_ttm"], errors="coerce").abs()
-L927         fcf_calc = cfo - capex
-L928         fcf_direct = pd.to_numeric(df.get("fcf_ttm_yf_direct"), errors="coerce")
-L929         df["fcf_ttm"] = fcf_calc.where(fcf_calc.notna(), fcf_direct)
-L930         df["cfo_source"]  = np.where(df["cfo_ttm_yf"].notna(),"yfinance",np.where(df["cfo_ttm_fh"].notna(),"finnhub",""))
-L931         df["capex_source"] = np.where(df["capex_ttm_yf"].notna(),"yfinance",np.where(df["capex_ttm_fh"].notna(),"finnhub",""))
-L932         df["fcf_imputed"] = df[["cfo_ttm","capex_ttm"]].isna().any(axis=1) & df["fcf_ttm"].notna()
-L933         cols = ["cfo_ttm_yf","capex_ttm_yf","cfo_ttm_fh","capex_ttm_fh","cfo_ttm","capex_ttm","fcf_ttm","fcf_ttm_yf_direct","cfo_source","capex_source","fcf_imputed"]
-L934         return df[cols].sort_index()
-L935
-L936     def _build_eps_df(self, tickers, tickers_bulk, info, sec_map: dict | None = None):
-L937         eps_rows=[]
-L938         for t in tickers:
-L939             info_t = info[t]
-L940             sec_t = (sec_map or {}).get(t, {})
-L941             eps_ttm = sec_t.get("eps_ttm", info_t.get("trailingEps", np.nan))
-L942             eps_q = sec_t.get("eps_q_recent", np.nan)
-L943             try:
-L944                 tk = tickers_bulk.tickers.get(t)
-L945                 if tk is None:
-L946                     sym = info_t.get("_yf_symbol") if isinstance(info_t, dict) else None
-L947                     if sym:
-L948                         tk = tickers_bulk.tickers.get(sym)
-L949                 qearn = tk.quarterly_earnings if tk is not None else None
-L950                 so = info_t.get("sharesOutstanding")
-L951                 if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
-L952                     eps_ttm_q = qearn["Earnings"].head(4).sum()/so
-L953                     if pd.notna(eps_ttm_q) and (pd.isna(eps_ttm) or (abs(eps_ttm)>0 and abs(eps_ttm/eps_ttm_q)>3)): eps_ttm = eps_ttm_q
-L954                     if pd.isna(eps_q):
-L955                         eps_q = qearn["Earnings"].iloc[-1]/so
-L956             except Exception: pass
-L957             rev_ttm = sec_t.get("rev_ttm", np.nan)
-L958             rev_q = sec_t.get("rev_q_recent", np.nan)
-L959             if (not sec_t) or pd.isna(rev_ttm):
-L960                 try:
-L961                     tk = tickers_bulk.tickers.get(t)
-L962                     if tk is None and isinstance(info_t, dict):
-L963                         sym = info_t.get("_yf_symbol")
-L964                         if sym:
-L965                             tk = tickers_bulk.tickers.get(sym)
-L966                     qfin = getattr(tk, "quarterly_financials", None)
-L967                     if qfin is not None and not qfin.empty:
-L968                         idx_lower = {str(i).lower(): i for i in qfin.index}
-L969                         rev_idx = None
-L970                         for name in ("Total Revenue", "TotalRevenue"):
-L971                             key = name.lower()
-L972                             if key in idx_lower:
-L973                                 rev_idx = idx_lower[key]
-L974                                 break
-L975                         if rev_idx is not None:
-L976                             rev_series = pd.to_numeric(qfin.loc[rev_idx], errors="coerce").dropna()
-L977                             if not rev_series.empty:
-L978                                 rev_ttm_yf = float(rev_series.head(4).sum())
-L979                                 if pd.isna(rev_ttm):
-L980                                     rev_ttm = rev_ttm_yf
-L981                                 if pd.isna(rev_q):
-L982                                     rev_q = float(rev_series.iloc[0])
-L983                 except Exception:
-L984                     pass
-L985             eps_rows.append({
-L986                 "ticker": t,
-L987                 "eps_ttm": eps_ttm,
-L988                 "eps_ttm_prev": sec_t.get("eps_ttm_prev", np.nan),
-L989                 "eps_q_recent": eps_q,
-L990                 "eps_q_prev": sec_t.get("eps_lastq_prev", np.nan),
-L991                 "rev_ttm": rev_ttm,
-L992                 "rev_ttm_prev": sec_t.get("rev_ttm_prev", np.nan),
-L993                 "rev_q_recent": rev_q,
-L994                 "rev_q_prev": sec_t.get("rev_lastq_prev", np.nan),
-L995                 "eps_annual_latest": sec_t.get("eps_annual_latest", np.nan),
-L996                 "eps_annual_prev": sec_t.get("eps_annual_prev", np.nan),
-L997                 "rev_annual_latest": sec_t.get("rev_annual_latest", np.nan),
-L998                 "rev_annual_prev": sec_t.get("rev_annual_prev", np.nan),
-L999                 "eps_cagr3": sec_t.get("eps_cagr3", np.nan),
-L1000                 "rev_cagr3": sec_t.get("rev_cagr3", np.nan),
-L1001             })
-L1002         return self.impute_eps_ttm(pd.DataFrame(eps_rows).set_index("ticker"))
+L597                 def _quarter_from_annual(vals: list[float]) -> float:
+L598                     v = _first_valid(vals)
+L599                     return float(v / 4.0) if v == v else float("nan")
+L600
+L601                 def _quarter_from_annual_prev(vals: list[float]) -> float:
+L602                     v = _nth_valid(vals, 1)
+L603                     return float(v / 4.0) if v == v else float("nan")
+L604
+L605                 rev_lastq = _first_valid(rev_q_vals)
+L606                 if rev_lastq != rev_lastq:
+L607                     rev_lastq = _quarter_from_annual(rev_a_vals)
+L608                 eps_lastq = _first_valid(eps_q_vals)
+L609                 if eps_lastq != eps_lastq:
+L610                     eps_lastq = _quarter_from_annual(eps_a_vals)
+L611
+L612                 rev_lastq_prev = _nth_valid(rev_q_vals, 4)
+L613                 if rev_lastq_prev != rev_lastq_prev:
+L614                     rev_lastq_prev = _quarter_from_annual_prev(rev_a_vals)
+L615                 eps_lastq_prev = _nth_valid(eps_q_vals, 4)
+L616                 if eps_lastq_prev != eps_lastq_prev:
+L617                     eps_lastq_prev = _quarter_from_annual_prev(eps_a_vals)
+L618
+L619                 rev_ttm = self._ttm_from_q_or_a(rev_q_vals, rev_a_vals)
+L620                 eps_ttm = self._ttm_from_q_or_a(eps_q_vals, eps_a_vals)
+L621                 rev_ttm_prev = self._ttm_from_q_or_a(rev_q_vals[4:], rev_a_vals[1:])
+L622                 eps_ttm_prev = self._ttm_from_q_or_a(eps_q_vals[4:], eps_a_vals[1:])
+L623
+L624                 rev_annual_latest = _first_valid(rev_a_vals)
+L625                 rev_annual_prev = _nth_valid(rev_a_vals, 1)
+L626                 eps_annual_latest = _first_valid(eps_a_vals)
+L627                 eps_annual_prev = _nth_valid(eps_a_vals, 1)
+L628
+L629                 def _cagr3(vals: list[float]) -> float:
+L630                     vals_valid = [v for v in vals if v == v]
+L631                     if len(vals_valid) >= 3:
+L632                         latest, base = float(vals_valid[0]), float(vals_valid[2])
+L633                         if latest > 0 and base > 0:
+L634                             try:
+L635                                 return float((latest / base) ** (1 / 2) - 1.0)
+L636                             except Exception:
+L637                                 return float("nan")
+L638                     return float("nan")
+L639
+L640                 rev_cagr3 = _cagr3(rev_a_vals)
+L641                 eps_cagr3 = _cagr3(eps_a_vals)
+L642
+L643                 out[t] = {
+L644                     "eps_q_recent": eps_lastq,
+L645                     "eps_ttm": eps_ttm,
+L646                     "eps_ttm_prev": eps_ttm_prev,
+L647                     "eps_lastq_prev": eps_lastq_prev,
+L648                     "rev_q_recent": rev_lastq,
+L649                     "rev_ttm": rev_ttm,
+L650                     "rev_ttm_prev": rev_ttm_prev,
+L651                     "rev_lastq_prev": rev_lastq_prev,
+L652                     # 後段でDatetimeIndex化できるよう (date,value) を保持。値だけの互換キーも残す。
+L653                     # 3年運用に合わせて四半期は直近12本のみ保持（約3年=12Q）
+L654                     "eps_q_series_pairs": eps_q_pairs,
+L655                     "rev_q_series_pairs": rev_q_pairs,
+L656                     "eps_q_series": eps_q_vals,
+L657                     "rev_q_series": rev_q_vals,
+L658                     "eps_a_series_pairs": eps_a_pairs,
+L659                     "rev_a_series_pairs": rev_a_pairs,
+L660                     "eps_a_series": eps_a_vals,
+L661                     "rev_a_series": rev_a_vals,
+L662                     "eps_annual_latest": eps_annual_latest,
+L663                     "eps_annual_prev": eps_annual_prev,
+L664                     "rev_annual_latest": rev_annual_latest,
+L665                     "rev_annual_prev": rev_annual_prev,
+L666                     "eps_cagr3": eps_cagr3,
+L667                     "rev_cagr3": rev_cagr3,
+L668                 }
+L669                 n_map += 1
+L670                 if any(v == v for v in rev_q_vals) or any(v == v for v in rev_a_vals):
+L671                     n_rev += 1
+L672                 if any(v == v for v in eps_q_vals) or any(v == v for v in eps_a_vals):
+L673                     n_eps += 1
+L674             except Exception:
+L675                 out[t] = {}
+L676                 miss_facts.append(t)
+L677             time.sleep(0.30)
+L678         # 取得サマリをログ（Actionsで確認しやすいよう print）
+L679         try:
+L680             total = len(tickers)
+L681             print(f"[SEC] map={n_map}/{total}  rev_q_hit={n_rev}  eps_q_hit={n_eps}")
+L682             # デバッグ: 取得本数の分布（先頭のみ）
+L683             try:
+L684                 lens = [len((out.get(t, {}) or {}).get("rev_q_series", [])) for t in tickers]
+L685                 print(f"[SEC] rev_q_series length: min={min(lens) if lens else 0} "
+L686                       f"p25={np.percentile(lens,25) if lens else 0} median={np.median(lens) if lens else 0} "
+L687                       f"p75={np.percentile(lens,75) if lens else 0} max={max(lens) if lens else 0}")
+L688             except Exception:
+L689                 pass
+L690             if miss_map:
+L691                 print(f"[SEC] no CIK map: {len(miss_map)} (サンプル例) {miss_map[:20]}")
+L692             if miss_facts:
+L693                 print(f"[SEC] CIKあり だが対象factなし: {len(miss_facts)} (サンプル例) {miss_facts[:20]}")
+L694         except Exception:
+L695             pass
+L696         return out
+L697
+L698     def sec_dryrun_sample(self, tickers: list[str] | None = None) -> None:
+L699         if not _env_true("SEC_DRYRUN_SAMPLE", False):
+L700             return
+L701         sample = tickers or ["BRK.B", "BF.B", "GOOGL", "META", "UBER", "PBR.A", "TSM", "NARI", "EVBN", "SWAV"]
+L702         print(f"[SEC-DRYRUN] sample tickers: {sample}")
+L703         try:
+L704             t2cik = self._sec_ticker_map()
+L705             hits = 0
+L706             for sym in sample:
+L707                 candidates: list[str] = []
+L708
+L709                 def add(key: str) -> None:
+L710                     if key and key not in candidates:
+L711                         candidates.append(key)
+L712
+L713                 add((sym or "").upper())
+L714                 for alt in self._normalize_ticker(sym):
+L715                     add(alt)
+L716                 if any(t2cik.get(key) for key in candidates):
+L717                     hits += 1
+L718             sec_data = self.fetch_eps_rev_from_sec(sample)
+L719             rev_hits = sum(1 for v in sec_data.values() if v.get("rev_q_series"))
+L720             eps_hits = sum(1 for v in sec_data.values() if v.get("eps_q_series"))
+L721             total = len(sample)
+L722             print(f"[SEC-DRYRUN] CIK map hit: {hits}/{total}  rev_q_series hits: {rev_hits}  eps_q_series hits: {eps_hits}")
+L723         except Exception as e:
+L724             print(f"[SEC-DRYRUN] error: {e}")
+L725     @staticmethod
+L726     def impute_eps_ttm(df: pd.DataFrame, ttm_col: str="eps_ttm", q_col: str="eps_q_recent", out_col: str|None=None) -> pd.DataFrame:
+L727         out_col = out_col or ttm_col; df = df.copy(); df["eps_imputed"] = False
+L728         cand = df[q_col]*4; ok = df[ttm_col].isna() & cand.replace([np.inf,-np.inf], np.nan).notna()
+L729         df.loc[ok, out_col], df.loc[ok,"eps_imputed"] = cand[ok], True; return df
+L730
+L731     _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"], "capex":["Capital Expenditure","Capital Expenditures"]}
+L732
+L733     @staticmethod
+L734     def _pick_row(df: pd.DataFrame, names: list[str]) -> pd.Series|None:
+L735         if df is None or df.empty: return None
+L736         idx_lower={str(i).lower():i for i in df.index}
+L737         for n in names:
+L738             k=n.lower()
+L739             if k in idx_lower: return df.loc[idx_lower[k]]
+L740         return None
+L741
+L742     @staticmethod
+L743     def _sum_last_n(s: pd.Series|None, n: int) -> float|None:
+L744         if s is None or s.empty: return None
+L745         v=s.dropna().astype(float); return None if v.empty else v.iloc[:n].sum()
+L746
+L747     @staticmethod
+L748     def _latest(s: pd.Series|None) -> float|None:
+L749         if s is None or s.empty: return None
+L750         v=s.dropna().astype(float); return v.iloc[0] if not v.empty else None
+L751
+L752     def fetch_cfo_capex_ttm_yf(self, tickers: list[str]) -> pd.DataFrame:
+L753         from concurrent.futures import ThreadPoolExecutor, as_completed
+L754         pick, sumn, latest, aliases = self._pick_row, self._sum_last_n, self._latest, self._CF_ALIASES
+L755
+L756         def one(t: str):
+L757             try:
+L758                 tk = yf.Ticker(t)  # ★ セッションは渡さない（YFがcurl_cffiで管理）
+L759                 qcf = tk.quarterly_cashflow
+L760                 cfo_q, capex_q = pick(qcf, aliases["cfo"]), pick(qcf, aliases["capex"])
+L761                 fcf_q = pick(qcf, ["Free Cash Flow","FreeCashFlow","Free cash flow"])
+L762                 cfo, capex, fcf = sumn(cfo_q,4), sumn(capex_q,4), sumn(fcf_q,4)
+L763                 if any(v is None for v in (cfo, capex, fcf)):
+L764                     acf = tk.cashflow
+L765                     if cfo   is None: cfo   = latest(pick(acf, aliases["cfo"]))
+L766                     if capex is None: capex = latest(pick(acf, aliases["capex"]))
+L767                     if fcf   is None: fcf   = latest(pick(acf, ["Free Cash Flow","FreeCashFlow","Free cash flow"]))
+L768             except Exception as e:
+L769                 print(f"[warn] yf financials error: {t}: {e}"); cfo=capex=fcf=None
+L770             n=np.nan
+L771             return {"ticker":t,
+L772                     "cfo_ttm_yf":   n if cfo   is None else cfo,
+L773                     "capex_ttm_yf": n if capex is None else capex,
+L774                     "fcf_ttm_yf_direct": n if fcf is None else fcf}
+L775
+L776         rows, mw = [], int(os.getenv("FIN_THREADS","8"))
+L777         with ThreadPoolExecutor(max_workers=mw) as ex:
+L778             rows=[f.result() for f in as_completed(ex.submit(one,t) for t in tickers)]
+L779         return pd.DataFrame(rows).set_index("ticker")
+L780
+L781     _FINN_CFO_KEYS = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
+L782     _FINN_CAPEX_KEYS = ["capitalExpenditure","capitalExpenditures","purchaseOfPPE","investmentsInPropertyPlantAndEquipment"]
+L783
+L784     @staticmethod
+L785     def _first_key(d: dict, keys: list[str]):
+L786         for k in keys:
+L787             if k in d and d[k] is not None: return d[k]
+L788         return None
+L789
+L790     @staticmethod
+L791     def _finn_get(session: requests.Session, url: str, params: dict, retries: int=3, sleep_s: float=0.5):
+L792         for i in range(retries):
+L793             r = session.get(url, params=params, timeout=15)
+L794             if r.status_code==429: time.sleep(min(2**i*sleep_s,4.0)); continue
+L795             r.raise_for_status(); return r.json()
+L796         r.raise_for_status()
+L797
+L798     def fetch_cfo_capex_ttm_finnhub(self, tickers: list[str], api_key: str|None=None) -> pd.DataFrame:
+L799         api_key = api_key or os.getenv("FINNHUB_API_KEY")
+L800         if not api_key: raise ValueError("Finnhub API key not provided. Set FINNHUB_API_KEY or pass api_key=")
+L801         base, s, rows = "https://finnhub.io/api/v1", requests.Session(), []
+L802         for sym in tickers:
+L803             cfo_ttm = capex_ttm = None
+L804             try:
+L805                 j = self._finn_get(s, f"{base}/stock/cash-flow", {"symbol":sym,"frequency":"quarterly","limit":8,"token":api_key})
+L806                 arr = j.get("cashFlow") or []; cfo_vals, capex_vals = [], []
+L807                 for item in arr[:4]:
+L808                     cfo_vals.append(self._first_key(item,self._FINN_CFO_KEYS)); capex_vals.append(self._first_key(item,self._FINN_CAPEX_KEYS))
+L809                 if any(v is not None for v in cfo_vals): cfo_ttm = float(np.nansum([np.nan if v is None else float(v) for v in cfo_vals]))
+L810                 if any(v is not None for v in capex_vals): capex_ttm = float(np.nansum([np.nan if v is None else float(v) for v in capex_vals]))
+L811             except Exception: pass
+L812             if cfo_ttm is None or capex_ttm is None:
+L813                 try:
+L814                     j = self._finn_get(s, f"{base}/stock/cash-flow", {"symbol":sym,"frequency":"annual","limit":1,"token":api_key})
+L815                     arr = j.get("cashFlow") or []
+L816                     if arr:
+L817                         item0 = arr[0]
+L818                         if cfo_ttm is None:
+L819                             v = self._first_key(item0,self._FINN_CFO_KEYS)
+L820                             if v is not None: cfo_ttm = float(v)
+L821                         if capex_ttm is None:
+L822                             v = self._first_key(item0,self._FINN_CAPEX_KEYS)
+L823                             if v is not None: capex_ttm = float(v)
+L824                 except Exception: pass
+L825             rows.append({"ticker":sym,"cfo_ttm_fh":np.nan if cfo_ttm is None else cfo_ttm,"capex_ttm_fh":np.nan if capex_ttm is None else capex_ttm})
+L826         return pd.DataFrame(rows).set_index("ticker")
+L827
+L828     def compute_fcf_with_fallback(self, tickers: list[str], finnhub_api_key: str|None=None) -> pd.DataFrame:
+L829         yf_df = self.fetch_cfo_capex_ttm_yf(tickers)
+L830         T.log("financials (yf) done")
+L831         miss_mask = yf_df[["cfo_ttm_yf","capex_ttm_yf","fcf_ttm_yf_direct"]].isna().any(axis=1)
+L832         need = yf_df.index[miss_mask].tolist(); print(f"[T] yf financials missing: {len(need)} {need[:10]}{'...' if len(need)>10 else ''}")
+L833         if need:
+L834             fh_df = self.fetch_cfo_capex_ttm_finnhub(need, api_key=finnhub_api_key)
+L835             df = yf_df.join(fh_df, how="left")
+L836             for col_yf, col_fh in [("cfo_ttm_yf","cfo_ttm_fh"),("capex_ttm_yf","capex_ttm_fh")]:
+L837                 df[col_yf] = df[col_yf].fillna(df[col_fh])
+L838             print("[T] financials (finnhub) done (fallback only)")
+L839         else:
+L840             df = yf_df.assign(cfo_ttm_fh=np.nan, capex_ttm_fh=np.nan)
+L841             print("[T] financials (finnhub) skipped (no missing)")
+L842         df["cfo_ttm"]  = df["cfo_ttm_yf"].where(df["cfo_ttm_yf"].notna(), df["cfo_ttm_fh"])
+L843         df["capex_ttm"] = df["capex_ttm_yf"].where(df["capex_ttm_yf"].notna(), df["capex_ttm_fh"])
+L844         cfo, capex = pd.to_numeric(df["cfo_ttm"], errors="coerce"), pd.to_numeric(df["capex_ttm"], errors="coerce").abs()
+L845         fcf_calc = cfo - capex
+L846         fcf_direct = pd.to_numeric(df.get("fcf_ttm_yf_direct"), errors="coerce")
+L847         df["fcf_ttm"] = fcf_calc.where(fcf_calc.notna(), fcf_direct)
+L848         df["cfo_source"]  = np.where(df["cfo_ttm_yf"].notna(),"yfinance",np.where(df["cfo_ttm_fh"].notna(),"finnhub",""))
+L849         df["capex_source"] = np.where(df["capex_ttm_yf"].notna(),"yfinance",np.where(df["capex_ttm_fh"].notna(),"finnhub",""))
+L850         df["fcf_imputed"] = df[["cfo_ttm","capex_ttm"]].isna().any(axis=1) & df["fcf_ttm"].notna()
+L851         cols = ["cfo_ttm_yf","capex_ttm_yf","cfo_ttm_fh","capex_ttm_fh","cfo_ttm","capex_ttm","fcf_ttm","fcf_ttm_yf_direct","cfo_source","capex_source","fcf_imputed"]
+L852         return df[cols].sort_index()
+L853
+L854     def _build_eps_df(self, tickers, tickers_bulk, info, sec_map: dict | None = None):
+L855         eps_rows=[]
+L856         for t in tickers:
+L857             info_t = info[t]
+L858             sec_t = (sec_map or {}).get(t, {})
+L859             eps_ttm = sec_t.get("eps_ttm", info_t.get("trailingEps", np.nan))
+L860             eps_q = sec_t.get("eps_q_recent", np.nan)
+L861             try:
+L862                 tk = tickers_bulk.tickers.get(t)
+L863                 if tk is None:
+L864                     sym = info_t.get("_yf_symbol") if isinstance(info_t, dict) else None
+L865                     if sym:
+L866                         tk = tickers_bulk.tickers.get(sym)
+L867                 qearn = tk.quarterly_earnings if tk is not None else None
+L868                 so = info_t.get("sharesOutstanding")
+L869                 if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
+L870                     eps_ttm_q = qearn["Earnings"].head(4).sum()/so
+L871                     if pd.notna(eps_ttm_q) and (pd.isna(eps_ttm) or (abs(eps_ttm)>0 and abs(eps_ttm/eps_ttm_q)>3)): eps_ttm = eps_ttm_q
+L872                     if pd.isna(eps_q):
+L873                         eps_q = qearn["Earnings"].iloc[-1]/so
+L874             except Exception: pass
+L875             rev_ttm = sec_t.get("rev_ttm", np.nan)
+L876             rev_q = sec_t.get("rev_q_recent", np.nan)
+L877             if (not sec_t) or pd.isna(rev_ttm):
+L878                 try:
+L879                     tk = tickers_bulk.tickers.get(t)
+L880                     if tk is None and isinstance(info_t, dict):
+L881                         sym = info_t.get("_yf_symbol")
+L882                         if sym:
+L883                             tk = tickers_bulk.tickers.get(sym)
+L884                     qfin = getattr(tk, "quarterly_financials", None)
+L885                     if qfin is not None and not qfin.empty:
+L886                         idx_lower = {str(i).lower(): i for i in qfin.index}
+L887                         rev_idx = None
+L888                         for name in ("Total Revenue", "TotalRevenue"):
+L889                             key = name.lower()
+L890                             if key in idx_lower:
+L891                                 rev_idx = idx_lower[key]
+L892                                 break
+L893                         if rev_idx is not None:
+L894                             rev_series = pd.to_numeric(qfin.loc[rev_idx], errors="coerce").dropna()
+L895                             if not rev_series.empty:
+L896                                 rev_ttm_yf = float(rev_series.head(4).sum())
+L897                                 if pd.isna(rev_ttm):
+L898                                     rev_ttm = rev_ttm_yf
+L899                                 if pd.isna(rev_q):
+L900                                     rev_q = float(rev_series.iloc[0])
+L901                 except Exception:
+L902                     pass
+L903             eps_rows.append({
+L904                 "ticker": t,
+L905                 "eps_ttm": eps_ttm,
+L906                 "eps_ttm_prev": sec_t.get("eps_ttm_prev", np.nan),
+L907                 "eps_q_recent": eps_q,
+L908                 "eps_q_prev": sec_t.get("eps_lastq_prev", np.nan),
+L909                 "rev_ttm": rev_ttm,
+L910                 "rev_ttm_prev": sec_t.get("rev_ttm_prev", np.nan),
+L911                 "rev_q_recent": rev_q,
+L912                 "rev_q_prev": sec_t.get("rev_lastq_prev", np.nan),
+L913                 "eps_annual_latest": sec_t.get("eps_annual_latest", np.nan),
+L914                 "eps_annual_prev": sec_t.get("eps_annual_prev", np.nan),
+L915                 "rev_annual_latest": sec_t.get("rev_annual_latest", np.nan),
+L916                 "rev_annual_prev": sec_t.get("rev_annual_prev", np.nan),
+L917                 "eps_cagr3": sec_t.get("eps_cagr3", np.nan),
+L918                 "rev_cagr3": sec_t.get("rev_cagr3", np.nan),
+L919             })
+L920         return self.impute_eps_ttm(pd.DataFrame(eps_rows).set_index("ticker"))
+L921
+L922     def prepare_data(self):
+L923         """Fetch price and fundamental data for all tickers."""
+L924         self.sec_dryrun_sample()
+L925         # --- yfinance 用にティッカーを正規化（"$"剥がし、"."→"-"） ---
+L926         def _to_yf(sym: str) -> str:
+L927             s = (sym or "").strip().lstrip("$").replace("＄", "")
+L928             # BRK.B / PBR.A などは Yahoo では '-' を使用
+L929             yf_sym = s.replace("．", ".").replace(".", "-")
+L930             return yf_sym or (sym or "")
+L931
+L932         cand_y = [_to_yf(t) for t in self.cand]
+L933         cand_info = yf.Tickers(" ".join(cand_y))
+L934
+L935         def _price(orig: str, ysym: str) -> float:
+L936             try:
+L937                 return cand_info.tickers[ysym].fast_info.get("lastPrice", np.inf)
+L938             except Exception as e:
+L939                 print(f"{orig}: price fetch failed ({e})")
+L940                 return np.inf
+L941
+L942         cand_prices = {orig: _price(orig, ysym) for orig, ysym in zip(self.cand, cand_y)}
+L943         cand_f = [t for t, p in cand_prices.items() if p <= self.price_max]
+L944         T.log("price cap filter done (CAND_PRICE_MAX)")
+L945         # 入力ティッカーの重複を除去し、現行→候補の順序を維持
+L946         # ユニバース確定（元ティッカー保持）。yfinance には後で変換して渡す
+L947         tickers = list(dict.fromkeys(self.exist + cand_f))
+L948         yf_map = {t: _to_yf(t) for t in tickers}
+L949         yf_list = list(dict.fromkeys([yf_map[t] for t in tickers]))
+L950         T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
+L951         data = yf.download(yf_list + [self.bench], period="600d",
+L952                            auto_adjust=True, progress=False, threads=False)
+L953         T.log("yf.download done")
+L954         inv = {v: k for k, v in yf_map.items()}
+L955         px = data["Close"].dropna(how="all", axis=1).ffill(limit=2)
+L956         px = px.rename(columns=inv)
+L957         try:
+L958             if isinstance(data.columns, pd.MultiIndex):
+L959                 data = data.rename(columns=inv, level=1)
+L960             else:
+L961                 data = data.rename(columns=inv)
+L962         except Exception:
+L963             pass
+L964         spx = data["Close"][self.bench].reindex(px.index).ffill()
+L965         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
+L966         if clip_days > 0:
+L967             px, spx = px.tail(clip_days + 1), spx.tail(clip_days + 1)
+L968             logger.info("[T] price window clipped by env: %d rows (PRICE_CLIP_DAYS=%d)", len(px), clip_days)
+L969         else:
+L970             logger.info("[T] price window clip skipped; rows=%d", len(px))
+L971         tickers_bulk, info = yf.Tickers(" ".join(yf_list)), {}
+L972         for orig, ysym in yf_map.items():
+L973             if ysym in tickers_bulk.tickers:
+L974                 tickers_bulk.tickers[orig] = tickers_bulk.tickers[ysym]
+L975         for t in tickers:
+L976             try:
+L977                 tk = tickers_bulk.tickers.get(t) or tickers_bulk.tickers.get(yf_map[t])
+L978                 info_entry = tk.info if tk is not None else {}
+L979                 if not isinstance(info_entry, dict):
+L980                     info_entry = {}
+L981                 info_entry.setdefault("_yf_symbol", getattr(tk, "ticker", yf_map.get(t)))
+L982                 info[t] = info_entry
+L983             except Exception as e:
+L984                 logger.info("[warn] %s: info fetch failed (%s)", t, e)
+L985                 info[t] = {}
+L986         try:
+L987             sec_map = self.fetch_eps_rev_from_sec(tickers)
+L988         except Exception as e:
+L989             logger.warning("[SEC] fetch_eps_rev_from_sec failed: %s", e)
+L990             sec_map = {}
+L991
+L992         def _brief_len(s):
+L993             try:
+L994                 if isinstance(s, pd.Series):
+L995                     return int(s.dropna().size)
+L996                 if isinstance(s, (list, tuple)):
+L997                     return len([v for v in s if pd.notna(v)])
+L998                 if isinstance(s, np.ndarray):
+L999                     return int(np.count_nonzero(~pd.isna(s)))
+L1000                 return int(bool(s))
+L1001             except Exception:
+L1002                 return 0
 L1003
-L1004     def prepare_data(self):
-L1005         """Fetch price and fundamental data for all tickers."""
-L1006         self.sec_dryrun_sample()
-L1007         # --- yfinance 用にティッカーを正規化（"$"剥がし、"."→"-"） ---
-L1008         def _to_yf(sym: str) -> str:
-L1009             s = (sym or "").strip().lstrip("$").replace("＄", "")
-L1010             # BRK.B / PBR.A などは Yahoo では '-' を使用
-L1011             yf_sym = s.replace("．", ".").replace(".", "-")
-L1012             return yf_sym or (sym or "")
+L1004         def _has_entries(val) -> bool:
+L1005             try:
+L1006                 if isinstance(val, pd.Series):
+L1007                     return not val.dropna().empty
+L1008                 if isinstance(val, (list, tuple)):
+L1009                     return any(pd.notna(v) for v in val)
+L1010                 return bool(val)
+L1011             except Exception:
+L1012                 return False
 L1013
-L1014         cand_y = [_to_yf(t) for t in self.cand]
-L1015         cand_info = yf.Tickers(" ".join(cand_y))
-L1016
-L1017         def _price(orig: str, ysym: str) -> float:
-L1018             try:
-L1019                 return cand_info.tickers[ysym].fast_info.get("lastPrice", np.inf)
-L1020             except Exception as e:
-L1021                 print(f"{orig}: price fetch failed ({e})")
-L1022                 return np.inf
-L1023
-L1024         cand_prices = {orig: _price(orig, ysym) for orig, ysym in zip(self.cand, cand_y)}
-L1025         cand_f = [t for t, p in cand_prices.items() if p <= self.price_max]
-L1026         T.log("price cap filter done (CAND_PRICE_MAX)")
-L1027         # 入力ティッカーの重複を除去し、現行→候補の順序を維持
-L1028         # ユニバース確定（元ティッカー保持）。yfinance には後で変換して渡す
-L1029         tickers = list(dict.fromkeys(self.exist + cand_f))
-L1030         yf_map = {t: _to_yf(t) for t in tickers}
-L1031         yf_list = list(dict.fromkeys([yf_map[t] for t in tickers]))
-L1032         T.log(f"universe prepared: unique={len(tickers)} bench={self.bench}")
-L1033         data = yf.download(yf_list + [self.bench], period="600d",
-L1034                            auto_adjust=True, progress=False, threads=False)
-L1035         T.log("yf.download done")
-L1036         inv = {v: k for k, v in yf_map.items()}
-L1037         px = data["Close"].dropna(how="all", axis=1).ffill(limit=2)
-L1038         px = px.rename(columns=inv)
-L1039         try:
-L1040             if isinstance(data.columns, pd.MultiIndex):
-L1041                 data = data.rename(columns=inv, level=1)
-L1042             else:
-L1043                 data = data.rename(columns=inv)
-L1044         except Exception:
-L1045             pass
-L1046         spx = data["Close"][self.bench].reindex(px.index).ffill()
-L1047         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
-L1048         if clip_days > 0:
-L1049             px, spx = px.tail(clip_days + 1), spx.tail(clip_days + 1)
-L1050             logger.info("[T] price window clipped by env: %d rows (PRICE_CLIP_DAYS=%d)", len(px), clip_days)
-L1051         else:
-L1052             logger.info("[T] price window clip skipped; rows=%d", len(px))
-L1053         tickers_bulk, info = yf.Tickers(" ".join(yf_list)), {}
-L1054         for orig, ysym in yf_map.items():
-L1055             if ysym in tickers_bulk.tickers:
-L1056                 tickers_bulk.tickers[orig] = tickers_bulk.tickers[ysym]
-L1057         for t in tickers:
-L1058             try:
-L1059                 tk = tickers_bulk.tickers.get(t) or tickers_bulk.tickers.get(yf_map[t])
-L1060                 info_entry = tk.info if tk is not None else {}
-L1061                 if not isinstance(info_entry, dict):
-L1062                     info_entry = {}
-L1063                 info_entry.setdefault("_yf_symbol", getattr(tk, "ticker", yf_map.get(t)))
-L1064                 info[t] = info_entry
-L1065             except Exception as e:
-L1066                 logger.info("[warn] %s: info fetch failed (%s)", t, e)
-L1067                 info[t] = {}
-L1068         try:
-L1069             sec_map = self.fetch_eps_rev_from_sec(tickers)
-L1070         except Exception as e:
-L1071             logger.warning("[SEC] fetch_eps_rev_from_sec failed: %s", e)
-L1072             sec_map = {}
-L1073
-L1074         def _brief_len(s):
-L1075             try:
-L1076                 if isinstance(s, pd.Series):
-L1077                     return int(s.dropna().size)
-L1078                 if isinstance(s, (list, tuple)):
-L1079                     return len([v for v in s if pd.notna(v)])
-L1080                 if isinstance(s, np.ndarray):
-L1081                     return int(np.count_nonzero(~pd.isna(s)))
-L1082                 return int(bool(s))
-L1083             except Exception:
-L1084                 return 0
-L1085
-L1086         def _has_entries(val) -> bool:
-L1087             try:
-L1088                 if isinstance(val, pd.Series):
-L1089                     return not val.dropna().empty
-L1090                 if isinstance(val, (list, tuple)):
-L1091                     return any(pd.notna(v) for v in val)
-L1092                 return bool(val)
-L1093             except Exception:
-L1094                 return False
-L1095
-L1096         have_rev = 0
-L1097         have_eps = 0
-L1098         rev_lens: list[int] = []
-L1099         eps_lens: list[int] = []
-L1100         rev_y_lens: list[int] = []
-L1101         samples: list[tuple[str, int, str, float | None, int, str, float | None]] = []
-L1102
-L1103         for t in tickers:
-L1104             entry = info.get(t, {})
-L1105             m = (sec_map or {}).get(t) or {}
-L1106             if entry is None or not isinstance(entry, dict):
-L1107                 entry = {}
-L1108                 info[t] = entry
-L1109
-L1110             if m:
-L1111                 pairs_r = m.get("rev_q_series_pairs") or []
-L1112                 pairs_e = m.get("eps_q_series_pairs") or []
-L1113                 if pairs_r:
-L1114                     idx = pd.to_datetime([d for (d, _v) in pairs_r], errors="coerce")
-L1115                     val = pd.to_numeric([v for (_d, v) in pairs_r], errors="coerce")
-L1116                     s = pd.Series(val, index=idx).sort_index()
-L1117                     entry["SEC_REV_Q_SERIES"] = s
-L1118                 else:
-L1119                     entry["SEC_REV_Q_SERIES"] = m.get("rev_q_series") or []
-L1120                 if pairs_e:
-L1121                     idx = pd.to_datetime([d for (d, _v) in pairs_e], errors="coerce")
-L1122                     val = pd.to_numeric([v for (_d, v) in pairs_e], errors="coerce")
-L1123                     s = pd.Series(val, index=idx).sort_index()
-L1124                     entry["SEC_EPS_Q_SERIES"] = s
-L1125                 else:
-L1126                     entry["SEC_EPS_Q_SERIES"] = m.get("eps_q_series") or []
-L1127
-L1128             r = entry.get("SEC_REV_Q_SERIES")
-L1129             e = entry.get("SEC_EPS_Q_SERIES")
-L1130             # 年次は直近3件（約3年）だけ保持。重み分岐の nY 判定は従来通り。
-L1131             try:
-L1132                 if hasattr(r, "index") and isinstance(r.index, pd.DatetimeIndex):
-L1133                     y = r.resample("Y").sum().dropna()
-L1134                     entry["SEC_REV_Y_SERIES"] = y.tail(3)
-L1135                 else:
-L1136                     entry["SEC_REV_Y_SERIES"] = []
-L1137             except Exception:
-L1138                 entry["SEC_REV_Y_SERIES"] = []
-L1139             ry = entry.get("SEC_REV_Y_SERIES")
-L1140             if _has_entries(r):
-L1141                 have_rev += 1
-L1142             if _has_entries(e):
-L1143                 have_eps += 1
-L1144             lr = _brief_len(r)
-L1145             le = _brief_len(e)
-L1146             rev_lens.append(lr)
-L1147             eps_lens.append(le)
-L1148             rev_y_lens.append(_brief_len(ry))
-L1149             if len(samples) < 8:
-L1150                 try:
-L1151                     rd = getattr(r, "index", [])[-1] if lr > 0 else None
-L1152                     rv = float(r.iloc[-1]) if lr > 0 else None
-L1153                     ed = getattr(e, "index", [])[-1] if le > 0 else None
-L1154                     ev = float(e.iloc[-1]) if le > 0 else None
-L1155                     samples.append((t, lr, str(rd) if rd is not None else "-", rv, le, str(ed) if ed is not None else "-", ev))
-L1156                 except Exception:
-L1157                     samples.append((t, lr, "-", None, le, "-", None))
-L1158
-L1159         logger.info("[SEC] series attach: rev_q=%d/%d, eps_q=%d/%d", have_rev, len(tickers), have_eps, len(tickers))
-L1160         logger.info(
-L1161             "[SEC_SERIES] rev_q=%d (<=12), eps_q=%d (<=12), rev_y=%d (<=3)",
-L1162             max(rev_lens) if rev_lens else 0,
-L1163             max(eps_lens) if eps_lens else 0,
-L1164             max(rev_y_lens) if rev_y_lens else 0,
-L1165         )
-L1166
-L1167         if rev_lens:
-L1168             rev_lens_sorted = sorted(rev_lens)
-L1169             eps_lens_sorted = sorted(eps_lens)
-L1170             _log(
-L1171                 "SEC_SERIES",
-L1172                 f"rev_len min/med/max={rev_lens_sorted[0]}/{rev_lens_sorted[len(rev_lens)//2]}/{rev_lens_sorted[-1]} "
-L1173                 f"eps_len min/med/max={eps_lens_sorted[0]}/{eps_lens_sorted[len(eps_lens)//2]}/{eps_lens_sorted[-1]}",
-L1174             )
-L1175         for (t, lr, rd, rv, le, ed, ev) in samples:
-L1176             _log("SEC_SERIES_SMP", f"{t}  rev_len={lr} last=({rd},{rv})  eps_len={le} last=({ed},{ev})")
-L1177         eps_df = self._build_eps_df(tickers, tickers_bulk, info, sec_map=sec_map)
-L1178         # index 重複があると .loc[t, col] が Series になり代入時に ValueError を誘発する
-L1179         if not eps_df.index.is_unique:
-L1180             eps_df = eps_df[~eps_df.index.duplicated(keep="last")]
-L1181         eps_df = eps_df.assign(
-L1182             EPS_TTM=eps_df["eps_ttm"],
-L1183             EPS_TTM_PREV=eps_df.get("eps_ttm_prev", np.nan),
-L1184             EPS_Q_LastQ=eps_df["eps_q_recent"],
-L1185             EPS_Q_Prev=eps_df.get("eps_q_prev", np.nan),
-L1186             REV_TTM=eps_df["rev_ttm"],
-L1187             REV_TTM_PREV=eps_df.get("rev_ttm_prev", np.nan),
-L1188             REV_Q_LastQ=eps_df["rev_q_recent"],
-L1189             REV_Q_Prev=eps_df.get("rev_q_prev", np.nan),
-L1190             EPS_A_LATEST=eps_df.get("eps_annual_latest", np.nan),
-L1191             EPS_A_PREV=eps_df.get("eps_annual_prev", np.nan),
-L1192             REV_A_LATEST=eps_df.get("rev_annual_latest", np.nan),
-L1193             REV_A_PREV=eps_df.get("rev_annual_prev", np.nan),
-L1194             EPS_A_CAGR3=eps_df.get("eps_cagr3", np.nan),
-L1195             REV_A_CAGR3=eps_df.get("rev_cagr3", np.nan),
-L1196         )
-L1197         missing_logs = _build_missing_logs_after_impute(eps_df)
-L1198         # ここで非NaN件数をサマリ表示（欠損状況の即時把握用）
-L1199         try:
-L1200             n = len(eps_df)
-L1201             c_eps = int(eps_df["EPS_TTM"].notna().sum())
-L1202             c_rev = int(eps_df["REV_TTM"].notna().sum())
-L1203             print(f"[SEC] eps_ttm non-NaN: {c_eps}/{n}  rev_ttm non-NaN: {c_rev}/{n}")
-L1204         except Exception:
-L1205             pass
-L1206         fcf_df = self.compute_fcf_with_fallback(tickers, finnhub_api_key=self.api_key)
-L1207         T.log("eps/fcf prep done")
-L1208         returns = px[tickers].pct_change()
-L1209         T.log("price prep/returns done")
-L1210         return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns, missing_logs=missing_logs)
-L1211
-L1212 # === Selector：相関低減・選定（スコア＆リターンだけ読む） ===
-L1213 class Selector:
-L1214     # ---- DRRS helpers（Selector専用） ----
-L1215     @staticmethod
-L1216     def _z_np(X: np.ndarray) -> np.ndarray:
-L1217         X = np.asarray(X, dtype=np.float32)
-L1218         m = np.nanmean(X, axis=0, keepdims=True)
-L1219         s = np.nanstd(X, axis=0, keepdims=True)
-L1220         # 分母0/全NaN列の安全化：std==0 を 1 に置換（z=0に収束）
-L1221         s = np.where(np.isfinite(s) & (s > 0), s, 1.0).astype(np.float32)
-L1222         with np.errstate(invalid="ignore", divide="ignore"):
-L1223             Z = (np.nan_to_num(X) - np.nan_to_num(m)) / s
-L1224         return np.nan_to_num(Z)
-L1225
-L1226     @classmethod
-L1227     def residual_corr(cls, R: np.ndarray, n_pc: int=3, shrink: float=0.1) -> np.ndarray:
-L1228         Z = cls._z_np(R); U,S,_ = np.linalg.svd(Z, full_matrices=False); F = U[:,:n_pc]*S[:n_pc]; B = np.linalg.lstsq(F, Z, rcond=None)[0]
-L1229         E = Z - F@B; C = np.corrcoef(E, rowvar=False)
-L1230         off = C - np.diag(np.diag(C)); iu = np.triu_indices_from(off,1); avg_abs = np.nanmean(np.abs(off[iu])) if iu[0].size else 0.0
-L1231         shrink_eff = float(np.clip(shrink + 0.5*avg_abs, 0.1, 0.6)); N = C.shape[0]
-L1232         return (1.0 - shrink_eff)*C + shrink_eff*np.eye(N, dtype=C.dtype)
+L1014         have_rev = 0
+L1015         have_eps = 0
+L1016         rev_lens: list[int] = []
+L1017         eps_lens: list[int] = []
+L1018         rev_y_lens: list[int] = []
+L1019         samples: list[tuple[str, int, str, float | None, int, str, float | None]] = []
+L1020
+L1021         for t in tickers:
+L1022             entry = info.get(t, {})
+L1023             m = (sec_map or {}).get(t) or {}
+L1024             if entry is None or not isinstance(entry, dict):
+L1025                 entry = {}
+L1026                 info[t] = entry
+L1027
+L1028             if m:
+L1029                 pairs_r = m.get("rev_q_series_pairs") or []
+L1030                 pairs_e = m.get("eps_q_series_pairs") or []
+L1031                 if pairs_r:
+L1032                     idx = pd.to_datetime([d for (d, _v) in pairs_r], errors="coerce")
+L1033                     val = pd.to_numeric([v for (_d, v) in pairs_r], errors="coerce")
+L1034                     s = pd.Series(val, index=idx).sort_index()
+L1035                     entry["SEC_REV_Q_SERIES"] = s
+L1036                 else:
+L1037                     entry["SEC_REV_Q_SERIES"] = m.get("rev_q_series") or []
+L1038                 if pairs_e:
+L1039                     idx = pd.to_datetime([d for (d, _v) in pairs_e], errors="coerce")
+L1040                     val = pd.to_numeric([v for (_d, v) in pairs_e], errors="coerce")
+L1041                     s = pd.Series(val, index=idx).sort_index()
+L1042                     entry["SEC_EPS_Q_SERIES"] = s
+L1043                 else:
+L1044                     entry["SEC_EPS_Q_SERIES"] = m.get("eps_q_series") or []
+L1045
+L1046             r = entry.get("SEC_REV_Q_SERIES")
+L1047             e = entry.get("SEC_EPS_Q_SERIES")
+L1048             # 年次は直近3件（約3年）だけ保持。重み分岐の nY 判定は従来通り。
+L1049             try:
+L1050                 if hasattr(r, "index") and isinstance(r.index, pd.DatetimeIndex):
+L1051                     y = r.resample("Y").sum().dropna()
+L1052                     entry["SEC_REV_Y_SERIES"] = y.tail(3)
+L1053                 else:
+L1054                     entry["SEC_REV_Y_SERIES"] = []
+L1055             except Exception:
+L1056                 entry["SEC_REV_Y_SERIES"] = []
+L1057             ry = entry.get("SEC_REV_Y_SERIES")
+L1058             if _has_entries(r):
+L1059                 have_rev += 1
+L1060             if _has_entries(e):
+L1061                 have_eps += 1
+L1062             lr = _brief_len(r)
+L1063             le = _brief_len(e)
+L1064             rev_lens.append(lr)
+L1065             eps_lens.append(le)
+L1066             rev_y_lens.append(_brief_len(ry))
+L1067             if len(samples) < 8:
+L1068                 try:
+L1069                     rd = getattr(r, "index", [])[-1] if lr > 0 else None
+L1070                     rv = float(r.iloc[-1]) if lr > 0 else None
+L1071                     ed = getattr(e, "index", [])[-1] if le > 0 else None
+L1072                     ev = float(e.iloc[-1]) if le > 0 else None
+L1073                     samples.append((t, lr, str(rd) if rd is not None else "-", rv, le, str(ed) if ed is not None else "-", ev))
+L1074                 except Exception:
+L1075                     samples.append((t, lr, "-", None, le, "-", None))
+L1076
+L1077         logger.info("[SEC] series attach: rev_q=%d/%d, eps_q=%d/%d", have_rev, len(tickers), have_eps, len(tickers))
+L1078         logger.info(
+L1079             "[SEC_SERIES] rev_q=%d (<=12), eps_q=%d (<=12), rev_y=%d (<=3)",
+L1080             max(rev_lens) if rev_lens else 0,
+L1081             max(eps_lens) if eps_lens else 0,
+L1082             max(rev_y_lens) if rev_y_lens else 0,
+L1083         )
+L1084
+L1085         if rev_lens:
+L1086             rev_lens_sorted = sorted(rev_lens)
+L1087             eps_lens_sorted = sorted(eps_lens)
+L1088             _log(
+L1089                 "SEC_SERIES",
+L1090                 f"rev_len min/med/max={rev_lens_sorted[0]}/{rev_lens_sorted[len(rev_lens)//2]}/{rev_lens_sorted[-1]} "
+L1091                 f"eps_len min/med/max={eps_lens_sorted[0]}/{eps_lens_sorted[len(eps_lens)//2]}/{eps_lens_sorted[-1]}",
+L1092             )
+L1093         for (t, lr, rd, rv, le, ed, ev) in samples:
+L1094             _log("SEC_SERIES_SMP", f"{t}  rev_len={lr} last=({rd},{rv})  eps_len={le} last=({ed},{ev})")
+L1095         eps_df = self._build_eps_df(tickers, tickers_bulk, info, sec_map=sec_map)
+L1096         # index 重複があると .loc[t, col] が Series になり代入時に ValueError を誘発する
+L1097         if not eps_df.index.is_unique:
+L1098             eps_df = eps_df[~eps_df.index.duplicated(keep="last")]
+L1099         eps_df = eps_df.assign(
+L1100             EPS_TTM=eps_df["eps_ttm"],
+L1101             EPS_TTM_PREV=eps_df.get("eps_ttm_prev", np.nan),
+L1102             EPS_Q_LastQ=eps_df["eps_q_recent"],
+L1103             EPS_Q_Prev=eps_df.get("eps_q_prev", np.nan),
+L1104             REV_TTM=eps_df["rev_ttm"],
+L1105             REV_TTM_PREV=eps_df.get("rev_ttm_prev", np.nan),
+L1106             REV_Q_LastQ=eps_df["rev_q_recent"],
+L1107             REV_Q_Prev=eps_df.get("rev_q_prev", np.nan),
+L1108             EPS_A_LATEST=eps_df.get("eps_annual_latest", np.nan),
+L1109             EPS_A_PREV=eps_df.get("eps_annual_prev", np.nan),
+L1110             REV_A_LATEST=eps_df.get("rev_annual_latest", np.nan),
+L1111             REV_A_PREV=eps_df.get("rev_annual_prev", np.nan),
+L1112             EPS_A_CAGR3=eps_df.get("eps_cagr3", np.nan),
+L1113             REV_A_CAGR3=eps_df.get("rev_cagr3", np.nan),
+L1114         )
+L1115         missing_logs = pd.DataFrame()
+L1116         # ここで非NaN件数をサマリ表示（欠損状況の即時把握用）
+L1117         try:
+L1118             n = len(eps_df)
+L1119             c_eps = int(eps_df["EPS_TTM"].notna().sum())
+L1120             c_rev = int(eps_df["REV_TTM"].notna().sum())
+L1121             print(f"[SEC] eps_ttm non-NaN: {c_eps}/{n}  rev_ttm non-NaN: {c_rev}/{n}")
+L1122         except Exception:
+L1123             pass
+L1124         fcf_df = self.compute_fcf_with_fallback(tickers, finnhub_api_key=self.api_key)
+L1125         T.log("eps/fcf prep done")
+L1126         returns = px[tickers].pct_change()
+L1127         T.log("price prep/returns done")
+L1128         return dict(cand=cand_f, tickers=tickers, data=data, px=px, spx=spx, tickers_bulk=tickers_bulk, info=info, eps_df=eps_df, fcf_df=fcf_df, returns=returns, missing_logs=missing_logs)
+L1129
+L1130 # === Selector：相関低減・選定（スコア＆リターンだけ読む） ===
+L1131 class Selector:
+L1132     # ---- DRRS helpers（Selector専用） ----
+L1133     @staticmethod
+L1134     def _z_np(X: np.ndarray) -> np.ndarray:
+L1135         X = np.asarray(X, dtype=np.float32)
+L1136         m = np.nanmean(X, axis=0, keepdims=True)
+L1137         s = np.nanstd(X, axis=0, keepdims=True)
+L1138         # 分母0/全NaN列の安全化：std==0 を 1 に置換（z=0に収束）
+L1139         s = np.where(np.isfinite(s) & (s > 0), s, 1.0).astype(np.float32)
+L1140         with np.errstate(invalid="ignore", divide="ignore"):
+L1141             Z = (np.nan_to_num(X) - np.nan_to_num(m)) / s
+L1142         return np.nan_to_num(Z)
+L1143
+L1144     @classmethod
+L1145     def residual_corr(cls, R: np.ndarray, n_pc: int=3, shrink: float=0.1) -> np.ndarray:
+L1146         Z = cls._z_np(R); U,S,_ = np.linalg.svd(Z, full_matrices=False); F = U[:,:n_pc]*S[:n_pc]; B = np.linalg.lstsq(F, Z, rcond=None)[0]
+L1147         E = Z - F@B; C = np.corrcoef(E, rowvar=False)
+L1148         off = C - np.diag(np.diag(C)); iu = np.triu_indices_from(off,1); avg_abs = np.nanmean(np.abs(off[iu])) if iu[0].size else 0.0
+L1149         shrink_eff = float(np.clip(shrink + 0.5*avg_abs, 0.1, 0.6)); N = C.shape[0]
+L1150         return (1.0 - shrink_eff)*C + shrink_eff*np.eye(N, dtype=C.dtype)
+L1151
+L1152     @classmethod
+L1153     def rrqr_like_det(cls, R: np.ndarray, score: np.ndarray, k: int, gamma: float=1.0):
+L1154         Z, w = cls._z_np(R), (score-score.min())/(np.ptp(score)+1e-12); X = Z*(1.0 + gamma*w)
+L1155         N, k = X.shape[1], max(0, min(k, X.shape[1]))
+L1156         if k==0: return []
+L1157         S, selected, Rres = [], np.zeros(N, dtype=bool), X.copy()
+L1158         for _ in range(k):
+L1159             norms = (Rres*Rres).sum(axis=0); cand = np.where(~selected)[0]
+L1160             j = sorted(cand, key=lambda c:(-norms[c], -w[c], c))[0]
+L1161             S.append(j); selected[j]=True; u = X[:,j:j+1]; u/=(np.linalg.norm(u)+1e-12); Rres = Rres - u @ (u.T @ Rres)
+L1162         return sorted(S)
+L1163
+L1164     @staticmethod
+L1165     def _obj(corrM: np.ndarray, score: np.ndarray, idx, lam: float) -> float:
+L1166         idx = list(idx); P = corrM[np.ix_(idx, idx)]; s = (score-score.mean())/(score.std()+1e-9)
+L1167         return float(s[idx].sum() - lam*((P.sum()-np.trace(P))/2.0))
+L1168
+L1169     @classmethod
+L1170     def swap_local_det(cls, corrM: np.ndarray, score: np.ndarray, idx, lam: float=0.6, max_pass: int=15):
+L1171         S, best, improved, passes = sorted(idx), cls._obj(corrM, score, idx, lam), True, 0
+L1172         while improved and passes<max_pass:
+L1173             improved, passes = False, passes+1
+L1174             for i,out in enumerate(list(S)):
+L1175                 for inn in range(len(score)):
+L1176                     if inn in S: continue
+L1177                     cand = sorted(S[:i]+[inn]+S[i+1:]); v = cls._obj(corrM, score, cand, lam)
+L1178                     if v>best+1e-10: S, best, improved = cand, v, True; break
+L1179                 if improved: break
+L1180         return S, best
+L1181
+L1182     @staticmethod
+L1183     def _obj_with_cross(C_within: np.ndarray, C_cross: np.ndarray|None, score: np.ndarray, idx, lam: float, mu: float) -> float:
+L1184         idx = list(idx); P = C_within[np.ix_(idx, idx)]; s = (score-score.mean())/(score.std()+1e-9)
+L1185         within = (P.sum()-np.trace(P))/2.0; cross = 0.0
+L1186         if C_cross is not None and C_cross.size>0: cross = C_cross[idx,:].sum()
+L1187         return float(s[idx].sum() - lam*within - mu*cross)
+L1188
+L1189     @classmethod
+L1190     def swap_local_det_cross(cls, C_within: np.ndarray, C_cross: np.ndarray|None, score: np.ndarray, idx, lam: float=0.6, mu: float=0.3, max_pass: int=15):
+L1191         S, best, improved, passes, N = sorted(idx), cls._obj_with_cross(C_within,C_cross,score,idx,lam,mu), True, 0, len(score)
+L1192         while improved and passes<max_pass:
+L1193             improved, passes = False, passes+1
+L1194             for i,out in enumerate(list(S)):
+L1195                 for inn in range(N):
+L1196                     if inn in S: continue
+L1197                     cand = sorted(S[:i]+[inn]+S[i+1:]); v = cls._obj_with_cross(C_within,C_cross,score,cand,lam,mu)
+L1198                     if v>best+1e-10: S, best, improved = cand, v, True; break
+L1199                 if improved: break
+L1200         return S, best
+L1201
+L1202     @staticmethod
+L1203     def avg_corr(C: np.ndarray, idx) -> float:
+L1204         k = len(idx); P = C[np.ix_(idx, idx)]
+L1205         return float((P.sum()-np.trace(P))/(k*(k-1)+1e-12))
+L1206
+L1207     @classmethod
+L1208     def select_bucket_drrs(cls, returns_df: pd.DataFrame, score_ser: pd.Series, pool_tickers: list[str], k: int, *, n_pc: int, gamma: float, lam: float, lookback: int, shrink: float=0.10, g_fixed_tickers: list[str]|None=None, mu: float=0.0):
+L1209         g_fixed = [t for t in (g_fixed_tickers or []) if t in returns_df.columns]
+L1210         union = [t for t in pool_tickers if t in returns_df.columns]
+L1211         for t in g_fixed:
+L1212             if t not in union: union.append(t)
+L1213         Rdf_all = returns_df[union]
+L1214         Rdf_all = Rdf_all.iloc[-lookback:] if len(Rdf_all) >= lookback else Rdf_all
+L1215         _thresh = max(1, int(0.8 * len(Rdf_all)))
+L1216         Rdf_all = Rdf_all.dropna(axis=1, thresh=_thresh)
+L1217         Rdf_all = Rdf_all.dropna()
+L1218         pool_eff, g_eff = (
+L1219             [t for t in pool_tickers if t in Rdf_all.columns],
+L1220             [t for t in g_fixed if t in Rdf_all.columns],
+L1221         )
+L1222         if len(pool_eff)==0: return dict(idx=[], tickers=[], avg_res_corr=np.nan, sum_score=0.0, objective=-np.inf)
+L1223         score = score_ser.reindex(pool_eff).to_numpy(dtype=np.float32)
+L1224         C_all = cls.residual_corr(Rdf_all.to_numpy(), n_pc=n_pc, shrink=shrink)
+L1225         col_pos = {c:i for i,c in enumerate(Rdf_all.columns)}; pool_pos = [col_pos[t] for t in pool_eff]
+L1226         C_within, C_cross = C_all[np.ix_(pool_pos,pool_pos)], None
+L1227         if len(g_eff)>0 and mu>0.0:
+L1228             g_pos = [col_pos[t] for t in g_eff]; C_cross = C_all[np.ix_(pool_pos,g_pos)]
+L1229         R_pool = Rdf_all[pool_eff].to_numpy(); S0 = cls.rrqr_like_det(R_pool, score, k, gamma=gamma)
+L1230         S, Jn = (cls.swap_local_det_cross(C_within, C_cross, score, S0, lam=lam, mu=mu, max_pass=15) if C_cross is not None else cls.swap_local_det(C_within, score, S0, lam=lam, max_pass=15))
+L1231         selected_tickers = [pool_eff[i] for i in S]
+L1232         return dict(idx=S, tickers=selected_tickers, avg_res_corr=cls.avg_corr(C_within,S), sum_score=float(score[S].sum()), objective=float(Jn))
 L1233
-L1234     @classmethod
-L1235     def rrqr_like_det(cls, R: np.ndarray, score: np.ndarray, k: int, gamma: float=1.0):
-L1236         Z, w = cls._z_np(R), (score-score.min())/(np.ptp(score)+1e-12); X = Z*(1.0 + gamma*w)
-L1237         N, k = X.shape[1], max(0, min(k, X.shape[1]))
-L1238         if k==0: return []
-L1239         S, selected, Rres = [], np.zeros(N, dtype=bool), X.copy()
-L1240         for _ in range(k):
-L1241             norms = (Rres*Rres).sum(axis=0); cand = np.where(~selected)[0]
-L1242             j = sorted(cand, key=lambda c:(-norms[c], -w[c], c))[0]
-L1243             S.append(j); selected[j]=True; u = X[:,j:j+1]; u/=(np.linalg.norm(u)+1e-12); Rres = Rres - u @ (u.T @ Rres)
-L1244         return sorted(S)
-L1245
-L1246     @staticmethod
-L1247     def _obj(corrM: np.ndarray, score: np.ndarray, idx, lam: float) -> float:
-L1248         idx = list(idx); P = corrM[np.ix_(idx, idx)]; s = (score-score.mean())/(score.std()+1e-9)
-L1249         return float(s[idx].sum() - lam*((P.sum()-np.trace(P))/2.0))
-L1250
-L1251     @classmethod
-L1252     def swap_local_det(cls, corrM: np.ndarray, score: np.ndarray, idx, lam: float=0.6, max_pass: int=15):
-L1253         S, best, improved, passes = sorted(idx), cls._obj(corrM, score, idx, lam), True, 0
-L1254         while improved and passes<max_pass:
-L1255             improved, passes = False, passes+1
-L1256             for i,out in enumerate(list(S)):
-L1257                 for inn in range(len(score)):
-L1258                     if inn in S: continue
-L1259                     cand = sorted(S[:i]+[inn]+S[i+1:]); v = cls._obj(corrM, score, cand, lam)
-L1260                     if v>best+1e-10: S, best, improved = cand, v, True; break
-L1261                 if improved: break
-L1262         return S, best
-L1263
-L1264     @staticmethod
-L1265     def _obj_with_cross(C_within: np.ndarray, C_cross: np.ndarray|None, score: np.ndarray, idx, lam: float, mu: float) -> float:
-L1266         idx = list(idx); P = C_within[np.ix_(idx, idx)]; s = (score-score.mean())/(score.std()+1e-9)
-L1267         within = (P.sum()-np.trace(P))/2.0; cross = 0.0
-L1268         if C_cross is not None and C_cross.size>0: cross = C_cross[idx,:].sum()
-L1269         return float(s[idx].sum() - lam*within - mu*cross)
-L1270
-L1271     @classmethod
-L1272     def swap_local_det_cross(cls, C_within: np.ndarray, C_cross: np.ndarray|None, score: np.ndarray, idx, lam: float=0.6, mu: float=0.3, max_pass: int=15):
-L1273         S, best, improved, passes, N = sorted(idx), cls._obj_with_cross(C_within,C_cross,score,idx,lam,mu), True, 0, len(score)
-L1274         while improved and passes<max_pass:
-L1275             improved, passes = False, passes+1
-L1276             for i,out in enumerate(list(S)):
-L1277                 for inn in range(N):
-L1278                     if inn in S: continue
-L1279                     cand = sorted(S[:i]+[inn]+S[i+1:]); v = cls._obj_with_cross(C_within,C_cross,score,cand,lam,mu)
-L1280                     if v>best+1e-10: S, best, improved = cand, v, True; break
-L1281                 if improved: break
-L1282         return S, best
-L1283
-L1284     @staticmethod
-L1285     def avg_corr(C: np.ndarray, idx) -> float:
-L1286         k = len(idx); P = C[np.ix_(idx, idx)]
-L1287         return float((P.sum()-np.trace(P))/(k*(k-1)+1e-12))
-L1288
-L1289     @classmethod
-L1290     def select_bucket_drrs(cls, returns_df: pd.DataFrame, score_ser: pd.Series, pool_tickers: list[str], k: int, *, n_pc: int, gamma: float, lam: float, lookback: int, shrink: float=0.10, g_fixed_tickers: list[str]|None=None, mu: float=0.0):
-L1291         g_fixed = [t for t in (g_fixed_tickers or []) if t in returns_df.columns]
-L1292         union = [t for t in pool_tickers if t in returns_df.columns]
-L1293         for t in g_fixed:
-L1294             if t not in union: union.append(t)
-L1295         Rdf_all = returns_df[union]
-L1296         Rdf_all = Rdf_all.iloc[-lookback:] if len(Rdf_all) >= lookback else Rdf_all
-L1297         _thresh = max(1, int(0.8 * len(Rdf_all)))
-L1298         Rdf_all = Rdf_all.dropna(axis=1, thresh=_thresh)
-L1299         Rdf_all = Rdf_all.dropna()
-L1300         pool_eff, g_eff = (
-L1301             [t for t in pool_tickers if t in Rdf_all.columns],
-L1302             [t for t in g_fixed if t in Rdf_all.columns],
-L1303         )
-L1304         if len(pool_eff)==0: return dict(idx=[], tickers=[], avg_res_corr=np.nan, sum_score=0.0, objective=-np.inf)
-L1305         score = score_ser.reindex(pool_eff).to_numpy(dtype=np.float32)
-L1306         C_all = cls.residual_corr(Rdf_all.to_numpy(), n_pc=n_pc, shrink=shrink)
-L1307         col_pos = {c:i for i,c in enumerate(Rdf_all.columns)}; pool_pos = [col_pos[t] for t in pool_eff]
-L1308         C_within, C_cross = C_all[np.ix_(pool_pos,pool_pos)], None
-L1309         if len(g_eff)>0 and mu>0.0:
-L1310             g_pos = [col_pos[t] for t in g_eff]; C_cross = C_all[np.ix_(pool_pos,g_pos)]
-L1311         R_pool = Rdf_all[pool_eff].to_numpy(); S0 = cls.rrqr_like_det(R_pool, score, k, gamma=gamma)
-L1312         S, Jn = (cls.swap_local_det_cross(C_within, C_cross, score, S0, lam=lam, mu=mu, max_pass=15) if C_cross is not None else cls.swap_local_det(C_within, score, S0, lam=lam, max_pass=15))
-L1313         selected_tickers = [pool_eff[i] for i in S]
-L1314         return dict(idx=S, tickers=selected_tickers, avg_res_corr=cls.avg_corr(C_within,S), sum_score=float(score[S].sum()), objective=float(Jn))
-L1315
-L1316     # ---- 選定（スコア Series / returns だけを受ける）----
-L1317 # === Output：出力整形と送信（表示・Slack） ===
-L1318 class Output:
-L1319
-L1320     def __init__(self, debug=None):
-L1321         # self.debug は使わない（互換のため引数は受けるが無視）
-L1322         self.miss_df = self.g_table = self.d_table = self.io_table = self.df_metrics_fmt = self.debug_table = None
-L1323         self.g_title = self.d_title = ""
-L1324         self.g_formatters = self.d_formatters = {}
-L1325         # 低スコア（GSC+DSC）Top10 表示/送信用
-L1326         self.low10_table = None
-L1327         self.debug_text = ""   # デバッグ用本文はここに一本化
-L1328         self._debug_logged = False
-L1329         self._miss_disp_info: Tuple[pd.DataFrame, bool, int] | None = None
-L1330
-L1331     @staticmethod
-L1332     def _prepare_missing_display(df: pd.DataFrame | None) -> Tuple[pd.DataFrame, bool, int]:
-L1333         if df is None or df.empty:
-L1334             return pd.DataFrame(), False, 0
-L1335         work = df.copy()
-L1336         if 'ticker' not in work.columns:
-L1337             work = work.reset_index()
-L1338             if 'ticker' not in work.columns and 'index' in work.columns:
-L1339                 work = work.rename(columns={'index': 'ticker'})
-L1340         bool_cols = [c for c in ['EPS_missing', 'REV_missing'] if c in work.columns]
-L1341         if bool_cols:
-L1342             work = work.loc[work[bool_cols].any(axis=1)]
-L1343         if work.empty:
-L1344             return pd.DataFrame(columns=work.columns), False, 0
-L1345         cols_order = [
-L1346             col for col in [
-L1347                 'ticker',
-L1348                 'EPS_missing',
-L1349                 'REV_missing',
-L1350                 'eps_imputed',
-L1351                 'EPS_TTM',
-L1352                 'EPS_Q_LastQ',
-L1353                 'EPS_A_LATEST',
-L1354                 'REV_TTM',
-L1355                 'REV_Q_LastQ',
-L1356                 'REV_A_LATEST',
-L1357             ]
-L1358             if col in work.columns
-L1359         ]
-L1360         if cols_order:
-L1361             work = work.loc[:, cols_order]
-L1362         total = len(work)
-L1363         truncated = False
-L1364         if total > 50:
-L1365             work = work.head(20)
-L1366             truncated = True
-L1367         return work, truncated, total
-L1368
-L1369     # --- 表示（元 display_results のロジックそのまま） ---
-L1370     def display_results(self, *, exist, bench, df_raw=None, df_z, g_score, d_score_all,
-L1371                         init_G, init_D, top_G, top_D, **kwargs):
-L1372         logger.info("📌 reached display_results")
-L1373         pd.set_option('display.float_format','{:.3f}'.format)
-L1374         print("📈 ファクター分散最適化の結果")
-L1375         miss_df, truncated, total = self._prepare_missing_display(self.miss_df)
-L1376         self._miss_disp_info = (miss_df, truncated, total)
-L1377         lines = compact_missing_lines(miss_df)
-L1378         if lines:
-L1379             txt = "Missing Data:\n```" + "\n".join(lines) + "```"
-L1380             if truncated:
-L1381                 txt += f"\n...省略 ({total}件中 上位20件のみ表示)"
-L1382             print(txt)
-L1383
-L1384         # ---- 表示用：Changes/Near-Miss のスコア源を“最終集計”に統一するプロキシ ----
-L1385         try:
-L1386             sc = getattr(self, "_sc", None)
-L1387             agg_G = getattr(sc, "_agg_G", None)
-L1388             agg_D = getattr(sc, "_agg_D", None)
-L1389         except Exception:
-L1390             sc = agg_G = agg_D = None
-L1391         class _SeriesProxy:
-L1392             __slots__ = ("primary", "fallback")
-L1393             def __init__(self, primary, fallback): self.primary, self.fallback = primary, fallback
-L1394             def get(self, key, default=None):
-L1395                 try:
-L1396                     v = self.primary.get(key) if hasattr(self.primary, "get") else None
-L1397                 except Exception:
-L1398                     v = None
-L1399                 if v is not None and not (isinstance(v, float) and v != v):
-L1400                     return v
-L1401                 try:
-L1402                     return self.fallback.get(key) if hasattr(self.fallback, "get") else default
-L1403                 except Exception:
-L1404                     return default
-L1405         g_score = _SeriesProxy(agg_G, g_score)
-L1406         d_score_all = _SeriesProxy(agg_D, d_score_all)
-L1407         near_G = getattr(sc, "_near_G", []) if sc else []
-L1408         near_D = getattr(sc, "_near_D", []) if sc else []
-L1409
-L1410         extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
-L1411         gsc_series = pd.Series({t: g_score.get(t) for t in G_UNI}, name='GSC')
-L1412         self.g_table = pd.concat([df_z.loc[G_UNI,['GROWTH_F','MOM','TRD','VOL']], gsc_series], axis=1)
-L1413         self.g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
-L1414         self.g_formatters = {col:"{:.2f}".format for col in ['GROWTH_F','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
-L1415         self.g_title = (f"[G枠 / {N_G} / {_fmt_w(g_weights)} / corrM={corrM} / "
-L1416                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
-L1417         if near_G:
-L1418             add = [t for t in near_G if t not in set(G_UNI)][:10]
-L1419             if len(add) < 10:
-L1420                 try:
-L1421                     aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False)
-L1422                     out_now = sorted(set(exist) - set(top_G + top_D))  # 今回 OUT
-L1423                     used = set(G_UNI + add)
-L1424                     def _push(lst):
-L1425                         nonlocal add, used
-L1426                         for t in lst:
-L1427                             if len(add) == 10: break
-L1428                             if t in aggG.index and t not in used:
-L1429                                 add.append(t); used.add(t)
-L1430                     _push(out_now)           # ① 今回 OUT を優先
-L1431                     _push(list(aggG.index))  # ② まだ足りなければ上位で充填
-L1432                 except Exception:
-L1433                     pass
-L1434             if add:
-L1435                 near_tbl = pd.concat([df_z.loc[add,['GROWTH_F','MOM','TRD','VOL']], pd.Series({t: g_score.get(t) for t in add}, name='GSC')], axis=1)
-L1436                 self.g_table = pd.concat([self.g_table, near_tbl], axis=0)
-L1437         print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
-L1438
-L1439         extra_D = [t for t in init_D if t not in top_D][:5]; D_UNI = top_D + extra_D
-L1440         cols_D = ['QAL','YLD','VOL','TRD']; d_disp = pd.DataFrame(index=D_UNI)
-L1441         d_disp['QAL'], d_disp['YLD'], d_disp['VOL'], d_disp['TRD'] = df_z.loc[D_UNI,'D_QAL'], df_z.loc[D_UNI,'D_YLD'], df_z.loc[D_UNI,'D_VOL_RAW'], df_z.loc[D_UNI,'D_TRD']
-L1442         dsc_series = pd.Series({t: d_score_all.get(t) for t in D_UNI}, name='DSC')
-L1443         self.d_table = pd.concat([d_disp, dsc_series], axis=1); self.d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
-L1444         self.d_formatters = {col:"{:.2f}".format for col in cols_D}; self.d_formatters['DSC']="{:.3f}".format
-L1445         import scorer
-L1446         dw_eff = scorer.D_WEIGHTS_EFF
-L1447         self.d_title = (f"[D枠 / {N_D} / {_fmt_w(dw_eff)} / corrM={corrM} / "
-L1448                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
-L1449         if near_D:
-L1450             add = [t for t in near_D if t not in set(D_UNI)][:10]
-L1451             if add:
-L1452                 d_disp2 = pd.DataFrame(index=add)
-L1453                 d_disp2['QAL'], d_disp2['YLD'], d_disp2['VOL'], d_disp2['TRD'] = df_z.loc[add,'D_QAL'], df_z.loc[add,'D_YLD'], df_z.loc[add,'D_VOL_RAW'], df_z.loc[add,'D_TRD']
-L1454                 near_tbl = pd.concat([d_disp2, pd.Series({t: d_score_all.get(t) for t in add}, name='DSC')], axis=1)
-L1455                 self.d_table = pd.concat([self.d_table, near_tbl], axis=0)
-L1456         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
-L1457
-L1458         # === Changes（IN の GSC/DSC を表示。OUT は銘柄名のみ） ===
-L1459         in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
-L1460         out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
-L1461
-L1462         self.io_table = pd.DataFrame({
-L1463             'IN': pd.Series(in_list),
-L1464             '/ OUT': pd.Series(out_list)
-L1465         })
-L1466         g_list = [f"{g_score.get(t):.3f}" if pd.notna(g_score.get(t)) else '—' for t in out_list]
-L1467         d_list = [f"{d_score_all.get(t):.3f}" if pd.notna(d_score_all.get(t)) else '—' for t in out_list]
-L1468         self.io_table['GSC'] = pd.Series(g_list)
-L1469         self.io_table['DSC'] = pd.Series(d_list)
-L1470
-L1471         print("Changes:")
-L1472         print(self.io_table.to_string(index=False))
-L1473
-L1474         all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False, threads=False)['Close'].ffill(limit=2)
-L1475         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
-L1476         for name,ticks in portfolios.items():
-L1477             pr = ret[ticks].mean(axis=1, skipna=True).dropna(); cum = (1+pr).cumprod()-1; n = len(pr)
-L1478             if n>=252: ann_ret, ann_vol = (1+cum.iloc[-1])**(252/n)-1, pr.std()*np.sqrt(252)
-L1479             else: ann_ret, ann_vol = cum.iloc[-1], pr.std()*np.sqrt(n)
-L1480             sharpe, drawdown = ann_ret/ann_vol, (cum - cum.cummax()).min()
-L1481             if len(ticks)>=2:
-L1482                 C_raw = ret[ticks].corr(); RAW_rho = C_raw.mask(np.eye(len(ticks), dtype=bool)).stack().mean()
-L1483                 R = ret[ticks].dropna().to_numpy(); C_resid = Selector.residual_corr(R, n_pc=3, shrink=DRRS_SHRINK)
-L1484                 RESID_rho = float((C_resid.sum()-np.trace(C_resid))/(C_resid.shape[0]*(C_resid.shape[0]-1)))
-L1485             else: RAW_rho = RESID_rho = np.nan
-L1486             divy = ttm_div_yield_portfolio(ticks); metrics[name] = {'RET':ann_ret,'VOL':ann_vol,'SHP':sharpe,'MDD':drawdown,'RAWρ':RAW_rho,'RESIDρ':RESID_rho,'DIVY':divy}
-L1487         df_metrics = pd.DataFrame(metrics).T; df_metrics_pct = df_metrics.copy(); self.df_metrics = df_metrics
-L1488         for col in ['RET','VOL','MDD','DIVY']: df_metrics_pct[col] = df_metrics_pct[col]*100
-L1489         cols_order = ['RET','VOL','SHP','MDD','RAWρ','RESIDρ','DIVY']; df_metrics_pct = df_metrics_pct.reindex(columns=cols_order)
-L1490         def _fmt_row(s):
-L1491             return pd.Series({'RET':f"{s['RET']:.1f}%",'VOL':f"{s['VOL']:.1f}%",'SHP':f"{s['SHP']:.1f}",'MDD':f"{s['MDD']:.1f}%",'RAWρ':(f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"),'RESIDρ':(f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN"),'DIVY':f"{s['DIVY']:.1f}%"})
-L1492         self.df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1); print("Performance Comparison:"); print(self.df_metrics_fmt.to_string())
-L1493         # === 追加: GSC+DSC が低い順 TOP10 ===
-L1494         try:
-L1495             all_scores = pd.DataFrame({'GSC': df_z['GSC'], 'DSC': df_z['DSC']}).copy()
-L1496             all_scores['G_plus_D'] = all_scores['GSC'] + all_scores['DSC']
-L1497             all_scores = all_scores.dropna(subset=['G_plus_D'])
-L1498             self.low10_table = all_scores.sort_values('G_plus_D', ascending=True).head(10).round(3)
-L1499             print("Low Score Candidates (GSC+DSC bottom 10):")
-L1500             print(self.low10_table.to_string())
-L1501         except Exception as e:
-L1502             print(f"[warn] low-score ranking failed: {e}")
-L1503             self.low10_table = None
-L1504         self.debug_text = ""
-L1505         if debug_mode:
-L1506             logger.info("debug_mode=True: df_z dump handled in scorer; skipping factor-side debug output")
-L1507         else:
-L1508             logger.debug(
-L1509                 "skip debug log: debug_mode=%s debug_text_empty=%s",
-L1510                 debug_mode, True
-L1511             )
-L1512         self._debug_logged = True
-L1513
-L1514     # --- Slack送信（元 notify_slack のロジックそのまま） ---
-L1515     def notify_slack(self):
-L1516         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-L1517
-L1518         if not SLACK_WEBHOOK_URL:
-L1519             print("⚠️ SLACK_WEBHOOK_URL not set (main report skipped)")
-L1520             return
-L1521
-L1522         def _filter_suffix_from(spec: dict, group: str) -> str:
-L1523             g = spec.get(group, {})
-L1524             parts = [str(m) for m in g.get("pre_mask", [])]
-L1525             for k, v in (g.get("pre_filter", {}) or {}).items():
-L1526                 base, op = (k[:-4], "<") if k.endswith("_max") else ((k[:-4], ">") if k.endswith("_min") else (k, "="))
-L1527                 name = {"beta": "β"}.get(base, base)
-L1528                 try:
-L1529                     val = f"{float(v):g}"
-L1530                 except Exception:
-L1531                     val = str(v)
-L1532                 parts.append(f"{name}{op}{val}")
-L1533             return "" if not parts else " / filter:" + " & ".join(parts)
-L1534
-L1535         def _inject_filter_suffix(title: str, group: str) -> str:
-L1536             suf = _filter_suffix_from(FILTER_SPEC, group)
-L1537             return f"{title[:-1]}{suf}]" if suf and title.endswith("]") else (title + suf)
-L1538
-L1539         def _blk(title, tbl, fmt=None, drop=()):
-L1540             if tbl is None or getattr(tbl, 'empty', False):
-L1541                 return f"{title}\n(選定なし)\n"
-L1542             if drop and hasattr(tbl, 'columns'):
-L1543                 keep = [c for c in tbl.columns if c not in drop]
-L1544                 tbl, fmt = tbl[keep], {k: v for k, v in (fmt or {}).items() if k in keep}
-L1545             return f"{title}\n```{tbl.to_string(formatters=fmt)}```\n"
-L1546
-L1547         message = "📈 ファクター分散最適化の結果\n"
-L1548         miss_df, truncated, total = self._miss_disp_info or self._prepare_missing_display(self.miss_df)
-L1549         lines = compact_missing_lines(miss_df, limit=300)
-L1550         missing_txt = "Missing Data:\n```" + "\n".join(lines) + "```" if lines else ""
-L1551         trunc_note = f"...省略 ({total}件中 上位20件のみ表示)" if truncated else ""
-L1552         if missing_txt:
-L1553             message += missing_txt + ("\n" + trunc_note if trunc_note else "") + "\n"
-L1554         message += _blk(_inject_filter_suffix(self.g_title, "G"), self.g_table, self.g_formatters, drop=("TRD",))
-L1555         message += _blk(_inject_filter_suffix(self.d_title, "D"), self.d_table, self.d_formatters)
-L1556         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table, 'empty', False) else f"```{self.io_table.to_string(index=False)}```\n")
-L1557         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
-L1558
-L1559         try:
-L1560             r = requests.post(SLACK_WEBHOOK_URL, json={"text": message})
-L1561             print(f"[DBG] main_post status={getattr(r, 'status_code', None)} size={len(message)}")
-L1562             if r is not None:
-L1563                 r.raise_for_status()
-L1564         except Exception as e:
-L1565             print(f"[ERR] main_post_failed: {e}")
-L1566
-L1567 def _infer_g_universe(feature_df, selected12=None, near5=None):
-L1568     try:
-L1569         out = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
-L1570         if out: return out
-L1571     except Exception:
-L1572         pass
-L1573     base = set()
-L1574     for lst in (selected12 or []), (near5 or []):
-L1575         for x in (lst or []): base.add(x)
-L1576     return list(base) if base else list(feature_df.index)
-L1577
-L1578 def _fmt_with_fire_mark(tickers, feature_df):
-L1579     # breakout/pullback 補助は廃止 → no-op（安全のため列参照なし）
-L1580     return [str(t) for t in (tickers or [])]
-L1581
-L1582 def _label_recent_event(t, feature_df):
-L1583     # ラベル付けは廃止 → no-op
-L1584     return t
-L1585
-L1586 # === パイプライン可視化：G/D共通フロー（出力は不変） ===
-L1587
-L1588 def io_build_input_bundle() -> InputBundle:
-L1589     """
-L1590     既存の『データ取得→前処理』を実行し、InputBundle を返す。
-L1591     処理内容・列名・丸め・例外・ログ文言は現行どおり（変更禁止）。
-L1592     """
-L1593     state = Input(cand=cand, exist=exist, bench=bench, price_max=CAND_PRICE_MAX, finnhub_api_key=FINNHUB_API_KEY).prepare_data()
-L1594     return InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench, data=state["data"], px=state["px"], spx=state["spx"], tickers_bulk=state["tickers_bulk"], info=state["info"], eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"], missing_logs=state["missing_logs"])
-L1595
-L1596 def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
-L1597               n_target: int) -> tuple[list, float, float, float]:
-L1598     """
-L1599     G/Dを同一手順で処理：採点→フィルター→選定（相関低減込み）。
-L1600     戻り値：(pick, avg_res_corr, sum_score, objective)
-L1601     JSON保存は既存フォーマット（キー名・丸め桁・順序）を踏襲。
-L1602     """
-L1603     sc.cfg = cfg
-L1604
-L1605     if hasattr(sc, "score_build_features"):
-L1606         feat = sc.score_build_features(inb)
-L1607         if not hasattr(sc, "_feat_logged"):
-L1608             T.log("features built (scorer)")
-L1609             sc._feat_logged = True
-L1610         agg = sc.score_aggregate(feat, group, cfg) if hasattr(sc, "score_aggregate") else feat
-L1611     else:
-L1612         if not hasattr(sc, "_feat"):
-L1613             fb = sc.aggregate_scores(inb, cfg)
-L1614             sc._feat = fb
-L1615         else:
-L1616             fb = sc._feat
-L1617         if not hasattr(sc, "_feat_logged"):
-L1618             T.log("features built (scorer)")
-L1619             sc._feat_logged = True
-L1620         agg = fb.g_score if group == "G" else fb.d_score_all
-L1621         if group == "D" and hasattr(fb, "df"):
-L1622             beta_raw = fb.df['BETA'].astype(float)
-L1623             if D_BETA_MODE == "z":
-L1624                 beta_for_filter = _zscore_series(beta_raw)
-L1625             else:
-L1626                 beta_for_filter = beta_raw
-L1627
-L1628             beta_mask = (beta_for_filter <= D_BETA_CUTOFF).reindex(agg.index, fill_value=False)
-L1629             agg = agg[beta_mask]
-L1630
-L1631             if isinstance(agg, pd.Series):
-L1632                 _min = agg.min(skipna=True)
-L1633                 floor = (0.0 if not np.isfinite(_min) else float(_min)) - 1e6
-L1634                 agg = agg.fillna(floor)
-L1635
-L1636             try:
-L1637                 logger.info(
-L1638                     "D-filter mode=%s cutoff=%s | pass=%d raw[mean=%.3f std=%.3f] z[mean≈0 std≈1]",
-L1639                     D_BETA_MODE,
-L1640                     D_BETA_CUTOFF,
-L1641                     int(beta_mask.sum()),
-L1642                     float(beta_raw.mean(skipna=True)),
-L1643                     float(beta_raw.std(skipna=True, ddof=0)),
-L1644                 )
-L1645             except Exception:
-L1646                 pass
-L1647
-L1648     if hasattr(sc, "filter_candidates"):
-L1649         agg = agg[sc.filter_candidates(inb, agg, group, cfg)]
-L1650
-L1651     if isinstance(agg, pd.Series):
-L1652         agg = _as_numeric_series(agg)
-L1653
-L1654     selector = Selector()
-L1655     if hasattr(sc, "select_diversified"):
-L1656         pick, avg_r, sum_sc, obj = sc.select_diversified(agg, group, cfg, n_target,
-L1657             selector=selector, prev_tickers=None,
-L1658             corrM=cfg.drrs.corrM, shrink=cfg.drrs.shrink,
-L1659             cross_mu=cfg.drrs.cross_mu_gd)
-L1660     else:
-L1661         if group == "G":
-L1662             init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
-L1663             res = selector.select_bucket_drrs(returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
-L1664                 n_pc=cfg.drrs.G.get("n_pc", 3), gamma=cfg.drrs.G.get("gamma", 1.2),
-L1665                 lam=cfg.drrs.G.get("lam", 0.68),
-L1666                 lookback=cfg.drrs.G.get("lookback", 252),
-L1667                 shrink=cfg.drrs.shrink, g_fixed_tickers=None, mu=0.0)
-L1668         else:
-L1669             init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
-L1670             g_fixed = getattr(sc, "_top_G", None)
-L1671             res = selector.select_bucket_drrs(returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
-L1672                 n_pc=cfg.drrs.D.get("n_pc", 4), gamma=cfg.drrs.D.get("gamma", 0.8),
-L1673                 lam=cfg.drrs.D.get("lam", 0.85),
-L1674                 lookback=cfg.drrs.D.get("lookback", 504),
-L1675                 shrink=cfg.drrs.shrink, g_fixed_tickers=g_fixed,
-L1676                 mu=cfg.drrs.cross_mu_gd)
-L1677         pick = res["tickers"]; avg_r = res["avg_res_corr"]
-L1678         sum_sc = res["sum_score"]; obj = res["objective"]
-L1679         if group == "D":
-L1680             _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
-L1681             T.log("selection finalized (G/D)")
-L1682     try:
-L1683         inc = [t for t in exist if t in agg.index]
-L1684         pick = _sticky_keep_current(
-L1685             agg=agg, pick=pick, incumbents=inc, n_target=n_target,
-L1686             delta_z=SWAP_DELTA_Z, keep_buffer=SWAP_KEEP_BUFFER
-L1687         )
-L1688     except Exception as _e:
-L1689         print(f"[warn] sticky_keep_current skipped: {str(_e)}")
-L1690     # --- Near-Miss: 惜しくも選ばれなかった上位10を保持（Slack表示用） ---
-L1691     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
-L1692     try:
-L1693         pool = agg.drop(index=[t for t in pick if t in agg.index], errors="ignore")
-L1694         near10 = list(pool.sort_values(ascending=False).head(10).index)
-L1695         setattr(sc, f"_near_{group}", near10)
-L1696         setattr(sc, f"_agg_{group}", agg)
-L1697     except Exception:
-L1698         pass
-L1699
-L1700     if group == "D":
-L1701         T.log("save done")
-L1702     if group == "G":
-L1703         sc._top_G = pick
-L1704     return pick, avg_r, sum_sc, obj
-L1705
-L1706 def run_pipeline() -> SelectionBundle:
-L1707     """
-L1708     G/D共通フローの入口。I/Oはここだけで実施し、計算はScorerに委譲。
-L1709     Slack文言・丸め・順序は既存の Output を用いて変更しない。
-L1710     """
-L1711     inb = io_build_input_bundle()
-L1712     cfg = PipelineConfig(
-L1713         weights=WeightsConfig(g=g_weights, d=D_weights),
-L1714         drrs=DRRSParams(
-L1715             corrM=corrM, shrink=DRRS_SHRINK,
-L1716             G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD
-L1717         ),
-L1718         price_max=CAND_PRICE_MAX,
-L1719         debug_mode=debug_mode
-L1720     )
-L1721     sc = Scorer()
-L1722     top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G)
-L1723     poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False).index)
-L1724     alpha = Scorer.spx_to_alpha(inb.spx)
-L1725     sectors = {t:(inb.info.get(t,{}).get("sector") or "U") for t in poolG}; scores = {t:Scorer.g_score.get(t,0.0) for t in poolG}
-L1726     top_G = Scorer.pick_top_softcap(scores, sectors, N=N_G, cap=2, alpha=alpha, hard=5)
-L1727     sc._top_G = top_G
-L1728     try:
-L1729         aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False)
-L1730         sc._near_G = [t for t in aggG.index if t not in set(top_G)][:10]
-L1731     except Exception:
-L1732         pass
-L1733     base = sum(Scorer.g_score.get(t,0.0) for t in poolG[:N_G])
-L1734     effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
-L1735     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
-L1736     top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D)
-L1737     fb = getattr(sc, "_feat", None)
-L1738     out = Output()
-L1739     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
-L1740     try:
-L1741         out._sc = sc
-L1742     except Exception:
-L1743         pass
-L1744     if hasattr(sc, "_feat"):
-L1745         try:
-L1746             fb = sc._feat
-L1747             out.miss_df = fb.missing_logs
-L1748             out.display_results(
-L1749                 exist=exist,
-L1750                 bench=bench,
-L1751                 df_raw=fb.df,
-L1752                 df_z=fb.df_z,
-L1753                 g_score=fb.g_score,
-L1754                 d_score_all=fb.d_score_all,
-L1755                 init_G=top_G,
-L1756                 init_D=top_D,
-L1757                 top_G=top_G,
-L1758                 top_D=top_D,
-L1759                 df_full_z=getattr(fb, "df_full_z", None),
-L1760                 prev_G=getattr(sc, "_prev_G", exist),
-L1761                 prev_D=getattr(sc, "_prev_D", exist),
-L1762             )
-L1763             try:
-L1764                 DBG_COLS = ["GSC", "GROWTH_F", "MOM", "VOL", "DBGRW.GROWTH_F", "DBGRW.MOM", "DBGRW.VOL"]
-L1765                 cols = [c for c in DBG_COLS if c in fb.df_z.columns]
-L1766                 idx = [t for t in top_G if t in fb.df_z.index]
-L1767                 out.debug_table = fb.df_z.loc[idx, cols].round(2) if idx and cols else None
-L1768             except Exception:
-L1769                 out.debug_table = None
-L1770         except Exception:
-L1771             pass
-L1772     out.notify_slack()
-L1773     sb = SelectionBundle(resG={"tickers": top_G, "avg_res_corr": avgG,
-L1774               "sum_score": sumG, "objective": objG},
-L1775         resD={"tickers": top_D, "avg_res_corr": avgD,
-L1776               "sum_score": sumD, "objective": objD},
-L1777         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
-L1778
-L1779     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
-L1780     try:
-L1781         _low_df = (pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
-L1782               .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
-L1783               .sort_values("G_plus_D")
-L1784               .head(10)
-L1785               .round(3))
-L1786         low_msg = "Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string(index=True, index_names=False)
-L1787         _post_slack({"text": f"```{low_msg}```"})
-L1788     except Exception as _e:
-L1789         _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
-L1790
-L1791     return sb
-L1792
-L1793 if __name__ == "__main__":
-L1794     run_pipeline()
+L1234     # ---- 選定（スコア Series / returns だけを受ける）----
+L1235 # === Output：出力整形と送信（表示・Slack） ===
+L1236 class Output:
+L1237
+L1238     def __init__(self, debug=None):
+L1239         # self.debug は使わない（互換のため引数は受けるが無視）
+L1240         self.miss_df = self.g_table = self.d_table = self.io_table = self.df_metrics_fmt = self.debug_table = None
+L1241         self.g_title = self.d_title = ""
+L1242         self.g_formatters = self.d_formatters = {}
+L1243         # 低スコア（GSC+DSC）Top10 表示/送信用
+L1244         self.low10_table = None
+L1245         self.debug_text = ""   # デバッグ用本文はここに一本化
+L1246         self._debug_logged = False
+L1247         self._miss_disp_info: Tuple[pd.DataFrame, bool, int] | None = None
+L1248
+L1249     @staticmethod
+L1250     def _prepare_missing_display(df: pd.DataFrame | None) -> Tuple[pd.DataFrame, bool, int]:
+L1251         if df is None or df.empty:
+L1252             return pd.DataFrame(), False, 0
+L1253         work = df.copy()
+L1254         if 'ticker' not in work.columns:
+L1255             work = work.reset_index()
+L1256             if 'ticker' not in work.columns and 'index' in work.columns:
+L1257                 work = work.rename(columns={'index': 'ticker'})
+L1258         bool_cols = [c for c in ['EPS_missing', 'REV_missing'] if c in work.columns]
+L1259         if bool_cols:
+L1260             work = work.loc[work[bool_cols].any(axis=1)]
+L1261         if work.empty:
+L1262             return pd.DataFrame(columns=work.columns), False, 0
+L1263         cols_order = [
+L1264             col for col in [
+L1265                 'ticker',
+L1266                 'EPS_missing',
+L1267                 'REV_missing',
+L1268                 'eps_imputed',
+L1269                 'EPS_TTM',
+L1270                 'EPS_Q_LastQ',
+L1271                 'EPS_A_LATEST',
+L1272                 'REV_TTM',
+L1273                 'REV_Q_LastQ',
+L1274                 'REV_A_LATEST',
+L1275             ]
+L1276             if col in work.columns
+L1277         ]
+L1278         if cols_order:
+L1279             work = work.loc[:, cols_order]
+L1280         total = len(work)
+L1281         truncated = False
+L1282         if total > 50:
+L1283             work = work.head(20)
+L1284             truncated = True
+L1285         return work, truncated, total
+L1286
+L1287     # --- 表示（元 display_results のロジックそのまま） ---
+L1288     def display_results(self, *, exist, bench, df_raw=None, df_z, g_score, d_score_all,
+L1289                         init_G, init_D, top_G, top_D, **kwargs):
+L1290         logger.info("📌 reached display_results")
+L1291         pd.set_option('display.float_format','{:.3f}'.format)
+L1292         print("📈 ファクター分散最適化の結果")
+L1293         miss_df, truncated, total = self._prepare_missing_display(self.miss_df)
+L1294         self._miss_disp_info = (miss_df, truncated, total)
+L1295
+L1296         # ---- 表示用：Changes/Near-Miss のスコア源を“最終集計”に統一するプロキシ ----
+L1297         try:
+L1298             sc = getattr(self, "_sc", None)
+L1299             agg_G = getattr(sc, "_agg_G", None)
+L1300             agg_D = getattr(sc, "_agg_D", None)
+L1301         except Exception:
+L1302             sc = agg_G = agg_D = None
+L1303         class _SeriesProxy:
+L1304             __slots__ = ("primary", "fallback")
+L1305             def __init__(self, primary, fallback): self.primary, self.fallback = primary, fallback
+L1306             def get(self, key, default=None):
+L1307                 try:
+L1308                     v = self.primary.get(key) if hasattr(self.primary, "get") else None
+L1309                 except Exception:
+L1310                     v = None
+L1311                 if v is not None and not (isinstance(v, float) and v != v):
+L1312                     return v
+L1313                 try:
+L1314                     return self.fallback.get(key) if hasattr(self.fallback, "get") else default
+L1315                 except Exception:
+L1316                     return default
+L1317         g_score = _SeriesProxy(agg_G, g_score)
+L1318         d_score_all = _SeriesProxy(agg_D, d_score_all)
+L1319         near_G = getattr(sc, "_near_G", []) if sc else []
+L1320         near_D = getattr(sc, "_near_D", []) if sc else []
+L1321
+L1322         extra_G = [t for t in init_G if t not in top_G][:5]; G_UNI = top_G + extra_G
+L1323         gsc_series = pd.Series({t: g_score.get(t) for t in G_UNI}, name='GSC')
+L1324         self.g_table = pd.concat([df_z.loc[G_UNI,['GROWTH_F','MOM','TRD','VOL']], gsc_series], axis=1)
+L1325         self.g_table.index = [t + ("⭐️" if t in top_G else "") for t in G_UNI]
+L1326         self.g_formatters = {col:"{:.2f}".format for col in ['GROWTH_F','MOM','TRD','VOL']}; self.g_formatters['GSC'] = "{:.3f}".format
+L1327         self.g_title = (f"[G枠 / {N_G} / {_fmt_w(g_weights)} / corrM={corrM} / "
+L1328                         f"LB={DRRS_G['lookback']} nPC={DRRS_G['n_pc']} γ={DRRS_G['gamma']} λ={DRRS_G['lam']} η={DRRS_G['eta']} shrink={DRRS_SHRINK}]")
+L1329         if near_G:
+L1330             add = [t for t in near_G if t not in set(G_UNI)][:10]
+L1331             if len(add) < 10:
+L1332                 try:
+L1333                     aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False)
+L1334                     out_now = sorted(set(exist) - set(top_G + top_D))  # 今回 OUT
+L1335                     used = set(G_UNI + add)
+L1336                     def _push(lst):
+L1337                         nonlocal add, used
+L1338                         for t in lst:
+L1339                             if len(add) == 10: break
+L1340                             if t in aggG.index and t not in used:
+L1341                                 add.append(t); used.add(t)
+L1342                     _push(out_now)           # ① 今回 OUT を優先
+L1343                     _push(list(aggG.index))  # ② まだ足りなければ上位で充填
+L1344                 except Exception:
+L1345                     pass
+L1346             if add:
+L1347                 near_tbl = pd.concat([df_z.loc[add,['GROWTH_F','MOM','TRD','VOL']], pd.Series({t: g_score.get(t) for t in add}, name='GSC')], axis=1)
+L1348                 self.g_table = pd.concat([self.g_table, near_tbl], axis=0)
+L1349         print(self.g_title); print(self.g_table.to_string(formatters=self.g_formatters))
+L1350
+L1351         extra_D = [t for t in init_D if t not in top_D][:5]; D_UNI = top_D + extra_D
+L1352         cols_D = ['QAL','YLD','VOL','TRD']; d_disp = pd.DataFrame(index=D_UNI)
+L1353         d_disp['QAL'], d_disp['YLD'], d_disp['VOL'], d_disp['TRD'] = df_z.loc[D_UNI,'D_QAL'], df_z.loc[D_UNI,'D_YLD'], df_z.loc[D_UNI,'D_VOL_RAW'], df_z.loc[D_UNI,'D_TRD']
+L1354         dsc_series = pd.Series({t: d_score_all.get(t) for t in D_UNI}, name='DSC')
+L1355         self.d_table = pd.concat([d_disp, dsc_series], axis=1); self.d_table.index = [t + ("⭐️" if t in top_D else "") for t in D_UNI]
+L1356         self.d_formatters = {col:"{:.2f}".format for col in cols_D}; self.d_formatters['DSC']="{:.3f}".format
+L1357         import scorer
+L1358         dw_eff = scorer.D_WEIGHTS_EFF
+L1359         self.d_title = (f"[D枠 / {N_D} / {_fmt_w(dw_eff)} / corrM={corrM} / "
+L1360                         f"LB={DRRS_D['lookback']} nPC={DRRS_D['n_pc']} γ={DRRS_D['gamma']} λ={DRRS_D['lam']} μ={CROSS_MU_GD} η={DRRS_D['eta']} shrink={DRRS_SHRINK}]")
+L1361         if near_D:
+L1362             add = [t for t in near_D if t not in set(D_UNI)][:10]
+L1363             if add:
+L1364                 d_disp2 = pd.DataFrame(index=add)
+L1365                 d_disp2['QAL'], d_disp2['YLD'], d_disp2['VOL'], d_disp2['TRD'] = df_z.loc[add,'D_QAL'], df_z.loc[add,'D_YLD'], df_z.loc[add,'D_VOL_RAW'], df_z.loc[add,'D_TRD']
+L1366                 near_tbl = pd.concat([d_disp2, pd.Series({t: d_score_all.get(t) for t in add}, name='DSC')], axis=1)
+L1367                 self.d_table = pd.concat([self.d_table, near_tbl], axis=0)
+L1368         print(self.d_title); print(self.d_table.to_string(formatters=self.d_formatters))
+L1369
+L1370         # === Changes（IN の GSC/DSC を表示。OUT は銘柄名のみ） ===
+L1371         in_list = sorted(set(list(top_G)+list(top_D)) - set(exist))
+L1372         out_list = sorted(set(exist) - set(list(top_G)+list(top_D)))
+L1373
+L1374         self.io_table = pd.DataFrame({
+L1375             'IN': pd.Series(in_list),
+L1376             '/ OUT': pd.Series(out_list)
+L1377         })
+L1378         g_list = [f"{g_score.get(t):.3f}" if pd.notna(g_score.get(t)) else '—' for t in out_list]
+L1379         d_list = [f"{d_score_all.get(t):.3f}" if pd.notna(d_score_all.get(t)) else '—' for t in out_list]
+L1380         self.io_table['GSC'] = pd.Series(g_list)
+L1381         self.io_table['DSC'] = pd.Series(d_list)
+L1382
+L1383         print("Changes:")
+L1384         print(self.io_table.to_string(index=False))
+L1385
+L1386         all_tickers = list(set(exist + list(top_G) + list(top_D) + [bench])); prices = yf.download(all_tickers, period='1y', auto_adjust=True, progress=False, threads=False)['Close'].ffill(limit=2)
+L1387         ret = prices.pct_change(); portfolios = {'CUR':exist,'NEW':list(top_G)+list(top_D)}; metrics={}
+L1388         for name,ticks in portfolios.items():
+L1389             pr = ret[ticks].mean(axis=1, skipna=True).dropna(); cum = (1+pr).cumprod()-1; n = len(pr)
+L1390             if n>=252: ann_ret, ann_vol = (1+cum.iloc[-1])**(252/n)-1, pr.std()*np.sqrt(252)
+L1391             else: ann_ret, ann_vol = cum.iloc[-1], pr.std()*np.sqrt(n)
+L1392             sharpe, drawdown = ann_ret/ann_vol, (cum - cum.cummax()).min()
+L1393             if len(ticks)>=2:
+L1394                 C_raw = ret[ticks].corr(); RAW_rho = C_raw.mask(np.eye(len(ticks), dtype=bool)).stack().mean()
+L1395                 R = ret[ticks].dropna().to_numpy(); C_resid = Selector.residual_corr(R, n_pc=3, shrink=DRRS_SHRINK)
+L1396                 RESID_rho = float((C_resid.sum()-np.trace(C_resid))/(C_resid.shape[0]*(C_resid.shape[0]-1)))
+L1397             else: RAW_rho = RESID_rho = np.nan
+L1398             divy = ttm_div_yield_portfolio(ticks); metrics[name] = {'RET':ann_ret,'VOL':ann_vol,'SHP':sharpe,'MDD':drawdown,'RAWρ':RAW_rho,'RESIDρ':RESID_rho,'DIVY':divy}
+L1399         df_metrics = pd.DataFrame(metrics).T; df_metrics_pct = df_metrics.copy(); self.df_metrics = df_metrics
+L1400         for col in ['RET','VOL','MDD','DIVY']: df_metrics_pct[col] = df_metrics_pct[col]*100
+L1401         cols_order = ['RET','VOL','SHP','MDD','RAWρ','RESIDρ','DIVY']; df_metrics_pct = df_metrics_pct.reindex(columns=cols_order)
+L1402         def _fmt_row(s):
+L1403             return pd.Series({'RET':f"{s['RET']:.1f}%",'VOL':f"{s['VOL']:.1f}%",'SHP':f"{s['SHP']:.1f}",'MDD':f"{s['MDD']:.1f}%",'RAWρ':(f"{s['RAWρ']:.2f}" if pd.notna(s['RAWρ']) else "NaN"),'RESIDρ':(f"{s['RESIDρ']:.2f}" if pd.notna(s['RESIDρ']) else "NaN"),'DIVY':f"{s['DIVY']:.1f}%"})
+L1404         self.df_metrics_fmt = df_metrics_pct.apply(_fmt_row, axis=1); print("Performance Comparison:"); print(self.df_metrics_fmt.to_string())
+L1405         # === 追加: GSC+DSC が低い順 TOP10 ===
+L1406         try:
+L1407             all_scores = pd.DataFrame({'GSC': df_z['GSC'], 'DSC': df_z['DSC']}).copy()
+L1408             all_scores['G_plus_D'] = all_scores['GSC'] + all_scores['DSC']
+L1409             all_scores = all_scores.dropna(subset=['G_plus_D'])
+L1410             self.low10_table = all_scores.sort_values('G_plus_D', ascending=True).head(10).round(3)
+L1411             print("Low Score Candidates (GSC+DSC bottom 10):")
+L1412             print(self.low10_table.to_string())
+L1413         except Exception as e:
+L1414             print(f"[warn] low-score ranking failed: {e}")
+L1415             self.low10_table = None
+L1416         self.debug_text = ""
+L1417         if debug_mode:
+L1418             logger.info("debug_mode=True: df_z dump handled in scorer; skipping factor-side debug output")
+L1419         else:
+L1420             logger.debug(
+L1421                 "skip debug log: debug_mode=%s debug_text_empty=%s",
+L1422                 debug_mode, True
+L1423             )
+L1424         self._debug_logged = True
+L1425
+L1426     # --- Slack送信（元 notify_slack のロジックそのまま） ---
+L1427     def notify_slack(self):
+L1428         SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+L1429
+L1430         if not SLACK_WEBHOOK_URL:
+L1431             print("⚠️ SLACK_WEBHOOK_URL not set (main report skipped)")
+L1432             return
+L1433
+L1434         def _filter_suffix_from(spec: dict, group: str) -> str:
+L1435             g = spec.get(group, {})
+L1436             parts = [str(m) for m in g.get("pre_mask", [])]
+L1437             for k, v in (g.get("pre_filter", {}) or {}).items():
+L1438                 base, op = (k[:-4], "<") if k.endswith("_max") else ((k[:-4], ">") if k.endswith("_min") else (k, "="))
+L1439                 name = {"beta": "β"}.get(base, base)
+L1440                 try:
+L1441                     val = f"{float(v):g}"
+L1442                 except Exception:
+L1443                     val = str(v)
+L1444                 parts.append(f"{name}{op}{val}")
+L1445             return "" if not parts else " / filter:" + " & ".join(parts)
+L1446
+L1447         def _inject_filter_suffix(title: str, group: str) -> str:
+L1448             suf = _filter_suffix_from(FILTER_SPEC, group)
+L1449             return f"{title[:-1]}{suf}]" if suf and title.endswith("]") else (title + suf)
+L1450
+L1451         def _blk(title, tbl, fmt=None, drop=()):
+L1452             if tbl is None or getattr(tbl, 'empty', False):
+L1453                 return f"{title}\n(選定なし)\n"
+L1454             if drop and hasattr(tbl, 'columns'):
+L1455                 keep = [c for c in tbl.columns if c not in drop]
+L1456                 tbl, fmt = tbl[keep], {k: v for k, v in (fmt or {}).items() if k in keep}
+L1457             return f"{title}\n```{tbl.to_string(formatters=fmt)}```\n"
+L1458
+L1459         message = "📈 ファクター分散最適化の結果\n"
+L1460         message += _blk(_inject_filter_suffix(self.g_title, "G"), self.g_table, self.g_formatters, drop=("TRD",))
+L1461         message += _blk(_inject_filter_suffix(self.d_title, "D"), self.d_table, self.d_formatters)
+L1462         message += "Changes\n" + ("(変更なし)\n" if self.io_table is None or getattr(self.io_table, 'empty', False) else f"```{self.io_table.to_string(index=False)}```\n")
+L1463         message += "Performance Comparison:\n```" + self.df_metrics_fmt.to_string() + "```"
+L1464
+L1465         try:
+L1466             r = requests.post(SLACK_WEBHOOK_URL, json={"text": message})
+L1467             print(f"[DBG] main_post status={getattr(r, 'status_code', None)} size={len(message)}")
+L1468             if r is not None:
+L1469                 r.raise_for_status()
+L1470         except Exception as e:
+L1471             print(f"[ERR] main_post_failed: {e}")
+L1472
+L1473 def _infer_g_universe(feature_df, selected12=None, near5=None):
+L1474     try:
+L1475         out = feature_df.index[feature_df['group'].astype(str).str.upper().eq('G')].tolist()
+L1476         if out: return out
+L1477     except Exception:
+L1478         pass
+L1479     base = set()
+L1480     for lst in (selected12 or []), (near5 or []):
+L1481         for x in (lst or []): base.add(x)
+L1482     return list(base) if base else list(feature_df.index)
+L1483
+L1484 def _fmt_with_fire_mark(tickers, feature_df):
+L1485     # breakout/pullback 補助は廃止 → no-op（安全のため列参照なし）
+L1486     return [str(t) for t in (tickers or [])]
+L1487
+L1488 def _label_recent_event(t, feature_df):
+L1489     # ラベル付けは廃止 → no-op
+L1490     return t
+L1491
+L1492 # === パイプライン可視化：G/D共通フロー（出力は不変） ===
+L1493
+L1494 def io_build_input_bundle() -> InputBundle:
+L1495     """
+L1496     既存の『データ取得→前処理』を実行し、InputBundle を返す。
+L1497     処理内容・列名・丸め・例外・ログ文言は現行どおり（変更禁止）。
+L1498     """
+L1499     state = Input(cand=cand, exist=exist, bench=bench, price_max=CAND_PRICE_MAX, finnhub_api_key=FINNHUB_API_KEY).prepare_data()
+L1500     return InputBundle(cand=state["cand"], tickers=state["tickers"], bench=bench, data=state["data"], px=state["px"], spx=state["spx"], tickers_bulk=state["tickers_bulk"], info=state["info"], eps_df=state["eps_df"], fcf_df=state["fcf_df"], returns=state["returns"], missing_logs=state["missing_logs"])
+L1501
+L1502 def run_group(sc: Scorer, group: str, inb: InputBundle, cfg: PipelineConfig,
+L1503               n_target: int) -> tuple[list, float, float, float]:
+L1504     """
+L1505     G/Dを同一手順で処理：採点→フィルター→選定（相関低減込み）。
+L1506     戻り値：(pick, avg_res_corr, sum_score, objective)
+L1507     JSON保存は既存フォーマット（キー名・丸め桁・順序）を踏襲。
+L1508     """
+L1509     sc.cfg = cfg
+L1510
+L1511     if hasattr(sc, "score_build_features"):
+L1512         feat = sc.score_build_features(inb)
+L1513         if not hasattr(sc, "_feat_logged"):
+L1514             T.log("features built (scorer)")
+L1515             sc._feat_logged = True
+L1516         agg = sc.score_aggregate(feat, group, cfg) if hasattr(sc, "score_aggregate") else feat
+L1517     else:
+L1518         if not hasattr(sc, "_feat"):
+L1519             fb = sc.aggregate_scores(inb, cfg)
+L1520             sc._feat = fb
+L1521         else:
+L1522             fb = sc._feat
+L1523         if not hasattr(sc, "_feat_logged"):
+L1524             T.log("features built (scorer)")
+L1525             sc._feat_logged = True
+L1526         agg = fb.g_score if group == "G" else fb.d_score_all
+L1527         if group == "D" and hasattr(fb, "df"):
+L1528             beta_raw = fb.df['BETA'].astype(float)
+L1529             if D_BETA_MODE == "z":
+L1530                 beta_for_filter = _zscore_series(beta_raw)
+L1531             else:
+L1532                 beta_for_filter = beta_raw
+L1533
+L1534             beta_mask = (beta_for_filter <= D_BETA_CUTOFF).reindex(agg.index, fill_value=False)
+L1535             agg = agg[beta_mask]
+L1536
+L1537             if isinstance(agg, pd.Series):
+L1538                 _min = agg.min(skipna=True)
+L1539                 floor = (0.0 if not np.isfinite(_min) else float(_min)) - 1e6
+L1540                 agg = agg.fillna(floor)
+L1541
+L1542             try:
+L1543                 logger.info(
+L1544                     "D-filter mode=%s cutoff=%s | pass=%d raw[mean=%.3f std=%.3f] z[mean≈0 std≈1]",
+L1545                     D_BETA_MODE,
+L1546                     D_BETA_CUTOFF,
+L1547                     int(beta_mask.sum()),
+L1548                     float(beta_raw.mean(skipna=True)),
+L1549                     float(beta_raw.std(skipna=True, ddof=0)),
+L1550                 )
+L1551             except Exception:
+L1552                 pass
+L1553
+L1554     if hasattr(sc, "filter_candidates"):
+L1555         agg = agg[sc.filter_candidates(inb, agg, group, cfg)]
+L1556
+L1557     if isinstance(agg, pd.Series):
+L1558         agg = _as_numeric_series(agg)
+L1559
+L1560     selector = Selector()
+L1561     if hasattr(sc, "select_diversified"):
+L1562         pick, avg_r, sum_sc, obj = sc.select_diversified(agg, group, cfg, n_target,
+L1563             selector=selector, prev_tickers=None,
+L1564             corrM=cfg.drrs.corrM, shrink=cfg.drrs.shrink,
+L1565             cross_mu=cfg.drrs.cross_mu_gd)
+L1566     else:
+L1567         if group == "G":
+L1568             init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
+L1569             res = selector.select_bucket_drrs(returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
+L1570                 n_pc=cfg.drrs.G.get("n_pc", 3), gamma=cfg.drrs.G.get("gamma", 1.2),
+L1571                 lam=cfg.drrs.G.get("lam", 0.68),
+L1572                 lookback=cfg.drrs.G.get("lookback", 252),
+L1573                 shrink=cfg.drrs.shrink, g_fixed_tickers=None, mu=0.0)
+L1574         else:
+L1575             init = agg.nlargest(min(cfg.drrs.corrM, len(agg))).index.tolist()
+L1576             g_fixed = getattr(sc, "_top_G", None)
+L1577             res = selector.select_bucket_drrs(returns_df=inb.returns, score_ser=agg, pool_tickers=init, k=n_target,
+L1578                 n_pc=cfg.drrs.D.get("n_pc", 4), gamma=cfg.drrs.D.get("gamma", 0.8),
+L1579                 lam=cfg.drrs.D.get("lam", 0.85),
+L1580                 lookback=cfg.drrs.D.get("lookback", 504),
+L1581                 shrink=cfg.drrs.shrink, g_fixed_tickers=g_fixed,
+L1582                 mu=cfg.drrs.cross_mu_gd)
+L1583         pick = res["tickers"]; avg_r = res["avg_res_corr"]
+L1584         sum_sc = res["sum_score"]; obj = res["objective"]
+L1585         if group == "D":
+L1586             _, pick = _disjoint_keepG(getattr(sc, "_top_G", []), pick, init)
+L1587             T.log("selection finalized (G/D)")
+L1588     try:
+L1589         inc = [t for t in exist if t in agg.index]
+L1590         pick = _sticky_keep_current(
+L1591             agg=agg, pick=pick, incumbents=inc, n_target=n_target,
+L1592             delta_z=SWAP_DELTA_Z, keep_buffer=SWAP_KEEP_BUFFER
+L1593         )
+L1594     except Exception as _e:
+L1595         print(f"[warn] sticky_keep_current skipped: {str(_e)}")
+L1596     # --- Near-Miss: 惜しくも選ばれなかった上位10を保持（Slack表示用） ---
+L1597     # 5) Near-Miss と最終集計Seriesを保持（表示専用。計算へ影響なし）
+L1598     try:
+L1599         pool = agg.drop(index=[t for t in pick if t in agg.index], errors="ignore")
+L1600         near10 = list(pool.sort_values(ascending=False).head(10).index)
+L1601         setattr(sc, f"_near_{group}", near10)
+L1602         setattr(sc, f"_agg_{group}", agg)
+L1603     except Exception:
+L1604         pass
+L1605
+L1606     if group == "D":
+L1607         T.log("save done")
+L1608     if group == "G":
+L1609         sc._top_G = pick
+L1610     return pick, avg_r, sum_sc, obj
+L1611
+L1612 def run_pipeline() -> SelectionBundle:
+L1613     """
+L1614     G/D共通フローの入口。I/Oはここだけで実施し、計算はScorerに委譲。
+L1615     Slack文言・丸め・順序は既存の Output を用いて変更しない。
+L1616     """
+L1617     inb = io_build_input_bundle()
+L1618     cfg = PipelineConfig(
+L1619         weights=WeightsConfig(g=g_weights, d=D_weights),
+L1620         drrs=DRRSParams(
+L1621             corrM=corrM, shrink=DRRS_SHRINK,
+L1622             G=DRRS_G, D=DRRS_D, cross_mu_gd=CROSS_MU_GD
+L1623         ),
+L1624         price_max=CAND_PRICE_MAX,
+L1625         debug_mode=debug_mode
+L1626     )
+L1627     sc = Scorer()
+L1628     top_G, avgG, sumG, objG = run_group(sc, "G", inb, cfg, N_G)
+L1629     poolG = list(getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False).index)
+L1630     alpha = Scorer.spx_to_alpha(inb.spx)
+L1631     sectors = {t:(inb.info.get(t,{}).get("sector") or "U") for t in poolG}; scores = {t:Scorer.g_score.get(t,0.0) for t in poolG}
+L1632     top_G = Scorer.pick_top_softcap(scores, sectors, N=N_G, cap=2, alpha=alpha, hard=5)
+L1633     sc._top_G = top_G
+L1634     try:
+L1635         aggG = getattr(sc, "_agg_G", pd.Series(dtype=float)).dropna().sort_values(ascending=False)
+L1636         sc._near_G = [t for t in aggG.index if t not in set(top_G)][:10]
+L1637     except Exception:
+L1638         pass
+L1639     base = sum(Scorer.g_score.get(t,0.0) for t in poolG[:N_G])
+L1640     effs = sum(Scorer.g_score.get(t,0.0) for t in top_G)
+L1641     print(f"[soft_cap2] score_cost={(base-effs)/max(1e-9,abs(base)):.2%}, alpha={alpha:.3f}")
+L1642     top_D, avgD, sumD, objD = run_group(sc, "D", inb, cfg, N_D)
+L1643     fb = getattr(sc, "_feat", None)
+L1644     out = Output()
+L1645     # 表示側から選定時の集計へアクセスできるように保持（表示専用・副作用なし）
+L1646     try:
+L1647         out._sc = sc
+L1648     except Exception:
+L1649         pass
+L1650     if hasattr(sc, "_feat"):
+L1651         try:
+L1652             fb = sc._feat
+L1653             out.miss_df = fb.missing_logs
+L1654             out.display_results(
+L1655                 exist=exist,
+L1656                 bench=bench,
+L1657                 df_raw=fb.df,
+L1658                 df_z=fb.df_z,
+L1659                 g_score=fb.g_score,
+L1660                 d_score_all=fb.d_score_all,
+L1661                 init_G=top_G,
+L1662                 init_D=top_D,
+L1663                 top_G=top_G,
+L1664                 top_D=top_D,
+L1665                 df_full_z=getattr(fb, "df_full_z", None),
+L1666                 prev_G=getattr(sc, "_prev_G", exist),
+L1667                 prev_D=getattr(sc, "_prev_D", exist),
+L1668             )
+L1669             try:
+L1670                 DBG_COLS = ["GSC", "GROWTH_F", "MOM", "VOL", "DBGRW.GROWTH_F", "DBGRW.MOM", "DBGRW.VOL"]
+L1671                 cols = [c for c in DBG_COLS if c in fb.df_z.columns]
+L1672                 idx = [t for t in top_G if t in fb.df_z.index]
+L1673                 out.debug_table = fb.df_z.loc[idx, cols].round(2) if idx and cols else None
+L1674             except Exception:
+L1675                 out.debug_table = None
+L1676         except Exception:
+L1677             pass
+L1678     out.notify_slack()
+L1679     sb = SelectionBundle(resG={"tickers": top_G, "avg_res_corr": avgG,
+L1680               "sum_score": sumG, "objective": objG},
+L1681         resD={"tickers": top_D, "avg_res_corr": avgD,
+L1682               "sum_score": sumD, "objective": objD},
+L1683         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
+L1684
+L1685     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
+L1686     try:
+L1687         _low_df = (pd.DataFrame({"GSC": fb.g_score, "DSC": fb.d_score_all})
+L1688               .assign(G_plus_D=lambda x: x["GSC"] + x["DSC"])
+L1689               .sort_values("G_plus_D")
+L1690               .head(10)
+L1691               .round(3))
+L1692         low_msg = "Low Score Candidates (GSC+DSC bottom 10)\n" + _low_df.to_string(index=True, index_names=False)
+L1693         _post_slack({"text": f"```{low_msg}```"})
+L1694     except Exception as _e:
+L1695         _post_slack({"text": f"```Low Score Candidates: 作成失敗: {_e}```"})
+L1696
+L1697     return sb
+L1698
+L1699 if __name__ == "__main__":
+L1700     run_pipeline()
 ```
 
 ## <scorer.py>
@@ -3058,7 +2964,8 @@ L39         env:
 L40           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 L41           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
 L42           FIN_THREADS: "8"
-L43         run: python factor.py
+L43           SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
+L44         run: python factor.py
 ```
 
 ## <documents/README.md>

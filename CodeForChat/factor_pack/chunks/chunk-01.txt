@@ -2,7 +2,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, factor.py, scorer.py, .github/workflows/weekly-report.yml, documents/README.md, documents/factor_design.md
-# 作成日時: 2025-09-24 19:35:14 (JST)
+# 作成日時: 2025-09-24 20:31:36 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -269,67 +269,66 @@ L228     out = [f"{m} ×{n}" if n > 1 else m for m, n in cnt.most_common()]
 L229     return out[:max_items]
 L230
 L231
-L232 def compact_missing_lines(missing_df, limit=300):
-L233     if missing_df is None or getattr(missing_df, "empty", True):
-L234         return []
-L235
-L236     df = missing_df.copy()
-L237     if "ticker" not in df.columns:
-L238         df = df.reset_index().rename(columns={"index": "ticker"})
-L239
-L240     out: list[str] = []
-L241     for _, r in df.iterrows():
-L242         tags: list[str] = []
-L243         if bool(r.get("EPS_missing", False)):
-L244             tags.append("eps")
-L245         if bool(r.get("REV_missing", False)):
-L246             tags.append("rev")
-L247         if tags:
-L248             ticker = r.get("ticker")
-L249             if pd.isna(ticker) or ticker is None:
-L250                 ticker = "(unknown)"
-L251             else:
-L252                 ticker = str(ticker)
-L253             out.append(f"{ticker} : {', '.join(tags)}")
-L254         if len(out) >= limit:
-L255             out.append("...")
-L256             break
-L257
-L258     return out
-L259
-L260 # === 共通ユーティリティ（複数クラスで使用） ===
-L261 # (unused local utils removed – use scorer.py versions if needed)
-L262
-L263 def _build_missing_logs_after_impute(eps_df: pd.DataFrame) -> pd.DataFrame:
-L264     df = eps_df.copy()
-L265     required_cols = [
-L266         "EPS_TTM",
-L267         "EPS_Q_LastQ",
-L268         "EPS_A_LATEST",
-L269         "REV_TTM",
-L270         "REV_Q_LastQ",
-L271         "REV_A_LATEST",
-L272     ]
-L273     for col in required_cols:
-L274         if col not in df.columns:
-L275             df[col] = np.nan
-L276
-L277     miss_eps = df["EPS_TTM"].isna() & df["EPS_Q_LastQ"].isna() & df["EPS_A_LATEST"].isna()
-L278     miss_rev = df["REV_TTM"].isna() & df["REV_Q_LastQ"].isna() & df["REV_A_LATEST"].isna()
+L232 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
+L233
+L234 def _post_slack(payload: dict):
+L235     url = os.getenv("SLACK_WEBHOOK_URL")
+L236     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
+L237     try:
+L238         requests.post(url, json=payload).raise_for_status()
+L239     except Exception as e:
+L240         print(f"⚠️ Slack通知エラー: {e}")
+L241
+L242 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
+L243     """Slackへテキストを分割送信（コードブロック形式）。"""
+L244
+L245     def _post_text(payload: str) -> None:
+L246         try:
+L247             resp = requests.post(url, json={"text": payload})
+L248             print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
+L249             if resp is not None:
+L250                 resp.raise_for_status()
+L251         except Exception as e:
+L252             print(f"[ERR] debug_post_failed: {e}")
+L253
+L254     body = (text or "").strip()
+L255     if not body:
+L256         print("[DBG] skip debug send: empty body")
+L257         return
+L258
+L259     block, block_len = [], 0
+L260
+L261     def _flush():
+L262         nonlocal block, block_len
+L263         if block:
+L264             _post_text("```" + "\n".join(block) + "```")
+L265             block, block_len = [], 0
+L266
+L267     for raw in body.splitlines():
+L268         line = raw or ""
+L269         while len(line) > chunk:
+L270             head, line = line[:chunk], line[chunk:]
+L271             _flush()
+L272             _post_text("```" + head + "```")
+L273         add_len = len(line) if not block else len(line) + 1
+L274         if block and block_len + add_len > chunk:
+L275             _flush(); add_len = len(line)
+L276         block.append(line)
+L277         block_len += add_len
+L278     _flush()
 L279
-L280     rows: list[dict] = []
-L281     for ticker, row in df.iterrows():
-L282         eps_missing = bool(miss_eps.loc[ticker])
-L283         rev_missing = bool(miss_rev.loc[ticker])
-L284         if not (eps_missing or rev_missing):
+L280 def _disjoint_keepG(top_G, top_D, poolD):
+L281     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
+L282     used, D, i = set(top_G), list(top_D), 0
+L283     for j, t in enumerate(D):
+L284         if t not in used:
 L285             continue
-L286         rows.append({
-L287             "ticker": ticker,
-L288             "EPS_missing": eps_missing,
-L289             "REV_missing": rev_missing,
-L290             "eps_imputed": bool(row.get("eps_imputed", False)),
-L291             "EPS_TTM": row.get("EPS_TTM"),
-L292             "EPS_Q_LastQ": row.get("EPS_Q_LastQ"),
-L293             "EPS_A_LATEST": row.get("EPS_A_LATEST"),
-L294             
+L286         while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
+L287             i += 1
+L288         if i < len(poolD):
+L289             D[j] = poolD[i]; used.add(D[j]); i += 1
+L290     return top_G, D
+L291
+L292
+L293 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[s
 ```

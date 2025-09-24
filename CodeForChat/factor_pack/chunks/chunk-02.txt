@@ -1,293 +1,280 @@
 ```text
-"REV_TTM": row.get("REV_TTM"),
-L295             "REV_Q_LastQ": row.get("REV_Q_LastQ"),
-L296             "REV_A_LATEST": row.get("REV_A_LATEST"),
-L297         })
-L298
-L299     if not rows:
-L300         return pd.DataFrame(
-L301             columns=[
-L302                 "ticker",
-L303                 "EPS_missing",
-L304                 "REV_missing",
-L305                 "eps_imputed",
-L306                 "EPS_TTM",
-L307                 "EPS_Q_LastQ",
-L308                 "EPS_A_LATEST",
-L309                 "REV_TTM",
-L310                 "REV_Q_LastQ",
-L311                 "REV_A_LATEST",
-L312             ]
-L313         )
-L314
-L315     return pd.DataFrame(rows)
-L316
-L317 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
-L318
-L319 def _post_slack(payload: dict):
-L320     url = os.getenv("SLACK_WEBHOOK_URL")
-L321     if not url: print("⚠️ SLACK_WEBHOOK_URL 未設定"); return
-L322     try:
-L323         requests.post(url, json=payload).raise_for_status()
-L324     except Exception as e:
-L325         print(f"⚠️ Slack通知エラー: {e}")
+tr],
+L294                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
+L295     import pandas as pd, numpy as np
+L296     sel = list(pick)
+L297     if not sel: return sel
+L298     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
+L299     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
+L300     std = agg.std()
+L301     sigma = float(std) if pd.notna(std) else 0.0
+L302     thresh = kth - delta_z * sigma
+L303     ranked_all = agg.sort_values(ascending=False)
+L304     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
+L305     for t in cand:
+L306         within_score = pd.notna(agg[t]) and agg[t] >= thresh
+L307         within_rank = t in ranked_all.index and ranked_all.index.get_loc(t) < n_target + keep_buffer
+L308         if not (within_score or within_rank):
+L309             continue
+L310         non_inc = [x for x in sel if x not in incumbents]
+L311         if not non_inc:
+L312             break
+L313         weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
+L314         if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
+L315             sel.remove(weakest); sel.append(t)
+L316     if len(sel) > n_target:
+L317         sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
+L318     return sel
+L319
+L320
+L321 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
+L322 class Input:
+L323     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
+L324         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
+L325         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
 L326
-L327 def _slack_send_text_chunks(url: str, text: str, chunk: int = 2800) -> None:
-L328     """Slackへテキストを分割送信（コードブロック形式）。"""
-L329
-L330     def _post_text(payload: str) -> None:
-L331         try:
-L332             resp = requests.post(url, json={"text": payload})
-L333             print(f"[DBG] debug_post status={getattr(resp,'status_code',None)} size={len(payload)}")
-L334             if resp is not None:
-L335                 resp.raise_for_status()
-L336         except Exception as e:
-L337             print(f"[ERR] debug_post_failed: {e}")
-L338
-L339     body = (text or "").strip()
-L340     if not body:
-L341         print("[DBG] skip debug send: empty body")
-L342         return
-L343
-L344     block, block_len = [], 0
-L345
-L346     def _flush():
-L347         nonlocal block, block_len
-L348         if block:
-L349             _post_text("```" + "\n".join(block) + "```")
-L350             block, block_len = [], 0
-L351
-L352     for raw in body.splitlines():
-L353         line = raw or ""
-L354         while len(line) > chunk:
-L355             head, line = line[:chunk], line[chunk:]
-L356             _flush()
-L357             _post_text("```" + head + "```")
-L358         add_len = len(line) if not block else len(line) + 1
-L359         if block and block_len + add_len > chunk:
-L360             _flush(); add_len = len(line)
-L361         block.append(line)
-L362         block_len += add_len
-L363     _flush()
-L364
-L365 def _disjoint_keepG(top_G, top_D, poolD):
-L366     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
-L367     used, D, i = set(top_G), list(top_D), 0
-L368     for j, t in enumerate(D):
-L369         if t not in used:
-L370             continue
-L371         while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
-L372             i += 1
-L373         if i < len(poolD):
-L374             D[j] = poolD[i]; used.add(D[j]); i += 1
-L375     return top_G, D
-L376
-L377
-L378 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
-L379                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
-L380     import pandas as pd, numpy as np
-L381     sel = list(pick)
-L382     if not sel: return sel
-L383     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
-L384     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
-L385     std = agg.std()
-L386     sigma = float(std) if pd.notna(std) else 0.0
-L387     thresh = kth - delta_z * sigma
-L388     ranked_all = agg.sort_values(ascending=False)
-L389     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
-L390     for t in cand:
-L391         within_score = pd.notna(agg[t]) and agg[t] >= thresh
-L392         within_rank = t in ranked_all.index and ranked_all.index.get_loc(t) < n_target + keep_buffer
-L393         if not (within_score or within_rank):
-L394             continue
-L395         non_inc = [x for x in sel if x not in incumbents]
-L396         if not non_inc:
-L397             break
-L398         weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
-L399         if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
-L400             sel.remove(weakest); sel.append(t)
-L401     if len(sel) > n_target:
-L402         sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
-L403     return sel
-L404
-L405
-L406 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
-L407 class Input:
-L408     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
-L409         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
-L410         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
-L411
-L412     # ---- （Input専用）EPS補完・FCF算出系 ----
+L327     # ---- （Input専用）EPS補完・FCF算出系 ----
+L328     @staticmethod
+L329     def _sec_headers():
+L330         mail = (os.getenv("SEC_CONTACT_EMAIL") or os.getenv("SEC_EMAIL") or "").strip()
+L331         ua = f"factor-selection/1 (+mailto:{mail})" if mail else "factor-selection/1"
+L332         headers = {"User-Agent": ua[:200], "Accept": "application/json"}
+L333         if mail:
+L334             headers["From"] = mail[:200]
+L335         return headers
+L336
+L337     @staticmethod
+L338     def _sec_get(url: str, retries: int = 3, backoff: float = 0.5):
+L339         for i in range(retries):
+L340             r = requests.get(url, headers=Input._sec_headers(), timeout=20)
+L341             if r.status_code in (429, 503, 403):
+L342                 time.sleep(min(2 ** i * backoff, 8.0))
+L343                 continue
+L344             r.raise_for_status(); return r.json()
+L345         r.raise_for_status()
+L346
+L347     @staticmethod
+L348     def _sec_ticker_map():
+L349         import requests
+L350
+L351         url_primary = "https://data.sec.gov/api/xbrl/company_tickers.json"
+L352         url_fallback = "https://www.sec.gov/files/company_tickers.json"
+L353         mp = {}
+L354         try:
+L355             j = Input._sec_get(url_primary)  # 既存の堅牢GET（リトライ・バックオフ）
+L356         except Exception:
+L357             r = requests.get(url_fallback, headers=Input._sec_headers(), timeout=20)
+L358             r.raise_for_status()
+L359             j = r.json()
+L360         # 形状A: {"0": {"ticker":..., "cik_str":...}, ...}
+L361         if isinstance(j, dict) and "0" in j:
+L362             for _, v in (j or {}).items():
+L363                 try:
+L364                     mp[str(v["ticker"]).upper()] = f"{int(v['cik_str']):010d}"
+L365                 except Exception:
+L366                     pass
+L367         # 形状B: [{"ticker":..., "cik_str":...}, ...]
+L368         elif isinstance(j, list):
+L369             for v in j:
+L370                 try:
+L371                     mp[str(v.get("ticker")).upper()] = f"{int(v.get('cik_str')):010d}"
+L372                 except Exception:
+L373                     pass
+L374         # 形状C: {"data":[[idx,ticker,title,cik_str],...]}
+L375         elif isinstance(j, dict) and "data" in j:
+L376             for row in j.get("data") or []:
+L377                 try:
+L378                     t = str(row[1]).upper()
+L379                     c = int(row[3])
+L380                     mp[t] = f"{c:010d}"
+L381                 except Exception:
+L382                     pass
+L383         return mp
+L384
+L385     # --- 追加: ADR/OTC向けの簡易正規化（末尾Y/F, ドット等） ---
+L386     @staticmethod
+L387     def _normalize_ticker(sym: str) -> list[str]:
+L388         s = (sym or "").upper().strip()
+L389         # 追加: 先頭の$や全角の記号を除去
+L390         s = s.lstrip("$").replace("＄", "").replace("．", ".").replace("－", "-")
+L391         cand: list[str] = []
+L392
+L393         def add(x: str) -> None:
+L394             if x and x not in cand:
+L395                 cand.append(x)
+L396
+L397         # 1) 原文を最優先（SECは BRK.B, BF.B など . を正式採用）
+L398         add(s)
+L399         # 2) Yahoo系バリアント（. と - の揺れを相互に）
+L400         if "." in s:
+L401             add(s.replace(".", "-"))
+L402             add(s.replace(".", ""))
+L403         if "-" in s:
+L404             add(s.replace("-", "."))
+L405             add(s.replace("-", ""))
+L406         # 3) ドット・ハイフン・ピリオド無し版（最後の保険）
+L407         add(s.replace("-", "").replace(".", ""))
+L408         # 4) ADR簡易：末尾Y/Fの除去（SECマップは本体ティッカーを持つことがある）
+L409         if len(s) >= 2 and s[-1] in {"Y", "F"}:
+L410             add(s[:-1])
+L411         return cand
+L412
 L413     @staticmethod
-L414     def _sec_headers():
-L415         mail = (os.getenv("SEC_CONTACT_EMAIL") or "yasonba55@gmail.com").strip()
-L416         app = (os.getenv("SEC_APP_NAME") or "FactorBot/1.0").strip()
-L417         return {"User-Agent": f"{app} ({mail})", "From": mail, "Accept": "application/json"}
-L418
-L419     @staticmethod
-L420     def _sec_get(url: str, retries: int = 3, backoff: float = 0.5):
-L421         for i in range(retries):
-L422             r = requests.get(url, headers=Input._sec_headers(), timeout=20)
-L423             if r.status_code in (429, 503, 403):
-L424                 time.sleep(min(2 ** i * backoff, 8.0))
-L425                 continue
-L426             r.raise_for_status(); return r.json()
-L427         r.raise_for_status()
-L428
-L429     @staticmethod
-L430     def _sec_ticker_map():
-L431         import requests
-L432
-L433         url_primary = "https://data.sec.gov/api/xbrl/company_tickers.json"
-L434         url_fallback = "https://www.sec.gov/files/company_tickers.json"
-L435         mp = {}
-L436         try:
-L437             j = Input._sec_get(url_primary)  # 既存の堅牢GET（リトライ・バックオフ）
-L438         except Exception:
-L439             r = requests.get(url_fallback, headers=Input._sec_headers(), timeout=20)
-L440             r.raise_for_status()
-L441             j = r.json()
-L442         # 形状A: {"0": {"ticker":..., "cik_str":...}, ...}
-L443         if isinstance(j, dict) and "0" in j:
-L444             for _, v in (j or {}).items():
-L445                 try:
-L446                     mp[str(v["ticker"]).upper()] = f"{int(v['cik_str']):010d}"
-L447                 except Exception:
-L448                     pass
-L449         # 形状B: [{"ticker":..., "cik_str":...}, ...]
-L450         elif isinstance(j, list):
-L451             for v in j:
-L452                 try:
-L453                     mp[str(v.get("ticker")).upper()] = f"{int(v.get('cik_str')):010d}"
-L454                 except Exception:
-L455                     pass
-L456         # 形状C: {"data":[[idx,ticker,title,cik_str],...]}
-L457         elif isinstance(j, dict) and "data" in j:
-L458             for row in j.get("data") or []:
-L459                 try:
-L460                     t = str(row[1]).upper()
-L461                     c = int(row[3])
-L462                     mp[t] = f"{c:010d}"
-L463                 except Exception:
-L464                     pass
-L465         return mp
-L466
-L467     # --- 追加: ADR/OTC向けの簡易正規化（末尾Y/F, ドット等） ---
-L468     @staticmethod
-L469     def _normalize_ticker(sym: str) -> list[str]:
-L470         s = (sym or "").upper().strip()
-L471         # 追加: 先頭の$や全角の記号を除去
-L472         s = s.lstrip("$").replace("＄", "").replace("．", ".").replace("－", "-")
-L473         cand: list[str] = []
-L474
-L475         def add(x: str) -> None:
-L476             if x and x not in cand:
-L477                 cand.append(x)
+L414     def _sec_companyfacts(cik: str):
+L415         return Input._sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
+L416
+L417     @staticmethod
+L418     def _units_for_tags(facts: dict, namespaces: list[str], tags: list[str]) -> list[dict]:
+L419         """facts から namespace/tag を横断して units 配列を収集（存在順に連結）。"""
+L420         out: list[dict] = []
+L421         facts = (facts or {}).get("facts", {})
+L422         for ns in namespaces:
+L423             node = facts.get(ns, {}) if isinstance(facts, dict) else {}
+L424             for tg in tags:
+L425                 try:
+L426                     units = node[tg]["units"]
+L427                 except Exception:
+L428                     continue
+L429                 picks: list[dict] = []
+L430                 if "USD/shares" in units:
+L431                     picks.extend(list(units["USD/shares"]))
+L432                 if "USD" in units:
+L433                     picks.extend(list(units["USD"]))
+L434                 if not picks:
+L435                     for arr in units.values():
+L436                         picks.extend(list(arr))
+L437                 out.extend(picks)
+L438         return out
+L439
+L440     @staticmethod
+L441     def _only_quarterly(arr: list[dict]) -> list[dict]:
+L442         """companyfactsの混在配列から『四半期』だけを抽出。
+L443
+L444         - frame に "Q" を含む（例: CY2024Q2I）
+L445         - fp が Q1/Q2/Q3/Q4
+L446         - form が 10-Q/10-Q/A/6-K
+L447         """
+L448         if not arr:
+L449             return []
+L450         q_forms = {"10-Q", "10-Q/A", "6-K"}
+L451         out = [
+L452             x
+L453             for x in arr
+L454             if (
+L455                 "Q" in (x.get("frame") or "").upper()
+L456                 or (x.get("fp") or "").upper() in {"Q1", "Q2", "Q3", "Q4"}
+L457                 or (x.get("form") or "").upper() in q_forms
+L458             )
+L459         ]
+L460         out.sort(key=lambda x: (x.get("end") or ""), reverse=True)
+L461         return out
+L462
+L463     @staticmethod
+L464     def _series_from_facts_with_dates(arr, key_val="val", key_dt="end", normalize=float):
+L465         """companyfactsアイテム配列から (date,value) を返す。dateはYYYY-MM-DDを想定。"""
+L466         out: List[Tuple[str, float]] = []
+L467         for x in (arr or []):
+L468             try:
+L469                 d = x.get(key_dt)
+L470                 if d is None:
+L471                     continue
+L472                 v = x.get(key_val)
+L473                 out.append((str(d), normalize(v) if v is not None else float("nan")))
+L474             except Exception:
+L475                 continue
+L476         out.sort(key=lambda t: t[0], reverse=True)
+L477         return out
 L478
-L479         # 1) 原文を最優先（SECは BRK.B, BF.B など . を正式採用）
-L480         add(s)
-L481         # 2) Yahoo系バリアント（. と - の揺れを相互に）
-L482         if "." in s:
-L483             add(s.replace(".", "-"))
-L484             add(s.replace(".", ""))
-L485         if "-" in s:
-L486             add(s.replace("-", "."))
-L487             add(s.replace("-", ""))
-L488         # 3) ドット・ハイフン・ピリオド無し版（最後の保険）
-L489         add(s.replace("-", "").replace(".", ""))
-L490         # 4) ADR簡易：末尾Y/Fの除去（SECマップは本体ティッカーを持つことがある）
-L491         if len(s) >= 2 and s[-1] in {"Y", "F"}:
-L492             add(s[:-1])
-L493         return cand
-L494
-L495     @staticmethod
-L496     def _sec_companyfacts(cik: str):
-L497         return Input._sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json")
-L498
-L499     @staticmethod
-L500     def _units_for_tags(facts: dict, namespaces: list[str], tags: list[str]) -> list[dict]:
-L501         """facts から namespace/tag を横断して units 配列を収集（存在順に連結）。"""
-L502         out: list[dict] = []
-L503         facts = (facts or {}).get("facts", {})
-L504         for ns in namespaces:
-L505             node = facts.get(ns, {}) if isinstance(facts, dict) else {}
-L506             for tg in tags:
-L507                 try:
-L508                     units = node[tg]["units"]
-L509                 except Exception:
-L510                     continue
-L511                 picks: list[dict] = []
-L512                 if "USD/shares" in units:
-L513                     picks.extend(list(units["USD/shares"]))
-L514                 if "USD" in units:
-L515                     picks.extend(list(units["USD"]))
-L516                 if not picks:
-L517                     for arr in units.values():
-L518                         picks.extend(list(arr))
-L519                 out.extend(picks)
-L520         return out
-L521
-L522     @staticmethod
-L523     def _only_quarterly(arr: list[dict]) -> list[dict]:
-L524         """companyfactsの混在配列から『四半期』だけを抽出。
-L525
-L526         - frame に "Q" を含む（例: CY2024Q2I）
-L527         - fp が Q1/Q2/Q3/Q4
-L528         - form が 10-Q/10-Q/A/6-K
-L529         """
-L530         if not arr:
-L531             return []
-L532         q_forms = {"10-Q", "10-Q/A", "6-K"}
-L533         out = [
-L534             x
-L535             for x in arr
-L536             if (
-L537                 "Q" in (x.get("frame") or "").upper()
-L538                 or (x.get("fp") or "").upper() in {"Q1", "Q2", "Q3", "Q4"}
-L539                 or (x.get("form") or "").upper() in q_forms
-L540             )
-L541         ]
-L542         out.sort(key=lambda x: (x.get("end") or ""), reverse=True)
-L543         return out
-L544
-L545     @staticmethod
-L546     def _series_from_facts_with_dates(arr, key_val="val", key_dt="end", normalize=float):
-L547         """companyfactsアイテム配列から (date,value) を返す。dateはYYYY-MM-DDを想定。"""
-L548         out: List[Tuple[str, float]] = []
-L549         for x in (arr or []):
-L550             try:
-L551                 d = x.get(key_dt)
-L552                 if d is None:
-L553                     continue
-L554                 v = x.get(key_val)
-L555                 out.append((str(d), normalize(v) if v is not None else float("nan")))
-L556             except Exception:
-L557                 continue
-L558         out.sort(key=lambda t: t[0], reverse=True)
-L559         return out
-L560
-L561     def _series_q_and_a(self, facts: list[dict]) -> tuple[list[Tuple[str, float]], list[Tuple[str, float]]]:
-L562         """四半期・年次の両seriesを抽出して返す（formで簡易判定）。"""
-L563         if not facts:
-L564             return [], []
-L565         q_items = self._only_quarterly(list(facts))
-L566         annual_forms = {"10-K", "10-K/A", "20-F", "20-F/A"}
-L567         a_items = [x for x in facts if str((x or {}).get("form", "")).upper() in annual_forms]
-L568         a_items.sort(key=lambda x: (x.get("end") or ""), reverse=True)
-L569         return self._series_from_facts_with_dates(q_items), self._series_from_facts_with_dates(a_items)
-L570
-L571     @staticmethod
-L572     def _ttm_from_q_or_a(q_vals: list[float], a_vals: list[float]) -> float:
-L573         """四半期TTM（4本合算）を優先し、欠損時は年次値で補完。"""
-L574         import math
-L575
-L576         def _clean(vals: list[float]) -> list[float]:
-L577             out: list[float] = []
-L578             for v in vals:
-L579                 try:
-L580                     f = float(v)
-L581                 except Exception:
-L582                     continue
-L583                 if math.isfinite(f):
-
+L479     def _series_q_and_a(self, facts: list[dict]) -> tuple[list[Tuple[str, float]], list[Tuple[str, float]]]:
+L480         """四半期・年次の両seriesを抽出して返す（formで簡易判定）。"""
+L481         if not facts:
+L482             return [], []
+L483         q_items = self._only_quarterly(list(facts))
+L484         annual_forms = {"10-K", "10-K/A", "20-F", "20-F/A"}
+L485         a_items = [x for x in facts if str((x or {}).get("form", "")).upper() in annual_forms]
+L486         a_items.sort(key=lambda x: (x.get("end") or ""), reverse=True)
+L487         return self._series_from_facts_with_dates(q_items), self._series_from_facts_with_dates(a_items)
+L488
+L489     @staticmethod
+L490     def _ttm_from_q_or_a(q_vals: list[float], a_vals: list[float]) -> float:
+L491         """四半期TTM（4本合算）を優先し、欠損時は年次値で補完。"""
+L492         import math
+L493
+L494         def _clean(vals: list[float]) -> list[float]:
+L495             out: list[float] = []
+L496             for v in vals:
+L497                 try:
+L498                     f = float(v)
+L499                 except Exception:
+L500                     continue
+L501                 if math.isfinite(f):
+L502                     out.append(f)
+L503                 else:
+L504                     out.append(float("nan"))
+L505             return out
+L506
+L507         def _sum4(vs: list[float]) -> float:
+L508             filtered = [v for v in vs[:4] if v == v]
+L509             if len(filtered) >= 2:
+L510                 return float(sum(filtered))
+L511             if len(filtered) == 1:
+L512                 return float(filtered[0])
+L513             return float("nan")
+L514
+L515         q_clean = _clean(q_vals or [])
+L516         ttm_q = _sum4(q_clean)
+L517         if ttm_q == ttm_q:
+L518             return ttm_q
+L519         for v in _clean(a_vals or []):
+L520             if v == v:
+L521                 return float(v)
+L522         return float("nan")
+L523
+L524     def fetch_eps_rev_from_sec(self, tickers: list[str]) -> dict:
+L525         out = {}
+L526         t2cik = self._sec_ticker_map()
+L527         n_map = n_rev = n_eps = 0
+L528         miss_map: list[str] = []
+L529         miss_facts: list[str] = []
+L530         for t in tickers:
+L531             base = (t or "").upper()
+L532             candidates: list[str] = []
+L533             for key in [base, *self._normalize_ticker(t)]:
+L534                 if key and key not in candidates:
+L535                     candidates.append(key)
+L536             cik = next((t2cik.get(key) for key in candidates if t2cik.get(key)), None)
+L537             if not cik:
+L538                 out[t] = {}
+L539                 miss_map.append(t)
+L540                 continue
+L541             try:
+L542                 j = self._sec_companyfacts(cik)
+L543                 facts = j or {}
+L544                 rev_tags = [
+L545                     "Revenues",
+L546                     "RevenueFromContractWithCustomerExcludingAssessedTax",
+L547                     "SalesRevenueNet",
+L548                     "SalesRevenueGoodsNet",
+L549                     "SalesRevenueServicesNet",
+L550                     "Revenue",
+L551                 ]
+L552                 eps_tags = [
+L553                     "EarningsPerShareDiluted",
+L554                     "EarningsPerShareBasicAndDiluted",
+L555                     "EarningsPerShare",
+L556                     "EarningsPerShareBasic",
+L557                 ]
+L558                 rev_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], rev_tags)
+L559                 eps_arr = self._units_for_tags(facts, ["us-gaap", "ifrs-full"], eps_tags)
+L560                 rev_q_pairs, rev_a_pairs = self._series_q_and_a(rev_arr)
+L561                 eps_q_pairs, eps_a_pairs = self._series_q_and_a(eps_arr)
+L562
+L563                 rev_q_pairs = rev_q_pairs[:12]
+L564                 eps_q_pairs = eps_q_pairs[:12]
+L565                 rev_a_pairs = rev_a_pairs[:6]
+L566                 eps_a_pairs = eps_a_pairs[:6]
+L567
+L568                 def _vals(pairs: list[tuple[str, float]]) -> list[float]:
+L569                     vals: list[float] = []
+L57
 ```
