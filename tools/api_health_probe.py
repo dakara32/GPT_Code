@@ -93,6 +93,9 @@ def _autodiscover_csv() -> tuple[str|None, str|None]:
 def _fmt_ms(ms: int) -> str:
     return f"{ms}ms" if ms < 1000 else f"{ms/1000:.2f}s"
 
+def _latency_icon(ms: int) -> str:
+    return "🐢" if ms >= TIMEOUT_MS_WARN else "✅"
+
 # ==== SEC helpers
 def _sec_headers():
     """
@@ -188,11 +191,12 @@ def yf_price_health(tickers: List[str]) -> Tuple[str, Dict]:
         else: ok.append(t)
 
     ms = _now_ms()-t0
-    level = "HEALTHY" if len(ok)==len(tickers) else ("DEGRADED" if len(ok)>=len(tickers)//2 else "DOWN")
-    slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
-    det = f"YF_PRICE:{level} ok={len(ok)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}"
+    total = len(tickers)
+    bad = list(dict.fromkeys([*nf, *missing]))
+    level = "HEALTHY" if not bad else ("DOWN" if total > 0 and len(bad) >= total else "DEGRADED")
+    det = f"YF_PRICE:{level} bad={len(bad)}/{total} latency={_fmt_ms(ms)} {_latency_icon(ms)}"
     meta = {"level":level,"latency_ms":ms,"ok":ok,"nf":nf,"missing":missing,
-            "per_ticker_missing":per_ticker_missing,"alias_fixed":alias_fixed}
+            "per_ticker_missing":per_ticker_missing,"alias_fixed":alias_fixed,"bad":bad}
     return det, meta
 
 # ==== YF: fast_info health
@@ -206,11 +210,10 @@ def yf_fastinfo_health(tickers: List[str]) -> Tuple[str, Dict]:
             if v is None or (isinstance(v,float) and math.isnan(v)): bad.append(t)
         except Exception: bad.append(t)
     ms=_now_ms()-t0
-    level = "HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-    slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
-    return f"YF_INFO:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
-        "level":level,"latency_ms":ms,"bad":bad
-    }
+    total=len(tickers)
+    level = "HEALTHY" if not bad else ("DOWN" if total > 0 and len(bad) >= total else "DEGRADED")
+    det = f"YF_INFO:{level} bad={len(bad)}/{total} latency={_fmt_ms(ms)} {_latency_icon(ms)}"
+    return det, {"level":level,"latency_ms":ms,"bad":bad}
 
 # ==== YF: financials health (CFO/Capex/FCF)
 _CF_ALIASES = {"cfo":["Operating Cash Flow","Total Cash From Operating Activities"],
@@ -250,11 +253,10 @@ def yf_financials_health(tickers: List[str]) -> Tuple[str, Dict]:
         for r in ex.map(one, tickers):
             if r: bad.append(r)
     ms=_now_ms()-t0
-    level = "HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-    slow = " SLOW" if ms>=TIMEOUT_MS_WARN else ""
-    return f"YF_FIN:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}", {
-        "level":level,"latency_ms":ms,"bad":bad
-    }
+    total=len(tickers)
+    level = "HEALTHY" if not bad else ("DOWN" if total > 0 and len(bad) >= total else "DEGRADED")
+    det = f"YF_FIN:{level} bad={len(bad)}/{total} latency={_fmt_ms(ms)} {_latency_icon(ms)}"
+    return det, {"level":level,"latency_ms":ms,"bad":bad}
 
 # ==== Finnhub: cash-flow fallback
 _FINN_CFO_KEYS   = ["netCashProvidedByOperatingActivities","netCashFromOperatingActivities","cashFlowFromOperatingActivities","operatingCashFlow"]
@@ -270,7 +272,8 @@ def _finn_get(session: requests.Session, url: str, params: dict, retries: int=3,
 
 def finnhub_health(tickers: List[str]) -> Tuple[str, Dict]:
     if not FINN_KEY:
-        return "FINNHUB:SKIPPED (no key)", dict(level="SKIPPED",bad=[])
+        det = f"FINNHUB:SKIPPED bad=0/{len(tickers)} latency=0ms {_latency_icon(0)} (no key)"
+        return det, dict(level="SKIPPED",bad=[],latency_ms=0)
     t0=_now_ms(); base="https://finnhub.io/api/v1"; s=requests.Session(); bad=[]
     for sym in tickers:
         try:
@@ -297,11 +300,10 @@ def finnhub_health(tickers: List[str]) -> Tuple[str, Dict]:
             if cfo_ttm is None or cap_ttm is None: bad.append(sym)
         except Exception: bad.append(sym)
     ms=_now_ms()-t0
-    level="HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-    slow=" SLOW" if ms>=TIMEOUT_MS_WARN else ""
-    return f"FINNHUB:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}",{
-        "level":level,"latency_ms":ms,"bad":bad
-    }
+    total=len(tickers)
+    level="HEALTHY" if not bad else ("DOWN" if total>0 and len(bad)>=total else "DEGRADED")
+    det = f"FINNHUB:{level} bad={len(bad)}/{total} latency={_fmt_ms(ms)} {_latency_icon(ms)}"
+    return det,{"level":level,"latency_ms":ms,"bad":bad}
 
 # ==== SEC: companyfacts (Revenue/EPS) health
 SEC_REV_TAGS=["Revenues","RevenueFromContractWithCustomerExcludingAssessedTax","SalesRevenueNet","SalesRevenueGoodsNet","SalesRevenueServicesNet","Revenue"]
@@ -334,7 +336,7 @@ def sec_health(tickers: List[str]) -> Tuple[str, Dict]:
     t0=_now_ms(); t2cik=_sec_ticker_map(); bad=[]
     if not t2cik:
         ms=_now_ms()-t0
-        det = f"SEC:SKIPPED (no SEC_CONTACT_EMAIL/403) latency={_fmt_ms(ms)}"
+        det = f"SEC:SKIPPED bad=0/{len(tickers)} latency={_fmt_ms(ms)} {_latency_icon(ms)} (no SEC_CONTACT_EMAIL/403)"
         return det, {"level":"SKIPPED","latency_ms":ms,"bad":[]}
     for t in tickers:
         # '.'と'-'のゆらぎを許容した簡易マッチ
@@ -352,11 +354,10 @@ def sec_health(tickers: List[str]) -> Tuple[str, Dict]:
         except Exception: bad.append(t)
         time.sleep(0.30)
     ms=_now_ms()-t0
-    level="HEALTHY" if not bad else ("DEGRADED" if len(bad)<=len(tickers)//2 else "DOWN")
-    slow=" SLOW" if ms>=TIMEOUT_MS_WARN else ""
-    return f"SEC:{level} bad={len(bad)}/{len(tickers)} latency={_fmt_ms(ms)}{slow}",{
-        "level":level,"latency_ms":ms,"bad":bad
-    }
+    total=len(tickers)
+    level="HEALTHY" if not bad else ("DOWN" if total>0 and len(bad)>=total else "DEGRADED")
+    det = f"SEC:{level} bad={len(bad)}/{total} latency={_fmt_ms(ms)} {_latency_icon(ms)}"
+    return det,{"level":level,"latency_ms":ms,"bad":bad}
 
 # ==== Orchestration
 def main():
@@ -414,44 +415,53 @@ def main():
     except Exception:
         pass
 
-    # 各APIのアイコン付与
+    LABELS = {
+        "YF_PRICE": "price",
+        "YF_INFO": "fast_info",
+        "YF_FIN": "financials (CFO/Capex/FCF)",
+        "FINNHUB": "cash-flow (fallback)",
+        "SEC": "companyfacts (revenue/eps)",
+    }
+
     def icon_for(level: str) -> str:
         return {"HEALTHY":"✅","DEGRADED":"⚠️","DOWN":"🛑","SKIPPED":"⏭️"}.get(level, "ℹ️")
-    det_price = f"{icon_for(levels_map['YF_PRICE'])} {det_price}"
-    det_info  = f"{icon_for(levels_map['YF_INFO' ])} {det_info}"
-    det_fin   = f"{icon_for(levels_map['YF_FIN'  ])} {det_fin}"
-    det_sec   = f"{icon_for(levels_map['SEC'     ])} {det_sec}"
-    det_finn  = f"{icon_for(levels_map['FINNHUB' ])} {det_finn}"
 
-    # ステータス行は「見出し→改行→メトリクス」形式に整形
-    def _fmt_block(s: str, key: str) -> str:
-        # 例: "⚠️ YF_PRICE:DEGRADED ok=..." -> "⚠️ YF_PRICE:\nDEGRADED ok=..."
-        return s.replace(f"{key}:", f"{key}:\n", 1)
-    status_lines = [
-        f"{emoji} API_HEALTH {worst}{outage_note} (exit_on={EXIT_ON_LEVEL})",
-        _fmt_block(det_price, "YF_PRICE"),
-        _fmt_block(det_info, "YF_INFO"),
-        _fmt_block(det_fin, "YF_FIN"),
-        _fmt_block(det_sec, "SEC"),
-        _fmt_block(det_finn, "FINNHUB"),
+    def _fmt_block(detail: str, key: str) -> str:
+        _, _, metrics = detail.partition(":")
+        metrics = metrics.lstrip()
+        heading = f"{icon_for(levels_map.get(key, ''))} {key}"
+        label = LABELS.get(key)
+        if label:
+            heading += f" ({label})"
+        return f"{heading}:\n{metrics}"
+
+    status_order = [
+        ("YF_PRICE", det_price),
+        ("YF_INFO", det_info),
+        ("YF_FIN", det_fin),
+        ("FINNHUB", det_finn),
+        ("SEC", det_sec),
     ]
+
+    status_lines = [f"{emoji} API_HEALTH {worst}{outage_note} (exit_on={EXIT_ON_LEVEL})"]
+    status_lines.extend(_fmt_block(detail, key) for key, detail in status_order)
     summary = "\n".join(status_lines)
     has_problem=("DEGRADED" in worst) or ("DOWN" in worst)
 
     if has_problem:
         def all_list(xs): return ", ".join(xs)
         lines=[]
-        if meta_price["missing"] or meta_price["nf"]:
-            xs=[*meta_price["nf"],*meta_price["missing"]]
-            lines.append("🆖YF_PRICE NG:\n" + all_list(xs))
-        if meta_info["bad"]:
+        price_bad = meta_price.get("bad") or []
+        if price_bad:
+            lines.append("🆖YF_PRICE NG:\n" + all_list(price_bad))
+        if meta_info.get("bad"):
             lines.append("🆖YF_INFO NG:\n" + all_list(meta_info["bad"]))
-        if meta_fin["bad"]:
+        if meta_fin.get("bad"):
             lines.append("🆖YF_FIN NG:\n" + all_list(meta_fin["bad"]))
-        if meta_sec["bad"]:
-            lines.append("🆖SEC NG:\n" + all_list(meta_sec["bad"]))
         if meta_finn.get("bad"):
             lines.append("🆖FINNHUB NG:\n" + all_list(meta_finn["bad"]))
+        if meta_sec.get("bad"):
+            lines.append("🆖SEC NG:\n" + all_list(meta_sec["bad"]))
         text=summary + ("\n" + "\n".join(lines) if lines else "")
     else:
         text=summary
