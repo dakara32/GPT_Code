@@ -13,7 +13,8 @@ CD_CAUTION = 0.10   # -10% で警戒
 CD_EMERG = 0.15   # -15% で緊急
 
 MODE_LABELS_JA = {"NORMAL": "通常", "CAUTION": "警戒", "EMERG": "緊急"}
-MODE_EMOJIS = {"NORMAL": "🟢", "CAUTION": "⚠️", "EMERG": "🚨"}
+# Slack通知用のモードアイコン
+MODE_EMOJIS = {"NORMAL": "🟢", "CAUTION": "⚠️", "EMERG": "🔴"}
 MODE_RANK = {"NORMAL": 0, "CAUTION": 1, "EMERG": 2}
 
 # --- breadth utilities (factor parity) ---
@@ -523,13 +524,18 @@ def recommended_counts_by_mode(mode: str) -> tuple[int, int, int]:
 def _mode_tail_line(final_mode: str) -> str:
     fm = (final_mode or "NORMAL").upper()
     base_ts = config.TS_BASE_BY_MODE.get(fm, config.TS_BASE_BY_MODE.get("NORMAL", 0.15))
-    ts_base = int(round(base_ts * 100))
+    ts_base_pct = int(round(base_ts * 100))
+    d1, d2, d3 = config.TS_STEP_DELTAS_PT
+    step30 = max(ts_base_pct - d1, 0)
+    step60 = max(ts_base_pct - d2, 0)
+    step100 = max(ts_base_pct - d3, 0)
     g_cnt, d_cnt, cash_slots = recommended_counts_by_mode(fm)
     cash_pct = config.CASH_RATIO_BY_MODE.get(
         fm, config.CASH_RATIO_BY_MODE.get("NORMAL", 0.10)
     ) * 100
     return (
-        f"〔このモードの設定〕TS基本: -{ts_base}% ／ "
+        f"〔このモードの設定〕"
+        f"TS基本: -{ts_base_pct}%（+30%→-{step30}%／+60%→-{step60}%／+100%→-{step100}%）／ "
         f"推奨保有: G{g_cnt}・D{d_cnt}（現金化枠 {cash_slots}）／ "
         f"推奨現金比率: {cash_pct:.0f}%"
     )
@@ -626,15 +632,6 @@ def build_header(mode, cash_ratio, drift_threshold, total_drift_abs, alert, simu
         header += "🚨 *アラート: 発生！！ Δqtyのマイナス銘柄を売却、任意の銘柄を買い増してバランスを取りましょう！*\n"
     else:
         header += "✅ アラートなし\n"
-    # ★ 追記: TSルール（G/D共通）と推奨保有数
-    # TS(基本)をモードで動的表示。段階TSは「基本から -3/-6/-8 pt」固定。
-    base_ts = config.TS_BASE_BY_MODE.get(mode.upper(), config.TS_BASE_BY_MODE["NORMAL"])
-    d1, d2, d3 = config.TS_STEP_DELTAS_PT
-    ts_line = f"*🛡 TS:* 基本 -{base_ts*100:.0f}% / +30%→-{max(base_ts*100 - d1, 0):.0f}% / +60%→-{max(base_ts*100 - d2, 0):.0f}% / +100%→-{max(base_ts*100 - d3, 0):.0f}%\n"
-    header += ts_line
-    g_cnt, d_cnt, cash_slots = recommended_counts_by_mode(mode)
-    cash_pct = cash_slots * (100 / (config.TOTAL_TARGETS))  # 1枠=総数分割の%（20銘柄なら5%）
-    header += f"*📋 推奨保有数:* G {g_cnt} / D {d_cnt}（現金化枠 {cash_slots}枠 ≒ {cash_pct:.0f}%）\n"
     return header
 
 
@@ -715,12 +712,15 @@ def main():
         final_mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
     )
 
+    me_g = MODE_EMOJIS.get(gcd_mode, "")
+    me_b = MODE_EMOJIS.get(breadth_mode, "")
+    me_f = MODE_EMOJIS.get(final_mode, "")
     block_gcd = (
         f"① GコンポジットDD: -{gcd_pct:.1f}%"
-        f"（基準: C={CD_CAUTION*100:.0f}% / E={CD_EMERG*100:.0f}%） 判定: {gcd_mode}"
+        f"（基準: C={CD_CAUTION*100:.0f}% / E={CD_EMERG*100:.0f}%） 判定: {me_g} {gcd_mode}"
     )
-    block_breadth = f"② Breadth: {breadth_mode}（テンプレ合格本数: {breadth_score}）"
-    block_final = f"総合（OR悪化／AND回復＋G先行なら1段階回復）: {final_mode}"
+    block_breadth = f"② Breadth: {me_b} {breadth_mode}（テンプレ合格本数: {breadth_score}）"
+    block_final = f"総合（OR悪化／AND回復＋G先行なら1段階回復）: {me_f} {final_mode}"
     prepend = (
         block_gcd
         + "\n"
