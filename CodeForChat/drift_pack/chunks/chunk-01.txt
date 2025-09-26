@@ -2,7 +2,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, drift.py, .github/workflows/daily-report.yml, documents/README.md, documents/drift_design.md
-# 作成日時: 2025-09-26 19:38:33 (JST)
+# 作成日時: 2025-09-26 20:35:47 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -25,15 +25,22 @@ L13
 L14 # モード別のドリフト閾値（%）
 L15 DRIFT_THRESHOLD_BY_MODE = {"NORMAL": 12, "CAUTION": 14, "EMERG": float("inf")}
 L16
-L17 # モード別のTS（基本幅, 小数=割合）
-L18 TS_BASE_BY_MODE = {"NORMAL": 0.15, "CAUTION": 0.13, "EMERG": 0.10}
-L19 # 利益到達(+30/+60/+100%)時の段階タイト化（ポイント差）
-L20 TS_STEP_DELTAS_PT = (3, 6, 8)
-L21
-L22 # Breadthの校正は N_G に連動（緊急解除=ceil(1.5*N_G), 通常復帰=3*N_G）
-L23 N_G = COUNTS_BASE["G"]
-L24 N_D = COUNTS_BASE["D"]
-L25
+L17 # モード別の推奨現金比率
+L18 CASH_RATIO_BY_MODE = {
+L19     "NORMAL": 0.10,  # 10%
+L20     "CAUTION": 0.20,  # 20%
+L21     "EMERG": 0.30,  # 30%
+L22 }
+L23
+L24 # モード別のTS（基本幅, 小数=割合）
+L25 TS_BASE_BY_MODE = {"NORMAL": 0.15, "CAUTION": 0.13, "EMERG": 0.10}
+L26 # 利益到達(+30/+60/+100%)時の段階タイト化（ポイント差）
+L27 TS_STEP_DELTAS_PT = (3, 6, 8)
+L28
+L29 # Breadthの校正は N_G に連動（緊急解除=ceil(1.5*N_G), 通常復帰=3*N_G）
+L30 N_G = COUNTS_BASE["G"]
+L31 N_D = COUNTS_BASE["D"]
+L32
 ```
 
 ## <drift.py>
@@ -48,9 +55,9 @@ L7 from pathlib import Path
 L8 import csv
 L9 import config
 L10
-L11 # --- コンポジットDDのしきい値（G枠平均DD基準） ---
-L12 CD_CAUTION = 0.10  # -10% で警戒モード
-L13 CD_EMERG = 0.15  # -15% で緊急モード
+L11 # --- GコンポジットDDのしきい値（Growthの平均DD基準）---
+L12 CD_CAUTION = 0.10   # -10% で警戒
+L13 CD_EMERG = 0.15   # -15% で緊急
 L14
 L15 MODE_LABELS_JA = {"NORMAL": "通常", "CAUTION": "警戒", "EMERG": "緊急"}
 L16 MODE_EMOJIS = {"NORMAL": "🟢", "CAUTION": "⚠️", "EMERG": "🚨"}
@@ -264,73 +271,64 @@ L223     return f"{MODE_EMOJIS.get(upper, 'ℹ️')} {MODE_LABELS_JA.get(upper, 
 L224
 L225
 L226 def _gcd_mode_today(g_syms: list[str]) -> tuple[str, float]:
-L227     """G枠の等加重コンポジットDD（Low/Peak60）を算出しモードを返す。"""
-L228
-L229     if not g_syms:
-L230         print("📝 audit[G-CD details]: G銘柄が空のため算出対象がありません")
-L231         print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
-L232         return "NORMAL", 0.0
-L233
-L234     try:
-L235         df = yf.download(
-L236             g_syms,
-L237             period="100d",
-L238             interval="1d",
-L239             auto_adjust=False,
-L240             progress=False,
-L241         )
-L242     except Exception as e:
-L243         print(f"⚠️ audit[G-CD details]: 株価データ取得に失敗しました ({e})")
-L244         print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
-L245         return "NORMAL", 0.0
-L246
-L247     if not isinstance(df, pd.DataFrame) or df.empty:
-L248         print("⚠️ audit[G-CD details]: 株価データが空のため算出できません")
-L249         print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
-L250         return "NORMAL", 0.0
-L251
-L252     try:
-L253         hi_all = df["High"] if "High" in df.columns else None
-L254         lo_all = df["Low"] if "Low" in df.columns else None
-L255     except Exception as e:
-L256         print(f"⚠️ audit[G-CD details]: High/Low データ取得に失敗しました ({e})")
-L257         print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
-L258         return "NORMAL", 0.0
-L259
-L260     if hi_all is None or lo_all is None:
-L261         print("⚠️ audit[G-CD details]: High/Low データが欠落しています")
-L262         print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
-L263         return "NORMAL", 0.0
-L264
-L265     if isinstance(hi_all, pd.Series):
-L266         hi_all = hi_all.to_frame(name=g_syms[0])
-L267     if isinstance(lo_all, pd.Series):
-L268         lo_all = lo_all.to_frame(name=g_syms[0])
-L269
-L270     if hi_all.empty or lo_all.empty:
-L271         print("⚠️ audit[G-CD details]: High/Low データが空のため算出できません")
-L272         print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
-L273         return "NORMAL", 0.0
+L227     """
+L228     現在のGrowth群について、Low_today / Peak60(High) の等加重平均から G-CD(%) を算出し、モードを返す。
+L229     戻り値: (gcd_mode, gcd_pct)  ※gcd_pctは正の%（例 11.3 は -11.3%の下落）
+L230     """
+L231
+L232     if not g_syms:
+L233         print("📝 audit[G-CD details]: G銘柄が空のため算出対象がありません")
+L234         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
+L235         return "NORMAL", 0.0
+L236
+L237     try:
+L238         df = yf.download(
+L239             g_syms,
+L240             period="100d",
+L241             interval="1d",
+L242             auto_adjust=False,
+L243             progress=False,
+L244         )
+L245     except Exception as e:
+L246         print(f"⚠️ audit[G-CD details]: 株価データ取得に失敗しました ({e})")
+L247         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
+L248         return "NORMAL", 0.0
+L249
+L250     if not isinstance(df, pd.DataFrame) or df.empty:
+L251         print("⚠️ audit[G-CD details]: 株価データが空のため算出できません")
+L252         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
+L253         return "NORMAL", 0.0
+L254
+L255     hi_all = df.get("High") if isinstance(df, pd.DataFrame) else None
+L256     lo_all = df.get("Low") if isinstance(df, pd.DataFrame) else None
+L257     if hi_all is None or lo_all is None:
+L258         print("⚠️ audit[G-CD details]: High/Low データが欠落しています")
+L259         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
+L260         return "NORMAL", 0.0
+L261
+L262     if isinstance(hi_all, pd.Series):
+L263         hi_all = hi_all.to_frame(name=g_syms[0])
+L264     if isinstance(lo_all, pd.Series):
+L265         lo_all = lo_all.to_frame(name=g_syms[0])
+L266
+L267     if hi_all.empty or lo_all.empty:
+L268         print("⚠️ audit[G-CD details]: High/Low データが空のため算出できません")
+L269         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
+L270         return "NORMAL", 0.0
+L271
+L272     peak60 = hi_all.rolling(60, min_periods=20).max().tail(1).iloc[0]
+L273     low_today = lo_all.tail(1).iloc[0]
 L274
-L275     roll_hi = hi_all.rolling(60, min_periods=20).max()
-L276     if roll_hi.empty or lo_all.empty:
-L277         print("⚠️ audit[G-CD details]: Peak60/Low データが揃いません")
-L278         print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
-L279         return "NORMAL", 0.0
-L280
-L281     peak_row = roll_hi.iloc[-1]
-L282     low_row = lo_all.iloc[-1]
+L275     details: list[tuple[str, float, float, float, float]] = []
+L276     for sym in g_syms:
+L277         p = float(peak60.get(sym, float("nan"))) if hasattr(peak60, "get") else float("nan")
+L278         lt = float(low_today.get(sym, float("nan"))) if hasattr(low_today, "get") else float("nan")
+L279         if pd.notna(p) and p > 0 and pd.notna(lt) and lt > 0:
+L280             ratio = lt / p
+L281             ddpct = (1.0 - ratio) * 100.0
+L282             details.append((sym, p, lt, ratio, ddpct))
 L283
-L284     details: list[tuple[str, float, float, float, float]] = []
-L285     for sym in g_syms:
-L286         p = float(peak_row.get(sym, float("nan"))) if hasattr(peak_row, "get") else float("nan")
-L287         lt = float(low_row.get(sym, float("nan"))) if hasattr(low_row, "get") else float("nan")
-L288         if pd.notna(p) and p > 0 and pd.notna(lt) and lt > 0:
-L289             ratio = lt / p
-L290             ddpct = (1.0 - ratio) * 100.0
-L291             details.append((sym, p, lt, ratio, ddpct))
-L292
-L293     if not details:
-L294         print("⚠️ audit[G-CD details]: 有効な銘柄データがありません")
-L295         print("📝 au
+L284     if not details:
+L285         print("⚠️ audit[G-CD details]: 有効な銘柄データがありません")
+L286         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%
 ```

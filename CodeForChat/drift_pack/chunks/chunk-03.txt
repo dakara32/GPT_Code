@@ -1,184 +1,213 @@
 ```text
-ll(x) else ""
+e", ascending=False)
+L594     df = pd.concat([df, pd.DataFrame([summary])], ignore_index=True)
+L595     if alert:
+L596         cols = ["symbol", "shares", "value", "current_ratio", "drift_abs", "trade_shares"]
+L597         df_small = df[cols].copy()
+L598         df_small.columns = ["sym", "qty", "val", "now", "|d|", "Δqty"]
+L599     else:
+L600         cols = ["symbol", "shares", "value", "current_ratio", "drift_abs"]
+L601         df_small = df[cols].copy()
+L602         df_small.columns = ["sym", "qty", "val", "now", "|d|"]
+L603     return df_small
+L604
 L605
-L606
-L607 def formatters_for(alert):
-L608     formatters = {"val": currency, "now": "{:.2%}".format, "|d|": "{:.2%}".format}
-L609     if alert:
-L610         formatters["Δqty"] = "{:.0f}".format
-L611     return formatters
-L612
-L613
-L614 def build_header(mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs):
-L615     header = (
-L616         f"*💼 現金保有率:* {cash_ratio*100:.1f}%\n"
-L617         f"*📊 ドリフト閾値:* {'🔴(停止)' if drift_threshold == float('inf') else str(drift_threshold)+'%'}\n"
-L618         f"*📉 現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
-L619     )
-L620     if alert:
-L621         header += f"*🔁 半戻し後ドリフト合計(想定):* {simulated_total_drift_abs * 100:.2f}%\n"
-L622         header += "🚨 *アラート: 発生！！ Δqtyのマイナス銘柄を売却、任意の銘柄を買い増してバランスを取りましょう！*\n"
-L623     else:
-L624         header += "✅ アラートなし\n"
-L625     # ★ 追記: TSルール（G/D共通）と推奨保有数
-L626     # TS(基本)をモードで動的表示。段階TSは「基本から -3/-6/-8 pt」固定。
-L627     base_ts = config.TS_BASE_BY_MODE.get(mode.upper(), config.TS_BASE_BY_MODE["NORMAL"])
-L628     d1, d2, d3 = config.TS_STEP_DELTAS_PT
-L629     ts_line = f"*🛡 TS:* 基本 -{base_ts*100:.0f}% / +30%→-{max(base_ts*100 - d1, 0):.0f}% / +60%→-{max(base_ts*100 - d2, 0):.0f}% / +100%→-{max(base_ts*100 - d3, 0):.0f}%\n"
-L630     header += ts_line
-L631     g_cnt, d_cnt, cash_slots = recommended_counts_by_mode(mode)
-L632     cash_pct = cash_slots * (100 / (config.TOTAL_TARGETS))  # 1枠=総数分割の%（20銘柄なら5%）
-L633     header += f"*📋 推奨保有数:* G {g_cnt} / D {d_cnt}（現金化枠 {cash_slots}枠 ≒ {cash_pct:.0f}%）\n"
-L634     return header
-L635
-L636
-L637 def send_slack(text):
-L638     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-L639     if not SLACK_WEBHOOK_URL:
-L640         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-L641     payload = {"text": text}
-L642     try:
-L643         resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
-L644         resp.raise_for_status()
-L645         print("✅ Slack（Webhook）へ送信しました")
-L646     except Exception as e:
-L647         print(f"⚠️ Slack通知エラー: {e}")
-L648
-L649
-L650 def send_debug(debug_text):
-L651     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
-L652     if not SLACK_WEBHOOK_URL:
-L653         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
-L654     debug_payload = {"text": "```" + debug_text + "```"}
-L655     try:
-L656         resp = requests.post(SLACK_WEBHOOK_URL, json=debug_payload)
-L657         resp.raise_for_status()
-L658         print("✅ Debug情報をSlackに送信しました")
-L659     except Exception as e:
-L660         print(f"⚠️ Slack通知エラー: {e}")
-L661
-L662
-L663 def main():
-L664     portfolio = load_portfolio()
-L665     symbols = [r["symbol"] for r in portfolio]
-L666     g_syms = _load_growth_symbols(portfolio)
-L667     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
-L668
-L669     breadth_block, breadth_mode, breadth_score = build_breadth_header()
-L670     gcd_mode, gcd_pct = _gcd_mode_today(g_syms)
-L671
-L672     prev_final = load_final_mode("NORMAL")
-L673     gcd_rank = MODE_RANK.get(gcd_mode, 0)
-L674     breadth_rank = MODE_RANK.get(breadth_mode, 0)
-L675     prev_rank = MODE_RANK.get(prev_final, 0)
-L676     if max(gcd_rank, breadth_rank) > prev_rank:
-L677         final_mode = gcd_mode if gcd_rank >= breadth_rank else breadth_mode
-L678     elif gcd_rank < prev_rank and breadth_rank < prev_rank:
-L679         final_mode = gcd_mode if gcd_rank >= breadth_rank else breadth_mode
-L680     else:
-L681         final_mode = prev_final
-L682     save_final_mode(final_mode)
-L683
-L684     cash_ratio, drift_threshold = compute_threshold_by_mode(final_mode)
-L685
-L686     df, total_value, total_drift_abs = build_dataframe(portfolio)
-L687     df, alert, new_total_value, simulated_total_drift_abs = simulate(
-L688         df, total_value, total_drift_abs, drift_threshold
-L689     )
-L690     df_small = prepare_summary(df, total_drift_abs, alert)
-L691     if 'df_small' in locals() and isinstance(df_small, pd.DataFrame) and not df_small.empty:
-L692         col_sym = "sym" if "sym" in df_small.columns else ("symbol" if "symbol" in df_small.columns else None)
-L693         if col_sym:
-L694             alert_keys = {str(k) for k in sell_alerts.keys()}
-L695             df_small[col_sym] = df_small[col_sym].astype(str)
-L696             df_small.insert(0, "⚠", df_small[col_sym].map(lambda x: "🔴" if x in alert_keys else ""))
-L697             latest_tag = {s: " / ".join(sell_alerts[s][-1][1]) for s in sell_alerts}
-L698             df_small.insert(1, "sig", df_small[col_sym].map(latest_tag).fillna(""))
-L699     formatters = formatters_for(alert)
-L700     header_core = build_header(
-L701         final_mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
-L702     )
-L703
-L704     summary_lines = [
-L705         (
-L706             f"① GコンポジットDD: -{gcd_pct:.1f}%"
-L707             f"（基準: C={CD_CAUTION*100:.0f}% / E={CD_EMERG*100:.0f}%） 判定: {_format_mode(gcd_mode)}"
-L708         ),
-L709         f"② Breadth: {_format_mode(breadth_mode)} （テンプレ合格本数: {breadth_score}）",
-L710         f"総合（OR悪化/AND回復）: {_format_mode(final_mode)}",
-L711     ]
-L712     prepend_block = "\n".join(summary_lines)
-L713
-L714     if breadth_block:
-L715         if breadth_block.startswith("```"):
-L716             inner = breadth_block[len("```") :]
-L717             if inner.startswith("\n"):
-L718                 inner = inner[1:]
-L719             if inner.endswith("```"):
-L720                 inner = inner[: -len("```")]
-L721             inner = inner.strip("\n")
-L722             inner_lines = [line for line in inner.splitlines() if "現在モード" not in line]
-L723             cleaned_inner = "\n".join(inner_lines)
-L724             if cleaned_inner:
-L725                 new_inner = prepend_block + "\n" + cleaned_inner
-L726             else:
-L727                 new_inner = prepend_block
-L728             breadth_block = "```\n" + new_inner + "\n```"
-L729         else:
-L730             lines = [line for line in breadth_block.splitlines() if "現在モード" not in line]
-L731             cleaned_block = "\n".join(lines)
-L732             breadth_block = prepend_block + ("\n" + cleaned_block if cleaned_block else "")
-L733         header = breadth_block + "\n" + header_core
-L734     else:
-L735         header = prepend_block + "\n" + header_core
-L736     if sell_alerts:
-L737         def fmt_pair(date_tags):
-L738             date, tags = date_tags
-L739             return f"{date}:" + "・".join(tags)
-L740         listed = []
-L741         for t, arr in sell_alerts.items():
-L742             listed.append(f"*{t}*（" + ", ".join(fmt_pair(x) for x in arr) + "）")
-L743         hits = ", ".join(listed)
-L744         if "✅ アラートなし" in header:
-L745             header = header.replace(
-L746                 "✅ アラートなし",
-L747                 f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hits}",
-L748             )
-L749         else:
-L750             header += f"\n🟥 {hits}"
-L751     table_text = df_small.to_string(formatters=formatters, index=False)
-L752     send_slack(header + "\n```" + table_text + "```")
-L753
-L754     if debug_mode:
-L755         debug_cols = [
-L756             "symbol",
-L757             "shares",
-L758             "price",
-L759             "value",
-L760             "current_ratio",
-L761             "drift",
-L762             "drift_abs",
-L763             "adjusted_ratio",
-L764             "adjustable",
-L765             "trade_shares",
-L766             "new_shares",
-L767             "new_value",
-L768             "simulated_ratio",
-L769             "simulated_drift_abs",
-L770         ]
-L771         debug_text = (
-L772             "=== DEBUG: full dataframe ===\n"
-L773             + df[debug_cols].to_string()
-L774             + f"\n\ntotal_value={total_value}, new_total_value={new_total_value}\n"
-L775             + f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}"
-L776         )
-L777         print("\n" + debug_text)
-L778         send_debug(debug_text)
-L779
-L780
-L781 if __name__ == "__main__":
-L782     main()
-L783
+L606 def currency(x):
+L607     return f"${x:,.0f}" if pd.notnull(x) else ""
+L608
+L609
+L610 def formatters_for(alert):
+L611     formatters = {"val": currency, "now": "{:.2%}".format, "|d|": "{:.2%}".format}
+L612     if alert:
+L613         formatters["Δqty"] = "{:.0f}".format
+L614     return formatters
+L615
+L616
+L617 def build_header(mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs):
+L618     mode_ratio = config.CASH_RATIO_BY_MODE.get(mode.upper(), cash_ratio)
+L619     header = (
+L620         f"*💼 推奨現金比率:* {mode_ratio*100:.1f}%（モード準拠）\n"
+L621         f"*📊 ドリフト閾値:* {'🔴(停止)' if drift_threshold == float('inf') else str(drift_threshold)+'%'}\n"
+L622         f"*📉 現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
+L623     )
+L624     if alert:
+L625         header += f"*🔁 半戻し後ドリフト合計(想定):* {simulated_total_drift_abs * 100:.2f}%\n"
+L626         header += "🚨 *アラート: 発生！！ Δqtyのマイナス銘柄を売却、任意の銘柄を買い増してバランスを取りましょう！*\n"
+L627     else:
+L628         header += "✅ アラートなし\n"
+L629     # ★ 追記: TSルール（G/D共通）と推奨保有数
+L630     # TS(基本)をモードで動的表示。段階TSは「基本から -3/-6/-8 pt」固定。
+L631     base_ts = config.TS_BASE_BY_MODE.get(mode.upper(), config.TS_BASE_BY_MODE["NORMAL"])
+L632     d1, d2, d3 = config.TS_STEP_DELTAS_PT
+L633     ts_line = f"*🛡 TS:* 基本 -{base_ts*100:.0f}% / +30%→-{max(base_ts*100 - d1, 0):.0f}% / +60%→-{max(base_ts*100 - d2, 0):.0f}% / +100%→-{max(base_ts*100 - d3, 0):.0f}%\n"
+L634     header += ts_line
+L635     g_cnt, d_cnt, cash_slots = recommended_counts_by_mode(mode)
+L636     cash_pct = cash_slots * (100 / (config.TOTAL_TARGETS))  # 1枠=総数分割の%（20銘柄なら5%）
+L637     header += f"*📋 推奨保有数:* G {g_cnt} / D {d_cnt}（現金化枠 {cash_slots}枠 ≒ {cash_pct:.0f}%）\n"
+L638     return header
+L639
+L640
+L641 def send_slack(text):
+L642     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+L643     if not SLACK_WEBHOOK_URL:
+L644         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+L645     payload = {"text": text}
+L646     try:
+L647         resp = requests.post(SLACK_WEBHOOK_URL, json=payload)
+L648         resp.raise_for_status()
+L649         print("✅ Slack（Webhook）へ送信しました")
+L650     except Exception as e:
+L651         print(f"⚠️ Slack通知エラー: {e}")
+L652
+L653
+L654 def send_debug(debug_text):
+L655     SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+L656     if not SLACK_WEBHOOK_URL:
+L657         raise ValueError("SLACK_WEBHOOK_URL not set (環境変数が未設定です)")
+L658     debug_payload = {"text": "```" + debug_text + "```"}
+L659     try:
+L660         resp = requests.post(SLACK_WEBHOOK_URL, json=debug_payload)
+L661         resp.raise_for_status()
+L662         print("✅ Debug情報をSlackに送信しました")
+L663     except Exception as e:
+L664         print(f"⚠️ Slack通知エラー: {e}")
+L665
+L666
+L667 def main():
+L668     portfolio = load_portfolio()
+L669     symbols = [r["symbol"] for r in portfolio]
+L670     g_syms = _load_growth_symbols(portfolio)
+L671     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
+L672
+L673     breadth_block, breadth_mode, breadth_score = build_breadth_header()
+L674     gcd_mode, gcd_pct = _gcd_mode_today(g_syms)
+L675
+L676     prev_final = load_final_mode("NORMAL")
+L677     order = MODE_RANK
+L678     gcd_rank = order.get(gcd_mode, 0)
+L679     breadth_rank = order.get(breadth_mode, 0)
+L680     prev_rank = order.get(prev_final, 0)
+L681     worsen_mode = gcd_mode if gcd_rank >= breadth_rank else breadth_mode
+L682     if max(gcd_rank, breadth_rank) > prev_rank:
+L683         final_mode = worsen_mode
+L684     else:
+L685         and_recover = gcd_rank < prev_rank and breadth_rank < prev_rank
+L686         g_leads_recover = gcd_rank < prev_rank
+L687         if and_recover or g_leads_recover:
+L688             if prev_final == "EMERG":
+L689                 final_mode = "CAUTION"
+L690             elif prev_final == "CAUTION":
+L691                 final_mode = "NORMAL"
+L692             else:
+L693                 final_mode = prev_final
+L694         else:
+L695             final_mode = prev_final
+L696     save_final_mode(final_mode)
+L697
+L698     cash_ratio, drift_threshold = compute_threshold_by_mode(final_mode)
+L699
+L700     df, total_value, total_drift_abs = build_dataframe(portfolio)
+L701     df, alert, new_total_value, simulated_total_drift_abs = simulate(
+L702         df, total_value, total_drift_abs, drift_threshold
+L703     )
+L704     df_small = prepare_summary(df, total_drift_abs, alert)
+L705     if 'df_small' in locals() and isinstance(df_small, pd.DataFrame) and not df_small.empty:
+L706         col_sym = "sym" if "sym" in df_small.columns else ("symbol" if "symbol" in df_small.columns else None)
+L707         if col_sym:
+L708             alert_keys = {str(k) for k in sell_alerts.keys()}
+L709             df_small[col_sym] = df_small[col_sym].astype(str)
+L710             df_small.insert(0, "⚠", df_small[col_sym].map(lambda x: "🔴" if x in alert_keys else ""))
+L711             latest_tag = {s: " / ".join(sell_alerts[s][-1][1]) for s in sell_alerts}
+L712             df_small.insert(1, "sig", df_small[col_sym].map(latest_tag).fillna(""))
+L713     formatters = formatters_for(alert)
+L714     header_core = build_header(
+L715         final_mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
+L716     )
+L717
+L718     block_gcd = (
+L719         f"① GコンポジットDD: -{gcd_pct:.1f}%"
+L720         f"（基準: C={CD_CAUTION*100:.0f}% / E={CD_EMERG*100:.0f}%） 判定: {gcd_mode}"
+L721     )
+L722     block_breadth = f"② Breadth: {breadth_mode}（テンプレ合格本数: {breadth_score}）"
+L723     block_final = f"総合（OR悪化／AND回復＋G先行なら1段階回復）: {final_mode}"
+L724     prepend = (
+L725         block_gcd
+L726         + "\n"
+L727         + block_breadth
+L728         + "\n"
+L729         + block_final
+L730         + "\n"
+L731         + _mode_tail_line(final_mode)
+L732         + "\n"
+L733     )
+L734
+L735     if breadth_block:
+L736         if breadth_block.startswith("```"):
+L737             inner = breadth_block[len("```") :]
+L738             if inner.startswith("\n"):
+L739                 inner = inner[1:]
+L740             if inner.endswith("```"):
+L741                 inner = inner[: -len("```")]
+L742             inner = inner.strip("\n")
+L743             inner_lines = [line for line in inner.splitlines() if "現在モード" not in line]
+L744             cleaned_inner = "\n".join(inner_lines)
+L745             new_inner = prepend + cleaned_inner if cleaned_inner else prepend.rstrip("\n")
+L746             breadth_block = "```\n" + new_inner + "\n```"
+L747         else:
+L748             lines = [line for line in breadth_block.splitlines() if "現在モード" not in line]
+L749             cleaned_block = "\n".join(lines)
+L750             breadth_block = prepend + cleaned_block if cleaned_block else prepend.rstrip("\n")
+L751         header = breadth_block + ("\n" if not breadth_block.endswith("\n") else "") + header_core
+L752     else:
+L753         header = prepend + header_core
+L754     if sell_alerts:
+L755         def fmt_pair(date_tags):
+L756             date, tags = date_tags
+L757             return f"{date}:" + "・".join(tags)
+L758         listed = []
+L759         for t, arr in sell_alerts.items():
+L760             listed.append(f"*{t}*（" + ", ".join(fmt_pair(x) for x in arr) + "）")
+L761         hits = ", ".join(listed)
+L762         if "✅ アラートなし" in header:
+L763             header = header.replace(
+L764                 "✅ アラートなし",
+L765                 f"⚠️ 売りシグナルあり: {len(sell_alerts)}銘柄\n🟥 {hits}",
+L766             )
+L767         else:
+L768             header += f"\n🟥 {hits}"
+L769     table_text = df_small.to_string(formatters=formatters, index=False)
+L770     send_slack(header + "\n```" + table_text + "```")
+L771
+L772     if debug_mode:
+L773         debug_cols = [
+L774             "symbol",
+L775             "shares",
+L776             "price",
+L777             "value",
+L778             "current_ratio",
+L779             "drift",
+L780             "drift_abs",
+L781             "adjusted_ratio",
+L782             "adjustable",
+L783             "trade_shares",
+L784             "new_shares",
+L785             "new_value",
+L786             "simulated_ratio",
+L787             "simulated_drift_abs",
+L788         ]
+L789         debug_text = (
+L790             "=== DEBUG: full dataframe ===\n"
+L791             + df[debug_cols].to_string()
+L792             + f"\n\ntotal_value={total_value}, new_total_value={new_total_value}\n"
+L793             + f"total_drift_abs={total_drift_abs}, simulated_total_drift_abs={simulated_total_drift_abs}"
+L794         )
+L795         print("\n" + debug_text)
+L796         send_debug(debug_text)
+L797
+L798
+L799 if __name__ == "__main__":
+L800     main()
+L801
 ```
 
 ## <.github/workflows/daily-report.yml>
@@ -252,67 +281,28 @@ L15 ---
 L16
 L17 ## モード判定（コンボ：GコンポジットDD × ブレッドス）
 L18
-L19 **考え方：** *悪化はゆるく（OR）、回復は厳しく（AND）*
+L19 **考え方：** *悪化はゆるく（OR）、回復は厳しく（AND）。Gが先行して良化すれば1段階回復*
 L20
 L21 ### ① GコンポジットDD（Growthのみ）
-L22 - 対象（Growthの定義）：当日保有銘柄のうち **β ≥ -0.6** を Growth とみなす（Defenseは無視）
-L23 - 判定：各銘柄の「今日の安値 / 直近60日高値」から等加重平均を算出し、平均ドローダウン率を評価
-L24 - 閾値：
-L25   - 平均DD ≥ 15% → ①=EMERG
-L26   - 平均DD ≥ 10% → ①=CAUTION
-L27   - それ未満 → ①=NORMAL
-L28 - 補足：Slackログとは別に、システムログへ銘柄別のPeak60・Low・DD%を降順で出力
-L29
-L30 ### ② ブレッドス（trend_template 合格本数）
-L31 - current+candidate 全体で trend_template 条件を満たした銘柄数（基準 N_G=12）
-L32 - 閾値：過去600営業日の分布から自動採用（分位点と運用“床”のmax）
-L33   - 緊急入り: max(q05, 12本)
-L34   - 緊急解除: max(q20, 18本)
-L35   - 通常復帰: max(q60, 36本)
-L36 - ヒステリシス：前回モードに依存（EMERG→解除は23本以上、CAUTION→通常は45本以上）
-L37
-L38 ### コンボルール
-L39 - **悪化（ダウングレード）**：
-L40   final_mode = max(mode①, mode②)
-L41   - 例：①=CAUTION, ②=NORMAL → final=CAUTION
-L42   - 例：①=EMERG, ②=CAUTION → final=EMERG
-L43
-L44 - **回復（アップグレード）**：
-L45   final_mode を1段階下げるには、mode① と mode② がともに下位モードに揃った場合のみ
-L46   - 例：EMERG→CAUTION は ①=CAUTION **かつ** ②=CAUTION
-L47   - 例：CAUTION→NORMAL は ①=NORMAL **かつ** ②=NORMAL
-L48
-L49 > 直感フレーズ：**「悪化はどちらか赤で赤、回復は両方青で青」**
-L50
-L51 ---
-L52
-L53 ## モード別設定（現金・ドリフト・保有数）
-L54
-L55 | モード       | 現金比率 | ドリフト閾値      | 基本TS幅 | Growth枠数 | Defense枠数 | 補足 |
-L56 |--------------|----------|-------------------|----------|------------|-------------|------|
-L57 | **NORMAL**   | 10%      | 12%               | -15%     | 12         | 8           | フル20銘柄（現金化枠なし） |
-L58 | **CAUTION**  | 20%      | 14%               | -13%     | 10         | 8           | Gを2枠外し=現金化10% |
-L59 | **EMERG**    | 30%      | ドリフト売買停止 | -10%     | 8          | 8           | Gを4枠外し=現金化20% |
-L60
-L61 - 含み益到達時のTSタイト化：+30% → -3pt、+60% → -6pt、+100% → -8pt
-L62 - 含み益 +100% 達成時は50%を利確し、残りはフリーポジションとして -15%TS で保有継続
-L63 - TS発動後のクールダウンは廃止（翌日以降すぐに再IN可）
-L64
-L65 ---
-L66
-L67 ## 新規買付
-L68 - **新規INは等分比率（=5%）の半分まで**を上限。  
-L69 - 追加補充や半戻し買付も同じ上限に従う。
-L70
-L71 ---
-L72
-L73 ## 半戻し（リバランス）
-L74 1. **現金比率 ≤ 閾値**：過重量銘柄を売却し、不足銘柄を補充。  
-L75 2. **現金比率 > 閾値**：**売却は行わず**、現金でドリフト不足銘柄を買付（現金比率を閾値以下へ戻すことを優先）。  
-L76 3. **共通**：リバランス後は全銘柄のTSを再設定。EMERGでは「ドリフト売買停止」、20銘柄×5%全戻しのみ許容。
-L77
-L78 ---
-L79
-L80 ## モード移行の実務手順
-L81 - モードが変わったら、**MMF≒現金**として扱い、
+L22 - 対象：ポートフォリオのうち `bucket = "G"` の銘柄を Growth 群として集計
+L23 - 算出：各G銘柄の `Low_today / Peak60(High)` を等加重平均し、`1 - 平均` を%表示（正の値が下落幅）
+L24 - しきい値：**CAUTION = 10% / EMERG = 15%**
+L25 - ログ：Slackとは別に、標準出力へ銘柄別の Peak60・Low・比率・DD% を降順で記録
+L26
+L27 ### ② ブレッドス（trend_template 合格本数）
+L28 - current+candidate 全体で trend_template 条件を満たした銘柄数（基準 N_G=12）
+L29 - 閾値：過去600営業日の分布から自動採用（分位点と運用“床”のmax）
+L30   - 緊急入り: max(q05, 12本)
+L31   - 緊急解除: max(q20, 18本)
+L32   - 通常復帰: max(q60, 36本)
+L33 - ヒステリシス：前回モードに依存（EMERG→解除は23本以上、CAUTION→通常は45本以上）
+L34
+L35 ### コンボルール
+L36 - **悪化（ダウングレード）**：①と②のうちランクが高い方（NORMAL < CAUTION < EMERG）を採用 = OR悪化
+L37   - 例：①=CAUTION, ②=NORMAL → final=CAUTION
+L38   - 例：①=EMERG, ②=CAUTION → final=EMERG
+L39
+L40 - **回復（アップグレード）**：基本は①②がともに現在より下位モードに揃ったときのみ1段階回復 = AND回復
+L41   - 例：EMERG→CAUTION は ①=CAUTION **かつ** ②=CAUTION
+L42   - 例：CAUTION→NORMAL は ①=NORMA
 ```
