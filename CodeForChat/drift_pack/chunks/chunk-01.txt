@@ -2,7 +2,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, drift.py, .github/workflows/daily-report.yml, documents/README.md, documents/drift_design.md
-# 作成日時: 2025-09-26 18:03:28 (JST)
+# 作成日時: 2025-09-26 18:24:45 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -42,300 +42,296 @@ L1 import pandas as pd, yfinance as yf
 L2 import numpy as np
 L3 import requests
 L4 import os
-L5 import csv
-L6 import json
-L7 import time
-L8 from pathlib import Path
-L9 import config
-L10
-L11 MODE_LABELS_JA = {"NORMAL": "通常", "CAUTION": "警戒", "EMERG": "緊急"}
-L12 MODE_EMOJIS = {"NORMAL": "🟢", "CAUTION": "⚠️", "EMERG": "🚨"}
-L13 MODE_RANK = {"NORMAL": 0, "CAUTION": 1, "EMERG": 2}
-L14
-L15 # --- breadth utilities (factor parity) ---
-L16 BENCH = "^GSPC"
-L17 CAND_PRICE_MAX = 450.0
-L18 RESULTS_DIR = "results"
-L19 os.makedirs(RESULTS_DIR, exist_ok=True)
-L20
-L21 AUDIT_PATH = Path(RESULTS_DIR) / "ts_eod_audit.csv"
+L5 import json
+L6 import time
+L7 from pathlib import Path
+L8 import config
+L9
+L10 MODE_LABELS_JA = {"NORMAL": "通常", "CAUTION": "警戒", "EMERG": "緊急"}
+L11 MODE_EMOJIS = {"NORMAL": "🟢", "CAUTION": "⚠️", "EMERG": "🚨"}
+L12 MODE_RANK = {"NORMAL": 0, "CAUTION": 1, "EMERG": 2}
+L13
+L14 # --- breadth utilities (factor parity) ---
+L15 BENCH = "^GSPC"
+L16 CAND_PRICE_MAX = 450.0
+L17 RESULTS_DIR = "results"
+L18 os.makedirs(RESULTS_DIR, exist_ok=True)
+L19
+L20 AUDIT_PRINT_MAX = int(os.environ.get("AUDIT_PRINT_MAX", "20"))  # stdout に流す本日の明細の最大行数
+L21
 L22
-L23
-L24 def _state_file():
-L25     return str(Path(RESULTS_DIR) / "breadth_state.json")
+L23 def _state_file():
+L24     return str(Path(RESULTS_DIR) / "breadth_state.json")
+L25
 L26
-L27
-L28 def load_mode(default="NORMAL"):
-L29     try:
-L30         m = json.loads(open(_state_file()).read()).get("mode", default)
-L31         return m if m in ("EMERG","CAUTION","NORMAL") else default
-L32     except Exception:
-L33         return default
+L27 def load_mode(default="NORMAL"):
+L28     try:
+L29         m = json.loads(open(_state_file()).read()).get("mode", default)
+L30         return m if m in ("EMERG","CAUTION","NORMAL") else default
+L31     except Exception:
+L32         return default
+L33
 L34
-L35
-L36 def save_mode(mode: str):
-L37     try:
-L38         open(_state_file(),"w").write(json.dumps({"mode": mode}))
-L39     except Exception:
-L40         pass
+L35 def save_mode(mode: str):
+L36     try:
+L37         open(_state_file(),"w").write(json.dumps({"mode": mode}))
+L38     except Exception:
+L39         pass
+L40
 L41
-L42
-L43 def _read_csv_list(fname):
-L44     p = Path(__file__).with_name(fname)
-L45     if not p.exists(): return []
-L46     return pd.read_csv(p, header=None).iloc[:,0].astype(str).str.upper().tolist()
+L42 def _read_csv_list(fname):
+L43     p = Path(__file__).with_name(fname)
+L44     if not p.exists(): return []
+L45     return pd.read_csv(p, header=None).iloc[:,0].astype(str).str.upper().tolist()
+L46
 L47
-L48
-L49 def _load_universe():
-L50     # exist + candidate を使用。candidate は価格上限で事前フィルタ
-L51     exist = _read_csv_list("current_tickers.csv")
-L52     cand  = _read_csv_list("candidate_tickers.csv")
-L53     cand_info = yf.Tickers(" ".join(cand)) if cand else None
-L54     cand_keep = []
-L55     for t in cand:
-L56         try:
-L57             px = cand_info.tickers[t].fast_info.get("lastPrice", float("inf"))
-L58         except Exception:
-L59             px = float("inf")
-L60         if pd.notna(px) and float(px) <= CAND_PRICE_MAX:
-L61             cand_keep.append(t)
-L62     tickers = sorted(set(exist + cand_keep))
-L63     return exist, cand_keep, tickers
+L48 def _load_universe():
+L49     # exist + candidate を使用。candidate は価格上限で事前フィルタ
+L50     exist = _read_csv_list("current_tickers.csv")
+L51     cand  = _read_csv_list("candidate_tickers.csv")
+L52     cand_info = yf.Tickers(" ".join(cand)) if cand else None
+L53     cand_keep = []
+L54     for t in cand:
+L55         try:
+L56             px = cand_info.tickers[t].fast_info.get("lastPrice", float("inf"))
+L57         except Exception:
+L58             px = float("inf")
+L59         if pd.notna(px) and float(px) <= CAND_PRICE_MAX:
+L60             cand_keep.append(t)
+L61     tickers = sorted(set(exist + cand_keep))
+L62     return exist, cand_keep, tickers
+L63
 L64
-L65
-L66 def _fetch_prices_600d(tickers):
-L67     data = yf.download(
-L68         tickers + [BENCH],
-L69         period="600d",
-L70         auto_adjust=True,
-L71         progress=False,
-L72         threads=False,
-L73     )
-L74     close = data["Close"]
-L75     px = close.dropna(how="all", axis=1).ffill(limit=2)
-L76     spx = close[BENCH].reindex(px.index).ffill()
-L77     return px, spx
+L65 def _fetch_prices_600d(tickers):
+L66     data = yf.download(
+L67         tickers + [BENCH],
+L68         period="600d",
+L69         auto_adjust=True,
+L70         progress=False,
+L71         threads=False,
+L72     )
+L73     close = data["Close"]
+L74     px = close.dropna(how="all", axis=1).ffill(limit=2)
+L75     spx = close[BENCH].reindex(px.index).ffill()
+L76     return px, spx
+L77
 L78
-L79
-L80 def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
-L81     # scorer.py の実装をそのまま移植（ベクトル化版）
-L82     import numpy as np, pandas as pd
-L83     if px is None or px.empty:
-L84         return pd.Series(dtype=int)
-L85     px = px.dropna(how="all", axis=1)
-L86     if win_days and win_days > 0:
-L87         px = px.tail(win_days)
-L88     if px.empty:
-L89         return pd.Series(dtype=int)
-L90     # 欠損吸収
-L91     px = px.ffill(limit=2)
-L92     spx = spx.reindex(px.index).ffill()
-L93
-L94     ma50  = px.rolling(50,  min_periods=50).mean()
-L95     ma150 = px.rolling(150, min_periods=150).mean()
-L96     ma200 = px.rolling(200, min_periods=200).mean()
-L97
-L98     tt = (px > ma150)
-L99     tt &= (px > ma200)
-L100     tt &= (ma150 > ma200)
-L101     tt &= (ma200 - ma200.shift(21) > 0)
-L102     tt &= (ma50  > ma150)
-L103     tt &= (ma50  > ma200)
-L104     tt &= (px    > ma50)
-L105
-L106     lo252 = px.rolling(252, min_periods=252).min()
-L107     hi252 = px.rolling(252, min_periods=252).max()
-L108     tt &= (px.divide(lo252).sub(1.0) >= 0.30)
-L109     tt &= (px >= (0.75 * hi252))
-L110
-L111     r12  = px.divide(px.shift(252)).sub(1.0)
-L112     br12 = spx.divide(spx.shift(252)).sub(1.0)
-L113     r1   = px.divide(px.shift(22)).sub(1.0)
-L114     br1  = spx.divide(spx.shift(22)).sub(1.0)
-L115     rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
-L116     tt &= (rs >= 0.10)
-L117
-L118     return tt.fillna(False).sum(axis=1).astype(int)
+L79 def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
+L80     # scorer.py の実装をそのまま移植（ベクトル化版）
+L81     import numpy as np, pandas as pd
+L82     if px is None or px.empty:
+L83         return pd.Series(dtype=int)
+L84     px = px.dropna(how="all", axis=1)
+L85     if win_days and win_days > 0:
+L86         px = px.tail(win_days)
+L87     if px.empty:
+L88         return pd.Series(dtype=int)
+L89     # 欠損吸収
+L90     px = px.ffill(limit=2)
+L91     spx = spx.reindex(px.index).ffill()
+L92
+L93     ma50  = px.rolling(50,  min_periods=50).mean()
+L94     ma150 = px.rolling(150, min_periods=150).mean()
+L95     ma200 = px.rolling(200, min_periods=200).mean()
+L96
+L97     tt = (px > ma150)
+L98     tt &= (px > ma200)
+L99     tt &= (ma150 > ma200)
+L100     tt &= (ma200 - ma200.shift(21) > 0)
+L101     tt &= (ma50  > ma150)
+L102     tt &= (ma50  > ma200)
+L103     tt &= (px    > ma50)
+L104
+L105     lo252 = px.rolling(252, min_periods=252).min()
+L106     hi252 = px.rolling(252, min_periods=252).max()
+L107     tt &= (px.divide(lo252).sub(1.0) >= 0.30)
+L108     tt &= (px >= (0.75 * hi252))
+L109
+L110     r12  = px.divide(px.shift(252)).sub(1.0)
+L111     br12 = spx.divide(spx.shift(252)).sub(1.0)
+L112     r1   = px.divide(px.shift(22)).sub(1.0)
+L113     br1  = spx.divide(spx.shift(22)).sub(1.0)
+L114     rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
+L115     tt &= (rs >= 0.10)
+L116
+L117     return tt.fillna(False).sum(axis=1).astype(int)
+L118
 L119
-L120
-L121 def build_breadth_header():
-L122     # factor._build_breadth_lead_lines と同一挙動
-L123     exist, cand, tickers = _load_universe()
-L124     if not tickers:
-L125         return "", "NORMAL", 0
-L126     px, spx = _fetch_prices_600d(tickers)
-L127     win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
-L128     C_ts = trend_template_breadth_series(px, spx, win_days=win)
-L129     if C_ts.empty:
-L130         return "", "NORMAL", 0
-L131     warmup = int(os.getenv("BREADTH_WARMUP_DAYS","252"))
-L132     base = C_ts.iloc[warmup:] if len(C_ts)>warmup else C_ts
-L133     C_full = int(C_ts.iloc[-1])
-L134
-L135     q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
-L136     q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
-L137     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
-L138
-L139     # G枠サイズ（Breadth基準）
-L140     N_G = config.N_G
-L141     th_in_rec   = max(N_G, q05)
-L142     th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
-L143     th_norm_rec = max(3*N_G, q60)
-L144
-L145     use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
-L146     if use_calib:
-L147         th_in, th_out, th_norm, th_src = th_in_rec, th_out_rec, th_norm_rec, "自動"
-L148     else:
-L149         th_in   = int(os.getenv("GTT_EMERG_IN", str(N_G)))
-L150         th_out  = int(os.getenv("GTT_EMERG_OUT", str(int(1.5*N_G))))
-L151         th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3*N_G)))
-L152         th_src = "手動"
-L153
-L154     prev = load_mode("NORMAL")
-L155     if   prev == "EMERG":
-L156         mode = "EMERG"   if (C_full < th_out)  else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-L157     elif prev == "CAUTION":
-L158         mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
-L159     else:
-L160         mode = "EMERG"   if (C_full < th_in)   else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-L161     save_mode(mode)
-L162
-L163     mode_ja, emoji = MODE_LABELS_JA.get(mode, mode), MODE_EMOJIS.get(mode, "ℹ️")
-L164     eff_days = len(base)
-L165
-L166     lead_lines = [
-L167         f"{emoji} *現在モード: {mode_ja}*",
-L168         f"テンプレ合格本数: *{C_full}本*",
-L169         "しきい値（{0}）".format(th_src),
-L170         f"  ・緊急入り: <{th_in}本",
-L171         f"  ・緊急解除: ≥{th_out}本",
-L172         f"  ・通常復帰: ≥{th_norm}本",
-L173         f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
-L174         f"  ・下位5%: {q05}本",
-L175         f"  ・下位20%: {q20}本",
-L176         f"  ・60%分位: {q60}本",
-L177     ]
-L178     return "```" + "\n".join(lead_lines) + "```", mode, C_full
+L120 def build_breadth_header():
+L121     # factor._build_breadth_lead_lines と同一挙動
+L122     exist, cand, tickers = _load_universe()
+L123     if not tickers:
+L124         return "", "NORMAL", 0
+L125     px, spx = _fetch_prices_600d(tickers)
+L126     win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
+L127     C_ts = trend_template_breadth_series(px, spx, win_days=win)
+L128     if C_ts.empty:
+L129         return "", "NORMAL", 0
+L130     warmup = int(os.getenv("BREADTH_WARMUP_DAYS","252"))
+L131     base = C_ts.iloc[warmup:] if len(C_ts)>warmup else C_ts
+L132     C_full = int(C_ts.iloc[-1])
+L133
+L134     q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
+L135     q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
+L136     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
+L137
+L138     # G枠サイズ（Breadth基準）
+L139     N_G = config.N_G
+L140     th_in_rec   = max(N_G, q05)
+L141     th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
+L142     th_norm_rec = max(3*N_G, q60)
+L143
+L144     use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
+L145     if use_calib:
+L146         th_in, th_out, th_norm, th_src = th_in_rec, th_out_rec, th_norm_rec, "自動"
+L147     else:
+L148         th_in   = int(os.getenv("GTT_EMERG_IN", str(N_G)))
+L149         th_out  = int(os.getenv("GTT_EMERG_OUT", str(int(1.5*N_G))))
+L150         th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3*N_G)))
+L151         th_src = "手動"
+L152
+L153     prev = load_mode("NORMAL")
+L154     if   prev == "EMERG":
+L155         mode = "EMERG"   if (C_full < th_out)  else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+L156     elif prev == "CAUTION":
+L157         mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
+L158     else:
+L159         mode = "EMERG"   if (C_full < th_in)   else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+L160     save_mode(mode)
+L161
+L162     mode_ja, emoji = MODE_LABELS_JA.get(mode, mode), MODE_EMOJIS.get(mode, "ℹ️")
+L163     eff_days = len(base)
+L164
+L165     lead_lines = [
+L166         f"{emoji} *現在モード: {mode_ja}*",
+L167         f"テンプレ合格本数: *{C_full}本*",
+L168         "しきい値（{0}）".format(th_src),
+L169         f"  ・緊急入り: <{th_in}本",
+L170         f"  ・緊急解除: ≥{th_out}本",
+L171         f"  ・通常復帰: ≥{th_norm}本",
+L172         f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
+L173         f"  ・下位5%: {q05}本",
+L174         f"  ・下位20%: {q20}本",
+L175         f"  ・60%分位: {q60}本",
+L176     ]
+L177     return "```" + "\n".join(lead_lines) + "```", mode, C_full
+L178
 L179
-L180
-L181 def _ensure_audit_header():
-L182     AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
-L183     if not AUDIT_PATH.exists():
-L184         with open(AUDIT_PATH, "w", newline="") as f:
-L185             f.write("date,symbol,high60,low_today,baseTS,threshold,breach\n")
-L186
-L187
-L188 def _load_growth_symbols(portfolio: list[dict]) -> list[str]:
-L189     growth = []
-L190     for row in portfolio:
-L191         bucket = str(row.get("bucket", "")).strip().upper()
-L192         if bucket == "G":
-L193             sym = str(row.get("symbol", "")).strip().upper()
-L194             if sym:
-L195                 growth.append(sym)
-L196     return sorted(set(growth))
-L197
+L180 def _load_growth_symbols(portfolio: list[dict]) -> list[str]:
+L181     growth = []
+L182     for row in portfolio:
+L183         bucket = str(row.get("bucket", "")).strip().upper()
+L184         if bucket == "G":
+L185             sym = str(row.get("symbol", "")).strip().upper()
+L186             if sym:
+L187                 growth.append(sym)
+L188     return sorted(set(growth))
+L189
+L190
+L191 def _combine_modes(mode_a: str, mode_b: str) -> str:
+L192     a = MODE_RANK.get((mode_a or "NORMAL").upper(), 0)
+L193     b = MODE_RANK.get((mode_b or "NORMAL").upper(), 0)
+L194     for mode, rank in MODE_RANK.items():
+L195         if rank == max(a, b):
+L196             return mode
+L197     return "NORMAL"
 L198
-L199 def _combine_modes(mode_a: str, mode_b: str) -> str:
-L200     a = MODE_RANK.get((mode_a or "NORMAL").upper(), 0)
-L201     b = MODE_RANK.get((mode_b or "NORMAL").upper(), 0)
-L202     for mode, rank in MODE_RANK.items():
-L203         if rank == max(a, b):
-L204             return mode
-L205     return "NORMAL"
-L206
+L199
+L200 def _format_mode(mode: str) -> str:
+L201     upper = (mode or "NORMAL").upper()
+L202     return f"{MODE_EMOJIS.get(upper, 'ℹ️')} {MODE_LABELS_JA.get(upper, upper)}"
+L203
+L204
+L205 def _ts_mode_growth_5d(g_syms: list[str], ref_mode: str) -> tuple[str, int, set[str]]:
+L206     """直近5営業日を株価直接方式で一括判定（Low vs 60D High）。"""
 L207
-L208 def _format_mode(mode: str) -> str:
-L209     upper = (mode or "NORMAL").upper()
-L210     return f"{MODE_EMOJIS.get(upper, 'ℹ️')} {MODE_LABELS_JA.get(upper, upper)}"
+L208     if not g_syms:
+L209         print("⚠️ audit: G銘柄リストが空のため、今日の明細を出力できません")
+L210         return "NORMAL", 0, set()
 L211
-L212
-L213 def _ts_mode_growth_5d(g_syms: list[str], ref_mode: str) -> tuple[str, int, set[str]]:
-L214     """直近5営業日を株価直接方式で一括判定（Low vs 60D High）。"""
-L215
-L216     if not g_syms:
-L217         return "NORMAL", 0, set()
-L218
-L219     try:
-L220         df = yf.download(
-L221             g_syms,
-L222             period="100d",
-L223             interval="1d",
-L224             auto_adjust=False,
-L225             progress=False,
-L226         )
-L227     except Exception:
-L228         df = None
-L229
-L230     if not isinstance(df, pd.DataFrame) or df.empty:
-L231         return "NORMAL", 0, set()
-L232
-L233     try:
-L234         hi_all = df["High"] if "High" in df.columns else None
-L235         lo_all = df["Low"] if "Low" in df.columns else None
-L236     except Exception:
-L237         hi_all = lo_all = None
+L212     try:
+L213         df = yf.download(
+L214             g_syms,
+L215             period="100d",
+L216             interval="1d",
+L217             auto_adjust=False,
+L218             progress=False,
+L219         )
+L220     except Exception as e:
+L221         print(f"⚠️ audit: 株価データ取得に失敗しました ({e})")
+L222         return "NORMAL", 0, set()
+L223
+L224     if not isinstance(df, pd.DataFrame) or df.empty:
+L225         print("⚠️ audit: 株価データが空のため、今日の明細を出力できません")
+L226         return "NORMAL", 0, set()
+L227
+L228     try:
+L229         hi_all = df["High"] if "High" in df.columns else None
+L230         lo_all = df["Low"] if "Low" in df.columns else None
+L231     except Exception as e:
+L232         print(f"⚠️ audit: High/Low データ取得に失敗しました ({e})")
+L233         hi_all = lo_all = None
+L234
+L235     if hi_all is None or lo_all is None:
+L236         print("⚠️ audit: High/Low データが欠落しているため、今日の明細を出力できません")
+L237         return "NORMAL", 0, set()
 L238
-L239     if hi_all is None or lo_all is None:
-L240         return "NORMAL", 0, set()
-L241
-L242     if isinstance(hi_all, pd.Series):
-L243         hi_all = hi_all.to_frame(name=g_syms[0])
-L244     if isinstance(lo_all, pd.Series):
-L245         lo_all = lo_all.to_frame(name=g_syms[0])
-L246
-L247     if hi_all.empty or lo_all.empty:
-L248         return "NORMAL", 0, set()
-L249
-L250     roll_hi = hi_all.rolling(60, min_periods=20).max()
-L251     last5_hi = roll_hi.tail(5)
-L252     last5_lo = lo_all.tail(5).reindex(last5_hi.index)
-L253
-L254     if last5_hi.empty or last5_lo.empty:
-L255         return "NORMAL", 0, set()
-L256
-L257     base = float(config.TS_BASE_BY_MODE.get((ref_mode or "NORMAL").upper(), 0.15))
-L258     uniq_hits: set[str] = set()
-L259     today_hits: set[str] = set()
-L260     _ensure_audit_header()
-L261
-L262     def _fmt(val: float) -> str:
-L263         if pd.isna(val):
-L264             return ""
-L265         return f"{float(val):.6g}"
-L266
-L267     rows = []
-L268     for dt in last5_hi.index:
-L269         hi_row = last5_hi.loc[dt]
-L270         lo_row = last5_lo.loc[dt]
-L271         for sym in g_syms:
-L272             rh = float(hi_row.get(sym, float("nan"))) if hasattr(hi_row, "get") else float("nan")
-L273             lt = float(lo_row.get(sym, float("nan"))) if hasattr(lo_row, "get") else float("nan")
-L274             threshold = float("nan")
-L275             breach = 0
-L276             if pd.notna(rh) and rh > 0 and pd.notna(lt) and lt > 0:
-L277                 threshold = rh * (1.0 - base)
-L278                 breach = int(lt <= threshold)
-L279                 if breach:
-L280                     uniq_hits.add(sym)
-L281                     if dt == last5_hi.index[-1]:
-L282                         today_hits.add(sym)
-L283             rows.append(
-L284                 {
-L285                     "date": dt.date().isoformat() if hasattr(dt, "date") else str(dt),
-L286                     "symbol": sym,
-L287                     "high60": _fmt(rh),
-L288                     "low_today": _fmt(lt),
-L289                     "baseTS": f"{base:.3f}",
-L290                     "threshold": _fmt(threshold),
-L291                     "breach": str(breach),
-L292                 }
-L293             )
+L239     if isinstance(hi_all, pd.Series):
+L240         hi_all = hi_all.to_frame(name=g_syms[0])
+L241     if isinstance(lo_all, pd.Series):
+L242         lo_all = lo_all.to_frame(name=g_syms[0])
+L243
+L244     if hi_all.empty or lo_all.empty:
+L245         print("⚠️ audit: High/Low データが空のため、今日の明細を出力できません")
+L246         return "NORMAL", 0, set()
+L247
+L248     roll_hi = hi_all.rolling(60, min_periods=20).max()
+L249     last5_hi = roll_hi.tail(5)
+L250     last5_lo = lo_all.tail(5).reindex(last5_hi.index)
+L251
+L252     if last5_hi.empty or last5_lo.empty:
+L253         print("⚠️ audit: 直近5営業日のデータが揃わず、今日の明細を出力できません")
+L254         return "NORMAL", 0, set()
+L255
+L256     base = float(config.TS_BASE_BY_MODE.get((ref_mode or "NORMAL").upper(), 0.15))
+L257     uniq_hits: set[str] = set()
+L258     today_hits: set[str] = set()
+L259
+L260     rows_today_printed = 0
+L261     today_reason_flags: list[str] = []
+L262     last_day = last5_hi.index[-1]
+L263
+L264     for dt in last5_hi.index:
+L265         hi_row = last5_hi.loc[dt]
+L266         lo_row = last5_lo.loc[dt]
+L267         for sym in g_syms:
+L268             rh = float(hi_row.get(sym, float("nan"))) if hasattr(hi_row, "get") else float("nan")
+L269             lt = float(lo_row.get(sym, float("nan"))) if hasattr(lo_row, "get") else float("nan")
+L270
+L271             if not (pd.notna(rh) and rh > 0):
+L272                 if dt == last_day:
+L273                     today_reason_flags.append("H60欠損")
+L274                 continue
+L275             if not (pd.notna(lt) and lt > 0):
+L276                 if dt == last_day:
+L277                     today_reason_flags.append("Low欠損")
+L278                 continue
+L279
+L280             threshold = rh * (1.0 - base)
+L281             breach = int(lt <= threshold)
+L282             if breach:
+L283                 uniq_hits.add(sym)
+L284                 if dt == last_day:
+L285                     today_hits.add(sym)
+L286
+L287             if dt == last_day and rows_today_printed < AUDIT_PRINT_MAX:
+L288                 print(
+L289                     "📝 audit: 今日の明細 "
+L290                     f"{dt.date().isoformat()} {sym} High60={rh:.6g} Low={lt:.6g} "
+L291                     f"baseTS={base:.3f} 阈値={threshold:.6g} 判定={breach}"
+L292                 )
+L293                 rows_today_printed += 1
 L294
-L295     if rows:
-L296         with open(AUDIT_PATH, "a", newline="") as f:
-L297             writer = csv.DictWriter(
-L298                 f,
-L299                 fieldnames=["date", "symbol", "high60", "low_today", "baseTS", "threshold", "breach"],
-L300        
+L295     print(
+L296         "📝 audit: 5
 ```
