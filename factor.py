@@ -1619,6 +1619,16 @@ def run_pipeline() -> SelectionBundle:
             extra_D += list(getattr(sb, "init_D", []) or [])
         except Exception:
             pass
+        # 追加: 候補テーブル全体（スコア計算済みユニバース）も網羅
+        try:
+            import pandas as _pd  # 局所importで安全
+            if 'fb' in locals() and fb is not None:
+                g_idx = getattr(fb, "g_score", _pd.Series(dtype=float))
+                d_idx = getattr(fb, "d_score_all", _pd.Series(dtype=float))
+                extra_G += list((g_idx.dropna().index if hasattr(g_idx, "dropna") else []))
+                extra_D += list((d_idx.dropna().index if hasattr(d_idx, "dropna") else []))
+        except Exception:
+            pass
 
         _update_bucket_by_selection(
             "current_tickers.csv",
