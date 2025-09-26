@@ -2,7 +2,6 @@ import pandas as pd, yfinance as yf
 import numpy as np
 import requests
 import os
-import csv
 import json
 import time
 from pathlib import Path
@@ -18,7 +17,7 @@ CAND_PRICE_MAX = 450.0
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-AUDIT_PATH = Path(RESULTS_DIR) / "ts_eod_audit.csv"
+AUDIT_PRINT_MAX = int(os.environ.get("AUDIT_PRINT_MAX", "20"))  # stdout に流す本日の明細の最大行数
 
 
 def _state_file():
@@ -178,13 +177,6 @@ def build_breadth_header():
     return "```" + "\n".join(lead_lines) + "```", mode, C_full
 
 
-def _ensure_audit_header():
-    AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not AUDIT_PATH.exists():
-        with open(AUDIT_PATH, "w", newline="") as f:
-            f.write("date,symbol,high60,low_today,baseTS,threshold,breach\n")
-
-
 def _load_growth_symbols(portfolio: list[dict]) -> list[str]:
     growth = []
     for row in portfolio:
@@ -214,6 +206,7 @@ def _ts_mode_growth_5d(g_syms: list[str], ref_mode: str) -> tuple[str, int, set[
     """直近5営業日を株価直接方式で一括判定（Low vs 60D High）。"""
 
     if not g_syms:
+        print("⚠️ audit: G銘柄リストが空のため、今日の明細を出力できません")
         return "NORMAL", 0, set()
 
     try:
@@ -224,19 +217,23 @@ def _ts_mode_growth_5d(g_syms: list[str], ref_mode: str) -> tuple[str, int, set[
             auto_adjust=False,
             progress=False,
         )
-    except Exception:
-        df = None
+    except Exception as e:
+        print(f"⚠️ audit: 株価データ取得に失敗しました ({e})")
+        return "NORMAL", 0, set()
 
     if not isinstance(df, pd.DataFrame) or df.empty:
+        print("⚠️ audit: 株価データが空のため、今日の明細を出力できません")
         return "NORMAL", 0, set()
 
     try:
         hi_all = df["High"] if "High" in df.columns else None
         lo_all = df["Low"] if "Low" in df.columns else None
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ audit: High/Low データ取得に失敗しました ({e})")
         hi_all = lo_all = None
 
     if hi_all is None or lo_all is None:
+        print("⚠️ audit: High/Low データが欠落しているため、今日の明細を出力できません")
         return "NORMAL", 0, set()
 
     if isinstance(hi_all, pd.Series):
@@ -245,6 +242,7 @@ def _ts_mode_growth_5d(g_syms: list[str], ref_mode: str) -> tuple[str, int, set[
         lo_all = lo_all.to_frame(name=g_syms[0])
 
     if hi_all.empty or lo_all.empty:
+        print("⚠️ audit: High/Low データが空のため、今日の明細を出力できません")
         return "NORMAL", 0, set()
 
     roll_hi = hi_all.rolling(60, min_periods=20).max()
@@ -252,53 +250,57 @@ def _ts_mode_growth_5d(g_syms: list[str], ref_mode: str) -> tuple[str, int, set[
     last5_lo = lo_all.tail(5).reindex(last5_hi.index)
 
     if last5_hi.empty or last5_lo.empty:
+        print("⚠️ audit: 直近5営業日のデータが揃わず、今日の明細を出力できません")
         return "NORMAL", 0, set()
 
     base = float(config.TS_BASE_BY_MODE.get((ref_mode or "NORMAL").upper(), 0.15))
     uniq_hits: set[str] = set()
     today_hits: set[str] = set()
-    _ensure_audit_header()
 
-    def _fmt(val: float) -> str:
-        if pd.isna(val):
-            return ""
-        return f"{float(val):.6g}"
+    rows_today_printed = 0
+    today_reason_flags: list[str] = []
+    last_day = last5_hi.index[-1]
 
-    rows = []
     for dt in last5_hi.index:
         hi_row = last5_hi.loc[dt]
         lo_row = last5_lo.loc[dt]
         for sym in g_syms:
             rh = float(hi_row.get(sym, float("nan"))) if hasattr(hi_row, "get") else float("nan")
             lt = float(lo_row.get(sym, float("nan"))) if hasattr(lo_row, "get") else float("nan")
-            threshold = float("nan")
-            breach = 0
-            if pd.notna(rh) and rh > 0 and pd.notna(lt) and lt > 0:
-                threshold = rh * (1.0 - base)
-                breach = int(lt <= threshold)
-                if breach:
-                    uniq_hits.add(sym)
-                    if dt == last5_hi.index[-1]:
-                        today_hits.add(sym)
-            rows.append(
-                {
-                    "date": dt.date().isoformat() if hasattr(dt, "date") else str(dt),
-                    "symbol": sym,
-                    "high60": _fmt(rh),
-                    "low_today": _fmt(lt),
-                    "baseTS": f"{base:.3f}",
-                    "threshold": _fmt(threshold),
-                    "breach": str(breach),
-                }
-            )
 
-    if rows:
-        with open(AUDIT_PATH, "a", newline="") as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=["date", "symbol", "high60", "low_today", "baseTS", "threshold", "breach"],
-            )
-            writer.writerows(rows)
+            if not (pd.notna(rh) and rh > 0):
+                if dt == last_day:
+                    today_reason_flags.append("H60欠損")
+                continue
+            if not (pd.notna(lt) and lt > 0):
+                if dt == last_day:
+                    today_reason_flags.append("Low欠損")
+                continue
+
+            threshold = rh * (1.0 - base)
+            breach = int(lt <= threshold)
+            if breach:
+                uniq_hits.add(sym)
+                if dt == last_day:
+                    today_hits.add(sym)
+
+            if dt == last_day and rows_today_printed < AUDIT_PRINT_MAX:
+                print(
+                    "📝 audit: 今日の明細 "
+                    f"{dt.date().isoformat()} {sym} High60={rh:.6g} Low={lt:.6g} "
+                    f"baseTS={base:.3f} 阈値={threshold:.6g} 判定={breach}"
+                )
+                rows_today_printed += 1
+
+    print(
+        "📝 audit: 5Dユニーク数={0} / 今日ヒット一覧={1}".format(
+            len(uniq_hits), sorted(today_hits) if today_hits else []
+        )
+    )
+
+    if rows_today_printed == 0:
+        reason = "、".join(sorted(set(today_reason_flags))) or "データ欠損または銘柄なし"
+        print(f"⚠️ audit: 今日の明細が空です（理由のヒント: {reason}）")
 
     k5 = len(uniq_hits)
     mode1 = "EMERG" if k5 >= 8 else "CAUTION" if k5 >= 6 else "NORMAL"
