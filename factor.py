@@ -9,6 +9,34 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+
+# --- [ADD] bucket更新ヘルパー（ヘッダー無し3列: ticker,qty,bucket を前提） ---
+def _update_bucket_by_selection(csv_path: str, top_G: list[str], top_D: list[str]) -> None:
+    """
+    current_tickers.csv の bucket 列を、選定結果に基づき部分上書きする。
+    - 該当ティッカーのみ "G"/"D" に更新、未登場は既存値（空欄含む）を維持
+    - 常にヘッダー無しで (ticker,qty,bucket) の3列で保存
+    """
+    df = pd.read_csv(csv_path, header=None, names=["ticker", "qty", "bucket"])
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+    df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(int)
+    df["bucket"] = df["bucket"].fillna("").astype(str).str.strip().str.upper()
+
+    gset = set([t.upper() for t in (top_G or [])])
+    dset = set([t.upper() for t in (top_D or [])])
+
+    def _assign(row):
+        t = row["ticker"]
+        if t in gset:
+            return "G"
+        if t in dset:
+            return "D"
+        return row["bucket"]
+
+    df["bucket"] = df.apply(_assign, axis=1)
+    df[["ticker", "qty", "bucket"]].to_csv(csv_path, index=False, header=False)
+    logging.info("[I/O] current_tickers.csv bucket updated (G=%d, D=%d)", len(gset), len(dset))
 from scipy.stats import zscore  # used via scorer
 
 from scorer import Scorer, ttm_div_yield_portfolio, _log, _as_numeric_series
@@ -1557,6 +1585,12 @@ def run_pipeline() -> SelectionBundle:
         resD={"tickers": top_D, "avg_res_corr": avgD,
               "sum_score": sumD, "objective": objD},
         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
+
+    # [ADD] 選定確定後に current_tickers.csv の bucket を最新化
+    try:
+        _update_bucket_by_selection("current_tickers.csv", sb.top_G, sb.top_D)
+    except Exception as e:
+        logging.warning("bucket update failed: %s", e)
 
     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
     try:
