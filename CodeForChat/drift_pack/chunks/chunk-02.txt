@@ -1,313 +1,315 @@
 ```text
-G" if k >= 8 else "CAUTION" if k >= 6 else "NORMAL"
-L296         return mode1, k, []
-L297     base = float(config.TS_BASE_BY_MODE.get((ref_mode or "NORMAL").upper(), 0.15))
-L298     hits = set()
-L299     for s in g_syms:
-L300         rh = float(roll_hi.get(s, float("nan")))
-L301         lt = float(low_today.get(s, float("nan")))
-L302         if pd.notna(rh) and rh > 0 and pd.notna(lt) and lt > 0:
-L303             if lt <= rh * (1.0 - base):
-L304                 hits.add(s)
-L305     today = now_utc.date().isoformat()
-L306     _upsert_ts_hits(today, hits)
-L307     k = _count_unique_hits_5d(now_utc)
-L308     mode1 = "EMERG" if k >= 8 else "CAUTION" if k >= 6 else "NORMAL"
-L309     return mode1, k, sorted(hits)
-L310 # Debug flag
-L311 debug_mode = False  # set to True for detailed output
-L312
-L313 # --- Finnhub settings & helper ---
-L314 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
-L315 if not FINNHUB_API_KEY:
-L316     raise ValueError("FINNHUB_API_KEY not set (環境変数が未設定です)")
-L317
-L318 RATE_LIMIT = 55  # requests per minute (free tier is 60)
-L319 call_times = []
-L320
+      roll_hi = hi.rolling(60, min_periods=20).max().tail(1).iloc[0]
+L306             low_today = lo.tail(1).iloc[0]
+L307         except Exception:
+L308             roll_hi = pd.Series(dtype=float)
+L309             low_today = pd.Series(dtype=float)
+L310
+L311     base = float(config.TS_BASE_BY_MODE.get((ref_mode or "NORMAL").upper(), 0.15))
+L312     hits = set()
+L313     audit_rows = []
+L314     today = now_utc.date().isoformat()
+L315     _ensure_audit_header()
+L316
+L317     def _fmt(val: float) -> str:
+L318         if pd.isna(val):
+L319             return ""
+L320         return f"{float(val):.6g}"
 L321
-L322 def finnhub_get(endpoint, params):
-L323     """Call Finnhub API with basic rate limiting."""
-L324     now = time.time()
-L325     cutoff = now - 60
-L326     while call_times and call_times[0] < cutoff:
-L327         call_times.pop(0)
-L328     if len(call_times) >= RATE_LIMIT:
-L329         sleep_time = 60 - (now - call_times[0])
-L330         time.sleep(sleep_time)
-L331     params = {**params, "token": FINNHUB_API_KEY}
-L332     try:
-L333         resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params)
-L334         resp.raise_for_status()
-L335         data = resp.json()
-L336     except requests.exceptions.JSONDecodeError as e:
-L337         print(f"⚠️ Finnhub API JSON decode error: {e}")
-L338         return {}
-L339     except Exception as e:
-L340         print(f"⚠️ Finnhub API error: {e}")
-L341         return {}
-L342     call_times.append(time.time())
-L343     return data
-L344
-L345
-L346 def fetch_price(symbol):
-L347     try:
-L348         data = finnhub_get("quote", {"symbol": symbol})
-L349         price = data.get("c")
-L350         return float(price) if price not in (None, 0) else float("nan")
-L351     except Exception:
-L352         return float("nan")
-L353
-L354
-L355 def fetch_vix_ma5():
-L356     """Retrieve VIX 5-day moving average via yfinance."""
-L357     try:
-L358         vix = (
-L359             yf.download("^VIX", period="7d", interval="1d", progress=False, auto_adjust=False)["Close"]
-L360             .dropna()
-L361             .tail(5)
-L362         )
-L363         if len(vix) < 5:
-L364             return float("nan")
-L365         return vix.mean().item()
-L366     except Exception:
-L367         return float("nan")
-L368
-L369
-L370
-L371 # === Minervini-like sell signals ===
-L372 def _yf_df(sym, period="6mo"):
-L373     """日足/MA/出来高平均を取得。欠損時は None。"""
-L374     try:
-L375         df = yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False)
-L376         if df is None or df.empty:
-L377             return None
-L378         return df.dropna().assign(
-L379             ma20=lambda d: d["Close"].rolling(20).mean(),
-L380             ma50=lambda d: d["Close"].rolling(50).mean(),
-L381             vol50=lambda d: d["Volume"].rolling(50).mean(),
-L382         )
-L383     except Exception:
-L384         return None
-L385
-L386
-L387 def _scalar(row, col):
-L388     """Series/npスカラ→Pythonスカラ化（NaNはNaNのまま）"""
-L389     try:
-L390         v = row[col]
-L391         if hasattr(v, "item"):
-L392             try:
-L393                 v = v.item()
-L394             except Exception:
-L395                 pass
-L396         return v
+L322     for s in g_syms:
+L323         rh = float(roll_hi.get(s, float("nan"))) if hasattr(roll_hi, "get") else float("nan")
+L324         lt = float(low_today.get(s, float("nan"))) if hasattr(low_today, "get") else float("nan")
+L325         threshold = float("nan")
+L326         breach = 0
+L327         if pd.notna(rh) and rh > 0 and pd.notna(lt) and lt > 0:
+L328             threshold = rh * (1.0 - base)
+L329             breach = int(lt <= threshold)
+L330             if breach:
+L331                 hits.add(s)
+L332         audit_rows.append(
+L333             {
+L334                 "date": today,
+L335                 "symbol": s,
+L336                 "high60": _fmt(rh),
+L337                 "low_today": _fmt(lt),
+L338                 "baseTS": f"{base:.3f}",
+L339                 "threshold": _fmt(threshold),
+L340                 "breach": str(breach),
+L341             }
+L342         )
+L343
+L344     if audit_rows:
+L345         with open(AUDIT_PATH, "a", newline="") as f:
+L346             writer = csv.DictWriter(
+L347                 f,
+L348                 fieldnames=["date", "symbol", "high60", "low_today", "baseTS", "threshold", "breach"],
+L349             )
+L350             writer.writerows(audit_rows)
+L351
+L352     _upsert_ts_hits(today, hits)
+L353     k = _count_unique_hits_5d(now_utc)
+L354     mode1 = "EMERG" if k >= 8 else "CAUTION" if k >= 6 else "NORMAL"
+L355     return mode1, k, sorted(hits)
+L356 # Debug flag
+L357 debug_mode = False  # set to True for detailed output
+L358
+L359 # --- Finnhub settings & helper ---
+L360 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+L361 if not FINNHUB_API_KEY:
+L362     raise ValueError("FINNHUB_API_KEY not set (環境変数が未設定です)")
+L363
+L364 RATE_LIMIT = 55  # requests per minute (free tier is 60)
+L365 call_times = []
+L366
+L367
+L368 def finnhub_get(endpoint, params):
+L369     """Call Finnhub API with basic rate limiting."""
+L370     now = time.time()
+L371     cutoff = now - 60
+L372     while call_times and call_times[0] < cutoff:
+L373         call_times.pop(0)
+L374     if len(call_times) >= RATE_LIMIT:
+L375         sleep_time = 60 - (now - call_times[0])
+L376         time.sleep(sleep_time)
+L377     params = {**params, "token": FINNHUB_API_KEY}
+L378     try:
+L379         resp = requests.get(f"https://finnhub.io/api/v1/{endpoint}", params=params)
+L380         resp.raise_for_status()
+L381         data = resp.json()
+L382     except requests.exceptions.JSONDecodeError as e:
+L383         print(f"⚠️ Finnhub API JSON decode error: {e}")
+L384         return {}
+L385     except Exception as e:
+L386         print(f"⚠️ Finnhub API error: {e}")
+L387         return {}
+L388     call_times.append(time.time())
+L389     return data
+L390
+L391
+L392 def fetch_price(symbol):
+L393     try:
+L394         data = finnhub_get("quote", {"symbol": symbol})
+L395         price = data.get("c")
+L396         return float(price) if price not in (None, 0) else float("nan")
 L397     except Exception:
 L398         return float("nan")
 L399
 L400
-L401 def _is_strict_down(seq):
-L402     """数列が厳密に連続で切り下がっているか（len>=4を想定）。NaN含みはFalse。"""
+L401 def fetch_vix_ma5():
+L402     """Retrieve VIX 5-day moving average via yfinance."""
 L403     try:
-L404         xs = [float(x) for x in seq]
-L405         if any(pd.isna(x) for x in xs) or len(xs) < 4:
-L406             return False
-L407         return all(b < a for a, b in zip(xs[:-1], xs[1:]))
-L408     except Exception:
-L409         return False
-L410
-L411
-L412 def _signals_for_day(df, idx):
-L413     """df.loc[idx] 1日分に対しシグナル配列を返す（値動き/出来高ベースのみ）。"""
-L414     try:
-L415         sig = []
-L416         d = df.loc[idx]
-L417         close = _scalar(d, "Close")
-L418         ma20 = _scalar(d, "ma20")
-L419         ma50 = _scalar(d, "ma50")
-L420         vol = _scalar(d, "Volume")
-L421         vol50 = _scalar(d, "vol50")
-L422
-L423         if pd.notna(close) and pd.notna(ma20) and close < ma20:
-L424             sig.append("20DMA↓")
-L425
-L426         if all(pd.notna(x) for x in (close, ma50, vol, vol50)) and close < ma50 and vol > 1.5 * vol50:
-L427             sig.append("50DMA↓(大商い)")
-L428
-L429         last4 = df.loc[:idx].tail(4)
-L430         last10 = df.loc[:idx].tail(10)
+L404         vix = (
+L405             yf.download("^VIX", period="7d", interval="1d", progress=False, auto_adjust=False)["Close"]
+L406             .dropna()
+L407             .tail(5)
+L408         )
+L409         if len(vix) < 5:
+L410             return float("nan")
+L411         return vix.mean().item()
+L412     except Exception:
+L413         return float("nan")
+L414
+L415
+L416
+L417 # === Minervini-like sell signals ===
+L418 def _yf_df(sym, period="6mo"):
+L419     """日足/MA/出来高平均を取得。欠損時は None。"""
+L420     try:
+L421         df = yf.download(sym, period=period, interval="1d", auto_adjust=False, progress=False)
+L422         if df is None or df.empty:
+L423             return None
+L424         return df.dropna().assign(
+L425             ma20=lambda d: d["Close"].rolling(20).mean(),
+L426             ma50=lambda d: d["Close"].rolling(50).mean(),
+L427             vol50=lambda d: d["Volume"].rolling(50).mean(),
+L428         )
+L429     except Exception:
+L430         return None
 L431
-L432         lows_desc = _is_strict_down(last4["Low"].tolist()) if last4["Low"].notna().all() else False
-L433         reds = int((last10["Close"] < last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
-L434         if lows_desc or reds > 5:
-L435             sig.append("連続安値/陰線優勢")
-L436
-L437         ups = int((last10["Close"] > last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
-L438         if ups >= 7:
-L439             sig.append("上げ偏重(>70%)")
-L440
-L441         last15 = df.loc[:idx].tail(15)
-L442         base0 = _scalar(last15.iloc[0], "Close") if len(last15) > 0 else float("nan")
-L443         if pd.notna(base0) and pd.notna(close) and base0 != 0 and (close / base0 - 1) >= 0.25:
-L444             sig.append("+25%/15日内")
+L432
+L433 def _scalar(row, col):
+L434     """Series/npスカラ→Pythonスカラ化（NaNはNaNのまま）"""
+L435     try:
+L436         v = row[col]
+L437         if hasattr(v, "item"):
+L438             try:
+L439                 v = v.item()
+L440             except Exception:
+L441                 pass
+L442         return v
+L443     except Exception:
+L444         return float("nan")
 L445
-L446         if len(df.loc[:idx]) >= 2:
-L447             t1, t0 = df.loc[:idx].iloc[-2], df.loc[:idx].iloc[-1]
-L448             t1_high = _scalar(t1, "High")
-L449             t0_open = _scalar(t0, "Open")
-L450             t0_close = _scalar(t0, "Close")
-L451             if all(pd.notna(x) for x in (t1_high, t0_open, t0_close)):
-L452                 if (t0_open > t1_high * 1.02) and (t0_close < t0_open):
-L453                     sig.append("GU→陰線")
-L454         return sig
-L455     except Exception:
-L456         return []
+L446
+L447 def _is_strict_down(seq):
+L448     """数列が厳密に連続で切り下がっているか（len>=4を想定）。NaN含みはFalse。"""
+L449     try:
+L450         xs = [float(x) for x in seq]
+L451         if any(pd.isna(x) for x in xs) or len(xs) < 4:
+L452             return False
+L453         return all(b < a for a, b in zip(xs[:-1], xs[1:]))
+L454     except Exception:
+L455         return False
+L456
 L457
-L458
-L459 def scan_sell_signals(symbols, lookback_days=5):
-L460     """
-L461     直近 lookback_days 日のうち一度でもシグナルが出たら {sym: [(date,[signals]),...]} を返す。
-L462     日付は YYYY-MM-DD。Slackで列挙する。
-L463     """
-L464     out = {}
-L465     for s in symbols:
-L466         df = _yf_df(s)
-L467         if df is None or len(df) < 60:
-L468             continue
-L469         alerts = []
-L470         for idx in df.tail(lookback_days).index:
-L471             tags = _signals_for_day(df, idx)
-L472             if tags:
-L473                 alerts.append((idx.strftime("%Y-%m-%d"), tags))
-L474         if alerts:
-L475             out[s] = alerts
-L476     return out
+L458 def _signals_for_day(df, idx):
+L459     """df.loc[idx] 1日分に対しシグナル配列を返す（値動き/出来高ベースのみ）。"""
+L460     try:
+L461         sig = []
+L462         d = df.loc[idx]
+L463         close = _scalar(d, "Close")
+L464         ma20 = _scalar(d, "ma20")
+L465         ma50 = _scalar(d, "ma50")
+L466         vol = _scalar(d, "Volume")
+L467         vol50 = _scalar(d, "vol50")
+L468
+L469         if pd.notna(close) and pd.notna(ma20) and close < ma20:
+L470             sig.append("20DMA↓")
+L471
+L472         if all(pd.notna(x) for x in (close, ma50, vol, vol50)) and close < ma50 and vol > 1.5 * vol50:
+L473             sig.append("50DMA↓(大商い)")
+L474
+L475         last4 = df.loc[:idx].tail(4)
+L476         last10 = df.loc[:idx].tail(10)
 L477
-L478
-L479 def load_portfolio():
-L480     tickers_path = Path(__file__).with_name("current_tickers.csv")
-L481     with tickers_path.open() as f:
-L482         rows = [row for row in csv.reader(f) if row and row[0].strip()]
-L483     n = len(rows)
-L484     portfolio = []
-L485     for row in rows:
-L486         sym = row[0].strip().upper()
-L487         qty = int(row[1]) if len(row) > 1 and row[1].strip() else 0
-L488         bucket = row[2].strip().upper() if len(row) > 2 else ""
-L489         entry = {
-L490             "symbol": sym,
-L491             "shares": qty,
-L492             "target_ratio": 1 / n if n else 0.0,
-L493             "bucket": bucket,
-L494         }
-L495         portfolio.append(entry)
-L496     return portfolio
-L497
-L498
-L499 def compute_threshold():
-L500     vix_ma5 = fetch_vix_ma5()
-L501     drift_threshold = 10 if vix_ma5 < 20 else 12 if vix_ma5 < 26 else float("inf")
-L502     return vix_ma5, drift_threshold
+L478         lows_desc = _is_strict_down(last4["Low"].tolist()) if last4["Low"].notna().all() else False
+L479         reds = int((last10["Close"] < last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
+L480         if lows_desc or reds > 5:
+L481             sig.append("連続安値/陰線優勢")
+L482
+L483         ups = int((last10["Close"] > last10["Open"]).sum()) if last10[["Close", "Open"]].notna().all().all() else 0
+L484         if ups >= 7:
+L485             sig.append("上げ偏重(>70%)")
+L486
+L487         last15 = df.loc[:idx].tail(15)
+L488         base0 = _scalar(last15.iloc[0], "Close") if len(last15) > 0 else float("nan")
+L489         if pd.notna(base0) and pd.notna(close) and base0 != 0 and (close / base0 - 1) >= 0.25:
+L490             sig.append("+25%/15日内")
+L491
+L492         if len(df.loc[:idx]) >= 2:
+L493             t1, t0 = df.loc[:idx].iloc[-2], df.loc[:idx].iloc[-1]
+L494             t1_high = _scalar(t1, "High")
+L495             t0_open = _scalar(t0, "Open")
+L496             t0_close = _scalar(t0, "Close")
+L497             if all(pd.notna(x) for x in (t1_high, t0_open, t0_close)):
+L498                 if (t0_open > t1_high * 1.02) and (t0_close < t0_open):
+L499                     sig.append("GU→陰線")
+L500         return sig
+L501     except Exception:
+L502         return []
 L503
 L504
-L505 def compute_threshold_by_mode(mode: str):
-L506     """モードに応じて現金保有率とドリフト閾値を返す（README準拠）"""
-L507     m = (mode or "NORMAL").upper()
-L508     cash_map = {"NORMAL": 0.10, "CAUTION": 0.125, "EMERG": 0.20}
-L509     drift_map = config.DRIFT_THRESHOLD_BY_MODE
-L510     return cash_map.get(m, 0.10), drift_map.get(m, 12)
-L511
-L512
-L513 def recommended_counts_by_mode(mode: str) -> tuple[int, int, int]:
-L514     """
-L515     モード別の推奨保有数 (G_count, D_count, cash_slots) を返す。
-L516     cash_slotsは「外すG枠の数」（各枠=5%）。
-L517     NORMAL: G12/D8/現金化0, CAUTION: G10/D8/現金化2, EMERG: G8/D8/現金化4
-L518     """
-L519     m = (mode or "NORMAL").upper()
-L520     base = config.COUNTS_BY_MODE.get("NORMAL", config.COUNTS_BASE)
-L521     now  = config.COUNTS_BY_MODE.get(m, base)
-L522     cash_slots = max(0, base["G"] - now["G"])
-L523     return now["G"], now["D"], cash_slots
+L505 def scan_sell_signals(symbols, lookback_days=5):
+L506     """
+L507     直近 lookback_days 日のうち一度でもシグナルが出たら {sym: [(date,[signals]),...]} を返す。
+L508     日付は YYYY-MM-DD。Slackで列挙する。
+L509     """
+L510     out = {}
+L511     for s in symbols:
+L512         df = _yf_df(s)
+L513         if df is None or len(df) < 60:
+L514             continue
+L515         alerts = []
+L516         for idx in df.tail(lookback_days).index:
+L517             tags = _signals_for_day(df, idx)
+L518             if tags:
+L519                 alerts.append((idx.strftime("%Y-%m-%d"), tags))
+L520         if alerts:
+L521             out[s] = alerts
+L522     return out
+L523
 L524
-L525
-L526 def build_dataframe(portfolio):
-L527     for stock in portfolio:
-L528         price = fetch_price(stock["symbol"])
-L529         stock["price"] = price
-L530         stock["value"] = price * stock["shares"]
-L531
-L532     df = pd.DataFrame(portfolio)
-L533     total_value = df["value"].sum()
-L534     df["current_ratio"] = df["value"] / total_value
-L535     df["drift"] = df["current_ratio"] - df["target_ratio"]
-L536     df["drift_abs"] = df["drift"].abs()
-L537     total_drift_abs = df["drift_abs"].sum()
-L538     df["adjusted_ratio"] = df["current_ratio"] - df["drift"] / 2
-L539     df["adjustable"] = (
-L540         (df["adjusted_ratio"] * total_value) >= df["price"]
-L541     ) & df["price"].notna() & df["price"].gt(0)
-L542     return df, total_value, total_drift_abs
+L525 def load_portfolio():
+L526     tickers_path = Path(__file__).with_name("current_tickers.csv")
+L527     with tickers_path.open() as f:
+L528         rows = [row for row in csv.reader(f) if row and row[0].strip()]
+L529     n = len(rows)
+L530     portfolio = []
+L531     for row in rows:
+L532         sym = row[0].strip().upper()
+L533         qty = int(row[1]) if len(row) > 1 and row[1].strip() else 0
+L534         bucket = row[2].strip().upper() if len(row) > 2 else ""
+L535         entry = {
+L536             "symbol": sym,
+L537             "shares": qty,
+L538             "target_ratio": 1 / n if n else 0.0,
+L539             "bucket": bucket,
+L540         }
+L541         portfolio.append(entry)
+L542     return portfolio
 L543
 L544
-L545 def simulate(df, total_value, total_drift_abs, drift_threshold):
-L546     alert = drift_threshold != float("inf") and total_drift_abs * 100 > drift_threshold
-L547     if alert:
-L548         df["trade_shares"] = df.apply(
-L549             lambda r: int(round(((r["adjusted_ratio"] * total_value) - r["value"]) / r["price"]))
-L550             if r["adjustable"] and r["price"] > 0 else 0,
-L551             axis=1,
-L552         )
-L553         df["new_shares"] = df["shares"] + df["trade_shares"]
-L554         df["new_value"] = df["new_shares"] * df["price"]
-L555         new_total_value = df["new_value"].sum()
-L556         df["simulated_ratio"] = df["new_value"] / new_total_value
-L557         df["simulated_drift_abs"] = (df["simulated_ratio"] - df["target_ratio"]).abs()
-L558         simulated_total_drift_abs = df["simulated_drift_abs"].sum()
-L559     else:
-L560         df["trade_shares"] = np.nan
-L561         df["new_shares"] = np.nan
-L562         df["new_value"] = np.nan
-L563         new_total_value = np.nan
-L564         df["simulated_ratio"] = np.nan
-L565         df["simulated_drift_abs"] = np.nan
-L566         simulated_total_drift_abs = np.nan
-L567     return df, alert, new_total_value, simulated_total_drift_abs
-L568
-L569
-L570 def prepare_summary(df, total_drift_abs, alert):
-L571     summary = {
-L572         "symbol": "合計",
-L573         "shares": df["shares"].sum(),
-L574         "value": df["value"].sum(),
-L575         "current_ratio": np.nan,
-L576         "drift_abs": total_drift_abs,
-L577     }
-L578     if alert:
-L579         summary["trade_shares"] = np.nan
-L580     # Sort details by evaluation value descending before appending summary
-L581     df = df.sort_values(by="value", ascending=False)
-L582     df = pd.concat([df, pd.DataFrame([summary])], ignore_index=True)
-L583     if alert:
-L584         cols = ["symbol", "shares", "value", "current_ratio", "drift_abs", "trade_shares"]
-L585         df_small = df[cols].copy()
-L586         df_small.columns = ["sym", "qty", "val", "now", "|d|", "Δqty"]
-L587     else:
-L588         cols = ["symbol", "shares", "value", "current_ratio", "drift_abs"]
-L589         df_small = df[cols].copy()
-L590         df_small.columns = ["sym", "qty", "val", "now", "|d|"]
-L591     return df_small
-L592
-L593
-L594 def currency(x):
-L595     return f"${x:,.0f}" if pd.notnull(x) else ""
-L596
-L597
-L598 def formatters_for(alert):
-L599     formatters = {"val": currency, "now": "{:.2%}".format, "|d|": "{:.2%}".format}
-L600     if alert:
-L601         formatters["Δqty"] = "{:.0f}".format
-L602     return formatters
-L603
-L604
-L605 def build_header(mode, cash_r
+L545 def compute_threshold():
+L546     vix_ma5 = fetch_vix_ma5()
+L547     drift_threshold = 10 if vix_ma5 < 20 else 12 if vix_ma5 < 26 else float("inf")
+L548     return vix_ma5, drift_threshold
+L549
+L550
+L551 def compute_threshold_by_mode(mode: str):
+L552     """モードに応じて現金保有率とドリフト閾値を返す（README準拠）"""
+L553     m = (mode or "NORMAL").upper()
+L554     cash_map = {"NORMAL": 0.10, "CAUTION": 0.125, "EMERG": 0.20}
+L555     drift_map = config.DRIFT_THRESHOLD_BY_MODE
+L556     return cash_map.get(m, 0.10), drift_map.get(m, 12)
+L557
+L558
+L559 def recommended_counts_by_mode(mode: str) -> tuple[int, int, int]:
+L560     """
+L561     モード別の推奨保有数 (G_count, D_count, cash_slots) を返す。
+L562     cash_slotsは「外すG枠の数」（各枠=5%）。
+L563     NORMAL: G12/D8/現金化0, CAUTION: G10/D8/現金化2, EMERG: G8/D8/現金化4
+L564     """
+L565     m = (mode or "NORMAL").upper()
+L566     base = config.COUNTS_BY_MODE.get("NORMAL", config.COUNTS_BASE)
+L567     now  = config.COUNTS_BY_MODE.get(m, base)
+L568     cash_slots = max(0, base["G"] - now["G"])
+L569     return now["G"], now["D"], cash_slots
+L570
+L571
+L572 def build_dataframe(portfolio):
+L573     for stock in portfolio:
+L574         price = fetch_price(stock["symbol"])
+L575         stock["price"] = price
+L576         stock["value"] = price * stock["shares"]
+L577
+L578     df = pd.DataFrame(portfolio)
+L579     total_value = df["value"].sum()
+L580     df["current_ratio"] = df["value"] / total_value
+L581     df["drift"] = df["current_ratio"] - df["target_ratio"]
+L582     df["drift_abs"] = df["drift"].abs()
+L583     total_drift_abs = df["drift_abs"].sum()
+L584     df["adjusted_ratio"] = df["current_ratio"] - df["drift"] / 2
+L585     df["adjustable"] = (
+L586         (df["adjusted_ratio"] * total_value) >= df["price"]
+L587     ) & df["price"].notna() & df["price"].gt(0)
+L588     return df, total_value, total_drift_abs
+L589
+L590
+L591 def simulate(df, total_value, total_drift_abs, drift_threshold):
+L592     alert = drift_threshold != float("inf") and total_drift_abs * 100 > drift_threshold
+L593     if alert:
+L594         df["trade_shares"] = df.apply(
+L595             lambda r: int(round(((r["adjusted_ratio"] * total_value) - r["value"]) / r["price"]))
+L596             if r["adjustable"] and r["price"] > 0 else 0,
+L597             axis=1,
+L598         )
+L599         df["new_shares"] = df["shares"] + df["trade_shares"]
+L600         df["new_value"] = df["new_shares"] * df["price"]
+L601         new_total_value = df["new_value"].sum()
+L602         df["simulated_ratio"] = df["new_value"] / new_total_value
+L603         df["simulated_drift_abs"] = (df["simulated_ratio"] - df["target_ratio"]).abs()
+L604         simulated_total_drift_abs = df["simulated_drift_abs"].sum()
+L605     else:
+L606         df["trade_shares"] = np.nan
+L607         df["new_shares"] = np.nan
+L608         df["new_value"] = np.nan
+L609         new_total_value = np.nan
+L610         df["simulated_ratio"] = np.nan
+L611         df["simulated_drift_abs"] = np.nan
+L612         simulated_total_drift_abs = np.nan
+L613     return df, alert, new_total_value, simulated_total_drift_abs
+L614
+L615
+L616 def prepare_summary(df, total_drift_abs, alert):
+L61
 ```
