@@ -8,6 +8,10 @@ from pathlib import Path
 import csv
 import config
 
+# --- コンポジットDDのしきい値（G枠平均DD基準） ---
+CD_CAUTION = 0.10  # -10% で警戒モード
+CD_EMERG = 0.15  # -15% で緊急モード
+
 MODE_LABELS_JA = {"NORMAL": "通常", "CAUTION": "警戒", "EMERG": "緊急"}
 MODE_EMOJIS = {"NORMAL": "🟢", "CAUTION": "⚠️", "EMERG": "🚨"}
 MODE_RANK = {"NORMAL": 0, "CAUTION": 1, "EMERG": 2}
@@ -18,26 +22,51 @@ CAND_PRICE_MAX = 450.0
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-AUDIT_PRINT_MAX = int(os.environ.get("AUDIT_PRINT_MAX", "20"))  # stdout に流す本日の明細の最大行数
-
-
 def _state_file():
     return str(Path(RESULTS_DIR) / "breadth_state.json")
 
 
-def load_mode(default="NORMAL"):
+def _load_state_dict() -> dict:
     try:
-        m = json.loads(open(_state_file()).read()).get("mode", default)
-        return m if m in ("EMERG","CAUTION","NORMAL") else default
+        with open(_state_file()) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
     except Exception:
-        return default
+        return {}
 
 
-def save_mode(mode: str):
+def _save_state_dict(state: dict):
     try:
-        open(_state_file(),"w").write(json.dumps({"mode": mode}))
+        with open(_state_file(), "w") as fh:
+            json.dump(state, fh)
     except Exception:
         pass
+
+
+def load_breadth_mode(default: str = "NORMAL") -> str:
+    state = _load_state_dict()
+    mode = state.get("breadth_mode", state.get("mode", default))
+    return mode if mode in MODE_RANK else default
+
+
+def save_breadth_mode(mode: str):
+    state = _load_state_dict()
+    state["breadth_mode"] = mode
+    _save_state_dict(state)
+
+
+def load_final_mode(default: str = "NORMAL") -> str:
+    state = _load_state_dict()
+    mode = state.get("final_mode", state.get("mode", default))
+    return mode if mode in MODE_RANK else default
+
+
+def save_final_mode(mode: str):
+    state = _load_state_dict()
+    state["final_mode"] = mode
+    state.setdefault("breadth_mode", state.get("breadth_mode", mode))
+    state["mode"] = mode
+    _save_state_dict(state)
 
 
 def _read_csv_list(fname):
@@ -151,14 +180,14 @@ def build_breadth_header():
         th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3*N_G)))
         th_src = "手動"
 
-    prev = load_mode("NORMAL")
+    prev = load_breadth_mode("NORMAL")
     if   prev == "EMERG":
         mode = "EMERG"   if (C_full < th_out)  else ("CAUTION" if (C_full < th_norm) else "NORMAL")
     elif prev == "CAUTION":
         mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
     else:
         mode = "EMERG"   if (C_full < th_in)   else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-    save_mode(mode)
+    save_breadth_mode(mode)
 
     mode_ja, emoji = MODE_LABELS_JA.get(mode, mode), MODE_EMOJIS.get(mode, "ℹ️")
     eff_days = len(base)
@@ -189,26 +218,18 @@ def _load_growth_symbols(portfolio: list[dict]) -> list[str]:
     return sorted(set(growth))
 
 
-def _combine_modes(mode_a: str, mode_b: str) -> str:
-    a = MODE_RANK.get((mode_a or "NORMAL").upper(), 0)
-    b = MODE_RANK.get((mode_b or "NORMAL").upper(), 0)
-    for mode, rank in MODE_RANK.items():
-        if rank == max(a, b):
-            return mode
-    return "NORMAL"
-
-
 def _format_mode(mode: str) -> str:
     upper = (mode or "NORMAL").upper()
     return f"{MODE_EMOJIS.get(upper, 'ℹ️')} {MODE_LABELS_JA.get(upper, upper)}"
 
 
-def _ts_mode_growth_5d(g_syms: list[str], ref_mode: str) -> tuple[str, int, set[str]]:
-    """直近5営業日を株価直接方式で一括判定（Low vs 60D High）。"""
+def _gcd_mode_today(g_syms: list[str]) -> tuple[str, float]:
+    """G枠の等加重コンポジットDD（Low/Peak60）を算出しモードを返す。"""
 
     if not g_syms:
-        print("⚠️ audit: G銘柄リストが空のため、今日の明細を出力できません")
-        return "NORMAL", 0, set()
+        print("📝 audit[G-CD details]: G銘柄が空のため算出対象がありません")
+        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        return "NORMAL", 0.0
 
     try:
         df = yf.download(
@@ -219,23 +240,27 @@ def _ts_mode_growth_5d(g_syms: list[str], ref_mode: str) -> tuple[str, int, set[
             progress=False,
         )
     except Exception as e:
-        print(f"⚠️ audit: 株価データ取得に失敗しました ({e})")
-        return "NORMAL", 0, set()
+        print(f"⚠️ audit[G-CD details]: 株価データ取得に失敗しました ({e})")
+        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        return "NORMAL", 0.0
 
     if not isinstance(df, pd.DataFrame) or df.empty:
-        print("⚠️ audit: 株価データが空のため、今日の明細を出力できません")
-        return "NORMAL", 0, set()
+        print("⚠️ audit[G-CD details]: 株価データが空のため算出できません")
+        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        return "NORMAL", 0.0
 
     try:
         hi_all = df["High"] if "High" in df.columns else None
         lo_all = df["Low"] if "Low" in df.columns else None
     except Exception as e:
-        print(f"⚠️ audit: High/Low データ取得に失敗しました ({e})")
-        hi_all = lo_all = None
+        print(f"⚠️ audit[G-CD details]: High/Low データ取得に失敗しました ({e})")
+        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        return "NORMAL", 0.0
 
     if hi_all is None or lo_all is None:
-        print("⚠️ audit: High/Low データが欠落しているため、今日の明細を出力できません")
-        return "NORMAL", 0, set()
+        print("⚠️ audit[G-CD details]: High/Low データが欠落しています")
+        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        return "NORMAL", 0.0
 
     if isinstance(hi_all, pd.Series):
         hi_all = hi_all.to_frame(name=g_syms[0])
@@ -243,69 +268,54 @@ def _ts_mode_growth_5d(g_syms: list[str], ref_mode: str) -> tuple[str, int, set[
         lo_all = lo_all.to_frame(name=g_syms[0])
 
     if hi_all.empty or lo_all.empty:
-        print("⚠️ audit: High/Low データが空のため、今日の明細を出力できません")
-        return "NORMAL", 0, set()
+        print("⚠️ audit[G-CD details]: High/Low データが空のため算出できません")
+        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        return "NORMAL", 0.0
 
     roll_hi = hi_all.rolling(60, min_periods=20).max()
-    last5_hi = roll_hi.tail(5)
-    last5_lo = lo_all.tail(5).reindex(last5_hi.index)
+    if roll_hi.empty or lo_all.empty:
+        print("⚠️ audit[G-CD details]: Peak60/Low データが揃いません")
+        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        return "NORMAL", 0.0
 
-    if last5_hi.empty or last5_lo.empty:
-        print("⚠️ audit: 直近5営業日のデータが揃わず、今日の明細を出力できません")
-        return "NORMAL", 0, set()
+    peak_row = roll_hi.iloc[-1]
+    low_row = lo_all.iloc[-1]
 
-    base = float(config.TS_BASE_BY_MODE.get((ref_mode or "NORMAL").upper(), 0.15))
-    uniq_hits: set[str] = set()
-    today_hits: set[str] = set()
+    details: list[tuple[str, float, float, float, float]] = []
+    for sym in g_syms:
+        p = float(peak_row.get(sym, float("nan"))) if hasattr(peak_row, "get") else float("nan")
+        lt = float(low_row.get(sym, float("nan"))) if hasattr(low_row, "get") else float("nan")
+        if pd.notna(p) and p > 0 and pd.notna(lt) and lt > 0:
+            ratio = lt / p
+            ddpct = (1.0 - ratio) * 100.0
+            details.append((sym, p, lt, ratio, ddpct))
 
-    rows_today_printed = 0
-    today_reason_flags: list[str] = []
-    last_day = last5_hi.index[-1]
+    if not details:
+        print("⚠️ audit[G-CD details]: 有効な銘柄データがありません")
+        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        return "NORMAL", 0.0
 
-    for dt in last5_hi.index:
-        hi_row = last5_hi.loc[dt]
-        lo_row = last5_lo.loc[dt]
-        for sym in g_syms:
-            rh = float(hi_row.get(sym, float("nan"))) if hasattr(hi_row, "get") else float("nan")
-            lt = float(lo_row.get(sym, float("nan"))) if hasattr(lo_row, "get") else float("nan")
+    details.sort(key=lambda x: x[4], reverse=True)
+    today = pd.Timestamp.now(tz="America/New_York").date().isoformat()
+    print(f"📝 audit[G-CD details] {today}  G={len(g_syms)}")
+    print("  SYMBOL        Peak60(H)     Low(T)     ratio    DD%")
+    for sym, peak, low, ratio, ddpct in details:
+        print(f"  {sym:<8}  {peak:>12.6g}  {low:>10.6g}   {ratio:>6.3f}  {ddpct:>6.2f}")
 
-            if not (pd.notna(rh) and rh > 0):
-                if dt == last_day:
-                    today_reason_flags.append("H60欠損")
-                continue
-            if not (pd.notna(lt) and lt > 0):
-                if dt == last_day:
-                    today_reason_flags.append("Low欠損")
-                continue
-
-            threshold = rh * (1.0 - base)
-            breach = int(lt <= threshold)
-            if breach:
-                uniq_hits.add(sym)
-                if dt == last_day:
-                    today_hits.add(sym)
-
-            if dt == last_day and rows_today_printed < AUDIT_PRINT_MAX:
-                print(
-                    "📝 audit: 今日の明細 "
-                    f"{dt.date().isoformat()} {sym} High60={rh:.6g} Low={lt:.6g} "
-                    f"baseTS={base:.3f} 阈値={threshold:.6g} 判定={breach}"
-                )
-                rows_today_printed += 1
+    avg_ratio = float(np.mean([r for _, _, _, r, _ in details]))
+    gcd_pct = max(0.0, (1.0 - avg_ratio) * 100.0)
+    if gcd_pct >= CD_EMERG * 100:
+        mode = "EMERG"
+    elif gcd_pct >= CD_CAUTION * 100:
+        mode = "CAUTION"
+    else:
+        mode = "NORMAL"
 
     print(
-        "📝 audit: 5Dユニーク数={0} / 今日ヒット一覧={1}".format(
-            len(uniq_hits), sorted(today_hits) if today_hits else []
-        )
+        "📝 audit[G-CD summary]: "
+        f"avg_low/peak60={avg_ratio:.4f}  drawdown={gcd_pct:.2f}%  => {mode}"
     )
-
-    if rows_today_printed == 0:
-        reason = "、".join(sorted(set(today_reason_flags))) or "データ欠損または銘柄なし"
-        print(f"⚠️ audit: 今日の明細が空です（理由のヒント: {reason}）")
-
-    k5 = len(uniq_hits)
-    mode1 = "EMERG" if k5 >= 8 else "CAUTION" if k5 >= 6 else "NORMAL"
-    return mode1, k5, today_hits
+    return mode, gcd_pct
 # Debug flag
 debug_mode = False  # set to True for detailed output
 
@@ -657,10 +667,21 @@ def main():
     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
 
     breadth_block, breadth_mode, breadth_score = build_breadth_header()
-    ts_mode, k5, today_hits = _ts_mode_growth_5d(g_syms, breadth_mode)
-    combo_mode = _combine_modes(ts_mode, breadth_mode)
+    gcd_mode, gcd_pct = _gcd_mode_today(g_syms)
 
-    cash_ratio, drift_threshold = compute_threshold_by_mode(breadth_mode)
+    prev_final = load_final_mode("NORMAL")
+    gcd_rank = MODE_RANK.get(gcd_mode, 0)
+    breadth_rank = MODE_RANK.get(breadth_mode, 0)
+    prev_rank = MODE_RANK.get(prev_final, 0)
+    if max(gcd_rank, breadth_rank) > prev_rank:
+        final_mode = gcd_mode if gcd_rank >= breadth_rank else breadth_mode
+    elif gcd_rank < prev_rank and breadth_rank < prev_rank:
+        final_mode = gcd_mode if gcd_rank >= breadth_rank else breadth_mode
+    else:
+        final_mode = prev_final
+    save_final_mode(final_mode)
+
+    cash_ratio, drift_threshold = compute_threshold_by_mode(final_mode)
 
     df, total_value, total_drift_abs = build_dataframe(portfolio)
     df, alert, new_total_value, simulated_total_drift_abs = simulate(
@@ -677,16 +698,16 @@ def main():
             df_small.insert(1, "sig", df_small[col_sym].map(latest_tag).fillna(""))
     formatters = formatters_for(alert)
     header_core = build_header(
-        breadth_mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
+        final_mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
     )
 
-    g_count = len(g_syms)
-    hits_line = "なし" if not today_hits else ", ".join(sorted(today_hits))
     summary_lines = [
-        f"① Growth TS: {_format_mode(ts_mode)} （5Dユニーク: {k5} / G={g_count}）",
-        f"・当日ヒット: {hits_line}",
+        (
+            f"① GコンポジットDD: -{gcd_pct:.1f}%"
+            f"（基準: C={CD_CAUTION*100:.0f}% / E={CD_EMERG*100:.0f}%） 判定: {_format_mode(gcd_mode)}"
+        ),
         f"② Breadth: {_format_mode(breadth_mode)} （テンプレ合格本数: {breadth_score}）",
-        f"総合（OR悪化/AND回復）: {_format_mode(combo_mode)}",
+        f"総合（OR悪化/AND回復）: {_format_mode(final_mode)}",
     ]
     prepend_block = "\n".join(summary_lines)
 
