@@ -36,6 +36,7 @@ def _update_bucket_by_selection(csv_path: str, top_G: list[str], top_D: list[str
 
     df["bucket"] = df.apply(_assign, axis=1)
     df[["ticker", "qty", "bucket"]].to_csv(csv_path, index=False, header=False)
+    logging.info("current_tickers.csv abspath: %s", os.path.abspath(csv_path))
     logging.info("[I/O] current_tickers.csv bucket updated (G=%d, D=%d)", len(gset), len(dset))
 from scipy.stats import zscore  # used via scorer
 
