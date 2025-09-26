@@ -8,9 +8,9 @@ from pathlib import Path
 import csv
 import config
 
-# --- コンポジットDDのしきい値（G枠平均DD基準） ---
-CD_CAUTION = 0.10  # -10% で警戒モード
-CD_EMERG = 0.15  # -15% で緊急モード
+# --- GコンポジットDDのしきい値（Growthの平均DD基準）---
+CD_CAUTION = 0.10   # -10% で警戒
+CD_EMERG = 0.15   # -15% で緊急
 
 MODE_LABELS_JA = {"NORMAL": "通常", "CAUTION": "警戒", "EMERG": "緊急"}
 MODE_EMOJIS = {"NORMAL": "🟢", "CAUTION": "⚠️", "EMERG": "🚨"}
@@ -224,11 +224,14 @@ def _format_mode(mode: str) -> str:
 
 
 def _gcd_mode_today(g_syms: list[str]) -> tuple[str, float]:
-    """G枠の等加重コンポジットDD（Low/Peak60）を算出しモードを返す。"""
+    """
+    現在のGrowth群について、Low_today / Peak60(High) の等加重平均から G-CD(%) を算出し、モードを返す。
+    戻り値: (gcd_mode, gcd_pct)  ※gcd_pctは正の%（例 11.3 は -11.3%の下落）
+    """
 
     if not g_syms:
         print("📝 audit[G-CD details]: G銘柄が空のため算出対象がありません")
-        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
         return "NORMAL", 0.0
 
     try:
@@ -241,25 +244,19 @@ def _gcd_mode_today(g_syms: list[str]) -> tuple[str, float]:
         )
     except Exception as e:
         print(f"⚠️ audit[G-CD details]: 株価データ取得に失敗しました ({e})")
-        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
         return "NORMAL", 0.0
 
     if not isinstance(df, pd.DataFrame) or df.empty:
         print("⚠️ audit[G-CD details]: 株価データが空のため算出できません")
-        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
         return "NORMAL", 0.0
 
-    try:
-        hi_all = df["High"] if "High" in df.columns else None
-        lo_all = df["Low"] if "Low" in df.columns else None
-    except Exception as e:
-        print(f"⚠️ audit[G-CD details]: High/Low データ取得に失敗しました ({e})")
-        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
-        return "NORMAL", 0.0
-
+    hi_all = df.get("High") if isinstance(df, pd.DataFrame) else None
+    lo_all = df.get("Low") if isinstance(df, pd.DataFrame) else None
     if hi_all is None or lo_all is None:
         print("⚠️ audit[G-CD details]: High/Low データが欠落しています")
-        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
         return "NORMAL", 0.0
 
     if isinstance(hi_all, pd.Series):
@@ -269,22 +266,16 @@ def _gcd_mode_today(g_syms: list[str]) -> tuple[str, float]:
 
     if hi_all.empty or lo_all.empty:
         print("⚠️ audit[G-CD details]: High/Low データが空のため算出できません")
-        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
         return "NORMAL", 0.0
 
-    roll_hi = hi_all.rolling(60, min_periods=20).max()
-    if roll_hi.empty or lo_all.empty:
-        print("⚠️ audit[G-CD details]: Peak60/Low データが揃いません")
-        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
-        return "NORMAL", 0.0
-
-    peak_row = roll_hi.iloc[-1]
-    low_row = lo_all.iloc[-1]
+    peak60 = hi_all.rolling(60, min_periods=20).max().tail(1).iloc[0]
+    low_today = lo_all.tail(1).iloc[0]
 
     details: list[tuple[str, float, float, float, float]] = []
     for sym in g_syms:
-        p = float(peak_row.get(sym, float("nan"))) if hasattr(peak_row, "get") else float("nan")
-        lt = float(low_row.get(sym, float("nan"))) if hasattr(low_row, "get") else float("nan")
+        p = float(peak60.get(sym, float("nan"))) if hasattr(peak60, "get") else float("nan")
+        lt = float(low_today.get(sym, float("nan"))) if hasattr(low_today, "get") else float("nan")
         if pd.notna(p) and p > 0 and pd.notna(lt) and lt > 0:
             ratio = lt / p
             ddpct = (1.0 - ratio) * 100.0
@@ -292,11 +283,11 @@ def _gcd_mode_today(g_syms: list[str]) -> tuple[str, float]:
 
     if not details:
         print("⚠️ audit[G-CD details]: 有効な銘柄データがありません")
-        print("📝 audit[G-CD summary]: drawdown=0.00% => NORMAL")
+        print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
         return "NORMAL", 0.0
 
     details.sort(key=lambda x: x[4], reverse=True)
-    today = pd.Timestamp.now(tz="America/New_York").date().isoformat()
+    today = pd.Timestamp.today(tz="America/New_York").date().isoformat()
     print(f"📝 audit[G-CD details] {today}  G={len(g_syms)}")
     print("  SYMBOL        Peak60(H)     Low(T)     ratio    DD%")
     for sym, peak, low, ratio, ddpct in details:
@@ -304,16 +295,9 @@ def _gcd_mode_today(g_syms: list[str]) -> tuple[str, float]:
 
     avg_ratio = float(np.mean([r for _, _, _, r, _ in details]))
     gcd_pct = max(0.0, (1.0 - avg_ratio) * 100.0)
-    if gcd_pct >= CD_EMERG * 100:
-        mode = "EMERG"
-    elif gcd_pct >= CD_CAUTION * 100:
-        mode = "CAUTION"
-    else:
-        mode = "NORMAL"
-
+    mode = "EMERG" if gcd_pct >= CD_EMERG * 100 else "CAUTION" if gcd_pct >= CD_CAUTION * 100 else "NORMAL"
     print(
-        "📝 audit[G-CD summary]: "
-        f"avg_low/peak60={avg_ratio:.4f}  drawdown={gcd_pct:.2f}%  => {mode}"
+        f"📝 audit[G-CD summary]: avg_low/peak60={avg_ratio:.4f}  drawdown={gcd_pct:.2f}%  => {mode}"
     )
     return mode, gcd_pct
 # Debug flag
@@ -514,9 +498,13 @@ def compute_threshold():
 def compute_threshold_by_mode(mode: str):
     """モードに応じて現金保有率とドリフト閾値を返す（README準拠）"""
     m = (mode or "NORMAL").upper()
-    cash_map = {"NORMAL": 0.10, "CAUTION": 0.125, "EMERG": 0.20}
-    drift_map = config.DRIFT_THRESHOLD_BY_MODE
-    return cash_map.get(m, 0.10), drift_map.get(m, 12)
+    cash_ratio = config.CASH_RATIO_BY_MODE.get(
+        m, config.CASH_RATIO_BY_MODE.get("NORMAL", 0.10)
+    )
+    drift_threshold = config.DRIFT_THRESHOLD_BY_MODE.get(
+        m, config.DRIFT_THRESHOLD_BY_MODE.get("NORMAL", 12)
+    )
+    return cash_ratio, drift_threshold
 
 
 def recommended_counts_by_mode(mode: str) -> tuple[int, int, int]:
@@ -530,6 +518,21 @@ def recommended_counts_by_mode(mode: str) -> tuple[int, int, int]:
     now  = config.COUNTS_BY_MODE.get(m, base)
     cash_slots = max(0, base["G"] - now["G"])
     return now["G"], now["D"], cash_slots
+
+
+def _mode_tail_line(final_mode: str) -> str:
+    fm = (final_mode or "NORMAL").upper()
+    base_ts = config.TS_BASE_BY_MODE.get(fm, config.TS_BASE_BY_MODE.get("NORMAL", 0.15))
+    ts_base = int(round(base_ts * 100))
+    g_cnt, d_cnt, cash_slots = recommended_counts_by_mode(fm)
+    cash_pct = config.CASH_RATIO_BY_MODE.get(
+        fm, config.CASH_RATIO_BY_MODE.get("NORMAL", 0.10)
+    ) * 100
+    return (
+        f"〔このモードの設定〕TS基本: -{ts_base}% ／ "
+        f"推奨保有: G{g_cnt}・D{d_cnt}（現金化枠 {cash_slots}）／ "
+        f"推奨現金比率: {cash_pct:.0f}%"
+    )
 
 
 def build_dataframe(portfolio):
@@ -612,8 +615,9 @@ def formatters_for(alert):
 
 
 def build_header(mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs):
+    mode_ratio = config.CASH_RATIO_BY_MODE.get(mode.upper(), cash_ratio)
     header = (
-        f"*💼 現金保有率:* {cash_ratio*100:.1f}%\n"
+        f"*💼 推奨現金比率:* {mode_ratio*100:.1f}%（モード準拠）\n"
         f"*📊 ドリフト閾値:* {'🔴(停止)' if drift_threshold == float('inf') else str(drift_threshold)+'%'}\n"
         f"*📉 現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
     )
@@ -670,15 +674,25 @@ def main():
     gcd_mode, gcd_pct = _gcd_mode_today(g_syms)
 
     prev_final = load_final_mode("NORMAL")
-    gcd_rank = MODE_RANK.get(gcd_mode, 0)
-    breadth_rank = MODE_RANK.get(breadth_mode, 0)
-    prev_rank = MODE_RANK.get(prev_final, 0)
+    order = MODE_RANK
+    gcd_rank = order.get(gcd_mode, 0)
+    breadth_rank = order.get(breadth_mode, 0)
+    prev_rank = order.get(prev_final, 0)
+    worsen_mode = gcd_mode if gcd_rank >= breadth_rank else breadth_mode
     if max(gcd_rank, breadth_rank) > prev_rank:
-        final_mode = gcd_mode if gcd_rank >= breadth_rank else breadth_mode
-    elif gcd_rank < prev_rank and breadth_rank < prev_rank:
-        final_mode = gcd_mode if gcd_rank >= breadth_rank else breadth_mode
+        final_mode = worsen_mode
     else:
-        final_mode = prev_final
+        and_recover = gcd_rank < prev_rank and breadth_rank < prev_rank
+        g_leads_recover = gcd_rank < prev_rank
+        if and_recover or g_leads_recover:
+            if prev_final == "EMERG":
+                final_mode = "CAUTION"
+            elif prev_final == "CAUTION":
+                final_mode = "NORMAL"
+            else:
+                final_mode = prev_final
+        else:
+            final_mode = prev_final
     save_final_mode(final_mode)
 
     cash_ratio, drift_threshold = compute_threshold_by_mode(final_mode)
@@ -701,15 +715,22 @@ def main():
         final_mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
     )
 
-    summary_lines = [
-        (
-            f"① GコンポジットDD: -{gcd_pct:.1f}%"
-            f"（基準: C={CD_CAUTION*100:.0f}% / E={CD_EMERG*100:.0f}%） 判定: {_format_mode(gcd_mode)}"
-        ),
-        f"② Breadth: {_format_mode(breadth_mode)} （テンプレ合格本数: {breadth_score}）",
-        f"総合（OR悪化/AND回復）: {_format_mode(final_mode)}",
-    ]
-    prepend_block = "\n".join(summary_lines)
+    block_gcd = (
+        f"① GコンポジットDD: -{gcd_pct:.1f}%"
+        f"（基準: C={CD_CAUTION*100:.0f}% / E={CD_EMERG*100:.0f}%） 判定: {gcd_mode}"
+    )
+    block_breadth = f"② Breadth: {breadth_mode}（テンプレ合格本数: {breadth_score}）"
+    block_final = f"総合（OR悪化／AND回復＋G先行なら1段階回復）: {final_mode}"
+    prepend = (
+        block_gcd
+        + "\n"
+        + block_breadth
+        + "\n"
+        + block_final
+        + "\n"
+        + _mode_tail_line(final_mode)
+        + "\n"
+    )
 
     if breadth_block:
         if breadth_block.startswith("```"):
@@ -721,18 +742,15 @@ def main():
             inner = inner.strip("\n")
             inner_lines = [line for line in inner.splitlines() if "現在モード" not in line]
             cleaned_inner = "\n".join(inner_lines)
-            if cleaned_inner:
-                new_inner = prepend_block + "\n" + cleaned_inner
-            else:
-                new_inner = prepend_block
+            new_inner = prepend + cleaned_inner if cleaned_inner else prepend.rstrip("\n")
             breadth_block = "```\n" + new_inner + "\n```"
         else:
             lines = [line for line in breadth_block.splitlines() if "現在モード" not in line]
             cleaned_block = "\n".join(lines)
-            breadth_block = prepend_block + ("\n" + cleaned_block if cleaned_block else "")
-        header = breadth_block + "\n" + header_core
+            breadth_block = prepend + cleaned_block if cleaned_block else prepend.rstrip("\n")
+        header = breadth_block + ("\n" if not breadth_block.endswith("\n") else "") + header_core
     else:
-        header = prepend_block + "\n" + header_core
+        header = prepend + header_core
     if sell_alerts:
         def fmt_pair(date_tags):
             date, tags = date_tags

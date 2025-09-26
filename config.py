@@ -14,6 +14,13 @@ COUNTS_BY_MODE = {
 # モード別のドリフト閾値（%）
 DRIFT_THRESHOLD_BY_MODE = {"NORMAL": 12, "CAUTION": 14, "EMERG": float("inf")}
 
+# モード別の推奨現金比率
+CASH_RATIO_BY_MODE = {
+    "NORMAL": 0.10,  # 10%
+    "CAUTION": 0.20,  # 20%
+    "EMERG": 0.30,  # 30%
+}
+
 # モード別のTS（基本幅, 小数=割合）
 TS_BASE_BY_MODE = {"NORMAL": 0.15, "CAUTION": 0.13, "EMERG": 0.10}
 # 利益到達(+30/+60/+100%)時の段階タイト化（ポイント差）
