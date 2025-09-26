@@ -1,208 +1,205 @@
 ```text
- v in cfo_vals]))
-L775                 if any(v is not None for v in capex_vals): capex_ttm = float(np.nansum([np.nan if v is None else float(v) for v in capex_vals]))
-L776             except Exception: pass
-L777             if cfo_ttm is None or capex_ttm is None:
-L778                 try:
-L779                     j = self._finn_get(s, f"{base}/stock/cash-flow", {"symbol":sym,"frequency":"annual","limit":1,"token":api_key})
-L780                     arr = j.get("cashFlow") or []
-L781                     if arr:
-L782                         item0 = arr[0]
-L783                         if cfo_ttm is None:
-L784                             v = self._first_key(item0,self._FINN_CFO_KEYS)
-L785                             if v is not None: cfo_ttm = float(v)
-L786                         if capex_ttm is None:
-L787                             v = self._first_key(item0,self._FINN_CAPEX_KEYS)
-L788                             if v is not None: capex_ttm = float(v)
-L789                 except Exception: pass
-L790             rows.append({"ticker":sym,"cfo_ttm_fh":np.nan if cfo_ttm is None else cfo_ttm,"capex_ttm_fh":np.nan if capex_ttm is None else capex_ttm})
-L791         return pd.DataFrame(rows).set_index("ticker")
-L792
-L793     def compute_fcf_with_fallback(self, tickers: list[str], finnhub_api_key: str|None=None) -> pd.DataFrame:
-L794         yf_df = self.fetch_cfo_capex_ttm_yf(tickers)
-L795         _tlog("financials (yf) done")
-L796         miss_mask = yf_df[["cfo_ttm_yf","capex_ttm_yf","fcf_ttm_yf_direct"]].isna().any(axis=1)
-L797         need = yf_df.index[miss_mask].tolist(); print(f"[T] yf financials missing: {len(need)} {need[:10]}{'...' if len(need)>10 else ''}")
-L798         if need:
-L799             fh_df = self.fetch_cfo_capex_ttm_finnhub(need, api_key=finnhub_api_key)
-L800             df = yf_df.join(fh_df, how="left")
-L801             for col_yf, col_fh in [("cfo_ttm_yf","cfo_ttm_fh"),("capex_ttm_yf","capex_ttm_fh")]:
-L802                 df[col_yf] = df[col_yf].fillna(df[col_fh])
-L803             print("[T] financials (finnhub) done (fallback only)")
-L804         else:
-L805             df = yf_df.assign(cfo_ttm_fh=np.nan, capex_ttm_fh=np.nan)
-L806             print("[T] financials (finnhub) skipped (no missing)")
-L807         df["cfo_ttm"]  = df["cfo_ttm_yf"].where(df["cfo_ttm_yf"].notna(), df["cfo_ttm_fh"])
-L808         df["capex_ttm"] = df["capex_ttm_yf"].where(df["capex_ttm_yf"].notna(), df["capex_ttm_fh"])
-L809         cfo, capex = pd.to_numeric(df["cfo_ttm"], errors="coerce"), pd.to_numeric(df["capex_ttm"], errors="coerce").abs()
-L810         fcf_calc = cfo - capex
-L811         fcf_direct = pd.to_numeric(df.get("fcf_ttm_yf_direct"), errors="coerce")
-L812         df["fcf_ttm"] = fcf_calc.where(fcf_calc.notna(), fcf_direct)
-L813         df["cfo_source"]  = np.where(df["cfo_ttm_yf"].notna(),"yfinance",np.where(df["cfo_ttm_fh"].notna(),"finnhub",""))
-L814         df["capex_source"] = np.where(df["capex_ttm_yf"].notna(),"yfinance",np.where(df["capex_ttm_fh"].notna(),"finnhub",""))
-L815         df["fcf_imputed"] = df[["cfo_ttm","capex_ttm"]].isna().any(axis=1) & df["fcf_ttm"].notna()
-L816         cols = ["cfo_ttm_yf","capex_ttm_yf","cfo_ttm_fh","capex_ttm_fh","cfo_ttm","capex_ttm","fcf_ttm","fcf_ttm_yf_direct","cfo_source","capex_source","fcf_imputed"]
-L817         return df[cols].sort_index()
-L818
-L819     def _build_eps_df(self, tickers, tickers_bulk, info, sec_map: dict | None = None):
-L820         eps_rows=[]
-L821         for t in tickers:
-L822             info_t = info[t]
-L823             sec_t = (sec_map or {}).get(t, {})
-L824             eps_ttm = sec_t.get("eps_ttm", info_t.get("trailingEps", np.nan))
-L825             eps_q = sec_t.get("eps_q_recent", np.nan)
-L826             try:
-L827                 tk = tickers_bulk.tickers.get(t)
-L828                 if tk is None:
-L829                     sym = info_t.get("_yf_symbol") if isinstance(info_t, dict) else None
-L830                     if sym:
-L831                         tk = tickers_bulk.tickers.get(sym)
-L832                 qearn = tk.quarterly_earnings if tk is not None else None
-L833                 so = info_t.get("sharesOutstanding")
-L834                 if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
-L835                     eps_ttm_q = qearn["Earnings"].head(4).sum()/so
-L836                     if pd.notna(eps_ttm_q) and (pd.isna(eps_ttm) or (abs(eps_ttm)>0 and abs(eps_ttm/eps_ttm_q)>3)): eps_ttm = eps_ttm_q
-L837                     if pd.isna(eps_q):
-L838                         eps_q = qearn["Earnings"].iloc[-1]/so
-L839             except Exception: pass
-L840             rev_ttm = sec_t.get("rev_ttm", np.nan)
-L841             rev_q = sec_t.get("rev_q_recent", np.nan)
-L842             if (not sec_t) or pd.isna(rev_ttm):
-L843                 try:
-L844                     tk = tickers_bulk.tickers.get(t)
-L845                     if tk is None and isinstance(info_t, dict):
-L846                         sym = info_t.get("_yf_symbol")
-L847                         if sym:
-L848                             tk = tickers_bulk.tickers.get(sym)
-L849                     qfin = getattr(tk, "quarterly_financials", None)
-L850                     if qfin is not None and not qfin.empty:
-L851                         idx_lower = {str(i).lower(): i for i in qfin.index}
-L852                         rev_idx = None
-L853                         for name in ("Total Revenue", "TotalRevenue"):
-L854                             key = name.lower()
-L855                             if key in idx_lower:
-L856                                 rev_idx = idx_lower[key]
-L857                                 break
-L858                         if rev_idx is not None:
-L859                             rev_series = pd.to_numeric(qfin.loc[rev_idx], errors="coerce").dropna()
-L860                             if not rev_series.empty:
-L861                                 rev_ttm_yf = float(rev_series.head(4).sum())
-L862                                 if pd.isna(rev_ttm):
-L863                                     rev_ttm = rev_ttm_yf
-L864                                 if pd.isna(rev_q):
-L865                                     rev_q = float(rev_series.iloc[0])
-L866                 except Exception:
-L867                     pass
-L868             eps_rows.append({
-L869                 "ticker": t,
-L870                 "eps_ttm": eps_ttm,
-L871                 "eps_ttm_prev": sec_t.get("eps_ttm_prev", np.nan),
-L872                 "eps_q_recent": eps_q,
-L873                 "eps_q_prev": sec_t.get("eps_lastq_prev", np.nan),
-L874                 "rev_ttm": rev_ttm,
-L875                 "rev_ttm_prev": sec_t.get("rev_ttm_prev", np.nan),
-L876                 "rev_q_recent": rev_q,
-L877                 "rev_q_prev": sec_t.get("rev_lastq_prev", np.nan),
-L878                 "eps_annual_latest": sec_t.get("eps_annual_latest", np.nan),
-L879                 "eps_annual_prev": sec_t.get("eps_annual_prev", np.nan),
-L880                 "rev_annual_latest": sec_t.get("rev_annual_latest", np.nan),
-L881                 "rev_annual_prev": sec_t.get("rev_annual_prev", np.nan),
-L882                 "eps_cagr3": sec_t.get("eps_cagr3", np.nan),
-L883                 "rev_cagr3": sec_t.get("rev_cagr3", np.nan),
-L884             })
-L885         return self.impute_eps_ttm(pd.DataFrame(eps_rows).set_index("ticker"))
-L886
-L887     def prepare_data(self):
-L888         """Fetch price and fundamental data for all tickers."""
-L889         self.sec_dryrun_sample()
-L890         # --- yfinance 用にティッカーを正規化（"$"剥がし、"."→"-"） ---
-L891         def _to_yf(sym: str) -> str:
-L892             s = (sym or "").strip().lstrip("$").replace("＄", "")
-L893             # BRK.B / PBR.A などは Yahoo では '-' を使用
-L894             yf_sym = s.replace("．", ".").replace(".", "-")
-L895             return yf_sym or (sym or "")
-L896
-L897         cand_y = [_to_yf(t) for t in self.cand]
-L898         cand_info = yf.Tickers(" ".join(cand_y))
-L899
-L900         def _price(orig: str, ysym: str) -> float:
-L901             try:
-L902                 return cand_info.tickers[ysym].fast_info.get("lastPrice", np.inf)
-L903             except Exception as e:
-L904                 print(f"{orig}: price fetch failed ({e})")
-L905                 return np.inf
-L906
-L907         cand_prices = {orig: _price(orig, ysym) for orig, ysym in zip(self.cand, cand_y)}
-L908         cand_f = [t for t, p in cand_prices.items() if p <= self.price_max]
-L909         _tlog("price cap filter done (CAND_PRICE_MAX)")
-L910         # 入力ティッカーの重複を除去し、現行→候補の順序を維持
-L911         # ユニバース確定（元ティッカー保持）。yfinance には後で変換して渡す
-L912         tickers = list(dict.fromkeys(self.exist + cand_f))
-L913         yf_map = {t: _to_yf(t) for t in tickers}
-L914         yf_list = list(dict.fromkeys([yf_map[t] for t in tickers]))
-L915         _tlog(f"universe prepared: unique={len(tickers)} bench={self.bench}")
-L916         data = yf.download(yf_list + [self.bench], period="600d",
-L917                            auto_adjust=True, progress=False, threads=False)
-L918         _tlog("yf.download done")
-L919         inv = {v: k for k, v in yf_map.items()}
-L920         px = data["Close"].dropna(how="all", axis=1).ffill(limit=2)
-L921         px = px.rename(columns=inv)
-L922         try:
-L923             if isinstance(data.columns, pd.MultiIndex):
-L924                 data = data.rename(columns=inv, level=1)
-L925             else:
-L926                 data = data.rename(columns=inv)
-L927         except Exception:
-L928             pass
-L929         spx = data["Close"][self.bench].reindex(px.index).ffill()
-L930         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
-L931         if clip_days > 0:
-L932             px, spx = px.tail(clip_days + 1), spx.tail(clip_days + 1)
-L933             logger.info("[T] price window clipped by env: %d rows (PRICE_CLIP_DAYS=%d)", len(px), clip_days)
-L934         else:
-L935             logger.debug("[T] price window clip skipped; rows=%d", len(px))
-L936         tickers_bulk, info = yf.Tickers(" ".join(yf_list)), {}
-L937         for orig, ysym in yf_map.items():
-L938             if ysym in tickers_bulk.tickers:
-L939                 tickers_bulk.tickers[orig] = tickers_bulk.tickers[ysym]
-L940         for t in tickers:
-L941             try:
-L942                 tk = tickers_bulk.tickers.get(t) or tickers_bulk.tickers.get(yf_map[t])
-L943                 info_entry = tk.info if tk is not None else {}
-L944                 if not isinstance(info_entry, dict):
-L945                     info_entry = {}
-L946                 info_entry.setdefault("_yf_symbol", getattr(tk, "ticker", yf_map.get(t)))
-L947                 info[t] = info_entry
-L948             except Exception as e:
-L949                 logger.info("[warn] %s: info fetch failed (%s)", t, e)
-L950                 info[t] = {}
-L951         try:
-L952             sec_map = self.fetch_eps_rev_from_sec(tickers)
-L953         except Exception as e:
-L954             logger.warning("[SEC] fetch_eps_rev_from_sec failed: %s", e)
-L955             sec_map = {}
-L956
-L957         def _brief_len(s):
-L958             try:
-L959                 if isinstance(s, pd.Series):
-L960                     return int(s.dropna().size)
-L961                 if isinstance(s, (list, tuple)):
-L962                     return len([v for v in s if pd.notna(v)])
-L963                 if isinstance(s, np.ndarray):
-L964                     return int(np.count_nonzero(~pd.isna(s)))
-L965                 return int(bool(s))
-L966             except Exception:
-L967                 return 0
-L968
-L969         def _has_entries(val) -> bool:
-L970             try:
-L971                 if isinstance(val, pd.Series):
-L972                     return not val.dropna().empty
-L973                 if isinstance(val, (list, tuple)):
-L974                     return any(pd.notna(v) for v in val)
-L975                 return bool(val)
-L976             except Exception:
-L977                 return False
-L978
-L979         have_rev = 0
+for v in cfo_vals): cfo_ttm = float(np.nansum([np.nan if v is None else float(v) for v in cfo_vals]))
+L776                 if any(v is not None for v in capex_vals): capex_ttm = float(np.nansum([np.nan if v is None else float(v) for v in capex_vals]))
+L777             except Exception: pass
+L778             if cfo_ttm is None or capex_ttm is None:
+L779                 try:
+L780                     j = self._finn_get(s, f"{base}/stock/cash-flow", {"symbol":sym,"frequency":"annual","limit":1,"token":api_key})
+L781                     arr = j.get("cashFlow") or []
+L782                     if arr:
+L783                         item0 = arr[0]
+L784                         if cfo_ttm is None:
+L785                             v = self._first_key(item0,self._FINN_CFO_KEYS)
+L786                             if v is not None: cfo_ttm = float(v)
+L787                         if capex_ttm is None:
+L788                             v = self._first_key(item0,self._FINN_CAPEX_KEYS)
+L789                             if v is not None: capex_ttm = float(v)
+L790                 except Exception: pass
+L791             rows.append({"ticker":sym,"cfo_ttm_fh":np.nan if cfo_ttm is None else cfo_ttm,"capex_ttm_fh":np.nan if capex_ttm is None else capex_ttm})
+L792         return pd.DataFrame(rows).set_index("ticker")
+L793
+L794     def compute_fcf_with_fallback(self, tickers: list[str], finnhub_api_key: str|None=None) -> pd.DataFrame:
+L795         yf_df = self.fetch_cfo_capex_ttm_yf(tickers)
+L796         _tlog("financials (yf) done")
+L797         miss_mask = yf_df[["cfo_ttm_yf","capex_ttm_yf","fcf_ttm_yf_direct"]].isna().any(axis=1)
+L798         need = yf_df.index[miss_mask].tolist(); print(f"[T] yf financials missing: {len(need)} {need[:10]}{'...' if len(need)>10 else ''}")
+L799         if need:
+L800             fh_df = self.fetch_cfo_capex_ttm_finnhub(need, api_key=finnhub_api_key)
+L801             df = yf_df.join(fh_df, how="left")
+L802             for col_yf, col_fh in [("cfo_ttm_yf","cfo_ttm_fh"),("capex_ttm_yf","capex_ttm_fh")]:
+L803                 df[col_yf] = df[col_yf].fillna(df[col_fh])
+L804             print("[T] financials (finnhub) done (fallback only)")
+L805         else:
+L806             df = yf_df.assign(cfo_ttm_fh=np.nan, capex_ttm_fh=np.nan)
+L807             print("[T] financials (finnhub) skipped (no missing)")
+L808         df["cfo_ttm"]  = df["cfo_ttm_yf"].where(df["cfo_ttm_yf"].notna(), df["cfo_ttm_fh"])
+L809         df["capex_ttm"] = df["capex_ttm_yf"].where(df["capex_ttm_yf"].notna(), df["capex_ttm_fh"])
+L810         cfo, capex = pd.to_numeric(df["cfo_ttm"], errors="coerce"), pd.to_numeric(df["capex_ttm"], errors="coerce").abs()
+L811         fcf_calc = cfo - capex
+L812         fcf_direct = pd.to_numeric(df.get("fcf_ttm_yf_direct"), errors="coerce")
+L813         df["fcf_ttm"] = fcf_calc.where(fcf_calc.notna(), fcf_direct)
+L814         df["cfo_source"]  = np.where(df["cfo_ttm_yf"].notna(),"yfinance",np.where(df["cfo_ttm_fh"].notna(),"finnhub",""))
+L815         df["capex_source"] = np.where(df["capex_ttm_yf"].notna(),"yfinance",np.where(df["capex_ttm_fh"].notna(),"finnhub",""))
+L816         df["fcf_imputed"] = df[["cfo_ttm","capex_ttm"]].isna().any(axis=1) & df["fcf_ttm"].notna()
+L817         cols = ["cfo_ttm_yf","capex_ttm_yf","cfo_ttm_fh","capex_ttm_fh","cfo_ttm","capex_ttm","fcf_ttm","fcf_ttm_yf_direct","cfo_source","capex_source","fcf_imputed"]
+L818         return df[cols].sort_index()
+L819
+L820     def _build_eps_df(self, tickers, tickers_bulk, info, sec_map: dict | None = None):
+L821         eps_rows=[]
+L822         for t in tickers:
+L823             info_t = info[t]
+L824             sec_t = (sec_map or {}).get(t, {})
+L825             eps_ttm = sec_t.get("eps_ttm", info_t.get("trailingEps", np.nan))
+L826             eps_q = sec_t.get("eps_q_recent", np.nan)
+L827             try:
+L828                 tk = tickers_bulk.tickers.get(t)
+L829                 if tk is None:
+L830                     sym = info_t.get("_yf_symbol") if isinstance(info_t, dict) else None
+L831                     if sym:
+L832                         tk = tickers_bulk.tickers.get(sym)
+L833                 qearn = tk.quarterly_earnings if tk is not None else None
+L834                 so = info_t.get("sharesOutstanding")
+L835                 if so and qearn is not None and not qearn.empty and "Earnings" in qearn.columns:
+L836                     eps_ttm_q = qearn["Earnings"].head(4).sum()/so
+L837                     if pd.notna(eps_ttm_q) and (pd.isna(eps_ttm) or (abs(eps_ttm)>0 and abs(eps_ttm/eps_ttm_q)>3)): eps_ttm = eps_ttm_q
+L838                     if pd.isna(eps_q):
+L839                         eps_q = qearn["Earnings"].iloc[-1]/so
+L840             except Exception: pass
+L841             rev_ttm = sec_t.get("rev_ttm", np.nan)
+L842             rev_q = sec_t.get("rev_q_recent", np.nan)
+L843             if (not sec_t) or pd.isna(rev_ttm):
+L844                 try:
+L845                     tk = tickers_bulk.tickers.get(t)
+L846                     if tk is None and isinstance(info_t, dict):
+L847                         sym = info_t.get("_yf_symbol")
+L848                         if sym:
+L849                             tk = tickers_bulk.tickers.get(sym)
+L850                     qfin = getattr(tk, "quarterly_financials", None)
+L851                     if qfin is not None and not qfin.empty:
+L852                         idx_lower = {str(i).lower(): i for i in qfin.index}
+L853                         rev_idx = None
+L854                         for name in ("Total Revenue", "TotalRevenue"):
+L855                             key = name.lower()
+L856                             if key in idx_lower:
+L857                                 rev_idx = idx_lower[key]
+L858                                 break
+L859                         if rev_idx is not None:
+L860                             rev_series = pd.to_numeric(qfin.loc[rev_idx], errors="coerce").dropna()
+L861                             if not rev_series.empty:
+L862                                 rev_ttm_yf = float(rev_series.head(4).sum())
+L863                                 if pd.isna(rev_ttm):
+L864                                     rev_ttm = rev_ttm_yf
+L865                                 if pd.isna(rev_q):
+L866                                     rev_q = float(rev_series.iloc[0])
+L867                 except Exception:
+L868                     pass
+L869             eps_rows.append({
+L870                 "ticker": t,
+L871                 "eps_ttm": eps_ttm,
+L872                 "eps_ttm_prev": sec_t.get("eps_ttm_prev", np.nan),
+L873                 "eps_q_recent": eps_q,
+L874                 "eps_q_prev": sec_t.get("eps_lastq_prev", np.nan),
+L875                 "rev_ttm": rev_ttm,
+L876                 "rev_ttm_prev": sec_t.get("rev_ttm_prev", np.nan),
+L877                 "rev_q_recent": rev_q,
+L878                 "rev_q_prev": sec_t.get("rev_lastq_prev", np.nan),
+L879                 "eps_annual_latest": sec_t.get("eps_annual_latest", np.nan),
+L880                 "eps_annual_prev": sec_t.get("eps_annual_prev", np.nan),
+L881                 "rev_annual_latest": sec_t.get("rev_annual_latest", np.nan),
+L882                 "rev_annual_prev": sec_t.get("rev_annual_prev", np.nan),
+L883                 "eps_cagr3": sec_t.get("eps_cagr3", np.nan),
+L884                 "rev_cagr3": sec_t.get("rev_cagr3", np.nan),
+L885             })
+L886         return self.impute_eps_ttm(pd.DataFrame(eps_rows).set_index("ticker"))
+L887
+L888     def prepare_data(self):
+L889         """Fetch price and fundamental data for all tickers."""
+L890         self.sec_dryrun_sample()
+L891         # --- yfinance 用にティッカーを正規化（"$"剥がし、"."→"-"） ---
+L892         def _to_yf(sym: str) -> str:
+L893             s = (sym or "").strip().lstrip("$").replace("＄", "")
+L894             # BRK.B / PBR.A などは Yahoo では '-' を使用
+L895             yf_sym = s.replace("．", ".").replace(".", "-")
+L896             return yf_sym or (sym or "")
+L897
+L898         cand_y = [_to_yf(t) for t in self.cand]
+L899         cand_info = yf.Tickers(" ".join(cand_y))
+L900
+L901         def _price(orig: str, ysym: str) -> float:
+L902             try:
+L903                 return cand_info.tickers[ysym].fast_info.get("lastPrice", np.inf)
+L904             except Exception as e:
+L905                 print(f"{orig}: price fetch failed ({e})")
+L906                 return np.inf
+L907
+L908         cand_prices = {orig: _price(orig, ysym) for orig, ysym in zip(self.cand, cand_y)}
+L909         cand_f = [t for t, p in cand_prices.items() if p <= self.price_max]
+L910         _tlog("price cap filter done (CAND_PRICE_MAX)")
+L911         # 入力ティッカーの重複を除去し、現行→候補の順序を維持
+L912         # ユニバース確定（元ティッカー保持）。yfinance には後で変換して渡す
+L913         tickers = list(dict.fromkeys(self.exist + cand_f))
+L914         yf_map = {t: _to_yf(t) for t in tickers}
+L915         yf_list = list(dict.fromkeys([yf_map[t] for t in tickers]))
+L916         _tlog(f"universe prepared: unique={len(tickers)} bench={self.bench}")
+L917         data = yf.download(yf_list + [self.bench], period="600d",
+L918                            auto_adjust=True, progress=False, threads=False)
+L919         _tlog("yf.download done")
+L920         inv = {v: k for k, v in yf_map.items()}
+L921         px = data["Close"].dropna(how="all", axis=1).ffill(limit=2)
+L922         px = px.rename(columns=inv)
+L923         try:
+L924             if isinstance(data.columns, pd.MultiIndex):
+L925                 data = data.rename(columns=inv, level=1)
+L926             else:
+L927                 data = data.rename(columns=inv)
+L928         except Exception:
+L929             pass
+L930         spx = data["Close"][self.bench].reindex(px.index).ffill()
+L931         clip_days = int(os.getenv("PRICE_CLIP_DAYS", "0"))   # 0なら無効（既定）
+L932         if clip_days > 0:
+L933             px, spx = px.tail(clip_days + 1), spx.tail(clip_days + 1)
+L934             logger.info("[T] price window clipped by env: %d rows (PRICE_CLIP_DAYS=%d)", len(px), clip_days)
+L935         else:
+L936             logger.debug("[T] price window clip skipped; rows=%d", len(px))
+L937         tickers_bulk, info = yf.Tickers(" ".join(yf_list)), {}
+L938         for orig, ysym in yf_map.items():
+L939             if ysym in tickers_bulk.tickers:
+L940                 tickers_bulk.tickers[orig] = tickers_bulk.tickers[ysym]
+L941         for t in tickers:
+L942             try:
+L943                 tk = tickers_bulk.tickers.get(t) or tickers_bulk.tickers.get(yf_map[t])
+L944                 info_entry = tk.info if tk is not None else {}
+L945                 if not isinstance(info_entry, dict):
+L946                     info_entry = {}
+L947                 info_entry.setdefault("_yf_symbol", getattr(tk, "ticker", yf_map.get(t)))
+L948                 info[t] = info_entry
+L949             except Exception as e:
+L950                 logger.info("[warn] %s: info fetch failed (%s)", t, e)
+L951                 info[t] = {}
+L952         try:
+L953             sec_map = self.fetch_eps_rev_from_sec(tickers)
+L954         except Exception as e:
+L955             logger.warning("[SEC] fetch_eps_rev_from_sec failed: %s", e)
+L956             sec_map = {}
+L957
+L958         def _brief_len(s):
+L959             try:
+L960                 if isinstance(s, pd.Series):
+L961                     return int(s.dropna().size)
+L962                 if isinstance(s, (list, tuple)):
+L963                     return len([v for v in s if pd.notna(v)])
+L964                 if isinstance(s, np.ndarray):
+L965                     return int(np.count_nonzero(~pd.isna(s)))
+L966                 return int(bool(s))
+L967             except Exception:
+L968                 return 0
+L969
+L970         def _has_entries(val) -> bool:
+L971             try:
+L972                 if isinstance(val, pd.Series):
+L973                     return not val.dropna().empty
+L974                 if isinstance(val, (list, tuple)):
+L975                     return any(pd.notna(v) for v in val)
+L976                 return bool(val)
+L977           
 ```
