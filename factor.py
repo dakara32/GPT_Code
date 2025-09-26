@@ -9,13 +9,21 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from typing import Iterable, Optional
 
 
-# --- [ADD] bucket更新ヘルパー（ヘッダー無し3列: ticker,qty,bucket を前提） ---
-def _update_bucket_by_selection(csv_path: str, top_G: list[str], top_D: list[str]) -> None:
+# --- [MOD] bucket更新ヘルパー（対象拡張 & 優先順位つき） ---
+def _update_bucket_by_selection(
+    csv_path: str,
+    top_G: Iterable[str],
+    top_D: Iterable[str],
+    extra_G: Optional[Iterable[str]] = None,
+    extra_D: Optional[Iterable[str]] = None,
+) -> None:
     """
     current_tickers.csv の bucket 列を、選定結果に基づき部分上書きする。
-    - 該当ティッカーのみ "G"/"D" に更新、未登場は既存値（空欄含む）を維持
+    - 対象は (top_G/top_D) に加えて (resG['tickers']/resD['tickers']/init_G/init_D 等) も反映
+    - 優先順位: top_G > top_D > extra_G > extra_D > 現状維持
     - 常にヘッダー無しで (ticker,qty,bucket) の3列で保存
     """
     df = pd.read_csv(csv_path, header=None, names=["ticker", "qty", "bucket"])
@@ -23,21 +31,31 @@ def _update_bucket_by_selection(csv_path: str, top_G: list[str], top_D: list[str
     df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(int)
     df["bucket"] = df["bucket"].fillna("").astype(str).str.strip().str.upper()
 
-    gset = set([t.upper() for t in (top_G or [])])
-    dset = set([t.upper() for t in (top_D or [])])
+    g_top = set(t.upper() for t in (top_G or []))
+    d_top = set(t.upper() for t in (top_D or []))
+    g_ext = set(t.upper() for t in (extra_G or []))
+    d_ext = set(t.upper() for t in (extra_D or []))
 
     def _assign(row):
         t = row["ticker"]
-        if t in gset:
+        # 優先順位: top_G > top_D > extra_G > extra_D > 現状維持
+        if t in g_top:
             return "G"
-        if t in dset:
+        if t in d_top:
+            return "D"
+        if t in g_ext:
+            return "G"
+        if t in d_ext:
             return "D"
         return row["bucket"]
 
     df["bucket"] = df.apply(_assign, axis=1)
     df[["ticker", "qty", "bucket"]].to_csv(csv_path, index=False, header=False)
     logging.info("current_tickers.csv abspath: %s", os.path.abspath(csv_path))
-    logging.info("[I/O] current_tickers.csv bucket updated (G=%d, D=%d)", len(gset), len(dset))
+    logging.info(
+        "[I/O] current_tickers.csv bucket updated (topG=%d, topD=%d, extraG=%d, extraD=%d)",
+        len(g_top), len(d_top), len(g_ext), len(d_ext)
+    )
 from scipy.stats import zscore  # used via scorer
 
 from scorer import Scorer, ttm_div_yield_portfolio, _log, _as_numeric_series
@@ -1587,9 +1605,28 @@ def run_pipeline() -> SelectionBundle:
               "sum_score": sumD, "objective": objD},
         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
 
-    # [ADD] G/D選定結果で current_tickers.csv の bucket を部分上書き
+    # [MOD] 選定確定後に current_tickers.csv の bucket を「全部紐づけ」で最新化
     try:
-        _update_bucket_by_selection("current_tickers.csv", top_G, top_D)
+        # 追加対象（候補群も反映）: resG['tickers'], resD['tickers'], init_G, init_D
+        extra_G, extra_D = [], []
+        try:
+            extra_G += list((sb.resG or {}).get("tickers", []) or [])
+            extra_D += list((sb.resD or {}).get("tickers", []) or [])
+        except Exception:
+            pass
+        try:
+            extra_G += list(getattr(sb, "init_G", []) or [])
+            extra_D += list(getattr(sb, "init_D", []) or [])
+        except Exception:
+            pass
+
+        _update_bucket_by_selection(
+            "current_tickers.csv",
+            top_G,
+            top_D,
+            extra_G=extra_G,
+            extra_D=extra_D,
+        )
     except Exception as e:
         logging.warning("bucket update skipped: %s", e)
         # 失敗しても本処理は継続（I/O都合で安全側）
