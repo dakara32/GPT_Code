@@ -1,5 +1,24 @@
 ```text
-52W_HIGH',0) + 0.15*df_z['TR'])
+          df_z["GROWTH_F"] = df_z["GROWTH_F"].clip(-3.0, 3.0)
+L956         # === end: BIO LOSS PENALTY =======================================
+L957
+L958         _debug_only_cols = [c for c in df_z.columns if c.endswith("_RAW")]
+L959         _no_score_cols = ["DIV_TTM_PS", "DIV_YOY", "LOW52PCT25_EXCESS", "MA50_OVER_200"]
+L960         _drop_cols = [c for c in (_debug_only_cols + _no_score_cols) if c in df_z.columns]
+L961         if _drop_cols:
+L962             df_z = df_z.drop(columns=_drop_cols, errors="ignore")
+L963
+L964         assert not any(c.endswith("_RAW") for c in df_z.columns)
+L965         for c in ["DIV_TTM_PS","DIV_YOY","LOW52PCT25_EXCESS","MA50_OVER_200"]:
+L966             assert c not in df_z.columns
+L967
+L968         df_z['TRD'] = 0.0  # TRDはスコア寄与から外し、テンプレ判定はフィルタで行う（列は表示互換のため残す）
+L969         if 'BETA' not in df_z.columns: df_z['BETA'] = robust_z(df['BETA'])
+L970
+L971         df_z['D_VOL_RAW'] = robust_z(0.40*df_z['DOWNSIDE_DEV'] + 0.22*df_z['RESID_VOL'] + 0.18*df_z['MDD_1Y'] - 0.10*df_z['DOWN_OUTPERF'] - 0.05*df_z['EXT_200'] - 0.08*df_z['SIZE'] - 0.10*df_z['LIQ'] + 0.10*df_z['BETA'])
+L972         df_z['D_QAL']     = robust_z(0.35*df_z['QAL'] + 0.20*df_z['FCF'] + 0.15*df_z['CURR_RATIO'] - 0.15*df_z['DEBT2EQ'] - 0.15*df_z['EPS_VAR_8Q'])
+L973         df_z['D_YLD']     = robust_z(0.45*df_z['DIV'] + 0.25*df_z['DIV_STREAK'] + 0.20*df_z['DIV_FCF_COVER'] - 0.10*df_z['DIV_VAR5'])
+L974         df_z['D_TRD']     = robust_z(0.40*df_z.get('MA200_SLOPE_5M',0) - 0.30*df_z.get('EXT_200',0) + 0.15*df_z.get('NEAR_52W_HIGH',0) + 0.15*df_z['TR'])
 L975
 L976         # --- 重みは cfg を優先（外部があればそれを使用） ---
 L977         # ① 全銘柄で G/D スコアを算出（unmasked）
@@ -290,43 +309,5 @@ L11 ## 全体フロー
 L12 1. **Input** – `current_tickers.csv`と`candidate_tickers.csv`を読み込み、yfinanceやFinnhubのAPIから価格・財務データを収集して`InputBundle`を整備。
 L13 2. **Score Calculation** – Scorerが特徴量を計算し因子スコアを合成して`FeatureBundle`を生成。
 L14 3. **Correlation Reduction & Selection** – SelectorがDRRSロジックで相関を抑えつつG/D銘柄を選定し`SelectionBundle`を得る。
-L15 4. **Output** – 採用結果と周辺情報を表・Slack通知として出力。
-L16
-L17 ```mermaid
-L18 flowchart LR
-L19   A[Input\nAPI & 前処理] --> B[Score Calculation\n特徴量・因子合成]
-L20   B --> C[Correlation Reduction\nDRRS選定]
-L21   C --> D[Output\nSlack通知]
-L22 ```
-L23
-L24 ## 定数・設定
-L25 | 変数 | 内容 | 主な用途 |
-L26 | --- | --- | --- |
-L27 | `exist` / `cand` | 現行ポートフォリオと検討中銘柄のティッカーリスト | スコア対象ユニバースの構成、候補整理 |
-L28 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
-L29 | `CAND_PRICE_MAX` | 候補銘柄の許容価格上限 | 高額銘柄の事前除外 |
-L30 | `N_G` / `N_D` | G/D採用枠の件数（**既定: 12 / 8**） | 最終的に選ぶ銘柄数の制約 |
-L31 | `g_weights` / `D_weights` | 各因子の重みdict | G/Dスコア合成 |
-L32 | `D_BETA_MAX` | Dバケットの許容β上限 | 高β銘柄の除外フィルタ |
-L33 | `FILTER_SPEC` | G/Dごとの前処理フィルタ | トレンドマスクやβ上限設定 |
-L34 | `corrM` | DRRS初期プールの最大件数 | 相関行列サイズ制御 |
-L35 | `DRRS_G` / `DRRS_D` | DRRSパラメータdict | バケット別の相関低減設定 |
-L36 | `DRRS_SHRINK` | 残差相関の対角シュリンク率 | `residual_corr`の安定化 |
-L37 | `CROSS_MU_GD` | G-D間クロス相関ペナルティμ | 2バケット同時最適化で相関抑制 |
-L38 | `RESULTS_DIR` | 選定結果保存ディレクトリ | `_save_sel`/`_load_prev`の入出力 |
-L39
-L40 選定結果は`results/`配下にJSONとして保存し、次回実行時に`_load_prev`で読み込んで選定条件に反映。
-L41
-L42 ## DTO/Config
-L43 各ステップ間で受け渡すデータ構造と設定値。変数の意味合いと利用箇所を以下に示す。
-L44
-L45 ### InputBundle（Input → Scorer）
-L46 | 変数 | 内容 | 主な用途 |
-L47 | --- | --- | --- |
-L48 | `cand` | 候補銘柄ティッカーのリスト | OUTテーブルや低スコアランキング対象の母集団 |
-L49 | `tickers` | 現行+候補を合わせたティッカー一覧 | 価格・出来高ダウンロード、リターン計算 |
-L50 | `bench` | ベンチマークティッカー | 相対強さ・β算出、ポート比較 |
-L51 | `data` | yfinanceのダウンロード結果（階層列） | `px`/`spx`/リターン等の基礎データ |
-L52 | `px` | `data['Close']`だけを抜き出した価格系列 | 指標計算・リターン生成 |
-L53 | `spx` | `data['Close'][bench]` のSeries | `rs`や`calc_beta`
+L15 4. **Output**
 ```

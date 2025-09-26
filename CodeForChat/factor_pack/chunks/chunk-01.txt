@@ -2,7 +2,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, factor.py, scorer.py, .github/workflows/weekly-report.yml, documents/README.md, documents/factor_design.md
-# 作成日時: 2025-09-26 13:51:00 (JST)
+# 作成日時: 2025-09-26 14:08:33 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -49,270 +49,272 @@ L8
 L9 import numpy as np
 L10 import pandas as pd
 L11 import yfinance as yf
-L12 from scipy.stats import zscore  # used via scorer
+L12
 L13
-L14 from scorer import Scorer, ttm_div_yield_portfolio, _log, _as_numeric_series
-L15 import config
-L16
-L17 import warnings, atexit, threading
-L18 from collections import Counter
-L19
-L20 # === 定数・設定・DTO（import直後に集約） ===
-L21 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
-L22 SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
-L23 SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
-L24
-L25 debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
-L26
-L27 _CSV_LOAD_START = perf_counter()
-L28 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
-L29 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
-L30 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
-L31 g_weights = {'GROWTH_F':0.30,'MOM':0.60,'VOL':-0.10}
-L32 D_BETA_MODE = os.environ.get("D_BETA_MODE", "z").lower()   # "raw" or "z"
-L33 D_BETA_CUTOFF = float(os.environ.get("D_BETA_CUTOFF", "-0.8"))
-L34 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_CUTOFF}}}
-L35 D_weights = {'QAL':0.15,'YLD':0.25,'VOL':-0.40,'TRD':0.20}
-L36 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
-L37
-L38 def _zscore_series(s: pd.Series) -> pd.Series:
-L39     # NaNはそのまま、標準偏差0なら全NaNにする（暴走防止）
-L40     v = s.astype(float)
-L41     m, std = v.mean(skipna=True), v.std(skipna=True, ddof=0)
-L42     if not np.isfinite(std) or std == 0:
-L43         return pd.Series(index=v.index, dtype=float)
-L44     return (v - m) / std
-L45
-L46 # DRRS 初期プール・各種パラメータ
-L47 corrM = 45
-L48 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
-L49 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
-L50
-L51 # クロス相関ペナルティ（未定義なら設定）
-L52 try: CROSS_MU_GD
-L53 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+L14 # --- [ADD] bucket更新ヘルパー（ヘッダー無し3列: ticker,qty,bucket を前提） ---
+L15 def _update_bucket_by_selection(csv_path: str, top_G: list[str], top_D: list[str]) -> None:
+L16     """
+L17     current_tickers.csv の bucket 列を、選定結果に基づき部分上書きする。
+L18     - 該当ティッカーのみ "G"/"D" に更新、未登場は既存値（空欄含む）を維持
+L19     - 常にヘッダー無しで (ticker,qty,bucket) の3列で保存
+L20     """
+L21     df = pd.read_csv(csv_path, header=None, names=["ticker", "qty", "bucket"])
+L22     df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+L23     df["qty"] = pd.to_numeric(df["qty"], errors="coerce").fillna(0).astype(int)
+L24     df["bucket"] = df["bucket"].fillna("").astype(str).str.strip().str.upper()
+L25
+L26     gset = set([t.upper() for t in (top_G or [])])
+L27     dset = set([t.upper() for t in (top_D or [])])
+L28
+L29     def _assign(row):
+L30         t = row["ticker"]
+L31         if t in gset:
+L32             return "G"
+L33         if t in dset:
+L34             return "D"
+L35         return row["bucket"]
+L36
+L37     df["bucket"] = df.apply(_assign, axis=1)
+L38     df[["ticker", "qty", "bucket"]].to_csv(csv_path, index=False, header=False)
+L39     logging.info("[I/O] current_tickers.csv bucket updated (G=%d, D=%d)", len(gset), len(dset))
+L40 from scipy.stats import zscore  # used via scorer
+L41
+L42 from scorer import Scorer, ttm_div_yield_portfolio, _log, _as_numeric_series
+L43 import config
+L44
+L45 import warnings, atexit, threading
+L46 from collections import Counter
+L47
+L48 # === 定数・設定・DTO（import直後に集約） ===
+L49 BONUS_COEFF = 0.55  # 推奨: 攻め=0.45 / 中庸=0.55 / 守り=0.65
+L50 SWAP_DELTA_Z = 0.15   # 僅差判定: σの15%。(緩め=0.10 / 標準=0.15 / 固め=0.20)
+L51 SWAP_KEEP_BUFFER = 3  # n_target+この順位以内の現行は保持。(粘り弱=2 / 標準=3 / 粘り強=4〜5)
+L52
+L53 debug_mode, FINNHUB_API_KEY = True, os.environ.get("FINNHUB_API_KEY")
 L54
-L55 # 出力関連
-L56 RESULTS_DIR = "results"
-L57 os.makedirs(RESULTS_DIR, exist_ok=True)
-L58
-L59 # === 共有DTO（クラス間I/O契約）＋ Config ===
-L60 @dataclass(frozen=True)
-L61 class InputBundle:
-L62     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
-L63     cand: List[str]
-L64     tickers: List[str]
-L65     bench: str
-L66     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
-L67     px: pd.DataFrame                # data['Close']
-L68     spx: pd.Series                  # data['Close'][bench]
-L69     tickers_bulk: object            # yfinance.Tickers
-L70     info: Dict[str, dict]           # yfinance info per ticker
-L71     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
-L72     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
-L73     returns: pd.DataFrame           # px[tickers].pct_change()
-L74     missing_logs: pd.DataFrame
-L75
-L76 @dataclass(frozen=True)
-L77 class FeatureBundle:
-L78     df: pd.DataFrame
-L79     df_z: pd.DataFrame
-L80     g_score: pd.Series
-L81     d_score_all: pd.Series
-L82     missing_logs: pd.DataFrame
-L83     df_full: pd.DataFrame | None = None
-L84     df_full_z: pd.DataFrame | None = None
-L85     scaler: Any | None = None
+L55 _CSV_LOAD_START = perf_counter()
+L56 exist, cand = [pd.read_csv(f, header=None)[0].tolist() for f in ("current_tickers.csv","candidate_tickers.csv")]
+L57 CAND_PRICE_MAX, bench = 450, '^GSPC'  # 価格上限・ベンチマーク
+L58 N_G, N_D = config.N_G, config.N_D  # G/D枠サイズ（NORMAL基準: G12/D8）
+L59 g_weights = {'GROWTH_F':0.30,'MOM':0.60,'VOL':-0.10}
+L60 D_BETA_MODE = os.environ.get("D_BETA_MODE", "z").lower()   # "raw" or "z"
+L61 D_BETA_CUTOFF = float(os.environ.get("D_BETA_CUTOFF", "-0.8"))
+L62 FILTER_SPEC = {"G":{"pre_mask":["trend_template"]},"D":{"pre_filter":{"beta_max":D_BETA_CUTOFF}}}
+L63 D_weights = {'QAL':0.15,'YLD':0.25,'VOL':-0.40,'TRD':0.20}
+L64 _fmt_w = lambda w: " ".join(f"{k}{int(v*100)}" for k, v in w.items())
+L65
+L66 def _zscore_series(s: pd.Series) -> pd.Series:
+L67     # NaNはそのまま、標準偏差0なら全NaNにする（暴走防止）
+L68     v = s.astype(float)
+L69     m, std = v.mean(skipna=True), v.std(skipna=True, ddof=0)
+L70     if not np.isfinite(std) or std == 0:
+L71         return pd.Series(index=v.index, dtype=float)
+L72     return (v - m) / std
+L73
+L74 # DRRS 初期プール・各種パラメータ
+L75 corrM = 45
+L76 DRRS_G, DRRS_D = dict(lookback=252,n_pc=3,gamma=1.2,lam=0.68,eta=0.8), dict(lookback=504,n_pc=4,gamma=0.8,lam=0.85,eta=0.5)
+L77 DRRS_SHRINK = 0.10  # 残差相関の対角シュリンク（基礎）
+L78
+L79 # クロス相関ペナルティ（未定義なら設定）
+L80 try: CROSS_MU_GD
+L81 except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
+L82
+L83 # 出力関連
+L84 RESULTS_DIR = "results"
+L85 os.makedirs(RESULTS_DIR, exist_ok=True)
 L86
-L87 @dataclass(frozen=True)
-L88 class SelectionBundle:
-L89     resG: dict
-L90     resD: dict
-L91     top_G: List[str]
-L92     top_D: List[str]
-L93     init_G: List[str]
-L94     init_D: List[str]
-L95
-L96 @dataclass(frozen=True)
-L97 class WeightsConfig:
-L98     g: Dict[str,float]
-L99     d: Dict[str,float]
-L100
-L101 @dataclass(frozen=True)
-L102 class DRRSParams:
-L103     corrM: int
-L104     shrink: float
-L105     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
-L106     D: Dict[str,float]
-L107     cross_mu_gd: float
-L108
-L109 @dataclass(frozen=True)
-L110 class PipelineConfig:
-L111     weights: WeightsConfig
-L112     drrs: DRRSParams
-L113     price_max: float
-L114     debug_mode: bool = False
-L115
-L116 # ---------- 重複警告の集約ロジック ----------
-L117 _warn_lock = threading.Lock()
-L118 _warn_seen = set()                     # 初回表示済みキー
-L119 _warn_count = Counter()                # (category, message, module) → 件数
-L120 _warn_first_ctx = {}                   # 初回の (filename, lineno)
-L121
-L122 def _warn_key(message, category, filename, lineno, *_args, **_kwargs):
-L123     # "同じ警告" を定義: カテゴリ + 正規化メッセージ + モジュールパス(先頭数階層)
-L124     mod = filename.split("/site-packages/")[-1] if "/site-packages/" in filename else filename
-L125     mod = mod.rsplit("/", 3)[-1]  # 長すぎ抑制（末尾3階層まで）
-L126     msg = str(message).strip()
-L127     return (category.__name__, msg, mod)
+L87 # === 共有DTO（クラス間I/O契約）＋ Config ===
+L88 @dataclass(frozen=True)
+L89 class InputBundle:
+L90     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
+L91     cand: List[str]
+L92     tickers: List[str]
+L93     bench: str
+L94     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
+L95     px: pd.DataFrame                # data['Close']
+L96     spx: pd.Series                  # data['Close'][bench]
+L97     tickers_bulk: object            # yfinance.Tickers
+L98     info: Dict[str, dict]           # yfinance info per ticker
+L99     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
+L100     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
+L101     returns: pd.DataFrame           # px[tickers].pct_change()
+L102     missing_logs: pd.DataFrame
+L103
+L104 @dataclass(frozen=True)
+L105 class FeatureBundle:
+L106     df: pd.DataFrame
+L107     df_z: pd.DataFrame
+L108     g_score: pd.Series
+L109     d_score_all: pd.Series
+L110     missing_logs: pd.DataFrame
+L111     df_full: pd.DataFrame | None = None
+L112     df_full_z: pd.DataFrame | None = None
+L113     scaler: Any | None = None
+L114
+L115 @dataclass(frozen=True)
+L116 class SelectionBundle:
+L117     resG: dict
+L118     resD: dict
+L119     top_G: List[str]
+L120     top_D: List[str]
+L121     init_G: List[str]
+L122     init_D: List[str]
+L123
+L124 @dataclass(frozen=True)
+L125 class WeightsConfig:
+L126     g: Dict[str,float]
+L127     d: Dict[str,float]
 L128
-L129 _orig_showwarning = warnings.showwarning
-L130
-L131 def _compact_showwarning(message, category, filename, lineno, file=None, line=None):
-L132     key = _warn_key(message, category, filename, lineno)
-L133     with _warn_lock:
-L134         _warn_count[key] += 1
-L135         if key not in _warn_seen:
-L136             # 初回だけ1行で出す（カテゴリ | モジュール | メッセージ）
-L137             _warn_seen.add(key)
-L138             _warn_first_ctx[key] = (filename, lineno)
-L139             # 1行フォーマット（行数節約）
-L140             txt = f"[WARN][{category.__name__}] {message} | {filename}:{lineno}"
-L141             print(txt)
-L142         # 2回目以降は出さない（集約）
+L129 @dataclass(frozen=True)
+L130 class DRRSParams:
+L131     corrM: int
+L132     shrink: float
+L133     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
+L134     D: Dict[str,float]
+L135     cross_mu_gd: float
+L136
+L137 @dataclass(frozen=True)
+L138 class PipelineConfig:
+L139     weights: WeightsConfig
+L140     drrs: DRRSParams
+L141     price_max: float
+L142     debug_mode: bool = False
 L143
-L144 warnings.showwarning = _compact_showwarning
-L145
-L146 # ベースポリシー: 通常は警告を出す（default）→ ただし同一メッセージは集約
-L147 warnings.resetwarnings()
-L148 warnings.simplefilter("default")
+L144 # ---------- 重複警告の集約ロジック ----------
+L145 _warn_lock = threading.Lock()
+L146 _warn_seen = set()                     # 初回表示済みキー
+L147 _warn_count = Counter()                # (category, message, module) → 件数
+L148 _warn_first_ctx = {}                   # 初回の (filename, lineno)
 L149
-L150 # 2) ピンポイント間引き: yfinance 'Ticker.earnings' は "once"（初回のみ可視化）
-L151 warnings.filterwarnings(
-L152     "once",
-L153     message="'Ticker.earnings' is deprecated",
-L154     category=DeprecationWarning,
-L155     module="yfinance"
-L156 )
-L157
-L158 # 3) 最終サマリ: 同一警告が何回出たかを最後に1行で
-L159 @atexit.register
-L160 def _print_warning_summary():
-L161     suppressed = []
-L162     for key, cnt in _warn_count.items():
-L163         if cnt > 1:
-L164             (cat, msg, mod) = key
-L165             filename, lineno = _warn_first_ctx.get(key, ("", 0))
-L166             suppressed.append((cnt, cat, msg, mod, filename, lineno))
-L167     if suppressed:
-L168         suppressed.sort(reverse=True)  # 件数降順
-L169         # 最多上位だけ出す（必要なら上限制御：ここでは上位10件）
-L170         top = suppressed[:10]
-L171         print(f"[WARN-SUMMARY] duplicated warning groups: {len(suppressed)}")
-L172         for cnt, cat, msg, mod, filename, lineno in top:
-L173             print(f"[WARN-SUMMARY] {cnt-1} more | [{cat}] {msg} | {mod} ({filename}:{lineno})")
-L174         if len(suppressed) > len(top):
-L175             print(f"[WARN-SUMMARY] ... and {len(suppressed)-len(top)} more groups suppressed")
-L176
-L177 # 4) 追加（任意）: 1ジョブあたりの総警告上限を設定したい場合
-L178 #    例: 上限1000を超えたら以降は完全サイレント
-L179 _WARN_HARD_LIMIT = int(os.getenv("WARN_HARD_LIMIT", "0") or "0")  # 0なら無効
-L180 if _WARN_HARD_LIMIT > 0:
-L181     _orig_warn_func = warnings.warn
-L182     def _limited_warn(*a, **k):
-L183         total = sum(_warn_count.values())
-L184         if total < _WARN_HARD_LIMIT:
-L185             return _orig_warn_func(*a, **k)
-L186         # 超過後は捨てる（最後にsummaryだけ残る）
-L187     warnings.warn = _limited_warn
-L188
-L189 # ---------- ここまでで警告の“可視性は維持”しつつ“重複で行数爆発”を抑止 ----------
-L190
-L191 # その他
-L192 logger = logging.getLogger(__name__)
-L193 logging.basicConfig(level=(logging.INFO if debug_mode else logging.WARNING), force=True)
-L194
-L195 _T0 = [perf_counter()]
-L196
-L197
-L198 def _tlog(tag: str) -> None:
-L199     now = perf_counter()
-L200     print(f"[T] {tag}: {now - _T0[0]:.2f}s")
-L201     _T0[0] = now
-L202
-L203
-L204 _tlog("start")
-L205 try:
-L206     _T0[0] = _CSV_LOAD_START
-L207 except NameError:
-L208     pass
-L209 _tlog(f"csv loaded: exist={len(exist)} cand={len(cand)}")
-L210
-L211 # === Utilities ===
-L212 # （ここには “本体ロジック直下で使う軽量ヘルパ” のみを残す）
-L213
-L214
-L215 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
+L150 def _warn_key(message, category, filename, lineno, *_args, **_kwargs):
+L151     # "同じ警告" を定義: カテゴリ + 正規化メッセージ + モジュールパス(先頭数階層)
+L152     mod = filename.split("/site-packages/")[-1] if "/site-packages/" in filename else filename
+L153     mod = mod.rsplit("/", 3)[-1]  # 長すぎ抑制（末尾3階層まで）
+L154     msg = str(message).strip()
+L155     return (category.__name__, msg, mod)
+L156
+L157 _orig_showwarning = warnings.showwarning
+L158
+L159 def _compact_showwarning(message, category, filename, lineno, file=None, line=None):
+L160     key = _warn_key(message, category, filename, lineno)
+L161     with _warn_lock:
+L162         _warn_count[key] += 1
+L163         if key not in _warn_seen:
+L164             # 初回だけ1行で出す（カテゴリ | モジュール | メッセージ）
+L165             _warn_seen.add(key)
+L166             _warn_first_ctx[key] = (filename, lineno)
+L167             # 1行フォーマット（行数節約）
+L168             txt = f"[WARN][{category.__name__}] {message} | {filename}:{lineno}"
+L169             print(txt)
+L170         # 2回目以降は出さない（集約）
+L171
+L172 warnings.showwarning = _compact_showwarning
+L173
+L174 # ベースポリシー: 通常は警告を出す（default）→ ただし同一メッセージは集約
+L175 warnings.resetwarnings()
+L176 warnings.simplefilter("default")
+L177
+L178 # 2) ピンポイント間引き: yfinance 'Ticker.earnings' は "once"（初回のみ可視化）
+L179 warnings.filterwarnings(
+L180     "once",
+L181     message="'Ticker.earnings' is deprecated",
+L182     category=DeprecationWarning,
+L183     module="yfinance"
+L184 )
+L185
+L186 # 3) 最終サマリ: 同一警告が何回出たかを最後に1行で
+L187 @atexit.register
+L188 def _print_warning_summary():
+L189     suppressed = []
+L190     for key, cnt in _warn_count.items():
+L191         if cnt > 1:
+L192             (cat, msg, mod) = key
+L193             filename, lineno = _warn_first_ctx.get(key, ("", 0))
+L194             suppressed.append((cnt, cat, msg, mod, filename, lineno))
+L195     if suppressed:
+L196         suppressed.sort(reverse=True)  # 件数降順
+L197         # 最多上位だけ出す（必要なら上限制御：ここでは上位10件）
+L198         top = suppressed[:10]
+L199         print(f"[WARN-SUMMARY] duplicated warning groups: {len(suppressed)}")
+L200         for cnt, cat, msg, mod, filename, lineno in top:
+L201             print(f"[WARN-SUMMARY] {cnt-1} more | [{cat}] {msg} | {mod} ({filename}:{lineno})")
+L202         if len(suppressed) > len(top):
+L203             print(f"[WARN-SUMMARY] ... and {len(suppressed)-len(top)} more groups suppressed")
+L204
+L205 # 4) 追加（任意）: 1ジョブあたりの総警告上限を設定したい場合
+L206 #    例: 上限1000を超えたら以降は完全サイレント
+L207 _WARN_HARD_LIMIT = int(os.getenv("WARN_HARD_LIMIT", "0") or "0")  # 0なら無効
+L208 if _WARN_HARD_LIMIT > 0:
+L209     _orig_warn_func = warnings.warn
+L210     def _limited_warn(*a, **k):
+L211         total = sum(_warn_count.values())
+L212         if total < _WARN_HARD_LIMIT:
+L213             return _orig_warn_func(*a, **k)
+L214         # 超過後は捨てる（最後にsummaryだけ残る）
+L215     warnings.warn = _limited_warn
 L216
-L217 def _disjoint_keepG(top_G, top_D, poolD):
-L218     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
-L219     used, D, i = set(top_G), list(top_D), 0
-L220     for j, t in enumerate(D):
-L221         if t not in used:
-L222             continue
-L223         while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
-L224             i += 1
-L225         if i < len(poolD):
-L226             D[j] = poolD[i]; used.add(D[j]); i += 1
-L227     return top_G, D
-L228
-L229
-L230 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
-L231                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
-L232     import pandas as pd, numpy as np
-L233     sel = list(pick)
-L234     if not sel: return sel
-L235     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
-L236     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
-L237     std = agg.std()
-L238     sigma = float(std) if pd.notna(std) else 0.0
-L239     thresh = kth - delta_z * sigma
-L240     ranked_all = agg.sort_values(ascending=False)
-L241     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
-L242     for t in cand:
-L243         within_score = pd.notna(agg[t]) and agg[t] >= thresh
-L244         within_rank = t in ranked_all.index and ranked_all.index.get_loc(t) < n_target + keep_buffer
-L245         if not (within_score or within_rank):
-L246             continue
-L247         non_inc = [x for x in sel if x not in incumbents]
-L248         if not non_inc:
-L249             break
-L250         weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
-L251         if weakest in sel and agg.get(t, -np.inf) >= agg.get(weakest, -np.inf):
-L252             sel.remove(weakest); sel.append(t)
-L253     if len(sel) > n_target:
-L254         sel = sorted(sel, key=lambda x: agg.get(x, -1e9), reverse=True)[:n_target]
-L255     return sel
+L217 # ---------- ここまでで警告の“可視性は維持”しつつ“重複で行数爆発”を抑止 ----------
+L218
+L219 # その他
+L220 logger = logging.getLogger(__name__)
+L221 logging.basicConfig(level=(logging.INFO if debug_mode else logging.WARNING), force=True)
+L222
+L223 _T0 = [perf_counter()]
+L224
+L225
+L226 def _tlog(tag: str) -> None:
+L227     now = perf_counter()
+L228     print(f"[T] {tag}: {now - _T0[0]:.2f}s")
+L229     _T0[0] = now
+L230
+L231
+L232 _tlog("start")
+L233 try:
+L234     _T0[0] = _CSV_LOAD_START
+L235 except NameError:
+L236     pass
+L237 _tlog(f"csv loaded: exist={len(exist)} cand={len(cand)}")
+L238
+L239 # === Utilities ===
+L240 # （ここには “本体ロジック直下で使う軽量ヘルパ” のみを残す）
+L241
+L242
+L243 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
+L244
+L245 def _disjoint_keepG(top_G, top_D, poolD):
+L246     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
+L247     used, D, i = set(top_G), list(top_D), 0
+L248     for j, t in enumerate(D):
+L249         if t not in used:
+L250             continue
+L251         while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
+L252             i += 1
+L253         if i < len(poolD):
+L254             D[j] = poolD[i]; used.add(D[j]); i += 1
+L255     return top_G, D
 L256
 L257
-L258 # === Input：外部I/Oと前処理（CSV/API・欠損補完） ===
-L259 class Input:
-L260     def __init__(self, cand, exist, bench, price_max, finnhub_api_key=None):
-L261         self.cand, self.exist, self.bench, self.price_max = cand, exist, bench, price_max
-L262         self.api_key = finnhub_api_key or os.environ.get("FINNHUB_API_KEY")
-L263
-L264     # ---- （Input専用）EPS補完・FCF算出系 ----
-L265     @staticmethod
-L266     def _sec_headers():
-L267         mail = (os.getenv("SEC_CONTACT_EMAIL") or os.getenv("SEC_EMAIL") or "").strip()
-L268         ua = f"factor-selection/1 (+mailto:{mail})" if mail else "factor-selection/1"
-L269         headers = {"User-Agent": ua[:200], "Accept": "application/json"}
-L270         if mail:
-L271             headers["From"] = mail[:200]
-L272         return headers
-L273
-L274     @staticmethod
-L275     def _sec_get(url: str, retries: int = 3, backoff: float = 0.5):
-L276         for i in range(retries):
-L277             r = requests.get(url, headers=Input._sec_
+L258 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
+L259                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
+L260     import pandas as pd, numpy as np
+L261     sel = list(pick)
+L262     if not sel: return sel
+L263     ranked_sel = agg.reindex(sel).sort_values(ascending=False)
+L264     kth = ranked_sel.iloc[min(len(sel), n_target)-1]
+L265     std = agg.std()
+L266     sigma = float(std) if pd.notna(std) else 0.0
+L267     thresh = kth - delta_z * sigma
+L268     ranked_all = agg.sort_values(ascending=False)
+L269     cand = [t for t in incumbents if (t not in sel) and (t in agg.index)]
+L270     for t in cand:
+L271         within_score = pd.notna(agg[t]) and agg[t] >= thresh
+L272         within_rank = t in ranked_all.index and ranked_all.index.get_loc(t) < n_target + keep_buffer
+L273         if not (within_score or within_rank):
+L274             continue
+L275         non_inc = [x for x in sel if x not in incumbents]
+L276         if not non_inc:
+L277             break
+L278         weakest = min(non_inc, key=lambda x: agg.get(x, -np.inf))
+L279         if w
 ```
