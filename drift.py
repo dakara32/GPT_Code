@@ -8,6 +8,10 @@ import time
 from pathlib import Path
 import config
 
+MODE_LABELS_JA = {"NORMAL": "通常", "CAUTION": "警戒", "EMERG": "緊急"}
+MODE_EMOJIS = {"NORMAL": "🟢", "CAUTION": "⚠️", "EMERG": "🚨"}
+MODE_RANK = {"NORMAL": 0, "CAUTION": 1, "EMERG": 2}
+
 # --- breadth utilities (factor parity) ---
 BENCH = "^GSPC"
 CAND_PRICE_MAX = 450.0
@@ -154,9 +158,7 @@ def build_breadth_header():
         mode = "EMERG"   if (C_full < th_in)   else ("CAUTION" if (C_full < th_norm) else "NORMAL")
     save_mode(mode)
 
-    _MODE_JA   = {"EMERG":"緊急","CAUTION":"警戒","NORMAL":"通常"}
-    _MODE_EMOJI= {"EMERG":"🚨","CAUTION":"⚠️","NORMAL":"🟢"}
-    mode_ja, emoji = _MODE_JA.get(mode,mode), _MODE_EMOJI.get(mode,"ℹ️")
+    mode_ja, emoji = MODE_LABELS_JA.get(mode, mode), MODE_EMOJIS.get(mode, "ℹ️")
     eff_days = len(base)
 
     lead_lines = [
@@ -172,6 +174,139 @@ def build_breadth_header():
         f"  ・60%分位: {q60}本",
     ]
     return "```" + "\n".join(lead_lines) + "```", mode, C_full
+
+
+TS_LOG_FILE = Path(RESULTS_DIR) / "ts_signal_log.csv"
+
+
+def _load_growth_symbols(portfolio: list[dict]) -> list[str]:
+    growth = []
+    for row in portfolio:
+        bucket = str(row.get("bucket", "")).strip().upper()
+        if bucket == "G":
+            sym = str(row.get("symbol", "")).strip().upper()
+            if sym:
+                growth.append(sym)
+    return sorted(set(growth))
+
+
+def _upsert_ts_hits(date_str: str, hits: set[str]):
+    df = None
+    if TS_LOG_FILE.exists():
+        try:
+            df = pd.read_csv(TS_LOG_FILE)
+        except Exception:
+            df = None
+    if df is None or not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(columns=["date", "symbol"])
+    df = df[df["date"] != date_str]
+    if hits:
+        add = pd.DataFrame({"date": date_str, "symbol": sorted({h.upper() for h in hits})})
+        df = pd.concat([df, add], ignore_index=True)
+    df = df.sort_values(["date", "symbol"])
+    df.to_csv(TS_LOG_FILE, index=False)
+
+
+def _count_unique_hits_5d(today_utc: pd.Timestamp) -> int:
+    if not TS_LOG_FILE.exists():
+        return 0
+    try:
+        df = pd.read_csv(TS_LOG_FILE)
+    except Exception:
+        return 0
+    if df.empty or "date" not in df.columns or "symbol" not in df.columns:
+        return 0
+    try:
+        df["date"] = pd.to_datetime(df["date"], utc=True)
+    except Exception:
+        return 0
+    today = today_utc.normalize()
+    start = today - pd.offsets.BDay(4)
+    mask = (df["date"] >= start) & (df["date"] <= today)
+    if not mask.any():
+        return 0
+    return int(df.loc[mask, "symbol"].str.upper().nunique())
+
+
+def _combine_modes(mode_a: str, mode_b: str) -> str:
+    a = MODE_RANK.get((mode_a or "NORMAL").upper(), 0)
+    b = MODE_RANK.get((mode_b or "NORMAL").upper(), 0)
+    for mode, rank in MODE_RANK.items():
+        if rank == max(a, b):
+            return mode
+    return "NORMAL"
+
+
+def _format_mode(mode: str) -> str:
+    upper = (mode or "NORMAL").upper()
+    return f"{MODE_EMOJIS.get(upper, 'ℹ️')} {MODE_LABELS_JA.get(upper, upper)}"
+
+
+def _build_status_block(ts_mode: str, k5: int, ts_hits: list[str], breadth_mode: str, breadth_score: int, combo_mode: str) -> str:
+    hits_line = "なし" if not ts_hits else ", ".join(sorted(ts_hits))
+    lines = [
+        f"*① Growth TS:* {_format_mode(ts_mode)}（5Dユニーク: {k5}銘柄）",
+        f"  ・当日ヒット: {hits_line}",
+        f"*② Breadth:* {_format_mode(breadth_mode)}（テンプレ合格本数: {breadth_score}本）",
+        f"*総合（OR悪化/AND回復）:* {_format_mode(combo_mode)}",
+    ]
+    return "\n".join(lines)
+
+
+def _ts_mode_growth_eod(g_syms: list[str], ref_mode: str) -> tuple[str, int, list[str]]:
+    now_utc = pd.Timestamp.today(tz="UTC")
+    if not g_syms:
+        k = _count_unique_hits_5d(now_utc)
+        mode1 = "EMERG" if k >= 8 else "CAUTION" if k >= 6 else "NORMAL"
+        return mode1, k, []
+    try:
+        df = yf.download(
+            g_syms,
+            period="90d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            group_by="column",
+        )
+    except Exception:
+        df = None
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        k = _count_unique_hits_5d(now_utc)
+        mode1 = "EMERG" if k >= 8 else "CAUTION" if k >= 6 else "NORMAL"
+        return mode1, k, []
+    try:
+        hi = df["High"] if "High" in df.columns else None
+        lo = df["Low"] if "Low" in df.columns else None
+    except Exception:
+        hi = lo = None
+    if hi is None or lo is None:
+        k = _count_unique_hits_5d(now_utc)
+        mode1 = "EMERG" if k >= 8 else "CAUTION" if k >= 6 else "NORMAL"
+        return mode1, k, []
+    if isinstance(hi, pd.Series):
+        hi = hi.to_frame(name=g_syms[0])
+    if isinstance(lo, pd.Series):
+        lo = lo.to_frame(name=g_syms[0])
+    try:
+        roll_hi = hi.rolling(60, min_periods=20).max().tail(1).iloc[0]
+        low_today = lo.tail(1).iloc[0]
+    except Exception:
+        k = _count_unique_hits_5d(now_utc)
+        mode1 = "EMERG" if k >= 8 else "CAUTION" if k >= 6 else "NORMAL"
+        return mode1, k, []
+    base = float(config.TS_BASE_BY_MODE.get((ref_mode or "NORMAL").upper(), 0.15))
+    hits = set()
+    for s in g_syms:
+        rh = float(roll_hi.get(s, float("nan")))
+        lt = float(low_today.get(s, float("nan")))
+        if pd.notna(rh) and rh > 0 and pd.notna(lt) and lt > 0:
+            if lt <= rh * (1.0 - base):
+                hits.add(s)
+    today = now_utc.date().isoformat()
+    _upsert_ts_hits(today, hits)
+    k = _count_unique_hits_5d(now_utc)
+    mode1 = "EMERG" if k >= 8 else "CAUTION" if k >= 6 else "NORMAL"
+    return mode1, k, sorted(hits)
 # Debug flag
 debug_mode = False  # set to True for detailed output
 
@@ -344,11 +479,21 @@ def scan_sell_signals(symbols, lookback_days=5):
 def load_portfolio():
     tickers_path = Path(__file__).with_name("current_tickers.csv")
     with tickers_path.open() as f:
-        reader = list(csv.reader(f))
-    return [
-        {"symbol": sym.strip().upper(), "shares": int(qty), "target_ratio": 1 / len(reader)}
-        for sym, qty in reader
-    ]
+        rows = [row for row in csv.reader(f) if row and row[0].strip()]
+    n = len(rows)
+    portfolio = []
+    for row in rows:
+        sym = row[0].strip().upper()
+        qty = int(row[1]) if len(row) > 1 and row[1].strip() else 0
+        bucket = row[2].strip().upper() if len(row) > 2 else ""
+        entry = {
+            "symbol": sym,
+            "shares": qty,
+            "target_ratio": 1 / n if n else 0.0,
+            "bucket": bucket,
+        }
+        portfolio.append(entry)
+    return portfolio
 
 
 def compute_threshold():
@@ -509,11 +654,14 @@ def send_debug(debug_text):
 def main():
     portfolio = load_portfolio()
     symbols = [r["symbol"] for r in portfolio]
+    g_syms = _load_growth_symbols(portfolio)
     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
 
-    breadth_block, mode, _C = build_breadth_header()
+    breadth_block, breadth_mode, breadth_score = build_breadth_header()
+    ts_mode, k5, ts_hits = _ts_mode_growth_eod(g_syms, breadth_mode)
+    combo_mode = _combine_modes(ts_mode, breadth_mode)
 
-    cash_ratio, drift_threshold = compute_threshold_by_mode(mode)
+    cash_ratio, drift_threshold = compute_threshold_by_mode(breadth_mode)
 
     df, total_value, total_drift_abs = build_dataframe(portfolio)
     df, alert, new_total_value, simulated_total_drift_abs = simulate(
@@ -529,9 +677,11 @@ def main():
             latest_tag = {s: " / ".join(sell_alerts[s][-1][1]) for s in sell_alerts}
             df_small.insert(1, "sig", df_small[col_sym].map(latest_tag).fillna(""))
     formatters = formatters_for(alert)
-    header = build_header(
-        mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
+    header_core = build_header(
+        breadth_mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
     )
+    status_block = _build_status_block(ts_mode, k5, ts_hits, breadth_mode, breadth_score, combo_mode)
+    header = header_core + "\n" + status_block
     if breadth_block:
         header = breadth_block + "\n" + header
     if sell_alerts:
