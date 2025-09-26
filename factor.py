@@ -103,6 +103,16 @@ except NameError: CROSS_MU_GD = 0.40  # 推奨 0.35–0.45（lam=0.85想定）
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+def _write_leaders_csv(results_dir: str, top_g, n: int = config.N_G) -> None:
+    import os, logging
+
+    os.makedirs(results_dir, exist_ok=True)
+    arr = [str(t).strip().upper() for t in list(top_g)[:n] if t]
+    path = os.path.join(results_dir, "leaders.csv")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(arr) + ("\n" if arr else ""))
+    logging.info("[I/O] results/leaders.csv updated (%d lines)", len(arr))
+
 # === 共有DTO（クラス間I/O契約）＋ Config ===
 @dataclass(frozen=True)
 class InputBundle:
@@ -1637,6 +1647,7 @@ def run_pipeline() -> SelectionBundle:
             extra_G=extra_G,
             extra_D=extra_D,
         )
+        _write_leaders_csv(RESULTS_DIR, sb.top_G, n=config.N_G)
     except Exception as e:
         logging.warning("bucket update skipped: %s", e)
         # 失敗しても本処理は継続（I/O都合で安全側）
