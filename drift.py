@@ -5,7 +5,10 @@ import os
 import csv
 import json
 import time
+from datetime import datetime, timedelta
+from collections import defaultdict
 from pathlib import Path
+from pandas.tseries.offsets import BDay
 import config
 
 # --- breadth utilities (factor parity) ---
@@ -13,6 +16,16 @@ BENCH = "^GSPC"
 CAND_PRICE_MAX = 450.0
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
+LOG_PATH = Path(RESULTS_DIR) / "ts_signal_log.csv"
+
+MODE_ORDER = ("NORMAL", "CAUTION", "EMERG")
+
+
+def _mode_rank(mode: str) -> int:
+    try:
+        return MODE_ORDER.index((mode or "NORMAL").upper())
+    except ValueError:
+        return 0
 
 
 def _state_file():
@@ -69,6 +82,154 @@ def _fetch_prices_600d(tickers):
     px = close.dropna(how="all", axis=1).ffill(limit=2)
     spx = close[BENCH].reindex(px.index).ffill()
     return px, spx
+
+
+def _calc_beta_same(series: pd.Series, market: pd.Series, lookback=252) -> float:
+    r, m = series.pct_change().dropna(), market.pct_change().dropna()
+    n = min(len(r), len(m), lookback)
+    if n < 60:
+        return float("nan")
+    r, m = r.iloc[-n:], m.iloc[-n:]
+    var = np.var(m)
+    if var == 0:
+        return float("nan")
+    return float(np.cov(r, m)[0, 1] / var)
+
+
+def _fallback_beta_finnhub(symbol: str) -> float | None:
+    try:
+        data = finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"})
+        metric = data.get("metric") if isinstance(data, dict) else {}
+        beta = metric.get("beta") if isinstance(metric, dict) else None
+        return float(beta) if beta not in (None, "") else None
+    except Exception:
+        return None
+
+
+def _beta_map(symbols: list[str]):
+    uniq = sorted({str(s).upper() for s in symbols if isinstance(s, str) and s.strip()})
+    if not uniq:
+        return {}, pd.DataFrame(), pd.Series(dtype=float)
+    try:
+        px, spx = _fetch_prices_600d(uniq)
+    except Exception:
+        return {}, pd.DataFrame(), pd.Series(dtype=float)
+    betas: dict[str, float] = {}
+    for sym in uniq:
+        if sym not in px.columns:
+            betas[sym] = float("nan")
+            continue
+        beta = _calc_beta_same(px[sym], spx)
+        if pd.isna(beta):
+            fb = _fallback_beta_finnhub(sym)
+            beta = float(fb) if fb is not None else float("nan")
+        betas[sym] = beta
+    return betas, px, spx
+
+
+def _upsert_ts_hits(today: str, hits: set[str], all_syms: set[str]):
+    all_syms = {str(s).upper() for s in all_syms if str(s).strip()}
+    if not all_syms:
+        return
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    existing: defaultdict[str, dict[str, int]] = defaultdict(dict)
+    if LOG_PATH.exists():
+        try:
+            df = pd.read_csv(LOG_PATH)
+        except Exception:
+            df = pd.DataFrame(columns=["date", "symbol", "breach"])
+        for row in df.itertuples(index=False):
+            date = str(getattr(row, "date", ""))
+            sym = str(getattr(row, "symbol", "")).upper()
+            try:
+                breach = int(getattr(row, "breach", 0))
+            except Exception:
+                breach = 0
+            if date:
+                existing[date][sym] = breach
+    for sym in all_syms:
+        existing[today][sym] = 1 if sym in hits else 0
+    rows = []
+    for date in sorted(existing.keys()):
+        for sym in sorted(existing[date].keys()):
+            rows.append({"date": date, "symbol": sym, "breach": int(existing[date][sym])})
+    pd.DataFrame(rows, columns=["date", "symbol", "breach"]).to_csv(LOG_PATH, index=False)
+
+
+def _count_unique_hits_5d(ref_date: pd.Timestamp, universe: set[str] | None = None) -> tuple[int, set[str]]:
+    if not LOG_PATH.exists():
+        return 0, set()
+    try:
+        df = pd.read_csv(LOG_PATH)
+    except Exception:
+        return 0, set()
+    if df.empty:
+        return 0, set()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return 0, set()
+    ref = pd.Timestamp(ref_date).normalize()
+    try:
+        start = (ref - BDay(4)).normalize()
+    except Exception:
+        start = (ref - timedelta(days=7)).normalize()
+    df = df[(df["date"] >= start) & (df["date"] <= ref)]
+    if universe:
+        uni = {str(s).upper() for s in universe}
+        df = df[df["symbol"].astype(str).str.upper().isin(uni)]
+    if df.empty:
+        return 0, set()
+    df["breach"] = pd.to_numeric(df["breach"], errors="coerce").fillna(0).astype(int)
+    df = df[df["breach"] == 1]
+    if df.empty:
+        return 0, set()
+    syms = set(df["symbol"].astype(str).str.upper())
+    return len(syms), syms
+
+
+def _ts_mode_for_growth(port_symbols: list[str], base_ts_by_mode: dict, ref_mode: str) -> tuple[str, int, int]:
+    symbols = sorted({str(s).upper() for s in port_symbols if isinstance(s, str) and s.strip()})
+    if not symbols:
+        return "NORMAL", 0, 0
+    betas, px, spx = _beta_map(symbols)
+    if px is None or px.empty or spx is None or spx.empty:
+        today = datetime.utcnow().date().isoformat()
+        _upsert_ts_hits(today, set(), set())
+        return "NORMAL", 0, len(symbols)
+    ts_base = base_ts_by_mode.get((ref_mode or "NORMAL").upper(), base_ts_by_mode.get("NORMAL", 0.15))
+    growth_syms = {sym for sym in symbols if pd.notna(betas.get(sym, np.nan)) and betas.get(sym, np.nan) >= -0.6}
+    if not growth_syms:
+        latest = px.index[-1] if len(px.index) else pd.Timestamp(datetime.utcnow())
+        _upsert_ts_hits(latest.strftime("%Y-%m-%d"), set(), set())
+        return "NORMAL", 0, 0
+    px_g = px.reindex(columns=sorted(growth_syms)).ffill(limit=2)
+    if px_g.empty:
+        latest = px.index[-1] if len(px.index) else pd.Timestamp(datetime.utcnow())
+        _upsert_ts_hits(latest.strftime("%Y-%m-%d"), set(), growth_syms)
+        return "NORMAL", 0, len(growth_syms)
+    latest_date = px_g.index[-1]
+    last_prices = px_g.iloc[-1]
+    hi60 = px_g.rolling(60, min_periods=60).max()
+    hits: set[str] = set()
+    for sym in growth_syms:
+        high = hi60[sym].iloc[-1] if sym in hi60.columns else float("nan")
+        close = last_prices.get(sym, float("nan"))
+        if pd.isna(high) or pd.isna(close) or high <= 0:
+            continue
+        drop = (high - close) / high
+        if drop >= ts_base:
+            hits.add(sym)
+    today = latest_date.strftime("%Y-%m-%d")
+    _upsert_ts_hits(today, hits, growth_syms)
+    k5_count, _ = _count_unique_hits_5d(latest_date, growth_syms)
+    if k5_count >= 8:
+        mode = "EMERG"
+    elif k5_count >= 6:
+        mode = "CAUTION"
+    else:
+        mode = "NORMAL"
+    return mode, k5_count, len(growth_syms)
 
 
 def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
@@ -511,9 +672,23 @@ def main():
     symbols = [r["symbol"] for r in portfolio]
     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
 
-    breadth_block, mode, _C = build_breadth_header()
+    prev_final = load_mode("NORMAL")
+    breadth_block, breadth_mode, _C = build_breadth_header()
+    ts_mode, k5_count, growth_total = _ts_mode_for_growth(symbols, config.TS_BASE_BY_MODE, breadth_mode)
 
-    cash_ratio, drift_threshold = compute_threshold_by_mode(mode)
+    worsen_mode = ts_mode if _mode_rank(ts_mode) >= _mode_rank(breadth_mode) else breadth_mode
+    prev_rank = _mode_rank(prev_final)
+    worsen_rank = _mode_rank(worsen_mode)
+    if worsen_rank > prev_rank:
+        final_mode = worsen_mode
+    elif _mode_rank(ts_mode) < prev_rank and _mode_rank(breadth_mode) < prev_rank:
+        better_rank = max(_mode_rank(ts_mode), _mode_rank(breadth_mode))
+        final_mode = MODE_ORDER[better_rank]
+    else:
+        final_mode = prev_final
+    save_mode(final_mode)
+
+    cash_ratio, drift_threshold = compute_threshold_by_mode(final_mode)
 
     df, total_value, total_drift_abs = build_dataframe(portfolio)
     df, alert, new_total_value, simulated_total_drift_abs = simulate(
@@ -530,10 +705,46 @@ def main():
             df_small.insert(1, "sig", df_small[col_sym].map(latest_tag).fillna(""))
     formatters = formatters_for(alert)
     header = build_header(
-        mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
+        final_mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
     )
+    denom_str = str(growth_total) if growth_total else "-"
+    reason_line = (
+        f"〔判定: ①TS={ts_mode}・②B={breadth_mode}・5D={k5_count}/{denom_str} ⇒ final={final_mode}〕"
+    )
+
+    def _inject_reason(block: str, line: str) -> str:
+        if not block:
+            return line
+        if block.startswith("```"):
+            inner = block[3:]
+            closing = ""
+            if inner.endswith("```"):
+                inner = inner[:-3]
+                closing = "```"
+            lines = inner.split("\n")
+            inserted = False
+            for idx, ln in enumerate(lines):
+                if "現在モード" in ln:
+                    lines.insert(idx + 1, line)
+                    inserted = True
+                    break
+            if not inserted:
+                lines.insert(0, line)
+            return "```" + "\n".join(lines) + closing
+        lines = block.split("\n")
+        for idx, ln in enumerate(lines):
+            if "現在モード" in ln:
+                lines.insert(idx + 1, line)
+                break
+        else:
+            lines.insert(0, line)
+        return "\n".join(lines)
+
     if breadth_block:
+        breadth_block = _inject_reason(breadth_block, reason_line)
         header = breadth_block + "\n" + header
+    else:
+        header = reason_line + "\n" + header
     if sell_alerts:
         def fmt_pair(date_tags):
             date, tags = date_tags
