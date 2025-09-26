@@ -18,7 +18,6 @@ CAND_PRICE_MAX = 450.0
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-LOG_PATH = Path(RESULTS_DIR) / "ts_signal_log.csv"
 AUDIT_PATH = Path(RESULTS_DIR) / "ts_eod_audit.csv"
 
 
@@ -179,13 +178,6 @@ def build_breadth_header():
     return "```" + "\n".join(lead_lines) + "```", mode, C_full
 
 
-def _ensure_log_header():
-    if not LOG_PATH.exists():
-        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG_PATH, "w", newline="") as f:
-            f.write("date,symbol,breach\n")
-
-
 def _ensure_audit_header():
     AUDIT_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not AUDIT_PATH.exists():
@@ -204,54 +196,6 @@ def _load_growth_symbols(portfolio: list[dict]) -> list[str]:
     return sorted(set(growth))
 
 
-def _upsert_ts_hits(date_str: str, hits: set[str]):
-    _ensure_log_header()
-    try:
-        df = pd.read_csv(LOG_PATH)
-    except Exception:
-        df = pd.DataFrame(columns=["date", "symbol", "breach"])
-    if df.empty:
-        df = pd.DataFrame(columns=["date", "symbol", "breach"])
-    df = df[df["date"] != date_str]
-    if hits:
-        add = pd.DataFrame(
-            {
-                "date": date_str,
-                "symbol": sorted({h.upper() for h in hits}),
-                "breach": 1,
-            }
-        )
-        df = pd.concat([df, add], ignore_index=True)
-    df = df.sort_values(["date", "symbol"])
-    df.to_csv(LOG_PATH, index=False)
-
-
-def _count_unique_hits_5d(today_utc: pd.Timestamp) -> int:
-    if not LOG_PATH.exists():
-        return 0
-    try:
-        df = pd.read_csv(LOG_PATH)
-    except Exception:
-        return 0
-    if df.empty or "date" not in df.columns or "symbol" not in df.columns:
-        return 0
-    if "breach" in df.columns:
-        try:
-            df = df[df["breach"].astype(int) == 1]
-        except Exception:
-            df = df[df["breach"] == 1]
-    try:
-        df["date"] = pd.to_datetime(df["date"], utc=True)
-    except Exception:
-        return 0
-    today = today_utc.normalize()
-    start = today - pd.offsets.BDay(4)
-    mask = (df["date"] >= start) & (df["date"] <= today)
-    if not mask.any():
-        return 0
-    return int(df.loc[mask, "symbol"].str.upper().nunique())
-
-
 def _combine_modes(mode_a: str, mode_b: str) -> str:
     a = MODE_RANK.get((mode_a or "NORMAL").upper(), 0)
     b = MODE_RANK.get((mode_b or "NORMAL").upper(), 0)
@@ -266,52 +210,53 @@ def _format_mode(mode: str) -> str:
     return f"{MODE_EMOJIS.get(upper, 'ℹ️')} {MODE_LABELS_JA.get(upper, upper)}"
 
 
-def _ts_mode_growth_eod(g_syms: list[str], ref_mode: str) -> tuple[str, int, list[str]]:
-    now_utc = pd.Timestamp.today(tz="UTC")
+def _ts_mode_growth_5d(g_syms: list[str], ref_mode: str) -> tuple[str, int, set[str]]:
+    """直近5営業日を株価直接方式で一括判定（Low vs 60D High）。"""
+
     if not g_syms:
-        k = _count_unique_hits_5d(now_utc)
-        mode1 = "EMERG" if k >= 8 else "CAUTION" if k >= 6 else "NORMAL"
-        return mode1, k, []
+        return "NORMAL", 0, set()
 
     try:
         df = yf.download(
             g_syms,
-            period="90d",
+            period="100d",
             interval="1d",
             auto_adjust=False,
             progress=False,
-            group_by="column",
         )
     except Exception:
         df = None
 
-    hi = lo = None
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        try:
-            hi = df["High"] if "High" in df.columns else None
-            lo = df["Low"] if "Low" in df.columns else None
-        except Exception:
-            hi = lo = None
-        if isinstance(hi, pd.Series):
-            hi = hi.to_frame(name=g_syms[0])
-        if isinstance(lo, pd.Series):
-            lo = lo.to_frame(name=g_syms[0])
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return "NORMAL", 0, set()
 
-    if hi is None or lo is None or hi.empty or lo.empty:
-        roll_hi = pd.Series(dtype=float)
-        low_today = pd.Series(dtype=float)
-    else:
-        try:
-            roll_hi = hi.rolling(60, min_periods=20).max().tail(1).iloc[0]
-            low_today = lo.tail(1).iloc[0]
-        except Exception:
-            roll_hi = pd.Series(dtype=float)
-            low_today = pd.Series(dtype=float)
+    try:
+        hi_all = df["High"] if "High" in df.columns else None
+        lo_all = df["Low"] if "Low" in df.columns else None
+    except Exception:
+        hi_all = lo_all = None
+
+    if hi_all is None or lo_all is None:
+        return "NORMAL", 0, set()
+
+    if isinstance(hi_all, pd.Series):
+        hi_all = hi_all.to_frame(name=g_syms[0])
+    if isinstance(lo_all, pd.Series):
+        lo_all = lo_all.to_frame(name=g_syms[0])
+
+    if hi_all.empty or lo_all.empty:
+        return "NORMAL", 0, set()
+
+    roll_hi = hi_all.rolling(60, min_periods=20).max()
+    last5_hi = roll_hi.tail(5)
+    last5_lo = lo_all.tail(5).reindex(last5_hi.index)
+
+    if last5_hi.empty or last5_lo.empty:
+        return "NORMAL", 0, set()
 
     base = float(config.TS_BASE_BY_MODE.get((ref_mode or "NORMAL").upper(), 0.15))
-    hits = set()
-    audit_rows = []
-    today = now_utc.date().isoformat()
+    uniq_hits: set[str] = set()
+    today_hits: set[str] = set()
     _ensure_audit_header()
 
     def _fmt(val: float) -> str:
@@ -319,40 +264,45 @@ def _ts_mode_growth_eod(g_syms: list[str], ref_mode: str) -> tuple[str, int, lis
             return ""
         return f"{float(val):.6g}"
 
-    for s in g_syms:
-        rh = float(roll_hi.get(s, float("nan"))) if hasattr(roll_hi, "get") else float("nan")
-        lt = float(low_today.get(s, float("nan"))) if hasattr(low_today, "get") else float("nan")
-        threshold = float("nan")
-        breach = 0
-        if pd.notna(rh) and rh > 0 and pd.notna(lt) and lt > 0:
-            threshold = rh * (1.0 - base)
-            breach = int(lt <= threshold)
-            if breach:
-                hits.add(s)
-        audit_rows.append(
-            {
-                "date": today,
-                "symbol": s,
-                "high60": _fmt(rh),
-                "low_today": _fmt(lt),
-                "baseTS": f"{base:.3f}",
-                "threshold": _fmt(threshold),
-                "breach": str(breach),
-            }
-        )
+    rows = []
+    for dt in last5_hi.index:
+        hi_row = last5_hi.loc[dt]
+        lo_row = last5_lo.loc[dt]
+        for sym in g_syms:
+            rh = float(hi_row.get(sym, float("nan"))) if hasattr(hi_row, "get") else float("nan")
+            lt = float(lo_row.get(sym, float("nan"))) if hasattr(lo_row, "get") else float("nan")
+            threshold = float("nan")
+            breach = 0
+            if pd.notna(rh) and rh > 0 and pd.notna(lt) and lt > 0:
+                threshold = rh * (1.0 - base)
+                breach = int(lt <= threshold)
+                if breach:
+                    uniq_hits.add(sym)
+                    if dt == last5_hi.index[-1]:
+                        today_hits.add(sym)
+            rows.append(
+                {
+                    "date": dt.date().isoformat() if hasattr(dt, "date") else str(dt),
+                    "symbol": sym,
+                    "high60": _fmt(rh),
+                    "low_today": _fmt(lt),
+                    "baseTS": f"{base:.3f}",
+                    "threshold": _fmt(threshold),
+                    "breach": str(breach),
+                }
+            )
 
-    if audit_rows:
+    if rows:
         with open(AUDIT_PATH, "a", newline="") as f:
             writer = csv.DictWriter(
                 f,
                 fieldnames=["date", "symbol", "high60", "low_today", "baseTS", "threshold", "breach"],
             )
-            writer.writerows(audit_rows)
+            writer.writerows(rows)
 
-    _upsert_ts_hits(today, hits)
-    k = _count_unique_hits_5d(now_utc)
-    mode1 = "EMERG" if k >= 8 else "CAUTION" if k >= 6 else "NORMAL"
-    return mode1, k, sorted(hits)
+    k5 = len(uniq_hits)
+    mode1 = "EMERG" if k5 >= 8 else "CAUTION" if k5 >= 6 else "NORMAL"
+    return mode1, k5, today_hits
 # Debug flag
 debug_mode = False  # set to True for detailed output
 
@@ -704,7 +654,7 @@ def main():
     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
 
     breadth_block, breadth_mode, breadth_score = build_breadth_header()
-    ts_mode, k5, ts_hits = _ts_mode_growth_eod(g_syms, breadth_mode)
+    ts_mode, k5, today_hits = _ts_mode_growth_5d(g_syms, breadth_mode)
     combo_mode = _combine_modes(ts_mode, breadth_mode)
 
     cash_ratio, drift_threshold = compute_threshold_by_mode(breadth_mode)
@@ -728,7 +678,7 @@ def main():
     )
 
     g_count = len(g_syms)
-    hits_line = "なし" if not ts_hits else ", ".join(sorted(ts_hits))
+    hits_line = "なし" if not today_hits else ", ".join(sorted(today_hits))
     summary_lines = [
         f"① Growth TS: {_format_mode(ts_mode)} （5Dユニーク: {k5} / G={g_count}）",
         f"・当日ヒット: {hits_line}",
@@ -739,12 +689,23 @@ def main():
 
     if breadth_block:
         if breadth_block.startswith("```"):
-            remainder = breadth_block[len("```") :]
-            if remainder.startswith("\n"):
-                remainder = remainder[1:]
-            breadth_block = "```\n" + prepend_block + "\n" + remainder
+            inner = breadth_block[len("```") :]
+            if inner.startswith("\n"):
+                inner = inner[1:]
+            if inner.endswith("```"):
+                inner = inner[: -len("```")]
+            inner = inner.strip("\n")
+            inner_lines = [line for line in inner.splitlines() if "現在モード" not in line]
+            cleaned_inner = "\n".join(inner_lines)
+            if cleaned_inner:
+                new_inner = prepend_block + "\n" + cleaned_inner
+            else:
+                new_inner = prepend_block
+            breadth_block = "```\n" + new_inner + "\n```"
         else:
-            breadth_block = prepend_block + "\n" + breadth_block
+            lines = [line for line in breadth_block.splitlines() if "現在モード" not in line]
+            cleaned_block = "\n".join(lines)
+            breadth_block = prepend_block + ("\n" + cleaned_block if cleaned_block else "")
         header = breadth_block + "\n" + header_core
     else:
         header = prepend_block + "\n" + header_core
