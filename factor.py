@@ -1586,11 +1586,12 @@ def run_pipeline() -> SelectionBundle:
               "sum_score": sumD, "objective": objD},
         top_G=top_G, top_D=top_D, init_G=top_G, init_D=top_D)
 
-    # [ADD] 選定確定後に current_tickers.csv の bucket を最新化
+    # [ADD] G/D選定結果で current_tickers.csv の bucket を部分上書き
     try:
-        _update_bucket_by_selection("current_tickers.csv", sb.top_G, sb.top_D)
+        _update_bucket_by_selection("current_tickers.csv", top_G, top_D)
     except Exception as e:
-        logging.warning("bucket update failed: %s", e)
+        logging.warning("bucket update skipped: %s", e)
+        # 失敗しても本処理は継続（I/O都合で安全側）
 
     # --- Low Score Candidates (GSC+DSC bottom 10) : send before debug dump ---
     try:
