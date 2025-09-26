@@ -2,7 +2,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, factor.py, scorer.py, .github/workflows/weekly-report.yml, documents/README.md, documents/factor_design.md
-# 作成日時: 2025-09-27 08:08:05 (JST)
+# 作成日時: 2025-09-27 08:21:05 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -150,180 +150,178 @@ L102 # 出力関連
 L103 RESULTS_DIR = "results"
 L104 os.makedirs(RESULTS_DIR, exist_ok=True)
 L105
-L106 # === 共有DTO（クラス間I/O契約）＋ Config ===
-L107 @dataclass(frozen=True)
-L108 class InputBundle:
-L109     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
-L110     cand: List[str]
-L111     tickers: List[str]
-L112     bench: str
-L113     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
-L114     px: pd.DataFrame                # data['Close']
-L115     spx: pd.Series                  # data['Close'][bench]
-L116     tickers_bulk: object            # yfinance.Tickers
-L117     info: Dict[str, dict]           # yfinance info per ticker
-L118     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
-L119     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
-L120     returns: pd.DataFrame           # px[tickers].pct_change()
-L121     missing_logs: pd.DataFrame
-L122
-L123 @dataclass(frozen=True)
-L124 class FeatureBundle:
-L125     df: pd.DataFrame
-L126     df_z: pd.DataFrame
-L127     g_score: pd.Series
-L128     d_score_all: pd.Series
-L129     missing_logs: pd.DataFrame
-L130     df_full: pd.DataFrame | None = None
-L131     df_full_z: pd.DataFrame | None = None
-L132     scaler: Any | None = None
-L133
-L134 @dataclass(frozen=True)
-L135 class SelectionBundle:
-L136     resG: dict
-L137     resD: dict
-L138     top_G: List[str]
-L139     top_D: List[str]
-L140     init_G: List[str]
-L141     init_D: List[str]
-L142
-L143 @dataclass(frozen=True)
-L144 class WeightsConfig:
-L145     g: Dict[str,float]
-L146     d: Dict[str,float]
-L147
-L148 @dataclass(frozen=True)
-L149 class DRRSParams:
-L150     corrM: int
-L151     shrink: float
-L152     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
-L153     D: Dict[str,float]
-L154     cross_mu_gd: float
-L155
-L156 @dataclass(frozen=True)
-L157 class PipelineConfig:
-L158     weights: WeightsConfig
-L159     drrs: DRRSParams
-L160     price_max: float
-L161     debug_mode: bool = False
-L162
-L163 # ---------- 重複警告の集約ロジック ----------
-L164 _warn_lock = threading.Lock()
-L165 _warn_seen = set()                     # 初回表示済みキー
-L166 _warn_count = Counter()                # (category, message, module) → 件数
-L167 _warn_first_ctx = {}                   # 初回の (filename, lineno)
-L168
-L169 def _warn_key(message, category, filename, lineno, *_args, **_kwargs):
-L170     # "同じ警告" を定義: カテゴリ + 正規化メッセージ + モジュールパス(先頭数階層)
-L171     mod = filename.split("/site-packages/")[-1] if "/site-packages/" in filename else filename
-L172     mod = mod.rsplit("/", 3)[-1]  # 長すぎ抑制（末尾3階層まで）
-L173     msg = str(message).strip()
-L174     return (category.__name__, msg, mod)
-L175
-L176 _orig_showwarning = warnings.showwarning
-L177
-L178 def _compact_showwarning(message, category, filename, lineno, file=None, line=None):
-L179     key = _warn_key(message, category, filename, lineno)
-L180     with _warn_lock:
-L181         _warn_count[key] += 1
-L182         if key not in _warn_seen:
-L183             # 初回だけ1行で出す（カテゴリ | モジュール | メッセージ）
-L184             _warn_seen.add(key)
-L185             _warn_first_ctx[key] = (filename, lineno)
-L186             # 1行フォーマット（行数節約）
-L187             txt = f"[WARN][{category.__name__}] {message} | {filename}:{lineno}"
-L188             print(txt)
-L189         # 2回目以降は出さない（集約）
-L190
-L191 warnings.showwarning = _compact_showwarning
-L192
-L193 # ベースポリシー: 通常は警告を出す（default）→ ただし同一メッセージは集約
-L194 warnings.resetwarnings()
-L195 warnings.simplefilter("default")
-L196
-L197 # 2) ピンポイント間引き: yfinance 'Ticker.earnings' は "once"（初回のみ可視化）
-L198 warnings.filterwarnings(
-L199     "once",
-L200     message="'Ticker.earnings' is deprecated",
-L201     category=DeprecationWarning,
-L202     module="yfinance"
-L203 )
-L204
-L205 # 3) 最終サマリ: 同一警告が何回出たかを最後に1行で
-L206 @atexit.register
-L207 def _print_warning_summary():
-L208     suppressed = []
-L209     for key, cnt in _warn_count.items():
-L210         if cnt > 1:
-L211             (cat, msg, mod) = key
-L212             filename, lineno = _warn_first_ctx.get(key, ("", 0))
-L213             suppressed.append((cnt, cat, msg, mod, filename, lineno))
-L214     if suppressed:
-L215         suppressed.sort(reverse=True)  # 件数降順
-L216         # 最多上位だけ出す（必要なら上限制御：ここでは上位10件）
-L217         top = suppressed[:10]
-L218         print(f"[WARN-SUMMARY] duplicated warning groups: {len(suppressed)}")
-L219         for cnt, cat, msg, mod, filename, lineno in top:
-L220             print(f"[WARN-SUMMARY] {cnt-1} more | [{cat}] {msg} | {mod} ({filename}:{lineno})")
-L221         if len(suppressed) > len(top):
-L222             print(f"[WARN-SUMMARY] ... and {len(suppressed)-len(top)} more groups suppressed")
-L223
-L224 # 4) 追加（任意）: 1ジョブあたりの総警告上限を設定したい場合
-L225 #    例: 上限1000を超えたら以降は完全サイレント
-L226 _WARN_HARD_LIMIT = int(os.getenv("WARN_HARD_LIMIT", "0") or "0")  # 0なら無効
-L227 if _WARN_HARD_LIMIT > 0:
-L228     _orig_warn_func = warnings.warn
-L229     def _limited_warn(*a, **k):
-L230         total = sum(_warn_count.values())
-L231         if total < _WARN_HARD_LIMIT:
-L232             return _orig_warn_func(*a, **k)
-L233         # 超過後は捨てる（最後にsummaryだけ残る）
-L234     warnings.warn = _limited_warn
-L235
-L236 # ---------- ここまでで警告の“可視性は維持”しつつ“重複で行数爆発”を抑止 ----------
-L237
-L238 # その他
-L239 logger = logging.getLogger(__name__)
-L240 logging.basicConfig(level=(logging.INFO if debug_mode else logging.WARNING), force=True)
-L241
-L242 _T0 = [perf_counter()]
-L243
-L244
-L245 def _tlog(tag: str) -> None:
-L246     now = perf_counter()
-L247     print(f"[T] {tag}: {now - _T0[0]:.2f}s")
-L248     _T0[0] = now
-L249
-L250
-L251 _tlog("start")
-L252 try:
-L253     _T0[0] = _CSV_LOAD_START
-L254 except NameError:
-L255     pass
-L256 _tlog(f"csv loaded: exist={len(exist)} cand={len(cand)}")
-L257
-L258 # === Utilities ===
-L259 # （ここには “本体ロジック直下で使う軽量ヘルパ” のみを残す）
+L106 def _write_leaders_csv(results_dir: str, top_g, n: int = config.N_G) -> None:
+L107     import os, logging
+L108
+L109     os.makedirs(results_dir, exist_ok=True)
+L110     arr = [str(t).strip().upper() for t in list(top_g)[:n] if t]
+L111     path = os.path.join(results_dir, "leaders.csv")
+L112     with open(path, "w", encoding="utf-8") as f:
+L113         f.write("\n".join(arr) + ("\n" if arr else ""))
+L114     logging.info("[I/O] results/leaders.csv updated (%d lines)", len(arr))
+L115
+L116 # === 共有DTO（クラス間I/O契約）＋ Config ===
+L117 @dataclass(frozen=True)
+L118 class InputBundle:
+L119     # Input → Scorer で受け渡す素材（I/O禁止の生データ）
+L120     cand: List[str]
+L121     tickers: List[str]
+L122     bench: str
+L123     data: pd.DataFrame              # yfinance download結果（'Close','Volume'等の階層列）
+L124     px: pd.DataFrame                # data['Close']
+L125     spx: pd.Series                  # data['Close'][bench]
+L126     tickers_bulk: object            # yfinance.Tickers
+L127     info: Dict[str, dict]           # yfinance info per ticker
+L128     eps_df: pd.DataFrame            # ['eps_ttm','eps_q_recent',...]
+L129     fcf_df: pd.DataFrame            # ['fcf_ttm', ...]
+L130     returns: pd.DataFrame           # px[tickers].pct_change()
+L131     missing_logs: pd.DataFrame
+L132
+L133 @dataclass(frozen=True)
+L134 class FeatureBundle:
+L135     df: pd.DataFrame
+L136     df_z: pd.DataFrame
+L137     g_score: pd.Series
+L138     d_score_all: pd.Series
+L139     missing_logs: pd.DataFrame
+L140     df_full: pd.DataFrame | None = None
+L141     df_full_z: pd.DataFrame | None = None
+L142     scaler: Any | None = None
+L143
+L144 @dataclass(frozen=True)
+L145 class SelectionBundle:
+L146     resG: dict
+L147     resD: dict
+L148     top_G: List[str]
+L149     top_D: List[str]
+L150     init_G: List[str]
+L151     init_D: List[str]
+L152
+L153 @dataclass(frozen=True)
+L154 class WeightsConfig:
+L155     g: Dict[str,float]
+L156     d: Dict[str,float]
+L157
+L158 @dataclass(frozen=True)
+L159 class DRRSParams:
+L160     corrM: int
+L161     shrink: float
+L162     G: Dict[str,float]   # lookback, n_pc, gamma, lam, eta
+L163     D: Dict[str,float]
+L164     cross_mu_gd: float
+L165
+L166 @dataclass(frozen=True)
+L167 class PipelineConfig:
+L168     weights: WeightsConfig
+L169     drrs: DRRSParams
+L170     price_max: float
+L171     debug_mode: bool = False
+L172
+L173 # ---------- 重複警告の集約ロジック ----------
+L174 _warn_lock = threading.Lock()
+L175 _warn_seen = set()                     # 初回表示済みキー
+L176 _warn_count = Counter()                # (category, message, module) → 件数
+L177 _warn_first_ctx = {}                   # 初回の (filename, lineno)
+L178
+L179 def _warn_key(message, category, filename, lineno, *_args, **_kwargs):
+L180     # "同じ警告" を定義: カテゴリ + 正規化メッセージ + モジュールパス(先頭数階層)
+L181     mod = filename.split("/site-packages/")[-1] if "/site-packages/" in filename else filename
+L182     mod = mod.rsplit("/", 3)[-1]  # 長すぎ抑制（末尾3階層まで）
+L183     msg = str(message).strip()
+L184     return (category.__name__, msg, mod)
+L185
+L186 _orig_showwarning = warnings.showwarning
+L187
+L188 def _compact_showwarning(message, category, filename, lineno, file=None, line=None):
+L189     key = _warn_key(message, category, filename, lineno)
+L190     with _warn_lock:
+L191         _warn_count[key] += 1
+L192         if key not in _warn_seen:
+L193             # 初回だけ1行で出す（カテゴリ | モジュール | メッセージ）
+L194             _warn_seen.add(key)
+L195             _warn_first_ctx[key] = (filename, lineno)
+L196             # 1行フォーマット（行数節約）
+L197             txt = f"[WARN][{category.__name__}] {message} | {filename}:{lineno}"
+L198             print(txt)
+L199         # 2回目以降は出さない（集約）
+L200
+L201 warnings.showwarning = _compact_showwarning
+L202
+L203 # ベースポリシー: 通常は警告を出す（default）→ ただし同一メッセージは集約
+L204 warnings.resetwarnings()
+L205 warnings.simplefilter("default")
+L206
+L207 # 2) ピンポイント間引き: yfinance 'Ticker.earnings' は "once"（初回のみ可視化）
+L208 warnings.filterwarnings(
+L209     "once",
+L210     message="'Ticker.earnings' is deprecated",
+L211     category=DeprecationWarning,
+L212     module="yfinance"
+L213 )
+L214
+L215 # 3) 最終サマリ: 同一警告が何回出たかを最後に1行で
+L216 @atexit.register
+L217 def _print_warning_summary():
+L218     suppressed = []
+L219     for key, cnt in _warn_count.items():
+L220         if cnt > 1:
+L221             (cat, msg, mod) = key
+L222             filename, lineno = _warn_first_ctx.get(key, ("", 0))
+L223             suppressed.append((cnt, cat, msg, mod, filename, lineno))
+L224     if suppressed:
+L225         suppressed.sort(reverse=True)  # 件数降順
+L226         # 最多上位だけ出す（必要なら上限制御：ここでは上位10件）
+L227         top = suppressed[:10]
+L228         print(f"[WARN-SUMMARY] duplicated warning groups: {len(suppressed)}")
+L229         for cnt, cat, msg, mod, filename, lineno in top:
+L230             print(f"[WARN-SUMMARY] {cnt-1} more | [{cat}] {msg} | {mod} ({filename}:{lineno})")
+L231         if len(suppressed) > len(top):
+L232             print(f"[WARN-SUMMARY] ... and {len(suppressed)-len(top)} more groups suppressed")
+L233
+L234 # 4) 追加（任意）: 1ジョブあたりの総警告上限を設定したい場合
+L235 #    例: 上限1000を超えたら以降は完全サイレント
+L236 _WARN_HARD_LIMIT = int(os.getenv("WARN_HARD_LIMIT", "0") or "0")  # 0なら無効
+L237 if _WARN_HARD_LIMIT > 0:
+L238     _orig_warn_func = warnings.warn
+L239     def _limited_warn(*a, **k):
+L240         total = sum(_warn_count.values())
+L241         if total < _WARN_HARD_LIMIT:
+L242             return _orig_warn_func(*a, **k)
+L243         # 超過後は捨てる（最後にsummaryだけ残る）
+L244     warnings.warn = _limited_warn
+L245
+L246 # ---------- ここまでで警告の“可視性は維持”しつつ“重複で行数爆発”を抑止 ----------
+L247
+L248 # その他
+L249 logger = logging.getLogger(__name__)
+L250 logging.basicConfig(level=(logging.INFO if debug_mode else logging.WARNING), force=True)
+L251
+L252 _T0 = [perf_counter()]
+L253
+L254
+L255 def _tlog(tag: str) -> None:
+L256     now = perf_counter()
+L257     print(f"[T] {tag}: {now - _T0[0]:.2f}s")
+L258     _T0[0] = now
+L259
 L260
-L261
-L262 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
-L263
-L264 def _disjoint_keepG(top_G, top_D, poolD):
-L265     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
-L266     used, D, i = set(top_G), list(top_D), 0
-L267     for j, t in enumerate(D):
-L268         if t not in used:
-L269             continue
-L270         while i < len(poolD) and (poolD[i] in used or poolD[i] in D):
-L271             i += 1
-L272         if i < len(poolD):
-L273             D[j] = poolD[i]; used.add(D[j]); i += 1
-L274     return top_G, D
-L275
-L276
-L277 def _sticky_keep_current(agg: pd.Series, pick: list[str], incumbents: list[str],
-L278                          n_target: int, delta_z: float, keep_buffer: int) -> list[str]:
-L279     import pandas as pd, numpy as np
-L280     sel = list(pick)
-L281     if 
+L261 _tlog("start")
+L262 try:
+L263     _T0[0] = _CSV_LOAD_START
+L264 except NameError:
+L265     pass
+L266 _tlog(f"csv loaded: exist={len(exist)} cand={len(cand)}")
+L267
+L268 # === Utilities ===
+L269 # （ここには “本体ロジック直下で使う軽量ヘルパ” のみを残す）
+L270
+L271
+L272 _env_true = lambda name, default=False: (os.getenv(name) or str(default)).strip().lower() == "true"
+L273
+L274 def _disjoint_keepG(top_G, top_D, poolD):
+L275     """G重複をDから除去し、poolDで順次補充（枯渇時は元銘柄維持）。"""
+L276     used, D, i = set(top_G), list(top_D), 0
+L277     for j, t in enumerate(D):
+L278         if t not in used:
+L279            
 ```
