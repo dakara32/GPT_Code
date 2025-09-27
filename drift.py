@@ -42,12 +42,13 @@ def _load_state_dict() -> dict:
 
 
 def _save_state_dict(state: dict):
-    try:
-        Path(_state_file()).write_text(
-            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except Exception:
-        pass
+    # 常に {"mode": "<...>"} の1キーに圧縮して保存
+    m = (state.get("mode") or state.get("final_mode") or state.get("breadth_mode") or "NORMAL")
+    m = str(m).upper().strip()
+    Path(_state_file()).write_text(
+        json.dumps({"mode": m}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def load_breadth_mode(default: str = "NORMAL") -> str:
