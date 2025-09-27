@@ -14,17 +14,17 @@
 
 ---
 
-## モード判定（コンボ：GコンポジットDD × ブレッドス）
+## モード判定（GコンポジットDDのみ／Breadthは参考指標）
 
 **考え方：** *悪化はゆるく（OR）、回復は厳しく（AND）。Gが先行して良化すれば1段階回復*
 
-### ① GコンポジットDD（Growthのみ）
+### ① GコンポジットDD（Growthのみ・**最終モードはこれで決定**）
 - 対象：ポートフォリオのうち `bucket = "G"` の銘柄を Growth 群として集計
 - 算出：各G銘柄の `Low_today / Peak60(High)` を等加重平均し、`1 - 平均` を%表示（正の値が下落幅）
 - しきい値：**CAUTION = 10% / EMERG = 15%**
 - ログ：Slackとは別に、標準出力へ銘柄別の Peak60・Low・比率・DD% を降順で記録
 
-### ② ブレッドス（trend_template 合格本数）
+### ② ブレッドス（trend_template 合格本数）※**参考表示のみ**
 - current+candidate 全体で trend_template 条件を満たした銘柄数（基準 N_G=12）
 - 閾値：過去600営業日の分布から自動採用（分位点と運用“床”のmax）
   - 緊急入り: max(q05, 12本)
@@ -32,17 +32,7 @@
   - 通常復帰: max(q60, 36本)
 - ヒステリシス：前回モードに依存（EMERG→解除は23本以上、CAUTION→通常は45本以上）
 
-### コンボルール
-- **悪化（ダウングレード）**：①と②のうちランクが高い方（NORMAL < CAUTION < EMERG）を採用 = OR悪化
-  - 例：①=CAUTION, ②=NORMAL → final=CAUTION
-  - 例：①=EMERG, ②=CAUTION → final=EMERG
-
-- **回復（アップグレード）**：基本は①②がともに現在より下位モードに揃ったときのみ1段階回復 = AND回復
-  - 例：EMERG→CAUTION は ①=CAUTION **かつ** ②=CAUTION
-  - 例：CAUTION→NORMAL は ①=NORMAL **かつ** ②=NORMAL
-  - ただし GコンポジットDD が先行して下位モードに改善した場合は、1段階だけ先行回復を許容
-
-> 直感フレーズ：**「悪化はどちらか赤で赤、回復は両方青で青。Gが先に青なら1段階戻す」**
+> メモ：Breadthは市場の体温計として併記するが、**モードの決定はGコンポジットDDのみ**。
 
 ---
 
@@ -58,9 +48,7 @@
 - 含み益 +100% 達成時は50%を利確し、残りはフリーポジションとして -15%TS で保有継続
 - TS発動後のクールダウンは廃止（翌日以降すぐに再IN可）
 
-> 定数管理：現金比率・ドリフト閾値・TS・段階TS・推奨保有数・総枠は `config.py`
-> の `CASH_RATIO_BY_MODE / DRIFT_THRESHOLD_BY_MODE / TS_BASE_BY_MODE / TS_STEP_DELTAS_PT / COUNTS_BY_MODE / TOTAL_TARGETS`
-> を参照する。
+<!-- 冗長な定数管理の注記は削除。実装は config.py に準拠。 -->
 
 ---
 
