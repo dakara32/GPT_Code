@@ -76,6 +76,12 @@ def _read_csv_list(fname):
     return pd.read_csv(p, header=None).iloc[:,0].astype(str).str.upper().tolist()
 
 
+# leaders.csv 読み込み（results/leaders.csv, 1列想定）
+def _read_leaders_symbols() -> list[str]:
+    p = Path(__file__).with_name("results").joinpath("leaders.csv")
+    df = pd.read_csv(p, header=None)
+    return sorted(set(df.iloc[:,0].astype(str).str.strip().str.upper().tolist()))
+
 def _load_universe():
     # exist + candidate を使用。candidate は価格上限で事前フィルタ
     exist = _read_csv_list("current_tickers.csv")
@@ -206,17 +212,6 @@ def build_breadth_header():
         f"  ・60%分位: {q60}本",
     ]
     return "```" + "\n".join(lead_lines) + "```", mode, C_full
-
-
-def _load_growth_symbols(portfolio: list[dict]) -> list[str]:
-    growth = []
-    for row in portfolio:
-        bucket = str(row.get("bucket", "")).strip().upper()
-        if bucket == "G":
-            sym = str(row.get("symbol", "")).strip().upper()
-            if sym:
-                growth.append(sym)
-    return sorted(set(growth))
 
 
 def _format_mode(mode: str) -> str:
@@ -664,32 +659,15 @@ def send_debug(debug_text):
 def main():
     portfolio = load_portfolio()
     symbols = [r["symbol"] for r in portfolio]
-    g_syms = _load_growth_symbols(portfolio)
+    # G集合は leaders.csv を使用（存在前提）
+    g_syms = _read_leaders_symbols()
     sell_alerts = scan_sell_signals(symbols, lookback_days=5)
 
     breadth_block, breadth_mode, breadth_score = build_breadth_header()
     gcd_mode, gcd_pct = _gcd_mode_today(g_syms)
 
-    prev_final = load_final_mode("NORMAL")
-    order = MODE_RANK
-    gcd_rank = order.get(gcd_mode, 0)
-    breadth_rank = order.get(breadth_mode, 0)
-    prev_rank = order.get(prev_final, 0)
-    worsen_mode = gcd_mode if gcd_rank >= breadth_rank else breadth_mode
-    if max(gcd_rank, breadth_rank) > prev_rank:
-        final_mode = worsen_mode
-    else:
-        and_recover = gcd_rank < prev_rank and breadth_rank < prev_rank
-        g_leads_recover = gcd_rank < prev_rank
-        if and_recover or g_leads_recover:
-            if prev_final == "EMERG":
-                final_mode = "CAUTION"
-            elif prev_final == "CAUTION":
-                final_mode = "NORMAL"
-            else:
-                final_mode = prev_final
-        else:
-            final_mode = prev_final
+    # モードは GコンポジットDD のみで決定（シンプル化）
+    final_mode = gcd_mode
     save_final_mode(final_mode)
 
     cash_ratio, drift_threshold = compute_threshold_by_mode(final_mode)
@@ -712,6 +690,7 @@ def main():
         final_mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs
     )
 
+    # --- Slack 送信：①ブロック（判定＋このモードの設定〜推奨現金比率）を独立、②以降は別ブロック ---
     me_g = MODE_EMOJIS.get(gcd_mode, "")
     me_b = MODE_EMOJIS.get(breadth_mode, "")
     me_f = MODE_EMOJIS.get(final_mode, "")
@@ -719,38 +698,28 @@ def main():
         f"① GコンポジットDD: -{gcd_pct:.1f}%"
         f"（基準: C={CD_CAUTION*100:.0f}% / E={CD_EMERG*100:.0f}%） 判定: {me_g} {gcd_mode}"
     )
-    block_breadth = f"② Breadth: {me_b} {breadth_mode}（テンプレ合格本数: {breadth_score}）"
-    block_final = f"総合（OR悪化／AND回復＋G先行なら1段階回復）: {me_f} {final_mode}"
-    prepend = (
-        block_gcd
-        + "\n"
-        + block_breadth
-        + "\n"
-        + block_final
-        + "\n"
-        + _mode_tail_line(final_mode)
-        + "\n"
-    )
+    # ①ブロック：ここまで＋このモードの設定〜推奨現金比率まで
+    first_block = "```\n" + block_gcd + "\n" + _mode_tail_line(final_mode) + "\n```"
 
+    # ②以降ブロック：Breadth と参考総合表示（※モードはGのみで決定）
+    block_breadth = f"② Breadth: {me_b} {breadth_mode}（テンプレ合格本数: {breadth_score}）"
+    block_final = f"総合（参考表示）: {me_f} {final_mode}"
+    # breadth_block の中身（コードフェンス除去＋「現在モード」行は除去）
+    breadth_details = ""
     if breadth_block:
-        if breadth_block.startswith("```"):
-            inner = breadth_block[len("```") :]
+        inner = breadth_block
+        if inner.startswith("```"):
+            inner = inner[len("```"):]
             if inner.startswith("\n"):
                 inner = inner[1:]
             if inner.endswith("```"):
-                inner = inner[: -len("```")]
-            inner = inner.strip("\n")
-            inner_lines = [line for line in inner.splitlines() if "現在モード" not in line]
-            cleaned_inner = "\n".join(inner_lines)
-            new_inner = prepend + cleaned_inner if cleaned_inner else prepend.rstrip("\n")
-            breadth_block = "```\n" + new_inner + "\n```"
-        else:
-            lines = [line for line in breadth_block.splitlines() if "現在モード" not in line]
-            cleaned_block = "\n".join(lines)
-            breadth_block = prepend + cleaned_block if cleaned_block else prepend.rstrip("\n")
-        header = breadth_block + ("\n" if not breadth_block.endswith("\n") else "") + header_core
-    else:
-        header = prepend + header_core
+                inner = inner[:-3]
+        inner_lines = [ln for ln in inner.splitlines() if "現在モード" not in ln]
+        breadth_details = "\n".join(inner_lines).strip()
+    second_body = block_breadth + "\n" + block_final + ("\n" + breadth_details if breadth_details else "")
+    second_block = "```\n" + second_body.strip() + "\n```"
+
+    header = first_block + "\n" + second_block + "\n" + header_core
     if sell_alerts:
         def fmt_pair(date_tags):
             date, tags = date_tags
