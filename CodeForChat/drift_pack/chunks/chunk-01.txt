@@ -2,7 +2,7 @@
 # === Chat Paste Pack ===
 # Repo: dakara32/GPT_Code @ main
 # Files: config.py, drift.py, .github/workflows/daily-report.yml, documents/README.md, documents/drift_design.md
-# 作成日時: 2025-09-27 10:03:28 (JST)
+# 作成日時: 2025-09-27 10:48:45 (JST)
 # 使い方: 下のチャンクを順に貼ればこのチャットで全体把握できます。
 # 注記: 各ファイルは個別に L1.. で行番号付与。
 ---
@@ -70,264 +70,265 @@ L22 CAND_PRICE_MAX = 450.0
 L23 RESULTS_DIR = "results"
 L24 os.makedirs(RESULTS_DIR, exist_ok=True)
 L25
-L26 def _state_file():
-L27     return str(Path(RESULTS_DIR) / "breadth_state.json")
-L28
+L26
+L27 def _state_file():
+L28     """Return path to JSON storing the latest breadth/final mode state."""
 L29
-L30 def _load_state_dict() -> dict:
-L31     try:
-L32         with open(_state_file()) as fh:
-L33             data = json.load(fh)
-L34         return data if isinstance(data, dict) else {}
-L35     except Exception:
+L30     return str(Path(RESULTS_DIR) / "current_mode.json")
+L31
+L32
+L33 def _load_state_dict() -> dict:
+L34     p = Path(_state_file())
+L35     if not p.exists():
 L36         return {}
-L37
-L38
-L39 def _save_state_dict(state: dict):
-L40     try:
-L41         with open(_state_file(), "w") as fh:
-L42             json.dump(state, fh)
-L43     except Exception:
-L44         pass
-L45
-L46
-L47 def load_breadth_mode(default: str = "NORMAL") -> str:
-L48     state = _load_state_dict()
-L49     mode = state.get("breadth_mode", state.get("mode", default))
-L50     return mode if mode in MODE_RANK else default
+L37     try:
+L38         data = json.loads(p.read_text(encoding="utf-8") or "{}")
+L39         return data if isinstance(data, dict) else {}
+L40     except Exception:
+L41         return {}
+L42
+L43
+L44 def _save_state_dict(state: dict):
+L45     try:
+L46         Path(_state_file()).write_text(
+L47             json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+L48         )
+L49     except Exception:
+L50         pass
 L51
 L52
-L53 def save_breadth_mode(mode: str):
+L53 def load_breadth_mode(default: str = "NORMAL") -> str:
 L54     state = _load_state_dict()
-L55     state["breadth_mode"] = mode
-L56     _save_state_dict(state)
+L55     mode = state.get("breadth_mode", state.get("mode", default))
+L56     return mode if mode in MODE_RANK else default
 L57
 L58
-L59 def load_final_mode(default: str = "NORMAL") -> str:
+L59 def save_breadth_mode(mode: str):
 L60     state = _load_state_dict()
-L61     mode = state.get("final_mode", state.get("mode", default))
-L62     return mode if mode in MODE_RANK else default
+L61     state["breadth_mode"] = mode
+L62     _save_state_dict(state)
 L63
 L64
-L65 def save_final_mode(mode: str):
+L65 def load_final_mode(default: str = "NORMAL") -> str:
 L66     state = _load_state_dict()
-L67     state["final_mode"] = mode
-L68     state.setdefault("breadth_mode", state.get("breadth_mode", mode))
-L69     state["mode"] = mode
-L70     _save_state_dict(state)
-L71
-L72
-L73 def _read_csv_list(fname):
-L74     p = Path(__file__).with_name(fname)
-L75     if not p.exists(): return []
-L76     return pd.read_csv(p, header=None).iloc[:,0].astype(str).str.upper().tolist()
+L67     mode = state.get("final_mode", state.get("mode", default))
+L68     return mode if mode in MODE_RANK else default
+L69
+L70
+L71 def save_final_mode(mode: str):
+L72     state = _load_state_dict()
+L73     state["final_mode"] = mode
+L74     state.setdefault("breadth_mode", state.get("breadth_mode", mode))
+L75     state["mode"] = mode
+L76     _save_state_dict(state)
 L77
 L78
-L79 # leaders.csv 読み込み（results/leaders.csv, 1列想定）
-L80 def _read_leaders_symbols() -> list[str]:
-L81     p = Path(__file__).with_name("results").joinpath("leaders.csv")
-L82     df = pd.read_csv(p, header=None)
-L83     return sorted(set(df.iloc[:,0].astype(str).str.strip().str.upper().tolist()))
+L79 def _read_csv_list(fname):
+L80     p = Path(__file__).with_name(fname)
+L81     if not p.exists(): return []
+L82     return pd.read_csv(p, header=None).iloc[:,0].astype(str).str.upper().tolist()
+L83
 L84
-L85 def _load_universe():
-L86     # exist + candidate を使用。candidate は価格上限で事前フィルタ
-L87     exist = _read_csv_list("current_tickers.csv")
-L88     cand  = _read_csv_list("candidate_tickers.csv")
-L89     cand_info = yf.Tickers(" ".join(cand)) if cand else None
-L90     cand_keep = []
-L91     for t in cand:
-L92         try:
-L93             px = cand_info.tickers[t].fast_info.get("lastPrice", float("inf"))
-L94         except Exception:
-L95             px = float("inf")
-L96         if pd.notna(px) and float(px) <= CAND_PRICE_MAX:
-L97             cand_keep.append(t)
-L98     tickers = sorted(set(exist + cand_keep))
-L99     return exist, cand_keep, tickers
-L100
-L101
-L102 def _fetch_prices_600d(tickers):
-L103     data = yf.download(
-L104         tickers + [BENCH],
-L105         period="600d",
-L106         auto_adjust=True,
-L107         progress=False,
-L108         threads=False,
-L109     )
-L110     close = data["Close"]
-L111     px = close.dropna(how="all", axis=1).ffill(limit=2)
-L112     spx = close[BENCH].reindex(px.index).ffill()
-L113     return px, spx
-L114
-L115
-L116 def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
-L117     # scorer.py の実装をそのまま移植（ベクトル化版）
-L118     import numpy as np, pandas as pd
-L119     if px is None or px.empty:
-L120         return pd.Series(dtype=int)
-L121     px = px.dropna(how="all", axis=1)
-L122     if win_days and win_days > 0:
-L123         px = px.tail(win_days)
-L124     if px.empty:
-L125         return pd.Series(dtype=int)
-L126     # 欠損吸収
-L127     px = px.ffill(limit=2)
-L128     spx = spx.reindex(px.index).ffill()
-L129
-L130     ma50  = px.rolling(50,  min_periods=50).mean()
-L131     ma150 = px.rolling(150, min_periods=150).mean()
-L132     ma200 = px.rolling(200, min_periods=200).mean()
-L133
-L134     tt = (px > ma150)
-L135     tt &= (px > ma200)
-L136     tt &= (ma150 > ma200)
-L137     tt &= (ma200 - ma200.shift(21) > 0)
-L138     tt &= (ma50  > ma150)
-L139     tt &= (ma50  > ma200)
-L140     tt &= (px    > ma50)
-L141
-L142     lo252 = px.rolling(252, min_periods=252).min()
-L143     hi252 = px.rolling(252, min_periods=252).max()
-L144     tt &= (px.divide(lo252).sub(1.0) >= 0.30)
-L145     tt &= (px >= (0.75 * hi252))
-L146
-L147     r12  = px.divide(px.shift(252)).sub(1.0)
-L148     br12 = spx.divide(spx.shift(252)).sub(1.0)
-L149     r1   = px.divide(px.shift(22)).sub(1.0)
-L150     br1  = spx.divide(spx.shift(22)).sub(1.0)
-L151     rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
-L152     tt &= (rs >= 0.10)
-L153
-L154     return tt.fillna(False).sum(axis=1).astype(int)
-L155
-L156
-L157 def build_breadth_header():
-L158     # factor._build_breadth_lead_lines と同一挙動
-L159     exist, cand, tickers = _load_universe()
-L160     if not tickers:
-L161         return "", "NORMAL", 0
-L162     px, spx = _fetch_prices_600d(tickers)
-L163     win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
-L164     C_ts = trend_template_breadth_series(px, spx, win_days=win)
-L165     if C_ts.empty:
-L166         return "", "NORMAL", 0
-L167     warmup = int(os.getenv("BREADTH_WARMUP_DAYS","252"))
-L168     base = C_ts.iloc[warmup:] if len(C_ts)>warmup else C_ts
-L169     C_full = int(C_ts.iloc[-1])
-L170
-L171     q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
-L172     q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
-L173     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
-L174
-L175     # G枠サイズ（Breadth基準）
-L176     N_G = config.N_G
-L177     th_in_rec   = max(N_G, q05)
-L178     th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
-L179     th_norm_rec = max(3*N_G, q60)
+L85 # leaders.csv 読み込み（results/leaders.csv, 1列想定）
+L86 def _read_leaders_symbols() -> list[str]:
+L87     p = Path(__file__).with_name("results").joinpath("leaders.csv")
+L88     df = pd.read_csv(p, header=None)
+L89     return sorted(set(df.iloc[:,0].astype(str).str.strip().str.upper().tolist()))
+L90
+L91 def _load_universe():
+L92     # exist + candidate を使用。candidate は価格上限で事前フィルタ
+L93     exist = _read_csv_list("current_tickers.csv")
+L94     cand  = _read_csv_list("candidate_tickers.csv")
+L95     cand_info = yf.Tickers(" ".join(cand)) if cand else None
+L96     cand_keep = []
+L97     for t in cand:
+L98         try:
+L99             px = cand_info.tickers[t].fast_info.get("lastPrice", float("inf"))
+L100         except Exception:
+L101             px = float("inf")
+L102         if pd.notna(px) and float(px) <= CAND_PRICE_MAX:
+L103             cand_keep.append(t)
+L104     tickers = sorted(set(exist + cand_keep))
+L105     return exist, cand_keep, tickers
+L106
+L107
+L108 def _fetch_prices_600d(tickers):
+L109     data = yf.download(
+L110         tickers + [BENCH],
+L111         period="600d",
+L112         auto_adjust=True,
+L113         progress=False,
+L114         threads=False,
+L115     )
+L116     close = data["Close"]
+L117     px = close.dropna(how="all", axis=1).ffill(limit=2)
+L118     spx = close[BENCH].reindex(px.index).ffill()
+L119     return px, spx
+L120
+L121
+L122 def trend_template_breadth_series(px: pd.DataFrame, spx: pd.Series, win_days: int | None = None) -> pd.Series:
+L123     # scorer.py の実装をそのまま移植（ベクトル化版）
+L124     import numpy as np, pandas as pd
+L125     if px is None or px.empty:
+L126         return pd.Series(dtype=int)
+L127     px = px.dropna(how="all", axis=1)
+L128     if win_days and win_days > 0:
+L129         px = px.tail(win_days)
+L130     if px.empty:
+L131         return pd.Series(dtype=int)
+L132     # 欠損吸収
+L133     px = px.ffill(limit=2)
+L134     spx = spx.reindex(px.index).ffill()
+L135
+L136     ma50  = px.rolling(50,  min_periods=50).mean()
+L137     ma150 = px.rolling(150, min_periods=150).mean()
+L138     ma200 = px.rolling(200, min_periods=200).mean()
+L139
+L140     tt = (px > ma150)
+L141     tt &= (px > ma200)
+L142     tt &= (ma150 > ma200)
+L143     tt &= (ma200 - ma200.shift(21) > 0)
+L144     tt &= (ma50  > ma150)
+L145     tt &= (ma50  > ma200)
+L146     tt &= (px    > ma50)
+L147
+L148     lo252 = px.rolling(252, min_periods=252).min()
+L149     hi252 = px.rolling(252, min_periods=252).max()
+L150     tt &= (px.divide(lo252).sub(1.0) >= 0.30)
+L151     tt &= (px >= (0.75 * hi252))
+L152
+L153     r12  = px.divide(px.shift(252)).sub(1.0)
+L154     br12 = spx.divide(spx.shift(252)).sub(1.0)
+L155     r1   = px.divide(px.shift(22)).sub(1.0)
+L156     br1  = spx.divide(spx.shift(22)).sub(1.0)
+L157     rs   = 0.7*(r12.sub(br12, axis=0)) + 0.3*(r1.sub(br1, axis=0))
+L158     tt &= (rs >= 0.10)
+L159
+L160     return tt.fillna(False).sum(axis=1).astype(int)
+L161
+L162
+L163 def build_breadth_header():
+L164     # factor._build_breadth_lead_lines と同一挙動
+L165     exist, cand, tickers = _load_universe()
+L166     if not tickers:
+L167         return "", "NORMAL", 0
+L168     px, spx = _fetch_prices_600d(tickers)
+L169     win = int(os.getenv("BREADTH_CALIB_WIN_DAYS", "600"))
+L170     C_ts = trend_template_breadth_series(px, spx, win_days=win)
+L171     if C_ts.empty:
+L172         return "", "NORMAL", 0
+L173     warmup = int(os.getenv("BREADTH_WARMUP_DAYS","252"))
+L174     base = C_ts.iloc[warmup:] if len(C_ts)>warmup else C_ts
+L175     C_full = int(C_ts.iloc[-1])
+L176
+L177     q05 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_IN",  "0.05"))), nan=0.0))
+L178     q20 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_EMERG_OUT", "0.20"))), nan=0.0))
+L179     q60 = int(np.nan_to_num(base.quantile(float(os.getenv("BREADTH_Q_WARN_OUT",  "0.60"))), nan=0.0))
 L180
-L181     use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
-L182     if use_calib:
-L183         th_in, th_out, th_norm, th_src = th_in_rec, th_out_rec, th_norm_rec, "自動"
-L184     else:
-L185         th_in   = int(os.getenv("GTT_EMERG_IN", str(N_G)))
-L186         th_out  = int(os.getenv("GTT_EMERG_OUT", str(int(1.5*N_G))))
-L187         th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3*N_G)))
-L188         th_src = "手動"
-L189
-L190     prev = load_breadth_mode("NORMAL")
-L191     if   prev == "EMERG":
-L192         mode = "EMERG"   if (C_full < th_out)  else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-L193     elif prev == "CAUTION":
-L194         mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
-L195     else:
-L196         mode = "EMERG"   if (C_full < th_in)   else ("CAUTION" if (C_full < th_norm) else "NORMAL")
-L197     save_breadth_mode(mode)
-L198
-L199     mode_ja, emoji = MODE_LABELS_JA.get(mode, mode), MODE_EMOJIS.get(mode, "ℹ️")
-L200     eff_days = len(base)
-L201
-L202     lead_lines = [
-L203         f"{emoji} *現在モード: {mode_ja}*",
-L204         f"テンプレ合格本数: *{C_full}本*",
-L205         "しきい値（{0}）".format(th_src),
-L206         f"  ・緊急入り: <{th_in}本",
-L207         f"  ・緊急解除: ≥{th_out}本",
-L208         f"  ・通常復帰: ≥{th_norm}本",
-L209         f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
-L210         f"  ・下位5%: {q05}本",
-L211         f"  ・下位20%: {q20}本",
-L212         f"  ・60%分位: {q60}本",
-L213     ]
-L214     return "```" + "\n".join(lead_lines) + "```", mode, C_full
-L215
-L216
-L217 def _format_mode(mode: str) -> str:
-L218     upper = (mode or "NORMAL").upper()
-L219     return f"{MODE_EMOJIS.get(upper, 'ℹ️')} {MODE_LABELS_JA.get(upper, upper)}"
-L220
+L181     # G枠サイズ（Breadth基準）
+L182     N_G = config.N_G
+L183     th_in_rec   = max(N_G, q05)
+L184     th_out_rec  = max(int(np.ceil(1.5*N_G)), q20)
+L185     th_norm_rec = max(3*N_G, q60)
+L186
+L187     use_calib = os.getenv("BREADTH_USE_CALIB", "true").strip().lower() == "true"
+L188     if use_calib:
+L189         th_in, th_out, th_norm, th_src = th_in_rec, th_out_rec, th_norm_rec, "自動"
+L190     else:
+L191         th_in   = int(os.getenv("GTT_EMERG_IN", str(N_G)))
+L192         th_out  = int(os.getenv("GTT_EMERG_OUT", str(int(1.5*N_G))))
+L193         th_norm = int(os.getenv("GTT_CAUTION_OUT", str(3*N_G)))
+L194         th_src = "手動"
+L195
+L196     prev = load_breadth_mode("NORMAL")
+L197     if   prev == "EMERG":
+L198         mode = "EMERG"   if (C_full < th_out)  else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+L199     elif prev == "CAUTION":
+L200         mode = "CAUTION" if (C_full < th_norm) else "NORMAL"
+L201     else:
+L202         mode = "EMERG"   if (C_full < th_in)   else ("CAUTION" if (C_full < th_norm) else "NORMAL")
+L203     save_breadth_mode(mode)
+L204
+L205     mode_ja, emoji = MODE_LABELS_JA.get(mode, mode), MODE_EMOJIS.get(mode, "ℹ️")
+L206     eff_days = len(base)
+L207
+L208     lead_lines = [
+L209         f"{emoji} *現在モード: {mode_ja}*",
+L210         f"テンプレ合格本数: *{C_full}本*",
+L211         "しきい値（{0}）".format(th_src),
+L212         f"  ・緊急入り: <{th_in}本",
+L213         f"  ・緊急解除: ≥{th_out}本",
+L214         f"  ・通常復帰: ≥{th_norm}本",
+L215         f"参考指標（過去~{win}営業日, 有効={eff_days}日）",
+L216         f"  ・下位5%: {q05}本",
+L217         f"  ・下位20%: {q20}本",
+L218         f"  ・60%分位: {q60}本",
+L219     ]
+L220     return "```" + "\n".join(lead_lines) + "```", mode, C_full
 L221
-L222 def _gcd_mode_today(g_syms: list[str]) -> tuple[str, float]:
-L223     """
-L224     現在のGrowth群について、Low_today / Peak60(High) の等加重平均から G-CD(%) を算出し、モードを返す。
-L225     戻り値: (gcd_mode, gcd_pct)  ※gcd_pctは正の%（例 11.3 は -11.3%の下落）
-L226     """
+L222
+L223 def _format_mode(mode: str) -> str:
+L224     upper = (mode or "NORMAL").upper()
+L225     return f"{MODE_EMOJIS.get(upper, 'ℹ️')} {MODE_LABELS_JA.get(upper, upper)}"
+L226
 L227
-L228     if not g_syms:
-L229         print("📝 audit[G-CD details]: G銘柄が空のため算出対象がありません")
-L230         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
-L231         return "NORMAL", 0.0
-L232
-L233     try:
-L234         df = yf.download(
-L235             g_syms,
-L236             period="100d",
-L237             interval="1d",
-L238             auto_adjust=False,
-L239             progress=False,
-L240         )
-L241     except Exception as e:
-L242         print(f"⚠️ audit[G-CD details]: 株価データ取得に失敗しました ({e})")
-L243         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
-L244         return "NORMAL", 0.0
-L245
-L246     if not isinstance(df, pd.DataFrame) or df.empty:
-L247         print("⚠️ audit[G-CD details]: 株価データが空のため算出できません")
-L248         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
-L249         return "NORMAL", 0.0
-L250
-L251     hi_all = df.get("High") if isinstance(df, pd.DataFrame) else None
-L252     lo_all = df.get("Low") if isinstance(df, pd.DataFrame) else None
-L253     if hi_all is None or lo_all is None:
-L254         print("⚠️ audit[G-CD details]: High/Low データが欠落しています")
-L255         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
-L256         return "NORMAL", 0.0
-L257
-L258     if isinstance(hi_all, pd.Series):
-L259         hi_all = hi_all.to_frame(name=g_syms[0])
-L260     if isinstance(lo_all, pd.Series):
-L261         lo_all = lo_all.to_frame(name=g_syms[0])
-L262
-L263     if hi_all.empty or lo_all.empty:
-L264         print("⚠️ audit[G-CD details]: High/Low データが空のため算出できません")
-L265         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
-L266         return "NORMAL", 0.0
-L267
-L268     peak60 = hi_all.rolling(60, min_periods=20).max().tail(1).iloc[0]
-L269     low_today = lo_all.tail(1).iloc[0]
-L270
-L271     details: list[tuple[str, float, float, float, float]] = []
-L272     for sym in g_syms:
-L273         p = float(peak60.get(sym, float("nan"))) if hasattr(peak60, "get") else float("nan")
-L274         lt = float(low_today.get(sym, float("nan"))) if hasattr(low_today, "get") else float("nan")
-L275         if pd.notna(p) and p > 0 and pd.notna(lt) and lt > 0:
-L276             ratio = lt / p
-L277             ddpct = (1.0 - ratio) * 100.0
-L278             details.append((sym, p, lt, ratio, ddpct))
-L279
-L280     if not details:
-L281         print("⚠️ audit[G-CD details]: 有効な銘柄データがありません")
-L282         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
-L283         return "NORMAL", 0.0
-L284
-L285     d
+L228 def _gcd_mode_today(g_syms: list[str]) -> tuple[str, float]:
+L229     """
+L230     現在のGrowth群について、Low_today / Peak60(High) の等加重平均から G-CD(%) を算出し、モードを返す。
+L231     戻り値: (gcd_mode, gcd_pct)  ※gcd_pctは正の%（例 11.3 は -11.3%の下落）
+L232     """
+L233
+L234     if not g_syms:
+L235         print("📝 audit[G-CD details]: G銘柄が空のため算出対象がありません")
+L236         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
+L237         return "NORMAL", 0.0
+L238
+L239     try:
+L240         df = yf.download(
+L241             g_syms,
+L242             period="100d",
+L243             interval="1d",
+L244             auto_adjust=False,
+L245             progress=False,
+L246         )
+L247     except Exception as e:
+L248         print(f"⚠️ audit[G-CD details]: 株価データ取得に失敗しました ({e})")
+L249         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
+L250         return "NORMAL", 0.0
+L251
+L252     if not isinstance(df, pd.DataFrame) or df.empty:
+L253         print("⚠️ audit[G-CD details]: 株価データが空のため算出できません")
+L254         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
+L255         return "NORMAL", 0.0
+L256
+L257     hi_all = df.get("High") if isinstance(df, pd.DataFrame) else None
+L258     lo_all = df.get("Low") if isinstance(df, pd.DataFrame) else None
+L259     if hi_all is None or lo_all is None:
+L260         print("⚠️ audit[G-CD details]: High/Low データが欠落しています")
+L261         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
+L262         return "NORMAL", 0.0
+L263
+L264     if isinstance(hi_all, pd.Series):
+L265         hi_all = hi_all.to_frame(name=g_syms[0])
+L266     if isinstance(lo_all, pd.Series):
+L267         lo_all = lo_all.to_frame(name=g_syms[0])
+L268
+L269     if hi_all.empty or lo_all.empty:
+L270         print("⚠️ audit[G-CD details]: High/Low データが空のため算出できません")
+L271         print("📝 audit[G-CD summary]: avg_low/peak60=1.0000  drawdown=0.00%  => NORMAL")
+L272         return "NORMAL", 0.0
+L273
+L274     peak60 = hi_all.rolling(60, min_periods=20).max().tail(1).iloc[0]
+L275     low_today = lo_all.tail(1).iloc[0]
+L276
+L277     details: list[tuple[str, float, float, float, float]] = []
+L278     for sym in g_syms:
+L279         p = float(peak60.get(sym, float("nan"))) if hasattr(peak60, "get") else float("nan")
+L280         lt = float(low_today.get(sym, float("nan"))) if hasattr(low_today, "get") else float("nan")
+L281         if pd.notna(p) and p > 0 and pd.notna(lt) and lt > 0:
+L282             ratio = lt / p
+L283             ddpct = (1.0 - ratio) * 100.0
+L284             details.append((sym, p, lt, ratio, ddpct))
+L285
+L286     if no
 ```
