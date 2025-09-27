@@ -57,9 +57,7 @@ def load_breadth_mode(default: str = "NORMAL") -> str:
 
 
 def save_breadth_mode(mode: str):
-    state = _load_state_dict()
-    state["breadth_mode"] = mode
-    _save_state_dict(state)
+    return  # 参考値のため保存しない（no-op）
 
 
 def load_final_mode(default: str = "NORMAL") -> str:
@@ -69,11 +67,12 @@ def load_final_mode(default: str = "NORMAL") -> str:
 
 
 def save_final_mode(mode: str):
-    state = _load_state_dict()
-    state["final_mode"] = mode
-    state.setdefault("breadth_mode", state.get("breadth_mode", mode))
-    state["mode"] = mode
-    _save_state_dict(state)
+    """状態ファイルは mode のみを保存（G-CDで決定）"""
+    m = (mode or "NORMAL").upper().strip()
+    Path(_state_file()).write_text(
+        json.dumps({"mode": m}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _read_csv_list(fname):
