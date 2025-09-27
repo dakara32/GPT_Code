@@ -517,6 +517,7 @@ def recommended_counts_by_mode(mode: str) -> tuple[int, int, int]:
 
 
 def _mode_tail_line(final_mode: str) -> str:
+    """①ブロック表示：改行＋アイコンで整形"""
     fm = (final_mode or "NORMAL").upper()
     base_ts = config.TS_BASE_BY_MODE.get(fm, config.TS_BASE_BY_MODE.get("NORMAL", 0.15))
     ts_base_pct = int(round(base_ts * 100))
@@ -525,15 +526,16 @@ def _mode_tail_line(final_mode: str) -> str:
     step60 = max(ts_base_pct - d2, 0)
     step100 = max(ts_base_pct - d3, 0)
     g_cnt, d_cnt, cash_slots = recommended_counts_by_mode(fm)
-    cash_pct = config.CASH_RATIO_BY_MODE.get(
-        fm, config.CASH_RATIO_BY_MODE.get("NORMAL", 0.10)
-    ) * 100
-    return (
-        f"〔このモードの設定〕"
-        f"TS基本: -{ts_base_pct}%（+30%→-{step30}%／+60%→-{step60}%／+100%→-{step100}%）／ "
-        f"推奨保有: G{g_cnt}・D{d_cnt}（現金化枠 {cash_slots}）／ "
-        f"推奨現金比率: {cash_pct:.0f}%"
-    )
+    cash_pct = config.CASH_RATIO_BY_MODE.get(fm, config.CASH_RATIO_BY_MODE.get("NORMAL", 0.10)) * 100
+    drift_th = config.DRIFT_THRESHOLD_BY_MODE.get(fm, config.DRIFT_THRESHOLD_BY_MODE.get("NORMAL", 12))
+    drift_str = "🔴(停止)" if drift_th == float("inf") else f"{int(drift_th)}%"
+    return "\n".join([
+        "〔このモードの設定〕",
+        f"🎯 TS基本: -{ts_base_pct}％（+30%→-{step30}％／+60%→-{step60}％／+100%→-{step100}％）",
+        f"🧩 推奨保有: G{g_cnt}・D{d_cnt}（現金化枠 {cash_slots}）",
+        f"💼 推奨現金比率: {cash_pct:.0f}％",
+        f"📊 ドリフト閾値: {drift_str}",
+    ])
 
 
 def build_dataframe(portfolio):
@@ -616,12 +618,9 @@ def formatters_for(alert):
 
 
 def build_header(mode, cash_ratio, drift_threshold, total_drift_abs, alert, simulated_total_drift_abs):
-    mode_ratio = config.CASH_RATIO_BY_MODE.get(mode.upper(), cash_ratio)
-    header = (
-        f"*💼 推奨現金比率:* {mode_ratio*100:.1f}%（モード準拠）\n"
-        f"*📊 ドリフト閾値:* {'🔴(停止)' if drift_threshold == float('inf') else str(drift_threshold)+'%'}\n"
-        f"*📉 現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
-    )
+    # 💼は①に集約し非表示。📊は維持。
+    header  = f"*📊 ドリフト閾値:* {'🔴(停止)' if drift_threshold == float('inf') else str(int(drift_threshold)) + '%'}\n"
+    header += f"*📉 現在のドリフト合計:* {total_drift_abs * 100:.2f}%\n"
     if alert:
         header += f"*🔁 半戻し後ドリフト合計(想定):* {simulated_total_drift_abs * 100:.2f}%\n"
         header += "🚨 *アラート: 発生！！ Δqtyのマイナス銘柄を売却、任意の銘柄を買い増してバランスを取りましょう！*\n"
@@ -693,7 +692,6 @@ def main():
     # --- Slack 送信：①ブロック（判定＋このモードの設定〜推奨現金比率）を独立、②以降は別ブロック ---
     me_g = MODE_EMOJIS.get(gcd_mode, "")
     me_b = MODE_EMOJIS.get(breadth_mode, "")
-    me_f = MODE_EMOJIS.get(final_mode, "")
     block_gcd = (
         f"① GコンポジットDD: -{gcd_pct:.1f}%"
         f"（基準: C={CD_CAUTION*100:.0f}% / E={CD_EMERG*100:.0f}%） 判定: {me_g} {gcd_mode}"
@@ -701,10 +699,9 @@ def main():
     # ①ブロック：ここまで＋このモードの設定〜推奨現金比率まで
     first_block = "```\n" + block_gcd + "\n" + _mode_tail_line(final_mode) + "\n```"
 
-    # ②以降ブロック：Breadth と参考総合表示（※モードはGのみで決定）
+    # ②以降ブロック：Breadthのみ（“総合（参考表示）”は削除）
     block_breadth = f"② Breadth: {me_b} {breadth_mode}（テンプレ合格本数: {breadth_score}）"
-    block_final = f"総合（参考表示）: {me_f} {final_mode}"
-    # breadth_block の中身（コードフェンス除去＋「現在モード」行は除去）
+    # breadth_block の中身（コードフェンス除去＋重複行は除去）
     breadth_details = ""
     if breadth_block:
         inner = breadth_block
@@ -714,9 +711,9 @@ def main():
                 inner = inner[1:]
             if inner.endswith("```"):
                 inner = inner[:-3]
-        inner_lines = [ln for ln in inner.splitlines() if "現在モード" not in ln]
+        inner_lines = [ln for ln in inner.splitlines() if ("現在モード" not in ln and "テンプレ合格本数" not in ln)]
         breadth_details = "\n".join(inner_lines).strip()
-    second_body = block_breadth + "\n" + block_final + ("\n" + breadth_details if breadth_details else "")
+    second_body = block_breadth + ("\n" + breadth_details if breadth_details else "")
     second_block = "```\n" + second_body.strip() + "\n```"
 
     header = first_block + "\n" + second_block + "\n" + header_core
