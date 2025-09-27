@@ -23,14 +23,19 @@ CAND_PRICE_MAX = 450.0
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+
 def _state_file():
-    return str(Path(RESULTS_DIR) / "breadth_state.json")
+    """Return path to JSON storing the latest breadth/final mode state."""
+
+    return str(Path(RESULTS_DIR) / "current_mode.json")
 
 
 def _load_state_dict() -> dict:
+    p = Path(_state_file())
+    if not p.exists():
+        return {}
     try:
-        with open(_state_file()) as fh:
-            data = json.load(fh)
+        data = json.loads(p.read_text(encoding="utf-8") or "{}")
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
@@ -38,8 +43,9 @@ def _load_state_dict() -> dict:
 
 def _save_state_dict(state: dict):
     try:
-        with open(_state_file(), "w") as fh:
-            json.dump(state, fh)
+        Path(_state_file()).write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     except Exception:
         pass
 
